@@ -4,9 +4,9 @@ r"""内存级临时盘（RAM Disk）管理 —— backend 与 filecore 共用。
 真实磁盘、也避免敏感报告内容残留在磁盘上。
 
 平台：
-- macOS：用 hdiutil 挂一块 512MB RAM disk 到 /Volumes/WebSubmitTemp。
-- Linux：直接用 tmpfs 目录 /dev/shm/websubmit（内存文件系统，无需挂载）。
-- Windows：**退化为真实磁盘**上的临时目录 %TEMP%\WebSubmitTemp。
+- macOS：用 hdiutil 挂一块 512MB RAM disk 到 /Volumes/PyBaseTemp。
+- Linux：直接用 tmpfs 目录 /dev/shm/pybase（内存文件系统，无需挂载）。
+- Windows：**退化为真实磁盘**上的临时目录 %TEMP%\PyBaseTemp。
 
 Windows 为什么是例外：这个系统压根没有内置的内存文件系统——没有 tmpfs，也没有
 hdiutil 那样自带的命令。要真挂内存盘只能装第三方内核驱动（ImDisk / OSFMount 等），
@@ -22,7 +22,7 @@ cleanup() 退出时尽力删干净（删不掉只记日志，不影响主流程�
 卸载会把还在用的另一方的盘拔掉"的冲突——每进程一个 pid 锁文件：
 - 每个进程在 users 目录下建 "{pid}.lock" 并独占它（LOCK_EX，fd 活到进程结束）。
   进程崩溃时内核自动释放该锁，留下的陈旧文件可被识别清理。
-- 创建/注册/卸载都在 create 锁（LOCK_EX）下串行，避免并发创建出 "WebSubmitTemp 1"，
+- 创建/注册/卸载都在 create 锁（LOCK_EX）下串行，避免并发创建出 "PyBaseTemp 1"，
   也保证"判断是否最后一人"与"新进程注册"互斥。
 - 卸载时移除自己的 pid 文件，再逐个 LOCK_EX|NB 试别的 pid 文件：能拿到=该进程已死
   （清掉陈旧文件）；拿不到=有进程仍在用。全部可拿 => 自己是最后一个 => 才 eject。
@@ -40,8 +40,8 @@ import subprocess
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_NAME = "WebSubmitTemp"
-_DEFAULT_LINUX_DIRNAME = "websubmit"
+_DEFAULT_NAME = "PyBaseTemp"
+_DEFAULT_LINUX_DIRNAME = "pybase"
 _DEFAULT_SIZE_MB = 512
 
 
@@ -470,15 +470,26 @@ class RamDiskManager:
 _singleton = None
 
 
-def get_ram_disk(size_mb: int = None) -> RamDiskManager:
-    """获取进程级 RAM Disk 管理单例（默认参数，两端共享同一块盘）。
+def get_ram_disk(
+    size_mb: int = None,
+    name: str = _DEFAULT_NAME,
+    linux_dirname: str = _DEFAULT_LINUX_DIRNAME,
+) -> RamDiskManager:
+    """获取进程级 RAM Disk 管理单例（同名同路径的调用方共享同一块盘）。
 
     size_mb 只在**首次创建单例**时决定初始大小，之后传入只更新"下次重挂用多大"
     ——盘已经挂上了，改这个数不会让它当场变大（macOS 的 RAM disk 大小创建时固定）。
+
+    name/linux_dirname 同理只在首次创建单例时生效；多个调用方要共享同一块盘，
+    必须传相同的 name/linux_dirname（或都不传，用默认值）。
     """
     global _singleton
     if _singleton is None:
-        _singleton = RamDiskManager(size_mb=size_mb or _DEFAULT_SIZE_MB)
+        _singleton = RamDiskManager(
+            name=name,
+            linux_dirname=linux_dirname,
+            size_mb=size_mb or _DEFAULT_SIZE_MB,
+        )
     elif size_mb and int(size_mb) != _singleton.size_mb:
         _singleton.size_mb = int(size_mb)
     return _singleton

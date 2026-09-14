@@ -31,7 +31,7 @@ pytestmark = pytest.mark.skipif(
     reason='内存盘的挂载/重挂行为是 macOS 专有；Linux 用 tmpfs，无此语义',
 )
 
-_USERS_DIR = f"{tempfile.gettempdir()}/.WebSubmitTemp.users.d"
+_USERS_DIR = f"{tempfile.gettempdir()}/.PyBaseTemp.users.d"
 
 # 子进程：一个"客户端"，按 stdin 指令做事、stdout 回报
 _WORKER = r'''

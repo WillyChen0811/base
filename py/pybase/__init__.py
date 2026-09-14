@@ -1,4 +1,4 @@
-"""pybase —— 从 websubmit 抽出的零业务依赖基础模块。
+"""pybase —— 零业务依赖的 Python 基础模块集。
 
 子模块：
 - rpc: JSON-RPC 客户端/服务端底座（业务路由、同步逻辑仍留在各项目自己的 rpc 包里）

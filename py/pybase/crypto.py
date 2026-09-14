@@ -1,13 +1,14 @@
 """密码加密/解密工具模块
 
-使用 Fernet 对称加密来安全存储 SMB 密码。
-密钥基于机器特征生成，存储在用户目录下。
+使用 Fernet 对称加密来安全存储密码。
+密钥基于机器特征生成，存储在调用方指定的文件路径下。
+
+本模块不带任何项目默认值——key_file、passphrase、fallback_salt 均由调用方传入。
 """
 
 import os
 import logging
 from pathlib import Path
-from typing import Optional
 from cryptography.fernet import Fernet
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
@@ -20,19 +21,23 @@ logger = logging.getLogger(__name__)
 class PasswordEncryption:
     """密码加密/解密工具类"""
 
-    def __init__(self, key_file: str = "~/.filecore/encryption.key"):
+    def __init__(self, key_file: str, passphrase: bytes, fallback_salt: bytes = b'pybase_default_salt_'):
         """初始化加密工具
-        
+
         Args:
             key_file: 加密密钥文件路径
+            passphrase: 派生密钥用的口令（项目自定义，不同项目应各不相同）
+            fallback_salt: 机器特征盐值生成失败时的兜底值
         """
         self.key_path = Path(key_file).expanduser().resolve()
         self.key_path.parent.mkdir(parents=True, exist_ok=True)
+        self._passphrase = passphrase
+        self._fallback_salt = fallback_salt
         self._fernet = self._get_or_create_fernet()
 
     def _generate_machine_salt(self) -> bytes:
         """生成基于机器特征的盐值
-        
+
         使用机器的 MAC 地址和主机名生成稳定的盐值
         """
         try:
@@ -48,14 +53,14 @@ class PasswordEncryption:
             return salt[:16]
         except Exception as e:
             logger.warning(f"无法生成机器特定盐值，使用默认值: {e}")
-            return b'filecore_default'
+            return self._fallback_salt
 
     def _generate_key(self) -> bytes:
         """生成加密密钥
-        
+
         基于机器特征生成密钥，确保在同一台机器上密钥稳定
         """
-        password = b'filecore_smb_encryption'
+        password = self._passphrase
         salt = self._generate_machine_salt()
         
         kdf = PBKDF2HMAC(
@@ -130,15 +135,3 @@ class PasswordEncryption:
         except Exception as e:
             logger.error(f"密码解密失败: {e}")
             raise ValueError(f"密码解密失败: {str(e)}")
-
-
-# 全局实例
-_encryption: Optional[PasswordEncryption] = None
-
-
-def get_encryption() -> PasswordEncryption:
-    """获取全局加密实例"""
-    global _encryption
-    if _encryption is None:
-        _encryption = PasswordEncryption()
-    return _encryption

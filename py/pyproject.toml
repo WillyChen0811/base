@@ -9,6 +9,7 @@ description = "零业务依赖的基础模块：RPC 底座、内存盘、AI 客�
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}
+authors = [{name = "WillyChen0811"}]
 dependencies = [
     "python-docx>=1.0.0",
     "openpyxl>=3.1.0",
@@ -19,6 +20,9 @@ dependencies = [
     "requests>=2.31.0",
     "urllib3>=2.0.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/WillyChen0811/base"
 
 [project.optional-dependencies]
 rpc-server = [

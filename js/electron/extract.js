@@ -142,9 +142,18 @@ function simplifyParam(node) {
 // 方法与属性共用同一个分隔符（# 或 .）是因为摸底确认过两边同一模块/类内部
 // 没有同名的方法+属性组合（见 js/tests 的 no-collision 测试）；事件单独用 @，
 // 即使同名方法/事件（如 BrowserWindow 的 close() 方法与 close 事件）也不会撞 key。
+// 构造函数单独一种 kind：electron-api.json 把它放在 constructorMethod 字段，
+// 不在 instanceMethods 里，但语义上和实例方法一样挂在 `#` 下——用
+// `new BrowserWindow(...)` 时传的 options 也要能被第 2 层按 key 挂断代信息。
+// Structure 的属性（0b）复用 `.` 分隔符，和模块成员/类静态成员同一形式：
+// Structure 名大写开头、模块名小写开头，不会互相撞 key（extract() 里的撞车
+// 断言覆盖了全部 entries，包括这里新增的两类）。
+const DOT_SCOPES = new Set(['static', 'module', 'structure']);
+
 function buildKey({ containerName, scope, kind, memberName }) {
   if (kind === 'event') return `${containerName}@${memberName}`;
-  const sep = scope === 'static' ? '.' : scope === 'module' ? '.' : '#';
+  if (kind === 'constructor') return `${containerName}#constructor`;
+  const sep = DOT_SCOPES.has(scope) ? '.' : '#';
   return `${containerName}${sep}${memberName}`;
 }
 
@@ -187,6 +196,23 @@ function extractContainer(item) {
   }
 
   if (isClass) {
+    // 构造函数：不是所有收录的类都能被用户 new（如 CommandLine 只能从
+    // app.commandLine 拿现成实例），constructorMethod 是 null 就跳过。
+    if (item.constructorMethod) {
+      const ctor = item.constructorMethod;
+      entries.push({
+        key: buildKey({ containerName: item.name, kind: 'constructor' }),
+        module: item.name,
+        itemType: item.type,
+        kind: 'constructor',
+        scope: 'instance',
+        name: 'constructor',
+        description: firstLine(ctor.description),
+        additionalTags: ctor.additionalTags || [],
+        signature: ctor.signature || '',
+        parameters: (ctor.parameters || []).map(simplifyParam),
+      });
+    }
     pushAll(item.instanceMethods, 'method', 'instance');
     pushAll(item.instanceProperties, 'property', 'instance');
     pushAll(item.instanceEvents, 'event', 'instance');
@@ -198,6 +224,183 @@ function extractContainer(item) {
     pushAll(item.events, 'event', 'module');
   }
 
+  return entries;
+}
+
+// ---- 0b：被引用的 Structure，传递闭包收集 ----
+//
+// electron-api.json 里参数/返回值/属性的 type 字段只记 Structure 的名字
+// （如 "BrowserWindowConstructorOptions"），具体有哪些字段要去 Structure
+// 条目自己的 properties 里找。第 2 层要挂"某个选项哪个版本才有"，没有 key
+// 就无处可挂，所以这里把收录模块/类用到的 Structure 也展开成 entries——
+// 但只展开"被引用到"的，不是 electron-api.json 里全部 174 项都收。
+//
+// electron-api.json 的 Class 条目（instanceMethods 等 5 个数组）已经是拍平的
+// （子类自己不重复声明继承来的成员，但数组里已经包含父类成员，如
+// BrowserWindow 的 instanceMethods 比 BaseWindow 多，`BrowserWindow#setBounds`
+// 已经在里面），但 Structure 不是——BrowserWindowConstructorOptions 自己的
+// properties 只有 2 条，width/height/show/x/y 等 50 条都在
+// BaseWindowConstructorOptions 里，要靠 `extends` 字段才能找到。所以这里既
+// 顺着 type 引用走，也顺着 `extends` 链把父 Structure 收进来；extractStructure
+// 再把继承链拍平进子 Structure 自己的 entries（见下面 flattenStructureProperties），
+// 这样查"BrowserWindow 能传哪些 options"不用消费方自己知道去查父类。
+// extends 目标不是本次收录范围内的 Structure（比如 IpcMainEvent extends
+// Event——Event 是 Node/DOM 内置类型，不在 electron-api.json 里）时链就到此为止，
+// 没法拍平不存在的文档条目。
+
+// 递归找出 type 结构（字符串/数组/对象）里出现的 Structure 名字，塞进 found。
+function walkTypeRefs(type, structNames, found) {
+  if (type == null) return;
+  if (typeof type === 'string') {
+    if (structNames.has(type)) found.add(type);
+    return;
+  }
+  if (Array.isArray(type)) {
+    for (const t of type) walkTypeRefs(t, structNames, found);
+    return;
+  }
+  if (typeof type === 'object') {
+    if (type.type !== undefined) walkTypeRefs(type.type, structNames, found);
+    for (const p of type.parameters || []) walkNodeRefs(p, structNames, found);
+    for (const p of type.properties || []) walkNodeRefs(p, structNames, found);
+    for (const t of type.innerTypes || []) walkTypeRefs(t, structNames, found);
+    if (type.returns) walkNodeRefs(type.returns, structNames, found);
+  }
+}
+
+// 参数/属性/事件字段/返回值（raw 形态，未经 simplify）统一递归，收集其中
+// 出现的 Structure 名字。
+function walkNodeRefs(node, structNames, found) {
+  if (node == null) return;
+  walkTypeRefs(node.type, structNames, found);
+  for (const p of node.properties || []) walkNodeRefs(p, structNames, found);
+  for (const p of node.parameters || []) walkNodeRefs(p, structNames, found);
+  for (const p of node.eventProperties || []) walkNodeRefs(p, structNames, found);
+  for (const t of node.innerTypes || []) walkTypeRefs(t, structNames, found);
+  if (node.returns) walkNodeRefs(node.returns, structNames, found);
+}
+
+// 收录模块/类自身（含构造函数）的所有方法/属性/事件节点，交给 walkNodeRefs 找引用。
+function collectOwnNodes(item) {
+  const nodes = [];
+  if (item.type === 'Class') {
+    if (item.constructorMethod) nodes.push(item.constructorMethod);
+    nodes.push(
+      ...(item.instanceMethods || []),
+      ...(item.instanceProperties || []),
+      ...(item.instanceEvents || []),
+      ...(item.staticMethods || []),
+      ...(item.staticProperties || [])
+    );
+  } else {
+    nodes.push(...(item.methods || []), ...(item.properties || []), ...(item.events || []));
+  }
+  return nodes;
+}
+
+// 从 WANTED 模块/类出发，传递闭包收集被引用到的 Structure 条目（原始形态）。
+// 返回 Map<name, rawItem>，按发现顺序无所谓，调用方会自己排序。
+function collectReferencedStructures(byName, wantedNames) {
+  const structNames = new Set(
+    Array.from(byName.values())
+      .filter((item) => item.type === 'Structure')
+      .map((item) => item.name)
+  );
+
+  const found = new Set();
+  for (const name of wantedNames) {
+    const item = byName.get(name);
+    if (!item) continue;
+    for (const node of collectOwnNodes(item)) walkNodeRefs(node, structNames, found);
+  }
+
+  // 再从已发现的 Structure 出发继续找：(a) 它自己 properties 里引用到的
+  // Structure（如 BrowserWindowConstructorOptions.webPreferences 指向
+  // WebPreferences），(b) 它 extends 的父 Structure（如
+  // BrowserWindowConstructorOptions -> BaseWindowConstructorOptions），
+  // 直到不再有新发现为止——两条线一起做传递闭包，因为父 Structure 自己的
+  // properties 也可能引用别的 Structure。
+  const visited = new Set(found);
+  let frontier = Array.from(found);
+  while (frontier.length) {
+    const next = [];
+    for (const sname of frontier) {
+      const s = byName.get(sname);
+      if (!s) continue;
+      const nested = new Set();
+      for (const p of s.properties || []) walkNodeRefs(p, structNames, nested);
+      if (s.extends && structNames.has(s.extends)) nested.add(s.extends);
+      for (const n of nested) {
+        if (!visited.has(n)) {
+          visited.add(n);
+          next.push(n);
+        }
+      }
+    }
+    frontier = next;
+  }
+
+  const result = new Map();
+  for (const name of visited) {
+    const item = byName.get(name);
+    if (item) result.set(name, item);
+  }
+  return result;
+}
+
+// 沿着 `extends` 链把一个 Structure 的属性拍平：返回 Map<propName,
+// {raw, declaredIn}>，declaredIn 是实际声明这个属性的 Structure 名字
+// （自己声明的就是它自己）。顺序从最远的祖先到自己，子的同名属性覆盖父的
+// （Map.set 覆盖同 key 时值更新、原插入位置不变，不影响正确性，最终 entries
+// 落进 byKey 对象，对外不依赖属性顺序）。
+// cycle 防御：electron-api.json 里没见过 extends 成环，但 `seen` 兜底，
+// 防止文档以后出现环时死循环。
+function flattenStructureProperties(byName, item) {
+  const chain = [];
+  const seen = new Set();
+  let cur = item;
+  while (cur && !seen.has(cur.name)) {
+    seen.add(cur.name);
+    chain.unshift(cur);
+    const parent = cur.extends && byName.get(cur.extends);
+    cur = parent && parent.type === 'Structure' ? parent : null;
+  }
+
+  const byPropName = new Map();
+  for (const node of chain) {
+    for (const raw of node.properties || []) {
+      byPropName.set(raw.name, { raw, declaredIn: node.name });
+    }
+  }
+  return byPropName;
+}
+
+// 把一个 Structure 条目的每个属性（含沿 extends 链继承来的）展开成一条快照
+// entry，key 形如 `BrowserWindowConstructorOptions.webPreferences`。继承来的
+// 属性带 `inheritedFrom: 声明它的祖先 Structure 名字`，自己声明的没有这个
+// 字段——第 3 层要挂"某个选项哪个版本才有"就挂在子的 key 上，不用消费方自己
+// 回溯继承链。
+function extractStructure(item, byName) {
+  const entries = [];
+  const flattened = flattenStructureProperties(byName, item);
+  for (const { raw, declaredIn } of flattened.values()) {
+    const entry = {
+      key: buildKey({ containerName: item.name, scope: 'structure', kind: 'property', memberName: raw.name }),
+      module: item.name,
+      itemType: 'Structure',
+      kind: 'property',
+      scope: 'structure',
+      name: raw.name,
+      required: !!raw.required,
+      description: firstLine(raw.description),
+      additionalTags: raw.additionalTags || [],
+      propertyType: raw.type !== undefined ? simplifyType(raw.type) : null,
+    };
+    if (declaredIn !== item.name) entry.inheritedFrom = declaredIn;
+    const possibleValues = simplifyPossibleValues(raw.possibleValues);
+    if (possibleValues !== undefined) entry.possibleValues = possibleValues;
+    entries.push(entry);
+  }
   return entries;
 }
 
@@ -218,6 +421,12 @@ function extract(version) {
     entries.push(...extractContainer(byName.get(name)));
   }
 
+  const referencedStructures = collectReferencedStructures(byName, WANTED);
+  const structureNames = Array.from(referencedStructures.keys()).sort();
+  for (const name of structureNames) {
+    entries.push(...extractStructure(referencedStructures.get(name), byName));
+  }
+
   const keys = new Set();
   for (const entry of entries) {
     if (keys.has(entry.key)) {
@@ -229,9 +438,23 @@ function extract(version) {
   const byKey = {};
   for (const entry of entries) byKey[entry.key] = entry;
 
+  // modules 顶层字段要能看出每一项是 Module/Class 还是（被引用而收录的）
+  // Structure——WANTED 里的按原顺序在前，Structure 按名字排序追加在后。
+  // Structure 带 extends 字段时原样带出来（父 Structure 自己也在这份列表里，
+  // 是独立的容器，有自己的 entries）。
+  const modules = [
+    ...WANTED.map((name) => ({ name, type: byName.get(name).type })),
+    ...structureNames.map((name) => {
+      const item = referencedStructures.get(name);
+      const m = { name, type: 'Structure' };
+      if (item.extends) m.extends = item.extends;
+      return m;
+    }),
+  ];
+
   return {
     electronVersion: version,
-    modules: WANTED.slice(),
+    modules,
     entryCount: entries.length,
     entries: byKey,
   };
@@ -251,10 +474,11 @@ function main() {
     process.exit(1);
   }
   const snapshot = writeSnapshot(version);
-  const moduleCount = new Set(Object.values(snapshot.entries).map((e) => e.module)).size;
+  const structCount = snapshot.modules.filter((m) => m.type === 'Structure').length;
+  const containerCount = snapshot.modules.length - structCount;
   console.error(
-    `[extract] v${version}：${moduleCount} 个模块/类，${snapshot.entryCount} 条 API，` +
-      `已写入 ${path.relative(process.cwd(), snapshotPath(version))}`
+    `[extract] v${version}：${containerCount} 个模块/类，${structCount} 个被引用的 Structure，` +
+      `${snapshot.entryCount} 条 API，已写入 ${path.relative(process.cwd(), snapshotPath(version))}`
   );
 }
 

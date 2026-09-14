@@ -1,0 +1,341 @@
+{
+  "byKey": {
+    "BrowserWindow#flashFrame": {
+      "changes": [
+        {
+          "breakingChangesHeader": "behavior-changed-windowflashframebool-will-flash-dock-icon-continuously-on-macos",
+          "description": "`window.flashFrame(bool)` will flash dock icon continuously on macOS",
+          "prUrl": "https://github.com/electron/electron/pull/41391"
+        }
+      ]
+    },
+    "WebContents#backgroundThrottling": {
+      "changes": [
+        {
+          "breakingChangesHeader": "behavior-changed-webcontentsbackgroundthrottling-set-to-false-affects-all-webcontents-in-the-host-browserwindow",
+          "description": "`WebContents.backgroundThrottling` set to false affects all `WebContents` in the host `BrowserWindow`",
+          "prUrl": "https://github.com/electron/electron/pull/38924"
+        }
+      ]
+    },
+    "WebContents#canGoBack": {
+      "deprecated": [
+        {
+          "breakingChangesHeader": "deprecated-clearhistory-cangoback-goback-cangoforward-goforward-gotoindex-cangotooffset-gotooffset-on-webcontents",
+          "prUrl": "https://github.com/electron/electron/pull/41752"
+        }
+      ]
+    },
+    "WebContents#canGoForward": {
+      "deprecated": [
+        {
+          "breakingChangesHeader": "deprecated-clearhistory-cangoback-goback-cangoforward-goforward-gotoindex-cangotooffset-gotooffset-on-webcontents",
+          "prUrl": "https://github.com/electron/electron/pull/41752"
+        }
+      ]
+    },
+    "WebContents#canGoToOffset": {
+      "deprecated": [
+        {
+          "breakingChangesHeader": "deprecated-clearhistory-cangoback-goback-cangoforward-goforward-gotoindex-cangotooffset-gotooffset-on-webcontents",
+          "prUrl": "https://github.com/electron/electron/pull/41752"
+        }
+      ]
+    },
+    "WebContents#clearHistory": {
+      "deprecated": [
+        {
+          "breakingChangesHeader": "deprecated-clearhistory-cangoback-goback-cangoforward-goforward-gotoindex-cangotooffset-gotooffset-on-webcontents",
+          "prUrl": "https://github.com/electron/electron/pull/41752"
+        }
+      ]
+    },
+    "WebContents#goBack": {
+      "deprecated": [
+        {
+          "breakingChangesHeader": "deprecated-clearhistory-cangoback-goback-cangoforward-goforward-gotoindex-cangotooffset-gotooffset-on-webcontents",
+          "prUrl": "https://github.com/electron/electron/pull/41752"
+        }
+      ]
+    },
+    "WebContents#goForward": {
+      "deprecated": [
+        {
+          "breakingChangesHeader": "deprecated-clearhistory-cangoback-goback-cangoforward-goforward-gotoindex-cangotooffset-gotooffset-on-webcontents",
+          "prUrl": "https://github.com/electron/electron/pull/41752"
+        }
+      ]
+    },
+    "WebContents#goToIndex": {
+      "deprecated": [
+        {
+          "breakingChangesHeader": "deprecated-clearhistory-cangoback-goback-cangoforward-goforward-gotoindex-cangotooffset-gotooffset-on-webcontents",
+          "prUrl": "https://github.com/electron/electron/pull/41752"
+        }
+      ]
+    },
+    "WebContents#goToOffset": {
+      "deprecated": [
+        {
+          "breakingChangesHeader": "deprecated-clearhistory-cangoback-goback-cangoforward-goforward-gotoindex-cangotooffset-gotooffset-on-webcontents",
+          "prUrl": "https://github.com/electron/electron/pull/41752"
+        }
+      ]
+    },
+    "WebContents#setBackgroundThrottling": {
+      "changes": [
+        {
+          "breakingChangesHeader": "behavior-changed-webcontentsbackgroundthrottling-set-to-false-affects-all-webcontents-in-the-host-browserwindow",
+          "description": "`WebContents.backgroundThrottling` set to false affects all `WebContents` in the host `BrowserWindow`",
+          "prUrl": "https://github.com/electron/electron/pull/38924"
+        }
+      ]
+    },
+    "desktopCapturer.getSources": {
+      "added": [
+        {
+          "prUrl": "https://github.com/electron/electron/pull/2963"
+        }
+      ],
+      "changes": [
+        {
+          "breakingChangesHeader": "api-changed-callback-based-versions-of-promisified-apis",
+          "description": "This method now returns a Promise instead of using a callback function.",
+          "prUrl": "https://github.com/electron/electron/pull/16427"
+        }
+      ]
+    },
+    "dialog.showCertificateTrustDialog": {
+      "added": [
+        {
+          "prUrl": "https://github.com/electron/electron/pull/9099"
+        }
+      ],
+      "changes": [
+        {
+          "breakingChangesHeader": "api-changed-callback-based-versions-of-promisified-apis",
+          "description": "This method now returns a Promise instead of using a callback function.",
+          "prUrl": "https://github.com/electron/electron/pull/17181"
+        }
+      ]
+    },
+    "dialog.showMessageBox": {
+      "changes": [
+        {
+          "breakingChangesHeader": "api-changed-callback-based-versions-of-promisified-apis",
+          "description": "This method now returns a Promise instead of using a callback function.",
+          "prUrl": "https://github.com/electron/electron/pull/17298"
+        },
+        {
+          "description": "Added the `signal` option.",
+          "prUrl": "https://github.com/electron/electron/pull/26102"
+        },
+        {
+          "description": "Added the `textWidth` option.",
+          "prUrl": "https://github.com/electron/electron/pull/30474"
+        }
+      ]
+    },
+    "dialog.showMessageBoxSync": {
+      "added": [
+        {
+          "prUrl": "https://github.com/electron/electron/pull/17298"
+        }
+      ]
+    },
+    "dialog.showOpenDialog": {
+      "changes": [
+        {
+          "breakingChangesHeader": "api-changed-callback-based-versions-of-promisified-apis",
+          "description": "This method now returns a Promise instead of using a callback function.",
+          "prUrl": "https://github.com/electron/electron/pull/16973"
+        }
+      ]
+    },
+    "dialog.showOpenDialogSync": {
+      "added": [
+        {
+          "prUrl": "https://github.com/electron/electron/pull/16973"
+        }
+      ]
+    },
+    "dialog.showSaveDialog": {
+      "changes": [
+        {
+          "breakingChangesHeader": "api-changed-callback-based-versions-of-promisified-apis",
+          "description": "This method now returns a Promise instead of using a callback function.",
+          "prUrl": "https://github.com/electron/electron/pull/17054"
+        }
+      ]
+    },
+    "dialog.showSaveDialogSync": {
+      "added": [
+        {
+          "prUrl": "https://github.com/electron/electron/pull/17054"
+        }
+      ]
+    },
+    "globalShortcut.isRegistered": {
+      "added": [
+        {
+          "prUrl": "https://github.com/electron/electron/pull/534"
+        }
+      ]
+    },
+    "globalShortcut.isSuspended": {
+      "added": [
+        {
+          "prUrl": "https://github.com/electron/electron/pull/50425"
+        }
+      ]
+    },
+    "globalShortcut.register": {
+      "added": [
+        {
+          "prUrl": "https://github.com/electron/electron/pull/534"
+        }
+      ]
+    },
+    "globalShortcut.registerAll": {
+      "added": [
+        {
+          "prUrl": "https://github.com/electron/electron/pull/15542"
+        }
+      ]
+    },
+    "globalShortcut.setSuspended": {
+      "added": [
+        {
+          "prUrl": "https://github.com/electron/electron/pull/50425"
+        }
+      ]
+    },
+    "globalShortcut.unregister": {
+      "added": [
+        {
+          "prUrl": "https://github.com/electron/electron/pull/534"
+        }
+      ]
+    },
+    "globalShortcut.unregisterAll": {
+      "added": [
+        {
+          "prUrl": "https://github.com/electron/electron/pull/534"
+        }
+      ]
+    },
+    "ipcMain.handle": {
+      "added": [
+        {
+          "prUrl": "https://github.com/electron/electron/pull/18449"
+        }
+      ]
+    },
+    "ipcMain.handleOnce": {
+      "added": [
+        {
+          "prUrl": "https://github.com/electron/electron/pull/18449"
+        }
+      ]
+    },
+    "ipcMain.off": {
+      "added": [
+        {
+          "prUrl": "https://github.com/electron/electron/pull/44651"
+        }
+      ]
+    },
+    "ipcMain.removeHandler": {
+      "added": [
+        {
+          "prUrl": "https://github.com/electron/electron/pull/18449"
+        }
+      ]
+    },
+    "ipcRenderer.addListener": {
+      "added": [
+        {
+          "prUrl": "https://github.com/electron/electron/pull/39816"
+        }
+      ]
+    },
+    "ipcRenderer.invoke": {
+      "added": [
+        {
+          "prUrl": "https://github.com/electron/electron/pull/18449"
+        }
+      ]
+    },
+    "ipcRenderer.off": {
+      "added": [
+        {
+          "prUrl": "https://github.com/electron/electron/pull/39816"
+        }
+      ]
+    },
+    "ipcRenderer.postMessage": {
+      "added": [
+        {
+          "prUrl": "https://github.com/electron/electron/pull/22404"
+        }
+      ]
+    },
+    "shell.openExternal": {
+      "changes": [
+        {
+          "description": "Added `activate` option.",
+          "prUrl": "https://github.com/electron/electron/pull/4508"
+        },
+        {
+          "description": "Added `workingDirectory` option.",
+          "prUrl": "https://github.com/electron/electron/pull/15065"
+        },
+        {
+          "description": "Added `logUsage` option.",
+          "prUrl": "https://github.com/electron/electron/pull/37139"
+        }
+      ]
+    },
+    "shell.openPath": {
+      "added": [
+        {
+          "breakingChangesHeader": "api-changed-shellopenitem-is-now-shellopenpath",
+          "prUrl": "https://github.com/electron/electron/pull/20682"
+        }
+      ]
+    },
+    "shell.trashItem": {
+      "added": [
+        {
+          "breakingChangesHeader": "deprecated-shellmoveitemtotrash",
+          "prUrl": "https://github.com/electron/electron/pull/25114"
+        }
+      ]
+    }
+  },
+  "source": {
+    "path": "docs/api/*.md",
+    "ref": "v43.3.0",
+    "repo": "electron/electron",
+    "sha": "1aa21d231aeaf5634880a6e60187256e9f2fd4f9"
+  },
+  "stats": {
+    "resolvedCount": 37,
+    "totalBlocks": 39,
+    "unresolvedCount": 2
+  },
+  "unresolved": [
+    {
+      "file": "context-bridge",
+      "owner": "contextBridge",
+      "reason": "module-level",
+      "title": "contextBridge"
+    },
+    {
+      "file": "ipc-renderer",
+      "owner": "ipcRenderer",
+      "reason": "module-level",
+      "title": "ipcRenderer"
+    }
+  ]
+}

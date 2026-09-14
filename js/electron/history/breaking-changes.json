@@ -1,0 +1,3126 @@
+{
+  "entries": [
+    {
+      "anchor": "behavior-changed-captured-page-images-have-the-pages-scale-factor",
+      "kind": "Behavior Changed",
+      "mentionedApis": [
+        "NativeImage",
+        "webContents.capturePage()",
+        "win.capturePage()",
+        "<webview>.capturePage()",
+        "paint",
+        "webContents.beginFrameSubscription()",
+        "webPreferences.offscreen.deviceScaleFactor",
+        "image.getSize()",
+        "image.crop()",
+        "image.resize()",
+        "toBitmap()",
+        "toPNG()",
+        "toJPEG()",
+        "toDataURL()"
+      ],
+      "rawTitle": "Behavior Changed: captured page images have the page's scale factor",
+      "summary": "The [`NativeImage`](api/native-image.md) returned by `webContents.capturePage()` (and `win.capturePage()` / `<webview>.capturePage()`), passed to the offscreen `paint` event, and passed to the `webContents.beginFrameSubscription()` callback now has the page's device scale factor. These images used t…",
+      "title": "captured page images have the page's scale factor",
+      "version": "46.0"
+    },
+    {
+      "anchor": "behavior-changed-workers-created-by-subframes-need-nodeintegrationinsubframes-for-nodejs-integration",
+      "kind": "Behavior Changed",
+      "mentionedApis": [
+        "nodeIntegrationInWorker: true",
+        "Worker",
+        "<iframe>",
+        "nodeIntegrationInSubFrames"
+      ],
+      "rawTitle": "Behavior Changed: workers created by subframes need `nodeIntegrationInSubFrames` for Node.js integration",
+      "summary": "With `nodeIntegrationInWorker: true`, a `Worker` created from an `<iframe>` in the same process as the main frame used to get Node.js integration even though the iframe itself had none. Workers now only get Node.js integration when the frame that creates them has it: the main frame, or any frame whe…",
+      "title": "workers created by subframes need `nodeIntegrationInSubFrames` for Node.js integration",
+      "version": "46.0"
+    },
+    {
+      "anchor": "behavior-changed-preload-scripts-only-run-in-devtools-extension-frames-hosted-by-devtools",
+      "kind": "Behavior Changed",
+      "mentionedApis": [
+        "chrome-extension://",
+        "devtools_page",
+        "nodeIntegrationInSubFrames"
+      ],
+      "rawTitle": "Behavior Changed: preload scripts only run in DevTools extension frames hosted by DevTools",
+      "summary": "A `chrome-extension://` document used to receive the window's preload script (and session preload scripts) wherever it was embedded. It now only does so when it is a top-level frame or is hosted inside the DevTools front-end (a `devtools_page` or panel); an extension frame embedded in an ordinary pa…",
+      "title": "preload scripts only run in DevTools extension frames hosted by DevTools",
+      "version": "46.0"
+    },
+    {
+      "anchor": "removed-contenttracingenableheapprofiling",
+      "kind": "Removed",
+      "mentionedApis": [
+        "contentTracing.enableHeapProfiling()",
+        "contentTracing"
+      ],
+      "rawTitle": "Removed: `contentTracing.enableHeapProfiling()`",
+      "summary": "The experimental `contentTracing.enableHeapProfiling()` API has been removed. Chromium removed the memlog implementation that backed this API and replaced it with a Perfetto heap-profiling data source. Heap profiling through Electron's `contentTracing` API is unavailable until that data source is in…",
+      "title": "`contentTracing.enableHeapProfiling()`",
+      "version": "45.0"
+    },
+    {
+      "anchor": "behavior-changed-screen-capture-requests-are-reported-as-display-capture-in-setpermissionrequesthandler",
+      "kind": "Behavior Changed",
+      "mentionedApis": [
+        "navigator.mediaDevices.getDisplayMedia()",
+        "getUserMedia()",
+        "chromeMediaSource",
+        "chromeMediaSourceId",
+        "desktopCapturer",
+        "session.setPermissionRequestHandler",
+        "display-capture",
+        "media",
+        "details.mediaTypes",
+        "video",
+        "audio",
+        "setDisplayMediaRequestHandler",
+        "getDisplayMedia()",
+        "self",
+        "<iframe>",
+        "allow=\"display-capture\""
+      ],
+      "rawTitle": "Behavior Changed: screen capture requests are reported as `display-capture` in `setPermissionRequestHandler`",
+      "summary": "Requests to capture the screen, a window or a tab -- made through `navigator.mediaDevices.getDisplayMedia()` or through `getUserMedia()` with the `chromeMediaSource` / `chromeMediaSourceId` constraints used with [`desktopCapturer`](api/desktop-capturer.md) -- are now passed to [`session.setPermissio…",
+      "title": "screen capture requests are reported as `display-capture` in `setPermissionRequestHandler`",
+      "version": "45.0"
+    },
+    {
+      "anchor": "default-changed-documentrequeststorageaccessfor-is-disabled",
+      "kind": "Default Changed",
+      "mentionedApis": [
+        "document.requestStorageAccessFor",
+        "enableBlinkFeatures",
+        "RequestStorageAccessFor"
+      ],
+      "rawTitle": "Default Changed: `document.requestStorageAccessFor` is disabled",
+      "summary": "Chromium has disabled `document.requestStorageAccessFor` by default ahead of its removal. The API can temporarily be restored with the [`enableBlinkFeatures`](api/structures/web-preferences.md) web preference set to `RequestStorageAccessFor`. See [Chromium's intent to remove discussion](https://grou…",
+      "title": "`document.requestStorageAccessFor` is disabled",
+      "version": "45.0"
+    },
+    {
+      "anchor": "behavior-changed-file-descriptors-for-files-inside-asar-archives-are-only-usable-through-fs",
+      "kind": "Behavior Changed",
+      "mentionedApis": [
+        "fs.open",
+        "fs.openSync",
+        "fs.promises.open",
+        "fs",
+        "fs.read",
+        "fs.readv",
+        "fs.fstat",
+        "fs.readFile(fd)",
+        "fs.createReadStream",
+        "FileHandle",
+        "child_process",
+        "stdio",
+        "net.Socket({ fd })",
+        "http2stream.respondWithFile()",
+        "respondWithFD()",
+        "EBADF",
+        "w",
+        "a",
+        "r+",
+        "EACCES",
+        "fs.fchmod",
+        "fs.fchown",
+        "fs.futimes",
+        "fs.stat",
+        "fs.lstat"
+      ],
+      "rawTitle": "Behavior Changed: file descriptors for files inside ASAR archives are only usable through `fs`",
+      "summary": "`fs.open`, `fs.openSync` and `fs.promises.open` on a file inside an ASAR archive used to extract the file to a temporary copy and return a descriptor for that copy. They now return a descriptor that only identifies the entry to Node's `fs` module, which reads directly out of the archive with no temp…",
+      "title": "file descriptors for files inside ASAR archives are only usable through `fs`",
+      "version": "45.0"
+    },
+    {
+      "anchor": "behavior-changed-windowopen-children-of-unsandboxed-windows-get-their-own-sandboxed-process",
+      "kind": "Behavior Changed",
+      "mentionedApis": [
+        "window.open()",
+        "nodeIntegration: true",
+        "webContents.getLastWebPreferences()",
+        "sandbox: true",
+        "null",
+        "window.opener",
+        "window.open(url, '_blank', 'noopener')",
+        "WindowProxy",
+        "webContents.setWindowOpenHandler"
+      ],
+      "rawTitle": "Behavior Changed: `window.open()` children of unsandboxed windows get their own sandboxed process",
+      "summary": "A `window.open()` child normally shares its opener's renderer process, and the OS sandbox of a renderer process is fixed when it launches. Previously a child opened from an unsandboxed (e.g. `nodeIntegration: true`) window silently ran in that unsandboxed process even though `webContents.getLastWebP…",
+      "title": "`window.open()` children of unsandboxed windows get their own sandboxed process",
+      "version": "45.0"
+    },
+    {
+      "anchor": "deprecated-safestorageisencryptionavailable-safestorageencryptstring-and-safestoragedecryptstring",
+      "kind": "Deprecated",
+      "mentionedApis": [
+        "safeStorage",
+        "safeStorage.encryptString()",
+        "safeStorage.decryptStringAsync()"
+      ],
+      "rawTitle": "Deprecated: `safeStorage.isEncryptionAvailable()`, `safeStorage.encryptString()` and `safeStorage.decryptString()`",
+      "summary": "The synchronous `safeStorage` methods are deprecated and will be removed in Electron 46, following Chromium's removal of the synchronous OSCrypt backend they are built on. Use the asynchronous methods instead, which use the same per-platform key stores. Data encrypted with `safeStorage.encryptString…",
+      "title": "`safeStorage.isEncryptionAvailable()`, `safeStorage.encryptString()` and `safeStorage.decryptString()`",
+      "version": "45.0"
+    },
+    {
+      "anchor": "behavior-changed-webcontents-may-be-null-in-select-client-certificate",
+      "kind": "Behavior Changed",
+      "mentionedApis": [
+        "app",
+        "'select-client-certificate'",
+        "net",
+        "respondToAuthRequestsFromMainProcess: true",
+        "webContents",
+        "null",
+        "WebContents",
+        "event.preventDefault()",
+        "ERR_SSL_CLIENT_AUTH_CERT_NEEDED",
+        "callback()"
+      ],
+      "rawTitle": "Behavior Changed: `webContents` may be `null` in `select-client-certificate`",
+      "summary": "The `app` `'select-client-certificate'` event is now also emitted for requests made via the [`net` module](api/net.md) and for [utility processes](api/utility-process.md) created with `respondToAuthRequestsFromMainProcess: true`. For these requests the `webContents` argument is `null`. Previously th…",
+      "title": "`webContents` may be `null` in `select-client-certificate`",
+      "version": "44.0"
+    },
+    {
+      "anchor": "removed-macos-12-support",
+      "kind": "Removed",
+      "mentionedApis": [],
+      "rawTitle": "Removed: macOS 12 support",
+      "summary": "macOS 12 (Monterey) is no longer supported by [Chromium](https://chromium-review.googlesource.com/c/chromium/src/+/7907086). Older versions of Electron will continue to run on Monterey, but macOS 13 (Ventura) or later will be required to run Electron v44.0.0 and higher.",
+      "title": "macOS 12 support",
+      "version": "44.0"
+    },
+    {
+      "anchor": "behavior-changed-angle-is-statically-linked-on-all-platforms",
+      "kind": "Behavior Changed",
+      "mentionedApis": [
+        "libEGL.(so|dylib|dll)",
+        "libGLESv2.(so|dylib|dll)"
+      ],
+      "rawTitle": "Behavior Changed: ANGLE is statically linked on all platforms",
+      "summary": "ANGLE is now [statically linked](https://issues.chromium.org/issues/40268378) into the Electron binary on all platforms, matching upstream Chromium. The `libEGL.(so|dylib|dll)` and `libGLESv2.(so|dylib|dll)` libraries are no longer shipped in the distribution. Apps that replaced or managed their own…",
+      "title": "ANGLE is statically linked on all platforms",
+      "version": "44.0"
+    },
+    {
+      "anchor": "behavior-changed-netrequest-rejects-frame-destinations-without-navigate-mode",
+      "kind": "Behavior Changed",
+      "mentionedApis": [
+        "net.request",
+        "Sec-Fetch-Dest",
+        "document",
+        "frame",
+        "iframe",
+        "fencedframe",
+        "Sec-Fetch-Mode",
+        "navigate"
+      ],
+      "rawTitle": "Behavior Changed: `net.request` rejects frame destinations without navigate mode",
+      "summary": "`net.request` now rejects requests where `Sec-Fetch-Dest` is `document`, `frame`, `iframe`, or `fencedframe` unless `Sec-Fetch-Mode` is also set to `navigate`. This matches Chromium's enforcement that frame-type request destinations must be navigations. Apps that explicitly set one of these `Sec-Fet…",
+      "title": "`net.request` rejects frame destinations without navigate mode",
+      "version": "44.0"
+    },
+    {
+      "anchor": "removed-unity-desktop-environment-support-on-linux",
+      "kind": "Removed",
+      "mentionedApis": [
+        "app.isUnityRunning()",
+        "app.setBadgeCount(count)",
+        "app.badgeCount",
+        "BaseWindow.setProgressBar(progress)",
+        "BrowserWindow.setProgressBar(progress)"
+      ],
+      "rawTitle": "Removed: Unity desktop environment support on Linux",
+      "summary": "Unity has not been the default desktop environment in Ubuntu LTS since version 16.04, which is not supported by current versions of Electron. The deprecation does not prevent Electron from running on Unity if it is installed in a newer distribution, but it will no longer offer unique functionality. …",
+      "title": "Unity desktop environment support on Linux",
+      "version": "44.0"
+    },
+    {
+      "anchor": "removed-windows-32-bit-ia32-and-linux-32-bit-arm-armv7l-support",
+      "kind": "Removed",
+      "mentionedApis": [
+        "win32-ia32",
+        "linux-armv7l",
+        "chromedriver",
+        "mksnapshot",
+        "ffmpeg",
+        "node.lib"
+      ],
+      "rawTitle": "Removed: Windows 32-bit (ia32) and Linux 32-bit ARM (armv7l) support",
+      "summary": "Electron no longer publishes prebuilt binaries for 32-bit platforms: Windows x86 (`win32-ia32`) and Linux ARM (`linux-armv7l`). All related release artifacts (`chromedriver`, `mksnapshot`, `ffmpeg`, and the Windows x86 `node.lib` on the Electron headers CDN) are no longer published either. Older ver…",
+      "title": "Windows 32-bit (ia32) and Linux 32-bit ARM (armv7l) support",
+      "version": "44.0"
+    },
+    {
+      "anchor": "removed-clipboard-module-is-no-longer-available-in-the-renderer-process",
+      "kind": "Removed",
+      "mentionedApis": [
+        "clipboard",
+        "navigator.clipboard",
+        "contextBridge",
+        "clipboard API"
+      ],
+      "rawTitle": "Removed: `clipboard` module is no longer available in the renderer process",
+      "summary": "The `clipboard` module is no longer exposed to renderer processes. It was [previously deprecated](#deprecated-clipboard-api-access-from-renderer-processes) and is now removed in line with [RFC&nbsp;0019](https://github.com/electron/rfcs/blob/main/text/0019-clipboard-rearchitecture.md#removing-the-cl…",
+      "title": "`clipboard` module is no longer available in the renderer process",
+      "version": "44.0"
+    },
+    {
+      "anchor": "api-changed-clipboard-module-rearchitected-to-align-with-the-w3c-clipboard-api",
+      "kind": "API Changed",
+      "mentionedApis": [
+        "clipboard",
+        "navigator.clipboard",
+        "clipboard.read()",
+        "Promise<ClipboardItem[]>",
+        "types",
+        "getType(type) → Promise<Blob>",
+        "ClipboardItem",
+        "getType('electron application/bookmark')",
+        "{ title, url }",
+        "Blob",
+        "clipboard.write(items)",
+        "Promise<void>",
+        "new ClipboardItem({ [mime]: payload })",
+        "ClipboardItem(items)",
+        "Blob | string | Object",
+        "string",
+        "electron application/bookmark",
+        "write()",
+        "clipboard.readText()",
+        "Promise<string>",
+        "clipboard.writeText(text)",
+        "text/uri-list",
+        "CF_HDROP",
+        "NSFilenamesPboardType",
+        "file://",
+        "clipboard.write()",
+        "clipboard.has(mimetype)",
+        "Promise<boolean>",
+        "clipboard.has()",
+        "public/utf8-plain-text",
+        "electron application/osclipboard",
+        "electron application/osclipboard;format=\"public/utf8-plain-text\"",
+        "availableFormats",
+        "readBookmark",
+        "writeBookmark",
+        "readBuffer",
+        "writeBuffer",
+        "readFindText",
+        "writeFindText",
+        "readHTML",
+        "writeHTML",
+        "readImage",
+        "writeImage",
+        "readRTF",
+        "writeRTF",
+        "type",
+        "clipboard.clear",
+        "clipboard.has",
+        "clipboard.readText",
+        "clipboard.writeText",
+        "clipboard.selection",
+        "clipboard.availableFormats([type])",
+        "clipboard.clear()",
+        "clipboard.clear('selection')",
+        "clipboard.selection.clear()",
+        "clipboard.has(format)",
+        "clipboard.has(format, 'selection')",
+        "clipboard.selection.has(mimetype)",
+        "clipboard.read('selection')",
+        "clipboard.selection.read()",
+        "clipboard.readBookmark()",
+        "clipboard.readBuffer(format)",
+        "electron application/osclipboard;format=\"...\"",
+        "clipboard.readBuffer('selection')",
+        "clipboard.readFindText()",
+        "electron application/findtext",
+        "clipboard.readHTML([type])",
+        "text/html",
+        "clipboard.readImage([type])",
+        "image/*",
+        "clipboard.readRTF([type])",
+        "text/rtf",
+        "clipboard.readText('selection')",
+        "clipboard.selection.readText()",
+        "clipboard.write(data)",
+        "clipboard.write([new ClipboardItem({ [mime]: Blob / string })])",
+        "data",
+        "clipboard.write(data, 'selection')",
+        "clipboard.selection.write([new ClipboardItem({ [mime]: Blob / string })])",
+        "clipboard.writeBookmark(title, url[, type])",
+        "clipboard.writeBuffer(format, buffer[, type])",
+        "clipboard.writeBuffer(format, buffer, 'selection')",
+        "clipboard.selection.write()",
+        "clipboard.writeFindText(text)",
+        "clipboard.writeHTML(markup[, type])",
+        "clipboard.writeImage(image[, type])",
+        "clipboard.writeRTF(text[, type])",
+        "clipboard.writeText(text, 'selection')",
+        "clipboard.selection.writeText(text)",
+        "electron application/osclipboard;format=\"${format}\""
+      ],
+      "rawTitle": "API Changed: `clipboard` module rearchitected to align with the W3C Clipboard API",
+      "summary": "The `clipboard` module has been [rearchitected](https://github.com/electron/rfcs/blob/main/text/0019-clipboard-rearchitecture.md) to align with the [W3C Clipboard API](https://w3c.github.io/clipboard-apis/#clipboard-interface). The four read/write methods now all return Promises, matching `navigator…",
+      "title": "`clipboard` module rearchitected to align with the W3C Clipboard API",
+      "version": "44.0"
+    },
+    {
+      "anchor": "removed-pre-macos-13-login-item-attributes",
+      "kind": "Removed",
+      "mentionedApis": [
+        "openAsHidden",
+        "app.setLoginItemSettings()",
+        "wasOpenedAsHidden",
+        "restoreState",
+        "app.getLoginItemSettings()"
+      ],
+      "rawTitle": "Removed: Pre-macOS 13 login item attributes",
+      "summary": "Electron 44 removes the option `openAsHidden` from [`app.setLoginItemSettings()`](https://www.electronjs.org/docs/latest/api/app#appsetloginitemsettingssettings-macos-windows) and the fields `openAsHidden`, `wasOpenedAsHidden` and `restoreState` from the return value of [`app.getLoginItemSettings()`…",
+      "title": "Pre-macOS 13 login item attributes",
+      "version": "44.0"
+    },
+    {
+      "anchor": "behavior-changed-rounded-corners-on-linux",
+      "kind": "Behavior Changed",
+      "mentionedApis": [
+        "roundedCorners",
+        "BrowserWindow",
+        "true"
+      ],
+      "rawTitle": "Behavior Changed: Rounded corners on Linux",
+      "summary": "Frameless windows default to rounded corners on Linux if the desktop environment supports client-side decorations. This can be configured using the existing `roundedCorners` option on `BrowserWindow`, which is now supported on Linux and defaults to `true` on all platforms.",
+      "title": "Rounded corners on Linux",
+      "version": "43.0"
+    },
+    {
+      "anchor": "behavior-changed-wco-respects-the-native-title-bar-layout-on-linux",
+      "kind": "Behavior Changed",
+      "mentionedApis": [
+        "env(titlebar-area-x, 0px)",
+        "env(titlebar-area-width, 100%)"
+      ],
+      "rawTitle": "Behavior Changed: WCO respects the native title bar layout on Linux",
+      "summary": "Frameless windows with Window Controls Overlay (WCO) now adopt the native title bar layout and user settings on Linux. For example, controls will appear on the left side of the frame on RTL systems, and only the close button will be visible by default on GNOME. Depending on the user's desktop enviro…",
+      "title": "WCO respects the native title bar layout on Linux",
+      "version": "43.0"
+    },
+    {
+      "anchor": "behavior-changed-nativeimagetobitmap-now-normalizes-color-space",
+      "kind": "Behavior Changed",
+      "mentionedApis": [
+        "NativeImage.toBitmap()",
+        "NativeImage.getBitmap()",
+        "colorSpace"
+      ],
+      "rawTitle": "Behavior Changed: `NativeImage.toBitmap()` now normalizes color space",
+      "summary": "`NativeImage.toBitmap()` (and its deprecated alias `NativeImage.getBitmap()`) now normalizes pixel data to sRGB by default. Previously, raw pixel data was returned without color space conversion, which meant pixel values from images with different embedded color profiles (e.g., Display P3 on macOS) …",
+      "title": "`NativeImage.toBitmap()` now normalizes color space",
+      "version": "43.0"
+    },
+    {
+      "anchor": "behavior-changed-chromescripting-css-injection-matches-more-fallback-frames",
+      "kind": "Behavior Changed",
+      "mentionedApis": [
+        "chrome.scripting.insertCSS()",
+        "chrome.scripting.removeCSS()",
+        "about:blank",
+        "data:"
+      ],
+      "rawTitle": "Behavior Changed: `chrome.scripting` CSS injection matches more fallback frames",
+      "summary": "Extensions using `chrome.scripting.insertCSS()` or `chrome.scripting.removeCSS()` now follow Chrome's behavior when Electron cannot match a frame's URL directly, such as with `about:blank` or `data:` frames. If the extension has access to the page that created the frame, CSS may now be inserted into…",
+      "title": "`chrome.scripting` CSS injection matches more fallback frames",
+      "version": "43.0"
+    },
+    {
+      "anchor": "behavior-changed-dialog-methods-default-to-downloads-directory",
+      "kind": "Behavior Changed",
+      "mentionedApis": [
+        "defaultPath",
+        "dialog.showOpenDialog",
+        "dialog.showOpenDialogSync",
+        "dialog.showSaveDialog",
+        "dialog.showSaveDialogSync"
+      ],
+      "rawTitle": "Behavior Changed: Dialog methods default to Downloads directory",
+      "summary": "The `defaultPath` option for the following methods now defaults to the user's Downloads folder (or their home directory if Downloads doesn't exist) when not explicitly provided: * `dialog.showOpenDialog` * `dialog.showOpenDialogSync` * `dialog.showSaveDialog` * `dialog.showSaveDialogSync` Previously…",
+      "title": "Dialog methods default to Downloads directory",
+      "version": "43.0"
+    },
+    {
+      "anchor": "removed-showhiddenfiles-in-dialogs-on-linux",
+      "kind": "Removed",
+      "mentionedApis": [
+        "showHiddenFiles"
+      ],
+      "rawTitle": "Removed: `showHiddenFiles` in Dialogs on Linux",
+      "summary": "The `showHiddenFiles` property is no longer supported on Linux. It continues to work on macOS and Windows. GTK intends for this feature to be a user choice rather than an app choice, and has removed the API to do this programmatically.",
+      "title": "`showHiddenFiles` in Dialogs on Linux",
+      "version": "43.0"
+    },
+    {
+      "anchor": "behavior-changed-macos-notifications-now-use-unnotification-api",
+      "kind": "Behavior Changed",
+      "mentionedApis": [
+        "NSUserNotification",
+        "UNNotification",
+        "failed",
+        "Notification"
+      ],
+      "rawTitle": "Behavior Changed: macOS notifications now use `UNNotification` API",
+      "summary": "Electron has migrated from the deprecated `NSUserNotification` API to the [`UNNotification`](https://developer.apple.com/documentation/usernotifications) API on macOS. The new API requires that an application be code-signed in order for notifications to be displayed. If an application is not code-si…",
+      "title": "macOS notifications now use `UNNotification` API",
+      "version": "42.0"
+    },
+    {
+      "anchor": "behavior-changed-offscreen-rendering-will-use-10-as-default-device-scale-factor",
+      "kind": "Behavior Changed",
+      "mentionedApis": [
+        "screen.getPrimaryDisplay().scaleFactor",
+        "webPreferences.offscreen.deviceScaleFactor",
+        "1.0"
+      ],
+      "rawTitle": "Behavior Changed: Offscreen rendering will use `1.0` as default device scale factor.",
+      "summary": "Previously, OSR used the primary display's device scale factor for rendering, which made the output frame size vary across users. Developers had to manually calculate the correct size using `screen.getPrimaryDisplay().scaleFactor`. We now provide an optional property `webPreferences.offscreen.device…",
+      "title": "Offscreen rendering will use `1.0` as default device scale factor.",
+      "version": "42.0"
+    },
+    {
+      "anchor": "behavior-changed-electron-no-longer-downloads-itself-via-postinstall-script",
+      "kind": "Behavior Changed",
+      "mentionedApis": [
+        "electron",
+        "postinstall",
+        "bin",
+        "npx electron",
+        "--ignore-scripts",
+        "node_modules/electron",
+        "install-electron",
+        "ELECTRON_INSTALL_ARCH",
+        "ELECTRON_INSTALL_PLATFORM",
+        "ELECTRON_SKIP_BINARY_DOWNLOAD"
+      ],
+      "rawTitle": "Behavior Changed: `electron` no longer downloads itself via `postinstall` script",
+      "summary": "Previously, the `electron` npm package would download the Electron binary from the repository's GitHub Releases in the package's `postinstall` script. With recent supply chain security attacks against the npm ecosystem with `postinstall` scripts as a common attack vector, Electron will now download …",
+      "title": "`electron` no longer downloads itself via `postinstall` script",
+      "version": "42.0"
+    },
+    {
+      "anchor": "removed-quotas-object-from-sessionclearstoragedataoptions",
+      "kind": "Removed",
+      "mentionedApis": [
+        "Session.clearStorageData(options)",
+        "options.quotas"
+      ],
+      "rawTitle": "Removed: `quotas` object from `Session.clearStorageData(options)`",
+      "summary": "When calling `Session.clearStorageData(options)`, the `options.quotas` object is no longer supported because it has been [removed](https://chromium-review.googlesource.com/c/chromium/src/+/7596126) from upstream Chromium.",
+      "title": "`quotas` object from `Session.clearStorageData(options)`",
+      "version": "42.0"
+    },
+    {
+      "anchor": "deprecated-passing-only-an-array-hslshift-to-nativeimagecreatefromnamedimage",
+      "kind": "Deprecated",
+      "mentionedApis": [
+        "hslShift",
+        "nativeImage.createFromNamedImage()"
+      ],
+      "rawTitle": "Deprecated: Passing only an array `hslShift` to `nativeImage.createFromNamedImage()`",
+      "summary": "Passing only an array `hslShift` to `nativeImage.createFromNamedImage()` is deprecated. You should now pass an options object with an `hslShift` property instead: ```js // Deprecated nativeImage.createFromNamedImage(imageName, [0, 1, -1]) // Replace with nativeImage.createFromNamedImage(imageName, {…",
+      "title": "Passing only an array `hslShift` to `nativeImage.createFromNamedImage()`",
+      "version": "42.0"
+    },
+    {
+      "anchor": "behavior-changed-pdfs-no-longer-create-a-separate-webcontents",
+      "kind": "Behavior Changed",
+      "mentionedApis": [
+        "MimeHandlerViewGuest"
+      ],
+      "rawTitle": "Behavior Changed: PDFs no longer create a separate WebContents",
+      "summary": "Previously, PDF resources created a separate guest [WebContents](https://www.electronjs.org/docs/latest/api/web-contents) for rendering. Now, PDFs are rendered within the same WebContents instead. If you have code to detect PDF resources, use the [frame tree](https://www.electronjs.org/docs/latest/a…",
+      "title": "PDFs no longer create a separate WebContents",
+      "version": "41.0"
+    },
+    {
+      "anchor": "behavior-changed-updated-cookie-change-cause-in-the-cookie-changed-event",
+      "kind": "Behavior Changed",
+      "mentionedApis": [
+        "inserted",
+        "explicit",
+        "inserted-no-change-overwrite",
+        "inserted-no-value-change-overwrite"
+      ],
+      "rawTitle": "Behavior Changed: Updated Cookie Change Cause in the Cookie 'changed' Event",
+      "summary": "We have updated the [cookie](https://www.electronjs.org/docs/latest/api/cookies#event-changed) change cause in the cookie 'changed' event. When a new cookie is set, the change cause is `inserted`. When a cookie is deleted, the change cause remains `explicit`. When the cookie being set is identical t…",
+      "title": "Updated Cookie Change Cause in the Cookie 'changed' Event",
+      "version": "41.0"
+    },
+    {
+      "anchor": "deprecated-showhiddenfiles-in-dialogs-on-linux",
+      "kind": "Deprecated",
+      "mentionedApis": [],
+      "rawTitle": "Deprecated: `showHiddenFiles` in Dialogs on Linux",
+      "summary": "This property will still be honored on macOS and Windows, but support on Linux will be removed in a future version of Electron. GTK intends for this to be a user choice rather than an app choice and has removed the API to do this programmatically.",
+      "title": "`showHiddenFiles` in Dialogs on Linux",
+      "version": "41.0"
+    },
+    {
+      "anchor": "deprecated-clipboard-api-access-from-renderer-processes",
+      "kind": "Deprecated",
+      "mentionedApis": [
+        "clipboard"
+      ],
+      "rawTitle": "Deprecated: `clipboard` API access from renderer processes",
+      "summary": "Using the `clipboard` API directly in the renderer process is deprecated. If you want to call this API from a renderer process, place the API call in your preload script and expose it using the [contextBridge](https://www.electronjs.org/docs/latest/api/context-bridge) API.",
+      "title": "`clipboard` API access from renderer processes",
+      "version": "40.0"
+    },
+    {
+      "anchor": "behavior-changed-macos-dsym-files-now-compressed-with-tarxz",
+      "kind": "Behavior Changed",
+      "mentionedApis": [
+        "dsym.zip",
+        "dsym.tar.xz"
+      ],
+      "rawTitle": "Behavior Changed: MacOS dSYM files now compressed with tar.xz",
+      "summary": "Debug symbols for MacOS (dSYM) now use xz compression in order to handle larger file sizes. `dsym.zip` files are now `dsym.tar.xz` files. End users using debug symbols may need to update their zip utilities.",
+      "title": "MacOS dSYM files now compressed with tar.xz",
+      "version": "40.0"
+    },
+    {
+      "anchor": "deprecated---host-rules-command-line-switch",
+      "kind": "Deprecated",
+      "mentionedApis": [
+        "--host-rules",
+        "--host-resolver-rules"
+      ],
+      "rawTitle": "Deprecated: `--host-rules` command line switch",
+      "summary": "Chromium is deprecating the `--host-rules` switch. You should use `--host-resolver-rules` instead.",
+      "title": "`--host-rules` command line switch",
+      "version": "39.0"
+    },
+    {
+      "anchor": "behavior-changed-windowopen-popups-are-always-resizable",
+      "kind": "Behavior Changed",
+      "mentionedApis": [
+        "window.open"
+      ],
+      "rawTitle": "Behavior Changed: window.open popups are always resizable",
+      "summary": "Per current [WHATWG spec](https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-open-dev), the `window.open` API will now always create a resizable popup window. To restore previous behavior: ```js webContents.setWindowOpenHandler((details) => { return { action: 'allow', overrideBrowserWi…",
+      "title": "window.open popups are always resizable",
+      "version": "39.0"
+    },
+    {
+      "anchor": "behavior-changed-nsaudiocaptureusagedescription-should-be-included-in-your-apps-infoplist-file-to-use-desktopcapturer-macos-142",
+      "kind": "Behavior Changed",
+      "mentionedApis": [
+        "NSAudioCaptureUsageDescription",
+        "Info.plist",
+        "desktopCapturer",
+        "Screen & System Audio Recording"
+      ],
+      "rawTitle": "Behavior Changed: `NSAudioCaptureUsageDescription` should be included in your app's Info.plist file to use `desktopCapturer` (🍏 macOS ≥14.2)",
+      "summary": "Per [Chromium update](https://source.chromium.org/chromium/chromium/src/+/ad17e8f8b93d5f34891b06085d373a668918255e) which enables Apple's newer [CoreAudio Tap API](https://developer.apple.com/documentation/CoreAudio/capturing-system-audio-with-core-audio-taps#Configure-the-sample-code-project) by de…",
+      "title": "`NSAudioCaptureUsageDescription` should be included in your app's Info.plist file to use `desktopCapturer` (🍏 macOS ≥14.2)",
+      "version": "39.0"
+    },
+    {
+      "anchor": "behavior-changed-shared-texture-osr-paint-event-data-structure",
+      "kind": "Behavior Changed",
+      "mentionedApis": [
+        "paint",
+        "sharedTextureHandle",
+        "planes",
+        "modifier",
+        "handle"
+      ],
+      "rawTitle": "Behavior Changed: shared texture OSR `paint` event data structure",
+      "summary": "When using shared texture offscreen rendering feature, the `paint` event now emits a more structured object. It moves the `sharedTextureHandle`, `planes`, `modifier` into a unified `handle` property. See the [OffscreenSharedTexture](./api/structures/offscreen-shared-texture.md) API structure for mor…",
+      "title": "shared texture OSR `paint` event data structure",
+      "version": "39.0"
+    },
+    {
+      "anchor": "removed-electron_ozone_platform_hint-environment-variable",
+      "kind": "Removed",
+      "mentionedApis": [
+        "--ozone-platform",
+        "auto",
+        "XDG_SESSION_TYPE=wayland",
+        "--ozone-platform=x11"
+      ],
+      "rawTitle": "Removed: `ELECTRON_OZONE_PLATFORM_HINT` environment variable",
+      "summary": "The default value of the `--ozone-platform` flag [changed to `auto`](https://chromium-review.googlesource.com/c/chromium/src/+/6775426). Electron now defaults to running as a native Wayland app when launched in a Wayland session (when `XDG_SESSION_TYPE=wayland`). Users can force XWayland by passing …",
+      "title": "`ELECTRON_OZONE_PLATFORM_HINT` environment variable",
+      "version": "38.0"
+    },
+    {
+      "anchor": "removed-original_xdg_current_desktop-environment-variable",
+      "kind": "Removed",
+      "mentionedApis": [
+        "XDG_CURRENT_DESKTOP",
+        "Unity"
+      ],
+      "rawTitle": "Removed: `ORIGINAL_XDG_CURRENT_DESKTOP` environment variable",
+      "summary": "Previously, Electron changed the value of `XDG_CURRENT_DESKTOP` internally to `Unity`, and stored the original name of the desktop session in a separate variable. `XDG_CURRENT_DESKTOP` is no longer overridden and now reflects the actual desktop environment.",
+      "title": "`ORIGINAL_XDG_CURRENT_DESKTOP` environment variable",
+      "version": "38.0"
+    },
+    {
+      "anchor": "removed-macos-11-support",
+      "kind": "Removed",
+      "mentionedApis": [],
+      "rawTitle": "Removed: macOS 11 support",
+      "summary": "macOS 11 (Big Sur) is no longer supported by [Chromium](https://chromium-review.googlesource.com/c/chromium/src/+/6594615). Older versions of Electron will continue to run on Big Sur, but macOS 12 (Monterey) or later will be required to run Electron v38.0.0 and higher.",
+      "title": "macOS 11 support",
+      "version": "38.0"
+    },
+    {
+      "anchor": "removed-plugin-crashed-event",
+      "kind": "Removed",
+      "mentionedApis": [
+        "plugin-crashed",
+        "webContents"
+      ],
+      "rawTitle": "Removed: `plugin-crashed` event",
+      "summary": "The `plugin-crashed` event has been removed from `webContents`.",
+      "title": "`plugin-crashed` event",
+      "version": "38.0"
+    },
+    {
+      "anchor": "deprecated-webframeroutingid-property",
+      "kind": "Deprecated",
+      "mentionedApis": [
+        "routingId",
+        "webFrame",
+        "webFrame.frameToken"
+      ],
+      "rawTitle": "Deprecated: `webFrame.routingId` property",
+      "summary": "The `routingId` property will be removed from `webFrame` objects. You should use `webFrame.frameToken` instead.",
+      "title": "`webFrame.routingId` property",
+      "version": "38.0"
+    },
+    {
+      "anchor": "deprecated-webframefindframebyroutingidroutingid",
+      "kind": "Deprecated",
+      "mentionedApis": [
+        "webFrame.findFrameByRoutingId(routingId)",
+        "webFrame.findFrameByToken(frameToken)"
+      ],
+      "rawTitle": "Deprecated: `webFrame.findFrameByRoutingId(routingId)`",
+      "summary": "The `webFrame.findFrameByRoutingId(routingId)` function will be removed. You should use `webFrame.findFrameByToken(frameToken)` instead.",
+      "title": "`webFrame.findFrameByRoutingId(routingId)`",
+      "version": "38.0"
+    },
+    {
+      "anchor": "utility-process-unhandled-rejection-behavior-change",
+      "kind": "Other",
+      "mentionedApis": [],
+      "rawTitle": "Utility Process unhandled rejection behavior change",
+      "summary": "Utility Processes will now warn with an error message when an unhandled rejection occurs instead of crashing the process. To restore the previous behavior, you can use: ```js process.on('unhandledRejection', () => { process.exit(1) }) ```",
+      "title": "Utility Process unhandled rejection behavior change",
+      "version": "37.0"
+    },
+    {
+      "anchor": "behavior-changed-processexit-kills-utility-process-synchronously",
+      "kind": "Behavior Changed",
+      "mentionedApis": [
+        "process.exit()",
+        "console.log()"
+      ],
+      "rawTitle": "Behavior Changed: `process.exit()` kills utility process synchronously",
+      "summary": "Calling `process.exit()` in a utility process will now kill the utility process synchronously. This brings the behavior of `process.exit()` in line with Node.js behavior. Please refer to the [Node.js docs](https://nodejs.org/docs/latest-v22.x/api/process.html#processexitcode) and [PR #45690](https:/…",
+      "title": "`process.exit()` kills utility process synchronously",
+      "version": "37.0"
+    },
+    {
+      "anchor": "behavior-changed-webusb-and-webserial-blocklist-support",
+      "kind": "Behavior Changed",
+      "mentionedApis": [
+        "disable-usb-blocklist",
+        "disable-serial-blocklist"
+      ],
+      "rawTitle": "Behavior Changed: WebUSB and WebSerial Blocklist Support",
+      "summary": "[WebUSB](https://developer.mozilla.org/en-US/docs/Web/API/WebUSB_API) and [Web Serial](https://developer.mozilla.org/en-US/docs/Web/API/Web_Serial_API) now support the [WebUSB Blocklist](https://wicg.github.io/webusb/#blocklist) and [Web Serial Blocklist](https://wicg.github.io/serial/#blocklist) us…",
+      "title": "WebUSB and WebSerial Blocklist Support",
+      "version": "37.0"
+    },
+    {
+      "anchor": "removed-null-value-for-session-property-in-protocolresponse",
+      "kind": "Removed",
+      "mentionedApis": [
+        "ProtocolResponse.session",
+        "null",
+        "session.fromPartition(some_random_string)"
+      ],
+      "rawTitle": "Removed: `null` value for `session` property in `ProtocolResponse`",
+      "summary": "This deprecated feature has been removed. Previously, setting the `ProtocolResponse.session` property to `null` would create a random independent session. This is no longer supported. Using single-purpose sessions here is discouraged due to overhead costs; however, old code that needs to preserve th…",
+      "title": "`null` value for `session` property in `ProtocolResponse`",
+      "version": "37.0"
+    },
+    {
+      "anchor": "behavior-changed-browserwindowisvisibleonallworkspaces-on-linux",
+      "kind": "Behavior Changed",
+      "mentionedApis": [
+        "BrowserWindow.IsVisibleOnAllWorkspaces()"
+      ],
+      "rawTitle": "Behavior Changed: `BrowserWindow.IsVisibleOnAllWorkspaces()` on Linux",
+      "summary": "`BrowserWindow.IsVisibleOnAllWorkspaces()` will now return false on Linux if the window is not currently visible.",
+      "title": "`BrowserWindow.IsVisibleOnAllWorkspaces()` on Linux",
+      "version": "37.0"
+    },
+    {
+      "anchor": "behavior-changes-appcommandline",
+      "kind": "Behavior Changed",
+      "mentionedApis": [
+        "app.commandLine",
+        "process.argv"
+      ],
+      "rawTitle": "Behavior Changes: `app.commandLine`",
+      "summary": "`app.commandLine` will convert upper-cases switches and arguments to lowercase. `app.commandLine` was only meant to handle chromium switches (which aren't case-sensitive) and switches passed via `app.commandLine` will not be passed down to any of the child processes. If you were using `app.commandLi…",
+      "title": "`app.commandLine`",
+      "version": "36.0"
+    },
+    {
+      "anchor": "deprecated-nativeimagegetbitmap",
+      "kind": "Deprecated",
+      "mentionedApis": [
+        "NativeImage.toBitmap()",
+        "NativeImage.getBitmap()"
+      ],
+      "rawTitle": "Deprecated: `NativeImage.getBitmap()`",
+      "summary": "`NativeImage.toBitmap()` returns a newly-allocated copy of the bitmap. `NativeImage.getBitmap()` was originally an alternative function that returned the original instead of a copy. This changed when sandboxing was introduced, so both return a copy and are functionally equivalent. Client code should…",
+      "title": "`NativeImage.getBitmap()`",
+      "version": "36.0"
+    },
+    {
+      "anchor": "removed-isdefault-and-status-properties-on-printerinfo",
+      "kind": "Removed",
+      "mentionedApis": [],
+      "rawTitle": "Removed: `isDefault` and `status` properties on `PrinterInfo`",
+      "summary": "These properties have been removed from the PrinterInfo Object because they have been removed from upstream Chromium.",
+      "title": "`isDefault` and `status` properties on `PrinterInfo`",
+      "version": "36.0"
+    },
+    {
+      "anchor": "removed-quota-type-syncable-in-sessionclearstoragedataoptions",
+      "kind": "Removed",
+      "mentionedApis": [
+        "Session.clearStorageData(options)",
+        "options.quota",
+        "syncable"
+      ],
+      "rawTitle": "Removed: `quota` type `syncable` in `Session.clearStorageData(options)`",
+      "summary": "When calling `Session.clearStorageData(options)`, the `options.quota` type `syncable` is no longer supported because it has been [removed](https://chromium-review.googlesource.com/c/chromium/src/+/6309405) from upstream Chromium.",
+      "title": "`quota` type `syncable` in `Session.clearStorageData(options)`",
+      "version": "36.0"
+    },
+    {
+      "anchor": "deprecated-null-value-for-session-property-in-protocolresponse",
+      "kind": "Deprecated",
+      "mentionedApis": [
+        "null",
+        "session.fromPartition(some_random_string)",
+        "ProtocolResponse.session"
+      ],
+      "rawTitle": "Deprecated: `null` value for `session` property in `ProtocolResponse`",
+      "summary": "Previously, setting the ProtocolResponse.session property to `null` would create a random independent session. This is no longer supported. Using single-purpose sessions here is discouraged due to overhead costs; however, old code that needs to preserve this behavior can emulate it by creating a ran…",
+      "title": "`null` value for `session` property in `ProtocolResponse`",
+      "version": "36.0"
+    },
+    {
+      "anchor": "deprecated-quota-property-in-sessionclearstoragedataoptions",
+      "kind": "Deprecated",
+      "mentionedApis": [
+        "Session.clearStorageData(options)",
+        "options.quota",
+        "syncable",
+        "'temporary'"
+      ],
+      "rawTitle": "Deprecated: `quota` property in `Session.clearStorageData(options)`",
+      "summary": "When calling `Session.clearStorageData(options)`, the `options.quota` property is deprecated. Since the `syncable` type was removed, there is only one type left -- `'temporary'` -- so specifying it is unnecessary.",
+      "title": "`quota` property in `Session.clearStorageData(options)`",
+      "version": "36.0"
+    },
+    {
+      "anchor": "deprecated-extension-methods-and-events-on-session",
+      "kind": "Deprecated",
+      "mentionedApis": [
+        "session.loadExtension",
+        "session.removeExtension",
+        "session.getExtension",
+        "session.getAllExtensions",
+        "session.extensions"
+      ],
+      "rawTitle": "Deprecated: Extension methods and events on `session`",
+      "summary": "`session.loadExtension`, `session.removeExtension`, `session.getExtension`, `session.getAllExtensions`, 'extension-loaded' event, 'extension-unloaded' event, and 'extension-ready' events have all moved to the new `session.extensions` class.",
+      "title": "Extension methods and events on `session`",
+      "version": "36.0"
+    },
+    {
+      "anchor": "removed-systempreferencesisaeroglassenabled",
+      "kind": "Removed",
+      "mentionedApis": [
+        "systemPreferences.isAeroGlassEnabled()",
+        "true"
+      ],
+      "rawTitle": "Removed: `systemPreferences.isAeroGlassEnabled()`",
+      "summary": "The `systemPreferences.isAeroGlassEnabled()` function has been removed without replacement. It has been always returning `true` since Electron 23, which only supports Windows 10+, where DWM composition can no longer be disabled. https://learn.microsoft.com/en-us/windows/win32/dwm/composition-ovw#dis…",
+      "title": "`systemPreferences.isAeroGlassEnabled()`",
+      "version": "36.0"
+    },
+    {
+      "anchor": "changed-gtk-4-is-default-when-running-gnome",
+      "kind": "Changed",
+      "mentionedApis": [
+        "gtk-version",
+        "app.commandLine.appendSwitch"
+      ],
+      "rawTitle": "Changed: GTK 4 is default when running GNOME",
+      "summary": "After an [upstream change](https://chromium-review.googlesource.com/c/chromium/src/+/6310469), GTK 4 is now the default when running GNOME. In rare cases, this may cause some applications or configurations to [error](https://github.com/electron/electron/issues/46538) with the following message: ```s…",
+      "title": "GTK 4 is default when running GNOME",
+      "version": "36.0"
+    },
+    {
+      "anchor": "behavior-changed-dialog-apis-defaultpath-option-on-linux",
+      "kind": "Behavior Changed",
+      "mentionedApis": [
+        "defaultPath",
+        "--xdg-portal-required-version"
+      ],
+      "rawTitle": "Behavior Changed: Dialog API's `defaultPath` option on Linux",
+      "summary": "On Linux, the required portal version for file dialogs has been reverted to 3 from 4. Using the `defaultPath` option of the Dialog API is not supported when using portal file chooser dialogs unless the portal backend is version 4 or higher. The `--xdg-portal-required-version` [command-line switch](a…",
+      "title": "Dialog API's `defaultPath` option on Linux",
+      "version": "35.0"
+    },
+    {
+      "anchor": "deprecated-getfromversionid-on-sessionserviceworkers",
+      "kind": "Deprecated",
+      "mentionedApis": [
+        "session.serviceWorkers.fromVersionID(versionId)",
+        "session.serviceWorkers.getInfoFromVersionID(versionId)",
+        "session.serviceWorkers.getWorkerFromVersionID(versionId)"
+      ],
+      "rawTitle": "Deprecated: `getFromVersionID` on `session.serviceWorkers`",
+      "summary": "The `session.serviceWorkers.fromVersionID(versionId)` API has been deprecated in favor of `session.serviceWorkers.getInfoFromVersionID(versionId)`. This was changed to make it more clear which object is returned with the introduction of the `session.serviceWorkers.getWorkerFromVersionID(versionId)` …",
+      "title": "`getFromVersionID` on `session.serviceWorkers`",
+      "version": "35.0"
+    },
+    {
+      "anchor": "deprecated-setpreloads-getpreloads-on-session",
+      "kind": "Deprecated",
+      "mentionedApis": [
+        "registerPreloadScript",
+        "unregisterPreloadScript",
+        "getPreloadScripts",
+        "type",
+        "frame"
+      ],
+      "rawTitle": "Deprecated: `setPreloads`, `getPreloads` on `Session`",
+      "summary": "`registerPreloadScript`, `unregisterPreloadScript`, and `getPreloadScripts` are introduced as a replacement for the deprecated methods. These new APIs allow third-party libraries to register preload scripts without replacing existing scripts. Also, the new `type` option allows for additional preload…",
+      "title": "`setPreloads`, `getPreloads` on `Session`",
+      "version": "35.0"
+    },
+    {
+      "anchor": "deprecated-level-message-line-and-sourceid-arguments-in-console-message-event-on-webcontents",
+      "kind": "Deprecated",
+      "mentionedApis": [
+        "console-message",
+        "WebContents",
+        "Event",
+        "level",
+        "info",
+        "warning",
+        "error",
+        "debug"
+      ],
+      "rawTitle": "Deprecated: `level`, `message`, `line`, and `sourceId` arguments in `console-message` event on `WebContents`",
+      "summary": "The `console-message` event on `WebContents` has been updated to provide details on the `Event` argument. ```js // Deprecated webContents.on('console-message', (event, level, message, line, sourceId) => {}) // Replace with: webContents.on('console-message', ({ level, message, lineNumber, sourceId, f…",
+      "title": "`level`, `message`, `line`, and `sourceId` arguments in `console-message` event on `WebContents`",
+      "version": "35.0"
+    },
+    {
+      "anchor": "behavior-changed-urls-property-of-webrequestfilter",
+      "kind": "Behavior Changed",
+      "mentionedApis": [
+        "<all_urls>"
+      ],
+      "rawTitle": "Behavior Changed: `urls` property of `WebRequestFilter`.",
+      "summary": "Previously, an empty urls array was interpreted as including all URLs. To explicitly include all URLs, developers should now use the `<all_urls>` pattern, which is a [designated URL pattern](https://developer.mozilla.org/en-US/docs/Mozilla/Add-ons/WebExtensions/Match_patterns#all_urls) that matches …",
+      "title": "`urls` property of `WebRequestFilter`.",
+      "version": "35.0"
+    },
+    {
+      "anchor": "deprecated-systempreferencesisaeroglassenabled",
+      "kind": "Deprecated",
+      "mentionedApis": [
+        "systemPreferences.isAeroGlassEnabled()",
+        "true"
+      ],
+      "rawTitle": "Deprecated: `systemPreferences.isAeroGlassEnabled()`",
+      "summary": "The `systemPreferences.isAeroGlassEnabled()` function has been deprecated without replacement. It has been always returning `true` since Electron 23, which only supports Windows 10+, where DWM composition can no longer be disabled. https://learn.microsoft.com/en-us/windows/win32/dwm/composition-ovw#…",
+      "title": "`systemPreferences.isAeroGlassEnabled()`",
+      "version": "35.0"
+    },
+    {
+      "anchor": "behavior-changed-menu-bar-will-be-hidden-during-fullscreen-on-windows",
+      "kind": "Behavior Changed",
+      "mentionedApis": [],
+      "rawTitle": "Behavior Changed: menu bar will be hidden during fullscreen on Windows",
+      "summary": "This brings the behavior to parity with Linux. Prior behavior: Menu bar is still visible during fullscreen on Windows. New behavior: Menu bar is hidden during fullscreen on Windows. **Correction**: This was previously listed as a breaking change in Electron 33, but was first released in Electron 34.",
+      "title": "menu bar will be hidden during fullscreen on Windows",
+      "version": "34.0"
+    },
+    {
+      "anchor": "deprecated-documentexeccommandpaste",
+      "kind": "Deprecated",
+      "mentionedApis": [
+        "enableDeprecatedPaste",
+        "WebPreferences",
+        "deprecated-sync-clipboard-read"
+      ],
+      "rawTitle": "Deprecated: `document.execCommand(\"paste\")`",
+      "summary": "The synchronous clipboard read API [document.execCommand(\"paste\")](https://developer.mozilla.org/en-US/docs/Mozilla/Add-ons/WebExtensions/Interact_with_the_clipboard) has been deprecated in favor of [async clipboard API](https://developer.mozilla.org/en-US/docs/Web/API/Clipboard_API). This is to ali…",
+      "title": "`document.execCommand(\"paste\")`",
+      "version": "33.0"
+    },
+    {
+      "anchor": "behavior-changed-frame-properties-may-retrieve-detached-webframemain-instances-or-none-at-all",
+      "kind": "Behavior Changed",
+      "mentionedApis": [
+        "WebFrameMain",
+        "frame.detached",
+        "true",
+        "null"
+      ],
+      "rawTitle": "Behavior Changed: frame properties may retrieve detached WebFrameMain instances or none at all",
+      "summary": "APIs which provide access to a `WebFrameMain` instance may return an instance with `frame.detached` set to `true`, or possibly return `null`. When a frame performs a cross-origin navigation, it enters into a detached state in which it's no longer attached to the page. In this state, it may be runnin…",
+      "title": "frame properties may retrieve detached WebFrameMain instances or none at all",
+      "version": "33.0"
+    },
+    {
+      "anchor": "behavior-changed-custom-protocol-url-handling-on-windows",
+      "kind": "Behavior Changed",
+      "mentionedApis": [
+        "protocol.registerFileProtocol",
+        "baseURLForDataURL",
+        "BrowserWindow.loadURL",
+        "WebContents.loadURL",
+        "<webview>.loadURL",
+        "protocol.handle"
+      ],
+      "rawTitle": "Behavior Changed: custom protocol URL handling on Windows",
+      "summary": "Due to changes made in Chromium to support [Non-Special Scheme URLs](http://bit.ly/url-non-special), custom protocol URLs that use Windows file paths will no longer work correctly with the deprecated `protocol.registerFileProtocol` and the `baseURLForDataURL` property on `BrowserWindow.loadURL`, `We…",
+      "title": "custom protocol URL handling on Windows",
+      "version": "33.0"
+    },
+    {
+      "anchor": "behavior-changed-webcontents-property-on-login-on-app",
+      "kind": "Behavior Changed",
+      "mentionedApis": [
+        "webContents",
+        "login",
+        "app",
+        "null",
+        "respondToAuthRequestsFromMainProcess"
+      ],
+      "rawTitle": "Behavior Changed: `webContents` property on `login` on `app`",
+      "summary": "The `webContents` property in the `login` event from `app` will be `null` when the event is triggered for requests from the [utility process](api/utility-process.md) created with `respondToAuthRequestsFromMainProcess` option.",
+      "title": "`webContents` property on `login` on `app`",
+      "version": "33.0"
+    },
+    {
+      "anchor": "deprecated-textured-option-in-browserwindowconstructoroptiontype",
+      "kind": "Deprecated",
+      "mentionedApis": [
+        "textured",
+        "type",
+        "BrowserWindowConstructorOptions",
+        "NSWindowStyleMaskTexturedBackground"
+      ],
+      "rawTitle": "Deprecated: `textured` option in `BrowserWindowConstructorOption.type`",
+      "summary": "The `textured` option of `type` in `BrowserWindowConstructorOptions` has been deprecated with no replacement. This option relied on the [`NSWindowStyleMaskTexturedBackground`](https://developer.apple.com/documentation/appkit/nswindowstylemask/nswindowstylemasktexturedbackground) style mask on macOS,…",
+      "title": "`textured` option in `BrowserWindowConstructorOption.type`",
+      "version": "33.0"
+    },
+    {
+      "anchor": "removed-macos-1015-support",
+      "kind": "Removed",
+      "mentionedApis": [],
+      "rawTitle": "Removed: macOS 10.15 support",
+      "summary": "macOS 10.15 (Catalina) is no longer supported by [Chromium](https://chromium-review.googlesource.com/c/chromium/src/+/5734361). Older versions of Electron will continue to run on Catalina, but macOS 11 (Big Sur) or later will be required to run Electron v33.0.0 and higher.",
+      "title": "macOS 10.15 support",
+      "version": "33.0"
+    },
+    {
+      "anchor": "behavior-changed-native-modules-now-require-c20",
+      "kind": "Behavior Changed",
+      "mentionedApis": [
+        "--std=c++20",
+        "--std=c++17"
+      ],
+      "rawTitle": "Behavior Changed: Native modules now require C++20",
+      "summary": "Due to changes made upstream, both [V8](https://chromium-review.googlesource.com/c/v8/v8/+/5587859) and [Node.js](https://github.com/nodejs/node/pull/45427) now require C++20 as a minimum version. Developers using native node modules should build their modules with `--std=c++20` rather than `--std=c…",
+      "title": "Native modules now require C++20",
+      "version": "33.0"
+    },
+    {
+      "anchor": "deprecated-systempreferencesaccessibilitydisplayshouldreducetransparency",
+      "kind": "Deprecated",
+      "mentionedApis": [
+        "systemPreferences.accessibilityDisplayShouldReduceTransparency",
+        "nativeTheme.prefersReducedTransparency"
+      ],
+      "rawTitle": "Deprecated: `systemPreferences.accessibilityDisplayShouldReduceTransparency`",
+      "summary": "The `systemPreferences.accessibilityDisplayShouldReduceTransparency` property is now deprecated in favor of the new `nativeTheme.prefersReducedTransparency`, which provides identical information and works cross-platform. ```js // Deprecated const shouldReduceTransparency = systemPreferences.accessib…",
+      "title": "`systemPreferences.accessibilityDisplayShouldReduceTransparency`",
+      "version": "33.0"
+    },
+    {
+      "anchor": "removed-filepath",
+      "kind": "Removed",
+      "mentionedApis": [
+        "path",
+        "File",
+        "webUtils.getPathForFile",
+        "Uploaded file path was: ${file.path}",
+        "Uploaded file path was: ${path}"
+      ],
+      "rawTitle": "Removed: `File.path`",
+      "summary": "The nonstandard `path` property of the Web `File` object was added in an early version of Electron as a convenience method for working with native files when doing everything in the renderer was more common. However, it represents a deviation from the standard and poses a minor security risk as well…",
+      "title": "`File.path`",
+      "version": "32.0"
+    },
+    {
+      "anchor": "deprecated-clearhistory-cangoback-goback-cangoforward-goforward-gotoindex-cangotooffset-gotooffset-on-webcontents",
+      "kind": "Deprecated",
+      "mentionedApis": [
+        "navigationHistory",
+        "WebContents"
+      ],
+      "rawTitle": "Deprecated: `clearHistory`, `canGoBack`, `goBack`, `canGoForward`, `goForward`, `goToIndex`, `canGoToOffset`, `goToOffset` on `WebContents`",
+      "summary": "The navigation-related APIs are now deprecated. These APIs have been moved to the `navigationHistory` property of `WebContents` to provide a more structured and intuitive interface for managing navigation history. ```js // Deprecated win.webContents.clearHistory() win.webContents.canGoBack() win.web…",
+      "title": "`clearHistory`, `canGoBack`, `goBack`, `canGoForward`, `goForward`, `goToIndex`, `canGoToOffset`, `goToOffset` on `WebContents`",
+      "version": "32.0"
+    },
+    {
+      "anchor": "behavior-changed-directory-databases-in-userdata-will-be-deleted",
+      "kind": "Behavior Changed",
+      "mentionedApis": [
+        "databases",
+        "app.getPath('userData')"
+      ],
+      "rawTitle": "Behavior changed: Directory `databases` in `userData` will be deleted",
+      "summary": "If you have a directory called `databases` in the directory returned by `app.getPath('userData')`, it will be deleted when Electron 32 is first run. The `databases` directory was used by WebSQL, which was removed in Electron 31. Chromium now performs a cleanup that deletes this directory. See [issue…",
+      "title": "Directory `databases` in `userData` will be deleted",
+      "version": "32.0"
+    },
+    {
+      "anchor": "removed-websql-support",
+      "kind": "Removed",
+      "mentionedApis": [],
+      "rawTitle": "Removed: `WebSQL` support",
+      "summary": "Chromium has removed support for WebSQL upstream, transitioning it to Android only. See [Chromium's intent to remove discussion](https://groups.google.com/a/chromium.org/g/blink-dev/c/fWYb6evVA-w/m/wGI863zaAAAJ) for more information.",
+      "title": "`WebSQL` support",
+      "version": "31.0"
+    },
+    {
+      "anchor": "behavior-changed-nativeimagetodataurl-will-preserve-png-colorspace",
+      "kind": "Behavior Changed",
+      "mentionedApis": [],
+      "rawTitle": "Behavior Changed: `nativeImage.toDataURL` will preserve PNG colorspace",
+      "summary": "PNG decoder implementation has been changed to preserve colorspace data, the encoded data returned from this function now matches it. See [crbug.com/332584706](https://issues.chromium.org/issues/332584706) for more information.",
+      "title": "`nativeImage.toDataURL` will preserve PNG colorspace",
+      "version": "31.0"
+    },
+    {
+      "anchor": "behavior-changed-windowflashframebool-will-flash-dock-icon-continuously-on-macos",
+      "kind": "Behavior Changed",
+      "mentionedApis": [
+        "flashFrame(true)",
+        "flashFrame(false)",
+        "NSInformationalRequest",
+        "dock.bounce('informational')"
+      ],
+      "rawTitle": "Behavior Changed: `window.flashFrame(bool)` will flash dock icon continuously on macOS",
+      "summary": "This brings the behavior to parity with Windows and Linux. Prior behavior: The first `flashFrame(true)` bounces the dock icon only once (using the [NSInformationalRequest](https://developer.apple.com/documentation/appkit/nsrequestuserattentiontype/nsinformationalrequest) level) and `flashFrame(false…",
+      "title": "`window.flashFrame(bool)` will flash dock icon continuously on macOS",
+      "version": "31.0"
+    },
+    {
+      "anchor": "behavior-changed-cross-origin-iframes-now-use-permission-policy-to-access-features",
+      "kind": "Behavior Changed",
+      "mentionedApis": [
+        "iframe",
+        "allow"
+      ],
+      "rawTitle": "Behavior Changed: cross-origin iframes now use Permission Policy to access features",
+      "summary": "Cross-origin iframes must now specify features available to a given `iframe` via the `allow` attribute in order to access them. See [documentation](https://developer.mozilla.org/en-US/docs/Web/HTML/Element/iframe#allow) for more information.",
+      "title": "cross-origin iframes now use Permission Policy to access features",
+      "version": "30.0"
+    },
+    {
+      "anchor": "removed-the---disable-color-correct-rendering-switch",
+      "kind": "Removed",
+      "mentionedApis": [],
+      "rawTitle": "Removed: The `--disable-color-correct-rendering` switch",
+      "summary": "This switch was never formally documented but its removal is being noted here regardless. Chromium itself now has better support for color spaces so this flag should not be needed.",
+      "title": "The `--disable-color-correct-rendering` switch",
+      "version": "30.0"
+    },
+    {
+      "anchor": "behavior-changed-browserviewsetautoresize-behavior-on-macos",
+      "kind": "Behavior Changed",
+      "mentionedApis": [
+        "setAutoResize",
+        "BrowserView",
+        "BrowserView.setAutoResize"
+      ],
+      "rawTitle": "Behavior Changed: `BrowserView.setAutoResize` behavior on macOS",
+      "summary": "In Electron 30, BrowserView is now a wrapper around the new [WebContentsView](api/web-contents-view.md) API. Previously, the `setAutoResize` function of the `BrowserView` API was backed by [autoresizing](https://developer.apple.com/documentation/appkit/nsview/1483281-autoresizingmask?language=objc) …",
+      "title": "`BrowserView.setAutoResize` behavior on macOS",
+      "version": "30.0"
+    },
+    {
+      "anchor": "deprecated-browserview",
+      "kind": "Deprecated",
+      "mentionedApis": [
+        "BrowserView",
+        "WebContentsView",
+        "BrowserWindow"
+      ],
+      "rawTitle": "Deprecated: `BrowserView`",
+      "summary": "The [`BrowserView`](./api/browser-view.md) class has been deprecated and replaced by the new [`WebContentsView`](./api/web-contents-view.md) class. `BrowserView` related methods in [`BrowserWindow`](./api/browser-window.md) have also been deprecated: ```js BrowserWindow.fromBrowserView(browserView) …",
+      "title": "`BrowserView`",
+      "version": "30.0"
+    },
+    {
+      "anchor": "removed-paramsinputformtype-property-on-context-menu-on-webcontents",
+      "kind": "Removed",
+      "mentionedApis": [
+        "inputFormType",
+        "context-menu",
+        "WebContents",
+        "formControlType"
+      ],
+      "rawTitle": "Removed: `params.inputFormType` property on `context-menu` on `WebContents`",
+      "summary": "The `inputFormType` property of the params object in the `context-menu` event from `WebContents` has been removed. Use the new `formControlType` property instead.",
+      "title": "`params.inputFormType` property on `context-menu` on `WebContents`",
+      "version": "30.0"
+    },
+    {
+      "anchor": "removed-processgetiocounters",
+      "kind": "Removed",
+      "mentionedApis": [],
+      "rawTitle": "Removed: `process.getIOCounters()`",
+      "summary": "Chromium has removed access to this information.",
+      "title": "`process.getIOCounters()`",
+      "version": "30.0"
+    },
+    {
+      "anchor": "behavior-changed-ipcrenderer-can-no-longer-be-sent-over-the-contextbridge",
+      "kind": "Behavior Changed",
+      "mentionedApis": [
+        "ipcRenderer",
+        "contextBridge"
+      ],
+      "rawTitle": "Behavior Changed: `ipcRenderer` can no longer be sent over the `contextBridge`",
+      "summary": "Attempting to send the entire `ipcRenderer` module as an object over the `contextBridge` will now result in an empty object on the receiving side of the bridge. This change was made to remove / mitigate a security footgun. You should not directly expose ipcRenderer or its methods over the bridge. In…",
+      "title": "`ipcRenderer` can no longer be sent over the `contextBridge`",
+      "version": "29.0"
+    },
+    {
+      "anchor": "removed-renderer-process-crashed-event-on-app",
+      "kind": "Removed",
+      "mentionedApis": [
+        "renderer-process-crashed",
+        "app",
+        "render-process-gone"
+      ],
+      "rawTitle": "Removed: `renderer-process-crashed` event on `app`",
+      "summary": "The `renderer-process-crashed` event on `app` has been removed. Use the new `render-process-gone` event instead. ```js // Removed app.on('renderer-process-crashed', (event, webContents, killed) => { /* ... */ }) // Replace with app.on('render-process-gone', (event, webContents, details) => { /* ... …",
+      "title": "`renderer-process-crashed` event on `app`",
+      "version": "29.0"
+    },
+    {
+      "anchor": "removed-crashed-event-on-webcontents-and",
+      "kind": "Removed",
+      "mentionedApis": [
+        "crashed",
+        "WebContents",
+        "<webview>",
+        "render-process-gone"
+      ],
+      "rawTitle": "Removed: `crashed` event on `WebContents` and `<webview>`",
+      "summary": "The `crashed` events on `WebContents` and `<webview>` have been removed. Use the new `render-process-gone` event instead. ```js // Removed win.webContents.on('crashed', (event, killed) => { /* ... */ }) webview.addEventListener('crashed', (event) => { /* ... */ }) // Replace with win.webContents.on(…",
+      "title": "`crashed` event on `WebContents` and `<webview>`",
+      "version": "29.0"
+    },
+    {
+      "anchor": "removed-gpu-process-crashed-event-on-app",
+      "kind": "Removed",
+      "mentionedApis": [
+        "gpu-process-crashed",
+        "app",
+        "child-process-gone"
+      ],
+      "rawTitle": "Removed: `gpu-process-crashed` event on `app`",
+      "summary": "The `gpu-process-crashed` event on `app` has been removed. Use the new `child-process-gone` event instead. ```js // Removed app.on('gpu-process-crashed', (event, killed) => { /* ... */ }) // Replace with app.on('child-process-gone', (event, details) => { /* ... */ }) ```",
+      "title": "`gpu-process-crashed` event on `app`",
+      "version": "29.0"
+    },
+    {
+      "anchor": "behavior-changed-webcontentsbackgroundthrottling-set-to-false-affects-all-webcontents-in-the-host-browserwindow",
+      "kind": "Behavior Changed",
+      "mentionedApis": [
+        "WebContents.backgroundThrottling",
+        "BrowserWindow",
+        "WebContents"
+      ],
+      "rawTitle": "Behavior Changed: `WebContents.backgroundThrottling` set to false affects all `WebContents` in the host `BrowserWindow`",
+      "summary": "`WebContents.backgroundThrottling` set to false will disable frames throttling in the `BrowserWindow` for all `WebContents` displayed by it.",
+      "title": "`WebContents.backgroundThrottling` set to false affects all `WebContents` in the host `BrowserWindow`",
+      "version": "28.0"
+    },
+    {
+      "anchor": "removed-browserwindowsettrafficlightpositionposition",
+      "kind": "Removed",
+      "mentionedApis": [
+        "BrowserWindow.setTrafficLightPosition(position)",
+        "BrowserWindow.setWindowButtonPosition(position)",
+        "null",
+        "{ x: 0, y: 0 }"
+      ],
+      "rawTitle": "Removed: `BrowserWindow.setTrafficLightPosition(position)`",
+      "summary": "`BrowserWindow.setTrafficLightPosition(position)` has been removed, the `BrowserWindow.setWindowButtonPosition(position)` API should be used instead which accepts `null` instead of `{ x: 0, y: 0 }` to reset the position to system default. ```js // Removed in Electron 28 win.setTrafficLightPosition({…",
+      "title": "`BrowserWindow.setTrafficLightPosition(position)`",
+      "version": "28.0"
+    },
+    {
+      "anchor": "removed-browserwindowgettrafficlightposition",
+      "kind": "Removed",
+      "mentionedApis": [
+        "BrowserWindow.getTrafficLightPosition()",
+        "BrowserWindow.getWindowButtonPosition()",
+        "null",
+        "{ x: 0, y: 0 }"
+      ],
+      "rawTitle": "Removed: `BrowserWindow.getTrafficLightPosition()`",
+      "summary": "`BrowserWindow.getTrafficLightPosition()` has been removed, the `BrowserWindow.getWindowButtonPosition()` API should be used instead which returns `null` instead of `{ x: 0, y: 0 }` when there is no custom position. ```js // Removed in Electron 28 const pos = win.getTrafficLightPosition() if (pos.x …",
+      "title": "`BrowserWindow.getTrafficLightPosition()`",
+      "version": "28.0"
+    },
+    {
+      "anchor": "removed-ipcrenderersendto",
+      "kind": "Removed",
+      "mentionedApis": [
+        "ipcRenderer.sendTo()",
+        "MessageChannel",
+        "senderId",
+        "senderIsMainFrame",
+        "IpcRendererEvent"
+      ],
+      "rawTitle": "Removed: `ipcRenderer.sendTo()`",
+      "summary": "The `ipcRenderer.sendTo()` API has been removed. It should be replaced by setting up a [`MessageChannel`](tutorial/message-ports.md#setting-up-a-messagechannel-between-two-renderers) between the renderers. The `senderId` and `senderIsMainFrame` properties of `IpcRendererEvent` have been removed as w…",
+      "title": "`ipcRenderer.sendTo()`",
+      "version": "28.0"
+    },
+    {
+      "anchor": "removed-apprunningunderrosettatranslation",
+      "kind": "Removed",
+      "mentionedApis": [
+        "app.runningUnderRosettaTranslation",
+        "app.runningUnderARM64Translation"
+      ],
+      "rawTitle": "Removed: `app.runningUnderRosettaTranslation`",
+      "summary": "The `app.runningUnderRosettaTranslation` property has been removed. Use `app.runningUnderARM64Translation` instead. ```js // Removed console.log(app.runningUnderRosettaTranslation) // Replace with console.log(app.runningUnderARM64Translation) ```",
+      "title": "`app.runningUnderRosettaTranslation`",
+      "version": "28.0"
+    },
+    {
+      "anchor": "deprecated-renderer-process-crashed-event-on-app",
+      "kind": "Deprecated",
+      "mentionedApis": [
+        "renderer-process-crashed",
+        "app",
+        "render-process-gone"
+      ],
+      "rawTitle": "Deprecated: `renderer-process-crashed` event on `app`",
+      "summary": "The `renderer-process-crashed` event on `app` has been deprecated. Use the new `render-process-gone` event instead. ```js // Deprecated app.on('renderer-process-crashed', (event, webContents, killed) => { /* ... */ }) // Replace with app.on('render-process-gone', (event, webContents, details) => { /…",
+      "title": "`renderer-process-crashed` event on `app`",
+      "version": "28.0"
+    },
+    {
+      "anchor": "deprecated-paramsinputformtype-property-on-context-menu-on-webcontents",
+      "kind": "Deprecated",
+      "mentionedApis": [
+        "inputFormType",
+        "context-menu",
+        "WebContents",
+        "formControlType"
+      ],
+      "rawTitle": "Deprecated: `params.inputFormType` property on `context-menu` on `WebContents`",
+      "summary": "The `inputFormType` property of the params object in the `context-menu` event from `WebContents` has been deprecated. Use the new `formControlType` property instead.",
+      "title": "`params.inputFormType` property on `context-menu` on `WebContents`",
+      "version": "28.0"
+    },
+    {
+      "anchor": "deprecated-crashed-event-on-webcontents-and",
+      "kind": "Deprecated",
+      "mentionedApis": [
+        "crashed",
+        "WebContents",
+        "<webview>",
+        "render-process-gone"
+      ],
+      "rawTitle": "Deprecated: `crashed` event on `WebContents` and `<webview>`",
+      "summary": "The `crashed` events on `WebContents` and `<webview>` have been deprecated. Use the new `render-process-gone` event instead. ```js // Deprecated win.webContents.on('crashed', (event, killed) => { /* ... */ }) webview.addEventListener('crashed', (event) => { /* ... */ }) // Replace with win.webConten…",
+      "title": "`crashed` event on `WebContents` and `<webview>`",
+      "version": "28.0"
+    },
+    {
+      "anchor": "deprecated-gpu-process-crashed-event-on-app",
+      "kind": "Deprecated",
+      "mentionedApis": [
+        "gpu-process-crashed",
+        "app",
+        "child-process-gone"
+      ],
+      "rawTitle": "Deprecated: `gpu-process-crashed` event on `app`",
+      "summary": "The `gpu-process-crashed` event on `app` has been deprecated. Use the new `child-process-gone` event instead. ```js // Deprecated app.on('gpu-process-crashed', (event, killed) => { /* ... */ }) // Replace with app.on('child-process-gone', (event, details) => { /* ... */ }) ```",
+      "title": "`gpu-process-crashed` event on `app`",
+      "version": "28.0"
+    },
+    {
+      "anchor": "removed-macos-1013-1014-support",
+      "kind": "Removed",
+      "mentionedApis": [],
+      "rawTitle": "Removed: macOS 10.13 / 10.14 support",
+      "summary": "macOS 10.13 (High Sierra) and macOS 10.14 (Mojave) are no longer supported by [Chromium](https://chromium-review.googlesource.com/c/chromium/src/+/4629466). Older versions of Electron will continue to run on these operating systems, but macOS 10.15 (Catalina) or later will be required to run Electro…",
+      "title": "macOS 10.13 / 10.14 support",
+      "version": "27.0"
+    },
+    {
+      "anchor": "deprecated-ipcrenderersendto",
+      "kind": "Deprecated",
+      "mentionedApis": [
+        "ipcRenderer.sendTo()",
+        "MessageChannel",
+        "senderId",
+        "senderIsMainFrame",
+        "IpcRendererEvent"
+      ],
+      "rawTitle": "Deprecated: `ipcRenderer.sendTo()`",
+      "summary": "The `ipcRenderer.sendTo()` API has been deprecated. It should be replaced by setting up a [`MessageChannel`](tutorial/message-ports.md#setting-up-a-messagechannel-between-two-renderers) between the renderers. The `senderId` and `senderIsMainFrame` properties of `IpcRendererEvent` have been deprecate…",
+      "title": "`ipcRenderer.sendTo()`",
+      "version": "27.0"
+    },
+    {
+      "anchor": "removed-color-scheme-events-in-systempreferences",
+      "kind": "Removed",
+      "mentionedApis": [
+        "systemPreferences",
+        "inverted-color-scheme-changed",
+        "high-contrast-color-scheme-changed",
+        "updated",
+        "nativeTheme"
+      ],
+      "rawTitle": "Removed: color scheme events in `systemPreferences`",
+      "summary": "The following `systemPreferences` events have been removed: * `inverted-color-scheme-changed` * `high-contrast-color-scheme-changed` Use the new `updated` event on the `nativeTheme` module instead. ```js // Removed systemPreferences.on('inverted-color-scheme-changed', () => { /* ... */ }) systemPref…",
+      "title": "color scheme events in `systemPreferences`",
+      "version": "27.0"
+    },
+    {
+      "anchor": "removed-some-windowsetvibrancy-options-on-macos",
+      "kind": "Removed",
+      "mentionedApis": [],
+      "rawTitle": "Removed: Some `window.setVibrancy` options on macOS",
+      "summary": "The following vibrancy options have been removed: * 'light' * 'medium-light' * 'dark' * 'ultra-dark' * 'appearance-based' These were previously deprecated and have been removed by Apple in 10.15.",
+      "title": "Some `window.setVibrancy` options on macOS",
+      "version": "27.0"
+    },
+    {
+      "anchor": "removed-webcontentsgetprinters",
+      "kind": "Removed",
+      "mentionedApis": [
+        "webContents.getPrinters",
+        "webContents.getPrintersAsync"
+      ],
+      "rawTitle": "Removed: `webContents.getPrinters`",
+      "summary": "The `webContents.getPrinters` method has been removed. Use `webContents.getPrintersAsync` instead. ```js const w = new BrowserWindow({ show: false }) // Removed console.log(w.webContents.getPrinters()) // Replace with w.webContents.getPrintersAsync().then((printers) => { console.log(printers) }) ```",
+      "title": "`webContents.getPrinters`",
+      "version": "27.0"
+    },
+    {
+      "anchor": "removed-systempreferencesgetsetapplevelappearance-and-systempreferencesapplevelappearance",
+      "kind": "Removed",
+      "mentionedApis": [
+        "systemPreferences.getAppLevelAppearance",
+        "systemPreferences.setAppLevelAppearance",
+        "systemPreferences.appLevelAppearance",
+        "nativeTheme"
+      ],
+      "rawTitle": "Removed: `systemPreferences.{get,set}AppLevelAppearance` and `systemPreferences.appLevelAppearance`",
+      "summary": "The `systemPreferences.getAppLevelAppearance` and `systemPreferences.setAppLevelAppearance` methods have been removed, as well as the `systemPreferences.appLevelAppearance` property. Use the `nativeTheme` module instead. ```js // Removed systemPreferences.getAppLevelAppearance() // Replace with nati…",
+      "title": "`systemPreferences.{get,set}AppLevelAppearance` and `systemPreferences.appLevelAppearance`",
+      "version": "27.0"
+    },
+    {
+      "anchor": "removed-alternate-selected-control-text-value-for-systempreferencesgetcolor",
+      "kind": "Removed",
+      "mentionedApis": [
+        "alternate-selected-control-text",
+        "systemPreferences.getColor",
+        "selected-content-background"
+      ],
+      "rawTitle": "Removed: `alternate-selected-control-text` value for `systemPreferences.getColor`",
+      "summary": "The `alternate-selected-control-text` value for `systemPreferences.getColor` has been removed. Use `selected-content-background` instead. ```js // Removed systemPreferences.getColor('alternate-selected-control-text') // Replace with systemPreferences.getColor('selected-content-background') ```",
+      "title": "`alternate-selected-control-text` value for `systemPreferences.getColor`",
+      "version": "27.0"
+    },
+    {
+      "anchor": "deprecated-webcontentsgetprinters",
+      "kind": "Deprecated",
+      "mentionedApis": [
+        "webContents.getPrinters",
+        "webContents.getPrintersAsync"
+      ],
+      "rawTitle": "Deprecated: `webContents.getPrinters`",
+      "summary": "The `webContents.getPrinters` method has been deprecated. Use `webContents.getPrintersAsync` instead. ```js const w = new BrowserWindow({ show: false }) // Deprecated console.log(w.webContents.getPrinters()) // Replace with w.webContents.getPrintersAsync().then((printers) => { console.log(printers) …",
+      "title": "`webContents.getPrinters`",
+      "version": "26.0"
+    },
+    {
+      "anchor": "deprecated-systempreferencesgetsetapplevelappearance-and-systempreferencesapplevelappearance",
+      "kind": "Deprecated",
+      "mentionedApis": [
+        "systemPreferences.getAppLevelAppearance",
+        "systemPreferences.setAppLevelAppearance",
+        "systemPreferences.appLevelAppearance",
+        "nativeTheme"
+      ],
+      "rawTitle": "Deprecated: `systemPreferences.{get,set}AppLevelAppearance` and `systemPreferences.appLevelAppearance`",
+      "summary": "The `systemPreferences.getAppLevelAppearance` and `systemPreferences.setAppLevelAppearance` methods have been deprecated, as well as the `systemPreferences.appLevelAppearance` property. Use the `nativeTheme` module instead. ```js // Deprecated systemPreferences.getAppLevelAppearance() // Replace wit…",
+      "title": "`systemPreferences.{get,set}AppLevelAppearance` and `systemPreferences.appLevelAppearance`",
+      "version": "26.0"
+    },
+    {
+      "anchor": "deprecated-alternate-selected-control-text-value-for-systempreferencesgetcolor",
+      "kind": "Deprecated",
+      "mentionedApis": [
+        "alternate-selected-control-text",
+        "systemPreferences.getColor",
+        "selected-content-background"
+      ],
+      "rawTitle": "Deprecated: `alternate-selected-control-text` value for `systemPreferences.getColor`",
+      "summary": "The `alternate-selected-control-text` value for `systemPreferences.getColor` has been deprecated. Use `selected-content-background` instead. ```js // Deprecated systemPreferences.getColor('alternate-selected-control-text') // Replace with systemPreferences.getColor('selected-content-background') ```",
+      "title": "`alternate-selected-control-text` value for `systemPreferences.getColor`",
+      "version": "26.0"
+    },
+    {
+      "anchor": "deprecated-protocolunregisterinterceptbufferstringstreamfilehttpprotocol-and-protocolisprotocolregisteredintercepted",
+      "kind": "Deprecated",
+      "mentionedApis": [
+        "protocol.register*Protocol",
+        "protocol.intercept*Protocol",
+        "protocol.handle"
+      ],
+      "rawTitle": "Deprecated: `protocol.{un,}{register,intercept}{Buffer,String,Stream,File,Http}Protocol` and `protocol.isProtocol{Registered,Intercepted}`",
+      "summary": "The `protocol.register*Protocol` and `protocol.intercept*Protocol` methods have been replaced with [`protocol.handle`](api/protocol.md#protocolhandlescheme-handler). The new method can either register a new protocol or intercept an existing protocol, and responses can be of any type. ```js // Deprec…",
+      "title": "`protocol.{un,}{register,intercept}{Buffer,String,Stream,File,Http}Protocol` and `protocol.isProtocol{Registered,Intercepted}`",
+      "version": "25.0"
+    },
+    {
+      "anchor": "deprecated-browserwindowsettrafficlightpositionposition",
+      "kind": "Deprecated",
+      "mentionedApis": [
+        "BrowserWindow.setTrafficLightPosition(position)",
+        "BrowserWindow.setWindowButtonPosition(position)",
+        "null",
+        "{ x: 0, y: 0 }"
+      ],
+      "rawTitle": "Deprecated: `BrowserWindow.setTrafficLightPosition(position)`",
+      "summary": "`BrowserWindow.setTrafficLightPosition(position)` has been deprecated, the `BrowserWindow.setWindowButtonPosition(position)` API should be used instead which accepts `null` instead of `{ x: 0, y: 0 }` to reset the position to system default. ```js // Deprecated in Electron 25 win.setTrafficLightPosi…",
+      "title": "`BrowserWindow.setTrafficLightPosition(position)`",
+      "version": "25.0"
+    },
+    {
+      "anchor": "deprecated-browserwindowgettrafficlightposition",
+      "kind": "Deprecated",
+      "mentionedApis": [
+        "BrowserWindow.getTrafficLightPosition()",
+        "BrowserWindow.getWindowButtonPosition()",
+        "null",
+        "{ x: 0, y: 0 }"
+      ],
+      "rawTitle": "Deprecated: `BrowserWindow.getTrafficLightPosition()`",
+      "summary": "`BrowserWindow.getTrafficLightPosition()` has been deprecated, the `BrowserWindow.getWindowButtonPosition()` API should be used instead which returns `null` instead of `{ x: 0, y: 0 }` when there is no custom position. ```js // Deprecated in Electron 25 const pos = win.getTrafficLightPosition() if (…",
+      "title": "`BrowserWindow.getTrafficLightPosition()`",
+      "version": "25.0"
+    },
+    {
+      "anchor": "api-changed-nativeimagecreatethumbnailfrompathpath-size",
+      "kind": "API Changed",
+      "mentionedApis": [
+        "maxSize",
+        "size"
+      ],
+      "rawTitle": "API Changed: `nativeImage.createThumbnailFromPath(path, size)`",
+      "summary": "The `maxSize` parameter has been changed to `size` to reflect that the size passed in will be the size the thumbnail created. Previously, Windows would not scale the image up if it were smaller than `maxSize`, and macOS would always set the size to `maxSize`. Behavior is now the same across platform…",
+      "title": "`nativeImage.createThumbnailFromPath(path, size)`",
+      "version": "24.0"
+    },
+    {
+      "anchor": "behavior-changed-draggable-regions-on-macos",
+      "kind": "Behavior Changed",
+      "mentionedApis": [
+        "-webkit-app-region: drag",
+        "-webkit-app-region: no-drag",
+        "no-drag",
+        "drag",
+        "customButtonsOnHover",
+        "-webkit-app-region"
+      ],
+      "rawTitle": "Behavior Changed: Draggable Regions on macOS",
+      "summary": "The implementation of draggable regions (using the CSS property `-webkit-app-region: drag`) has changed on macOS to bring it in line with Windows and Linux. Previously, when a region with `-webkit-app-region: no-drag` overlapped a region with `-webkit-app-region: drag`, the `no-drag` region would al…",
+      "title": "Draggable Regions on macOS",
+      "version": "23.0"
+    },
+    {
+      "anchor": "removed-windows-7-8-81-support",
+      "kind": "Removed",
+      "mentionedApis": [],
+      "rawTitle": "Removed: Windows 7 / 8 / 8.1 support",
+      "summary": "[Windows 7, Windows 8, and Windows 8.1 are no longer supported](https://www.electronjs.org/blog/windows-7-to-8-1-deprecation-notice). Electron follows the planned Chromium deprecation policy, which will [deprecate Windows 7 support beginning in Chromium 109](https://support.google.com/chrome/thread/…",
+      "title": "Windows 7 / 8 / 8.1 support",
+      "version": "23.0"
+    },
+    {
+      "anchor": "removed-browserwindow-scroll-touch--events",
+      "kind": "Removed",
+      "mentionedApis": [
+        "scroll-touch-begin",
+        "scroll-touch-end",
+        "scroll-touch-edge",
+        "input-event"
+      ],
+      "rawTitle": "Removed: BrowserWindow `scroll-touch-*` events",
+      "summary": "The deprecated `scroll-touch-begin`, `scroll-touch-end` and `scroll-touch-edge` events on BrowserWindow have been removed. Instead, use the newly available [`input-event` event](api/web-contents.md#event-input-event) on WebContents. ```js // Removed in Electron 23.0 win.on('scroll-touch-begin', scro…",
+      "title": "BrowserWindow `scroll-touch-*` events",
+      "version": "23.0"
+    },
+    {
+      "anchor": "removed-webcontentsincrementcapturercountstayhidden-stayawake",
+      "kind": "Removed",
+      "mentionedApis": [
+        "webContents.incrementCapturerCount(stayHidden, stayAwake)",
+        "webContents.capturePage"
+      ],
+      "rawTitle": "Removed: `webContents.incrementCapturerCount(stayHidden, stayAwake)`",
+      "summary": "The `webContents.incrementCapturerCount(stayHidden, stayAwake)` function has been removed. It is now automatically handled by `webContents.capturePage` when a page capture completes. ```js const w = new BrowserWindow({ show: false }) // Removed in Electron 23 w.webContents.incrementCapturerCount() w…",
+      "title": "`webContents.incrementCapturerCount(stayHidden, stayAwake)`",
+      "version": "23.0"
+    },
+    {
+      "anchor": "removed-webcontentsdecrementcapturercountstayhidden-stayawake",
+      "kind": "Removed",
+      "mentionedApis": [
+        "webContents.decrementCapturerCount(stayHidden, stayAwake)",
+        "webContents.capturePage"
+      ],
+      "rawTitle": "Removed: `webContents.decrementCapturerCount(stayHidden, stayAwake)`",
+      "summary": "The `webContents.decrementCapturerCount(stayHidden, stayAwake)` function has been removed. It is now automatically handled by `webContents.capturePage` when a page capture completes. ```js const w = new BrowserWindow({ show: false }) // Removed in Electron 23 w.webContents.incrementCapturerCount() w…",
+      "title": "`webContents.decrementCapturerCount(stayHidden, stayAwake)`",
+      "version": "23.0"
+    },
+    {
+      "anchor": "deprecated-webcontentsincrementcapturercountstayhidden-stayawake",
+      "kind": "Deprecated",
+      "mentionedApis": [
+        "webContents.incrementCapturerCount(stayHidden, stayAwake)",
+        "webContents.capturePage"
+      ],
+      "rawTitle": "Deprecated: `webContents.incrementCapturerCount(stayHidden, stayAwake)`",
+      "summary": "`webContents.incrementCapturerCount(stayHidden, stayAwake)` has been deprecated. It is now automatically handled by `webContents.capturePage` when a page capture completes. ```js const w = new BrowserWindow({ show: false }) // Removed in Electron 23 w.webContents.incrementCapturerCount() w.capturePa…",
+      "title": "`webContents.incrementCapturerCount(stayHidden, stayAwake)`",
+      "version": "22.0"
+    },
+    {
+      "anchor": "deprecated-webcontentsdecrementcapturercountstayhidden-stayawake",
+      "kind": "Deprecated",
+      "mentionedApis": [
+        "webContents.decrementCapturerCount(stayHidden, stayAwake)",
+        "webContents.capturePage"
+      ],
+      "rawTitle": "Deprecated: `webContents.decrementCapturerCount(stayHidden, stayAwake)`",
+      "summary": "`webContents.decrementCapturerCount(stayHidden, stayAwake)` has been deprecated. It is now automatically handled by `webContents.capturePage` when a page capture completes. ```js const w = new BrowserWindow({ show: false }) // Removed in Electron 23 w.webContents.incrementCapturerCount() w.capturePa…",
+      "title": "`webContents.decrementCapturerCount(stayHidden, stayAwake)`",
+      "version": "22.0"
+    },
+    {
+      "anchor": "removed-webcontents-new-window-event",
+      "kind": "Removed",
+      "mentionedApis": [
+        "new-window",
+        "webContents.setWindowOpenHandler()"
+      ],
+      "rawTitle": "Removed: WebContents `new-window` event",
+      "summary": "The `new-window` event of WebContents has been removed. It is replaced by [`webContents.setWindowOpenHandler()`](api/web-contents.md#contentssetwindowopenhandlerhandler). ```js // Removed in Electron 22 webContents.on('new-window', (event) => { event.preventDefault() }) // Replace with webContents.s…",
+      "title": "WebContents `new-window` event",
+      "version": "22.0"
+    },
+    {
+      "anchor": "removed-new-window-event",
+      "kind": "Removed",
+      "mentionedApis": [
+        "new-window",
+        "<webview>"
+      ],
+      "rawTitle": "Removed: `<webview>` `new-window` event",
+      "summary": "The `new-window` event of `<webview>` has been removed. There is no direct replacement. ```js // Removed in Electron 22 webview.addEventListener('new-window', (event) => {}) ``` ```js // Replace with // main.js mainWindow.webContents.on('did-attach-webview', (event, wc) => { wc.setWindowOpenHandler(…",
+      "title": "`<webview>` `new-window` event",
+      "version": "22.0"
+    },
+    {
+      "anchor": "deprecated-browserwindow-scroll-touch--events",
+      "kind": "Deprecated",
+      "mentionedApis": [
+        "scroll-touch-begin",
+        "scroll-touch-end",
+        "scroll-touch-edge",
+        "input-event"
+      ],
+      "rawTitle": "Deprecated: BrowserWindow `scroll-touch-*` events",
+      "summary": "The `scroll-touch-begin`, `scroll-touch-end` and `scroll-touch-edge` events on BrowserWindow are deprecated. Instead, use the newly available [`input-event` event](api/web-contents.md#event-input-event) on WebContents. ```js // Deprecated win.on('scroll-touch-begin', scrollTouchBegin) win.on('scroll…",
+      "title": "BrowserWindow `scroll-touch-*` events",
+      "version": "22.0"
+    },
+    {
+      "anchor": "behavior-changed-v8-memory-cage-enabled",
+      "kind": "Behavior Changed",
+      "mentionedApis": [
+        "ArrayBuffer",
+        "Buffer"
+      ],
+      "rawTitle": "Behavior Changed: V8 Memory Cage enabled",
+      "summary": "The V8 memory cage has been enabled, which has implications for native modules which wrap non-V8 memory with `ArrayBuffer` or `Buffer`. See the [blog post about the V8 memory cage](https://www.electronjs.org/blog/v8-memory-cage) for more details.",
+      "title": "V8 Memory Cage enabled",
+      "version": "21.0"
+    },
+    {
+      "anchor": "api-changed-webcontentsprinttopdf",
+      "kind": "API Changed",
+      "mentionedApis": [
+        "webContents.printToPDF()",
+        "Page.printToPDF",
+        "pageRanges",
+        "printSelectionOnly",
+        "marginsType",
+        "headerFooter",
+        "scaleFactor",
+        "headerTemplate",
+        "footerTemplate",
+        "displayHeaderFooter",
+        "margins",
+        "scale",
+        "preferCSSPageSize",
+        "Wrote PDF successfully to ${pdfPath}",
+        "Failed to write PDF to ${pdfPath}:"
+      ],
+      "rawTitle": "API Changed: `webContents.printToPDF()`",
+      "summary": "`webContents.printToPDF()` has been modified to conform to [`Page.printToPDF`](https://chromedevtools.github.io/devtools-protocol/tot/Page/#method-printToPDF) in the Chrome DevTools Protocol. This has been changed in order to address changes upstream that made our previous implementation untenable a…",
+      "title": "`webContents.printToPDF()`",
+      "version": "21.0"
+    },
+    {
+      "anchor": "removed-macos-1011-1012-support",
+      "kind": "Removed",
+      "mentionedApis": [],
+      "rawTitle": "Removed: macOS 10.11 / 10.12 support",
+      "summary": "macOS 10.11 (El Capitan) and macOS 10.12 (Sierra) are no longer supported by [Chromium](https://chromium-review.googlesource.com/c/chromium/src/+/3646050). Older versions of Electron will continue to run on these operating systems, but macOS 10.13 (High Sierra) or later will be required to run Elect…",
+      "title": "macOS 10.11 / 10.12 support",
+      "version": "20.0"
+    },
+    {
+      "anchor": "default-changed-renderers-without-nodeintegration-true-are-sandboxed-by-default",
+      "kind": "Default Changed",
+      "mentionedApis": [
+        "nodeIntegration: true",
+        "sandbox: false"
+      ],
+      "rawTitle": "Default Changed: renderers without `nodeIntegration: true` are sandboxed by default",
+      "summary": "Previously, renderers that specified a preload script defaulted to being unsandboxed. This meant that by default, preload scripts had access to Node.js. In Electron 20, this default has changed. Beginning in Electron 20, renderers will be sandboxed by default, unless `nodeIntegration: true` or `sand…",
+      "title": "renderers without `nodeIntegration: true` are sandboxed by default",
+      "version": "20.0"
+    },
+    {
+      "anchor": "removed-skiptaskbar-on-linux",
+      "kind": "Removed",
+      "mentionedApis": [
+        "skipTaskbar",
+        "_NET_WM_STATE_SKIP_TASKBAR"
+      ],
+      "rawTitle": "Removed: `skipTaskbar` on Linux",
+      "summary": "On X11, `skipTaskbar` sends a `_NET_WM_STATE_SKIP_TASKBAR` message to the X11 window manager. There is not a direct equivalent for Wayland, and the known workarounds have unacceptable tradeoffs (e.g. Window.is_skip_taskbar in GNOME requires unsafe mode), so Electron is unable to support this feature…",
+      "title": "`skipTaskbar` on Linux",
+      "version": "20.0"
+    },
+    {
+      "anchor": "api-changed-sessionsetdevicepermissionhandlerhandler",
+      "kind": "API Changed",
+      "mentionedApis": [
+        "session.setDevicePermissionHandler(handler)",
+        "WebFrameMain",
+        "origin"
+      ],
+      "rawTitle": "API Changed: `session.setDevicePermissionHandler(handler)`",
+      "summary": "The handler invoked when `session.setDevicePermissionHandler(handler)` is used has a change to its arguments. This handler no longer is passed a frame [`WebFrameMain`](api/web-frame-main.md), but instead is passed the `origin`, which is the origin that is checking for device permission.",
+      "title": "`session.setDevicePermissionHandler(handler)`",
+      "version": "20.0"
+    },
+    {
+      "anchor": "removed-ia32-linux-binaries",
+      "kind": "Removed",
+      "mentionedApis": [],
+      "rawTitle": "Removed: IA32 Linux binaries",
+      "summary": "This is a result of Chromium 102.0.4999.0 dropping support for IA32 Linux. This concludes the [removal of support for IA32 Linux](#removed-ia32-linux-support).",
+      "title": "IA32 Linux binaries",
+      "version": "19.0"
+    },
+    {
+      "anchor": "removed-nativewindowopen",
+      "kind": "Removed",
+      "mentionedApis": [
+        "window.open",
+        "BrowserWindowProxy",
+        "window.open('about:blank')",
+        "nativeWindowOpen"
+      ],
+      "rawTitle": "Removed: `nativeWindowOpen`",
+      "summary": "Prior to Electron 15, `window.open` was by default shimmed to use `BrowserWindowProxy`. This meant that `window.open('about:blank')` did not work to open synchronously scriptable child windows, among other incompatibilities. Since Electron 15, `nativeWindowOpen` has been enabled by default. See the …",
+      "title": "`nativeWindowOpen`",
+      "version": "18.0"
+    },
+    {
+      "anchor": "removed-desktopcapturergetsources-in-the-renderer",
+      "kind": "Removed",
+      "mentionedApis": [
+        "desktopCapturer.getSources"
+      ],
+      "rawTitle": "Removed: `desktopCapturer.getSources` in the renderer",
+      "summary": "The `desktopCapturer.getSources` API is now only available in the main process. This has been changed in order to improve the default security of Electron apps. If you need this functionality, it can be replaced as follows: ```js // Main process const { ipcMain, desktopCapturer } = require('electron…",
+      "title": "`desktopCapturer.getSources` in the renderer",
+      "version": "17.0"
+    },
+    {
+      "anchor": "deprecated-nativewindowopen",
+      "kind": "Deprecated",
+      "mentionedApis": [
+        "window.open",
+        "BrowserWindowProxy",
+        "window.open('about:blank')",
+        "nativeWindowOpen"
+      ],
+      "rawTitle": "Deprecated: `nativeWindowOpen`",
+      "summary": "Prior to Electron 15, `window.open` was by default shimmed to use `BrowserWindowProxy`. This meant that `window.open('about:blank')` did not work to open synchronously scriptable child windows, among other incompatibilities. Since Electron 15, `nativeWindowOpen` has been enabled by default. See the …",
+      "title": "`nativeWindowOpen`",
+      "version": "17.0"
+    },
+    {
+      "anchor": "behavior-changed-crashreporter-implementation-switched-to-crashpad-on-linux",
+      "kind": "Behavior Changed",
+      "mentionedApis": [
+        "crashReporter",
+        "process.crashReporter.start",
+        "__1",
+        "__2"
+      ],
+      "rawTitle": "Behavior Changed: `crashReporter` implementation switched to Crashpad on Linux",
+      "summary": "The underlying implementation of the `crashReporter` API on Linux has changed from Breakpad to Crashpad, bringing it in line with Windows and Mac. As a result of this, child processes are now automatically monitored, and calling `process.crashReporter.start` in Node child processes is no longer need…",
+      "title": "`crashReporter` implementation switched to Crashpad on Linux",
+      "version": "16.0"
+    },
+    {
+      "anchor": "deprecated-desktopcapturergetsources-in-the-renderer",
+      "kind": "Deprecated",
+      "mentionedApis": [
+        "desktopCapturer.getSources"
+      ],
+      "rawTitle": "Deprecated: `desktopCapturer.getSources` in the renderer",
+      "summary": "Usage of the `desktopCapturer.getSources` API in the renderer has been deprecated and will be removed. This change improves the default security of Electron apps. See [here](#removed-desktopcapturergetsources-in-the-renderer) for details on how to replace this API in your app.",
+      "title": "`desktopCapturer.getSources` in the renderer",
+      "version": "16.0"
+    },
+    {
+      "anchor": "default-changed-nativewindowopen-defaults-to-true",
+      "kind": "Default Changed",
+      "mentionedApis": [
+        "window.open",
+        "BrowserWindowProxy",
+        "window.open('about:blank')",
+        "nativeWindowOpen"
+      ],
+      "rawTitle": "Default Changed: `nativeWindowOpen` defaults to `true`",
+      "summary": "Prior to Electron 15, `window.open` was by default shimmed to use `BrowserWindowProxy`. This meant that `window.open('about:blank')` did not work to open synchronously scriptable child windows, among other incompatibilities. `nativeWindowOpen` is no longer experimental, and is now the default. See t…",
+      "title": "`nativeWindowOpen` defaults to `true`",
+      "version": "15.0"
+    },
+    {
+      "anchor": "deprecated-apprunningunderrosettatranslation",
+      "kind": "Deprecated",
+      "mentionedApis": [
+        "app.runningUnderRosettaTranslation",
+        "app.runningUnderARM64Translation"
+      ],
+      "rawTitle": "Deprecated: `app.runningUnderRosettaTranslation`",
+      "summary": "The `app.runningUnderRosettaTranslation` property has been deprecated. Use `app.runningUnderARM64Translation` instead. ```js // Deprecated console.log(app.runningUnderRosettaTranslation) // Replace with console.log(app.runningUnderARM64Translation) ```",
+      "title": "`app.runningUnderRosettaTranslation`",
+      "version": "15.0"
+    },
+    {
+      "anchor": "removed-remote-module",
+      "kind": "Removed",
+      "mentionedApis": [
+        "remote",
+        "@electron/remote"
+      ],
+      "rawTitle": "Removed: `remote` module",
+      "summary": "The `remote` module was deprecated in Electron 12, and will be removed in Electron 14. It is replaced by the [`@electron/remote`](https://github.com/electron/remote) module. ```js // Deprecated in Electron 12: const { BrowserWindow } = require('electron').remote ``` ```js // Replace with: const { Br…",
+      "title": "`remote` module",
+      "version": "14.0"
+    },
+    {
+      "anchor": "removed-appallowrendererprocessreuse",
+      "kind": "Removed",
+      "mentionedApis": [
+        "app.allowRendererProcessReuse"
+      ],
+      "rawTitle": "Removed: `app.allowRendererProcessReuse`",
+      "summary": "The `app.allowRendererProcessReuse` property will be removed as part of our plan to more closely align with Chromium's process model for security, performance and maintainability. For more detailed information see [#18397](https://github.com/electron/electron/issues/18397).",
+      "title": "`app.allowRendererProcessReuse`",
+      "version": "14.0"
+    },
+    {
+      "anchor": "removed-browser-window-affinity",
+      "kind": "Removed",
+      "mentionedApis": [
+        "affinity",
+        "BrowserWindow"
+      ],
+      "rawTitle": "Removed: Browser Window Affinity",
+      "summary": "The `affinity` option when constructing a new `BrowserWindow` will be removed as part of our plan to more closely align with Chromium's process model for security, performance and maintainability. For more detailed information see [#18397](https://github.com/electron/electron/issues/18397).",
+      "title": "Browser Window Affinity",
+      "version": "14.0"
+    },
+    {
+      "anchor": "api-changed-windowopen",
+      "kind": "API Changed",
+      "mentionedApis": [
+        "frameName",
+        "windowName"
+      ],
+      "rawTitle": "API Changed: `window.open()`",
+      "summary": "The optional parameter `frameName` will no longer set the title of the window. This now follows the specification described by the [native documentation](https://developer.mozilla.org/en-US/docs/Web/API/Window/open#parameters) under the corresponding parameter `windowName`. If you were using this pa…",
+      "title": "`window.open()`",
+      "version": "14.0"
+    },
+    {
+      "anchor": "removed-worldsafeexecutejavascript",
+      "kind": "Removed",
+      "mentionedApis": [
+        "worldSafeExecuteJavaScript",
+        "webFrame.executeJavaScript",
+        "webFrame.executeJavaScriptInIsolatedWorld"
+      ],
+      "rawTitle": "Removed: `worldSafeExecuteJavaScript`",
+      "summary": "In Electron 14, `worldSafeExecuteJavaScript` will be removed. There is no alternative, please ensure your code works with this property enabled. It has been enabled by default since Electron 12. You will be affected by this change if you use either `webFrame.executeJavaScript` or `webFrame.executeJa…",
+      "title": "`worldSafeExecuteJavaScript`",
+      "version": "14.0"
+    },
+    {
+      "anchor": "removed-browserwindowconstructoroptions-inheriting-from-parent-windows",
+      "kind": "Removed",
+      "mentionedApis": [
+        "window.open",
+        "transparent",
+        "resizable",
+        "setWindowOpenHandler"
+      ],
+      "rawTitle": "Removed: BrowserWindowConstructorOptions inheriting from parent windows",
+      "summary": "Prior to Electron 14, windows opened with `window.open` would inherit BrowserWindow constructor options such as `transparent` and `resizable` from their parent window. Beginning with Electron 14, this behavior is removed, and windows will not inherit any BrowserWindow constructor options from their …",
+      "title": "BrowserWindowConstructorOptions inheriting from parent windows",
+      "version": "14.0"
+    },
+    {
+      "anchor": "removed-additionalfeatures",
+      "kind": "Removed",
+      "mentionedApis": [
+        "additionalFeatures",
+        "new-window",
+        "did-create-window",
+        "[]",
+        "setWindowOpenHandler",
+        "true"
+      ],
+      "rawTitle": "Removed: `additionalFeatures`",
+      "summary": "The deprecated `additionalFeatures` property in the `new-window` and `did-create-window` events of WebContents has been removed. Since `new-window` uses positional arguments, the argument is still present, but will always be the empty array `[]`. (Though note, the `new-window` event itself is deprec…",
+      "title": "`additionalFeatures`",
+      "version": "14.0"
+    },
+    {
+      "anchor": "api-changed-sessionsetpermissioncheckhandlerhandler",
+      "kind": "API Changed",
+      "mentionedApis": [
+        "handler",
+        "webContents",
+        "null",
+        "requestingOrigin",
+        "embeddingOrigin",
+        "securityOrigin"
+      ],
+      "rawTitle": "API Changed: `session.setPermissionCheckHandler(handler)`",
+      "summary": "The `handler` methods first parameter was previously always a `webContents`, it can now sometimes be `null`. You should use the `requestingOrigin`, `embeddingOrigin` and `securityOrigin` properties to respond to the permission check correctly. As the `webContents` can be `null` it can no longer be r…",
+      "title": "`session.setPermissionCheckHandler(handler)`",
+      "version": "13.0"
+    },
+    {
+      "anchor": "removed-shellmoveitemtotrash",
+      "kind": "Removed",
+      "mentionedApis": [
+        "shell.moveItemToTrash()",
+        "shell.trashItem()"
+      ],
+      "rawTitle": "Removed: `shell.moveItemToTrash()`",
+      "summary": "The deprecated synchronous `shell.moveItemToTrash()` API has been removed. Use the asynchronous `shell.trashItem()` instead. ```js // Removed in Electron 13 shell.moveItemToTrash(path) // Replace with shell.trashItem(path).then(/* ... */) ```",
+      "title": "`shell.moveItemToTrash()`",
+      "version": "13.0"
+    },
+    {
+      "anchor": "removed-browserwindow-extension-apis",
+      "kind": "Removed",
+      "mentionedApis": [
+        "BrowserWindow.addExtension(path)",
+        "BrowserWindow.addDevToolsExtension(path)",
+        "BrowserWindow.removeExtension(name)",
+        "BrowserWindow.removeDevToolsExtension(name)",
+        "BrowserWindow.getExtensions()",
+        "BrowserWindow.getDevToolsExtensions()",
+        "ses.loadExtension(path)",
+        "ses.removeExtension(extension_id)",
+        "ses.getAllExtensions()"
+      ],
+      "rawTitle": "Removed: `BrowserWindow` extension APIs",
+      "summary": "The deprecated extension APIs have been removed: * `BrowserWindow.addExtension(path)` * `BrowserWindow.addDevToolsExtension(path)` * `BrowserWindow.removeExtension(name)` * `BrowserWindow.removeDevToolsExtension(name)` * `BrowserWindow.getExtensions()` * `BrowserWindow.getDevToolsExtensions()` Use t…",
+      "title": "`BrowserWindow` extension APIs",
+      "version": "13.0"
+    },
+    {
+      "anchor": "removed-methods-in-systempreferences",
+      "kind": "Removed",
+      "mentionedApis": [
+        "systemPreferences",
+        "systemPreferences.isDarkMode()",
+        "systemPreferences.isInvertedColorScheme()",
+        "systemPreferences.isHighContrastColorScheme()",
+        "nativeTheme",
+        "nativeTheme.shouldUseDarkColors",
+        "nativeTheme.shouldUseInvertedColorScheme",
+        "nativeTheme.shouldUseHighContrastColors"
+      ],
+      "rawTitle": "Removed: methods in `systemPreferences`",
+      "summary": "The following `systemPreferences` methods have been deprecated: * `systemPreferences.isDarkMode()` * `systemPreferences.isInvertedColorScheme()` * `systemPreferences.isHighContrastColorScheme()` Use the following `nativeTheme` properties instead: * `nativeTheme.shouldUseDarkColors` * `nativeTheme.sh…",
+      "title": "methods in `systemPreferences`",
+      "version": "13.0"
+    },
+    {
+      "anchor": "deprecated-webcontents-new-window-event",
+      "kind": "Deprecated",
+      "mentionedApis": [
+        "new-window",
+        "webContents.setWindowOpenHandler()"
+      ],
+      "rawTitle": "Deprecated: WebContents `new-window` event",
+      "summary": "The `new-window` event of WebContents has been deprecated. It is replaced by [`webContents.setWindowOpenHandler()`](api/web-contents.md#contentssetwindowopenhandlerhandler). ```js // Deprecated in Electron 13 webContents.on('new-window', (event) => { event.preventDefault() }) // Replace with webCont…",
+      "title": "WebContents `new-window` event",
+      "version": "13.0"
+    },
+    {
+      "anchor": "removed-pepper-flash-support",
+      "kind": "Removed",
+      "mentionedApis": [],
+      "rawTitle": "Removed: Pepper Flash support",
+      "summary": "Chromium has removed support for Flash, and so we must follow suit. See Chromium's [Flash Roadmap](https://www.chromium.org/flash-roadmap) for more details.",
+      "title": "Pepper Flash support",
+      "version": "12.0"
+    },
+    {
+      "anchor": "default-changed-worldsafeexecutejavascript-defaults-to-true",
+      "kind": "Default Changed",
+      "mentionedApis": [
+        "worldSafeExecuteJavaScript",
+        "worldSafeExecuteJavaScript: false",
+        "false"
+      ],
+      "rawTitle": "Default Changed: `worldSafeExecuteJavaScript` defaults to `true`",
+      "summary": "In Electron 12, `worldSafeExecuteJavaScript` will be enabled by default. To restore the previous behavior, `worldSafeExecuteJavaScript: false` must be specified in WebPreferences. Please note that setting this option to `false` is **insecure**. This option will be removed in Electron 14 so please mi…",
+      "title": "`worldSafeExecuteJavaScript` defaults to `true`",
+      "version": "12.0"
+    },
+    {
+      "anchor": "default-changed-contextisolation-defaults-to-true",
+      "kind": "Default Changed",
+      "mentionedApis": [
+        "contextIsolation",
+        "contextIsolation: false",
+        "require()",
+        "nodeIntegration",
+        "true",
+        "false"
+      ],
+      "rawTitle": "Default Changed: `contextIsolation` defaults to `true`",
+      "summary": "In Electron 12, `contextIsolation` will be enabled by default. To restore the previous behavior, `contextIsolation: false` must be specified in WebPreferences. We [recommend having contextIsolation enabled](tutorial/security.md#3-enable-context-isolation) for the security of your application. Anothe…",
+      "title": "`contextIsolation` defaults to `true`",
+      "version": "12.0"
+    },
+    {
+      "anchor": "removed-crashreportergetcrashesdirectory",
+      "kind": "Removed",
+      "mentionedApis": [
+        "crashReporter.getCrashesDirectory",
+        "app.getPath('crashDumps')"
+      ],
+      "rawTitle": "Removed: `crashReporter.getCrashesDirectory()`",
+      "summary": "The `crashReporter.getCrashesDirectory` method has been removed. Usage should be replaced by `app.getPath('crashDumps')`. ```js // Removed in Electron 12 crashReporter.getCrashesDirectory() // Replace with app.getPath('crashDumps') ```",
+      "title": "`crashReporter.getCrashesDirectory()`",
+      "version": "12.0"
+    },
+    {
+      "anchor": "removed-crashreporter-methods-in-the-renderer-process",
+      "kind": "Removed",
+      "mentionedApis": [
+        "crashReporter",
+        "crashReporter.start",
+        "crashReporter.getLastCrashReport",
+        "crashReporter.getUploadedReports",
+        "crashReporter.getUploadToServer",
+        "crashReporter.setUploadToServer",
+        "crashReporter.getCrashesDirectory"
+      ],
+      "rawTitle": "Removed: `crashReporter` methods in the renderer process",
+      "summary": "The following `crashReporter` methods are no longer available in the renderer process: * `crashReporter.start` * `crashReporter.getLastCrashReport` * `crashReporter.getUploadedReports` * `crashReporter.getUploadToServer` * `crashReporter.setUploadToServer` * `crashReporter.getCrashesDirectory` They …",
+      "title": "`crashReporter` methods in the renderer process",
+      "version": "12.0"
+    },
+    {
+      "anchor": "default-changed-crashreporterstart-compress-true",
+      "kind": "Default Changed",
+      "mentionedApis": [
+        "compress",
+        "crashReporter.start",
+        "false",
+        "true",
+        "Content-Encoding: gzip",
+        "{ compress: false }"
+      ],
+      "rawTitle": "Default Changed: `crashReporter.start({ compress: true })`",
+      "summary": "The default value of the `compress` option to `crashReporter.start` has changed from `false` to `true`. This means that crash dumps will be uploaded to the crash ingestion server with the `Content-Encoding: gzip` header, and the body will be compressed. If your crash ingestion server does not suppor…",
+      "title": "`crashReporter.start({ compress: true })`",
+      "version": "12.0"
+    },
+    {
+      "anchor": "deprecated-remote-module",
+      "kind": "Deprecated",
+      "mentionedApis": [
+        "remote",
+        "@electron/remote"
+      ],
+      "rawTitle": "Deprecated: `remote` module",
+      "summary": "The `remote` module is deprecated in Electron 12, and will be removed in Electron 14. It is replaced by the [`@electron/remote`](https://github.com/electron/remote) module. ```js // Deprecated in Electron 12: const { BrowserWindow } = require('electron').remote ``` ```js // Replace with: const { Bro…",
+      "title": "`remote` module",
+      "version": "12.0"
+    },
+    {
+      "anchor": "deprecated-shellmoveitemtotrash",
+      "kind": "Deprecated",
+      "mentionedApis": [
+        "shell.moveItemToTrash()",
+        "shell.trashItem()"
+      ],
+      "rawTitle": "Deprecated: `shell.moveItemToTrash()`",
+      "summary": "The synchronous `shell.moveItemToTrash()` has been replaced by the new, asynchronous `shell.trashItem()`. ```js // Deprecated in Electron 12 shell.moveItemToTrash(path) // Replace with shell.trashItem(path).then(/* ... */) ```",
+      "title": "`shell.moveItemToTrash()`",
+      "version": "12.0"
+    },
+    {
+      "anchor": "removed-browserviewdestroy-fromid-fromwebcontents-getallviews-and-id-property-of-browserview",
+      "kind": "Removed",
+      "mentionedApis": [
+        "BrowserView.{destroy, fromId, fromWebContents, getAllViews}",
+        "id",
+        "BrowserView"
+      ],
+      "rawTitle": "Removed: `BrowserView.{destroy, fromId, fromWebContents, getAllViews}` and `id` property of `BrowserView`",
+      "summary": "The experimental APIs `BrowserView.{destroy, fromId, fromWebContents, getAllViews}` have now been removed. Additionally, the `id` property of `BrowserView` has also been removed. For more detailed information, see [#23578](https://github.com/electron/electron/pull/23578).",
+      "title": "`BrowserView.{destroy, fromId, fromWebContents, getAllViews}` and `id` property of `BrowserView`",
+      "version": "11.0"
+    },
+    {
+      "anchor": "deprecated-companyname-argument-to-crashreporterstart",
+      "kind": "Deprecated",
+      "mentionedApis": [
+        "companyName",
+        "crashReporter.start()",
+        "globalExtra"
+      ],
+      "rawTitle": "Deprecated: `companyName` argument to `crashReporter.start()`",
+      "summary": "The `companyName` argument to `crashReporter.start()`, which was previously required, is now optional, and further, is deprecated. To get the same behavior in a non-deprecated way, you can pass a `companyName` value in `globalExtra`. ```js // Deprecated in Electron 10 crashReporter.start({ companyNa…",
+      "title": "`companyName` argument to `crashReporter.start()`",
+      "version": "10.0"
+    },
+    {
+      "anchor": "deprecated-crashreportergetcrashesdirectory",
+      "kind": "Deprecated",
+      "mentionedApis": [
+        "crashReporter.getCrashesDirectory",
+        "app.getPath('crashDumps')"
+      ],
+      "rawTitle": "Deprecated: `crashReporter.getCrashesDirectory()`",
+      "summary": "The `crashReporter.getCrashesDirectory` method has been deprecated. Usage should be replaced by `app.getPath('crashDumps')`. ```js // Deprecated in Electron 10 crashReporter.getCrashesDirectory() // Replace with app.getPath('crashDumps') ```",
+      "title": "`crashReporter.getCrashesDirectory()`",
+      "version": "10.0"
+    },
+    {
+      "anchor": "deprecated-crashreporter-methods-in-the-renderer-process",
+      "kind": "Deprecated",
+      "mentionedApis": [
+        "crashReporter",
+        "crashReporter.start",
+        "crashReporter.getLastCrashReport",
+        "crashReporter.getUploadedReports",
+        "crashReporter.getUploadToServer",
+        "crashReporter.setUploadToServer",
+        "crashReporter.getCrashesDirectory",
+        "addExtraParameter",
+        "removeExtraParameter",
+        "getParameters"
+      ],
+      "rawTitle": "Deprecated: `crashReporter` methods in the renderer process",
+      "summary": "Calling the following `crashReporter` methods from the renderer process is deprecated: * `crashReporter.start` * `crashReporter.getLastCrashReport` * `crashReporter.getUploadedReports` * `crashReporter.getUploadToServer` * `crashReporter.setUploadToServer` * `crashReporter.getCrashesDirectory` The o…",
+      "title": "`crashReporter` methods in the renderer process",
+      "version": "10.0"
+    },
+    {
+      "anchor": "deprecated-crashreporterstart-compress-false",
+      "kind": "Deprecated",
+      "mentionedApis": [
+        "{ compress: false }",
+        "crashReporter.start"
+      ],
+      "rawTitle": "Deprecated: `crashReporter.start({ compress: false })`",
+      "summary": "Setting `{ compress: false }` in `crashReporter.start` is deprecated. Nearly all crash ingestion servers support gzip compression. This option will be removed in a future version of Electron.",
+      "title": "`crashReporter.start({ compress: false })`",
+      "version": "10.0"
+    },
+    {
+      "anchor": "default-changed-enableremotemodule-defaults-to-false",
+      "kind": "Default Changed",
+      "mentionedApis": [
+        "enableRemoteModule",
+        "enableRemoteModule: true"
+      ],
+      "rawTitle": "Default Changed: `enableRemoteModule` defaults to `false`",
+      "summary": "In Electron 9, using the remote module without explicitly enabling it via the `enableRemoteModule` WebPreferences option began emitting a warning. In Electron 10, the remote module is now disabled by default. To use the remote module, `enableRemoteModule: true` must be specified in WebPreferences: `…",
+      "title": "`enableRemoteModule` defaults to `false`",
+      "version": "10.0"
+    },
+    {
+      "anchor": "protocolunregisterprotocol",
+      "kind": "Other",
+      "mentionedApis": [],
+      "rawTitle": "`protocol.unregisterProtocol`",
+      "summary": "",
+      "title": "`protocol.unregisterProtocol`",
+      "version": "10.0"
+    },
+    {
+      "anchor": "protocoluninterceptprotocol",
+      "kind": "Other",
+      "mentionedApis": [],
+      "rawTitle": "`protocol.uninterceptProtocol`",
+      "summary": "The APIs are now synchronous and the optional callback is no longer needed. ```js // Deprecated protocol.unregisterProtocol(scheme, () => { /* ... */ }) // Replace with protocol.unregisterProtocol(scheme) ```",
+      "title": "`protocol.uninterceptProtocol`",
+      "version": "10.0"
+    },
+    {
+      "anchor": "protocolregisterfileprotocol",
+      "kind": "Other",
+      "mentionedApis": [],
+      "rawTitle": "`protocol.registerFileProtocol`",
+      "summary": "",
+      "title": "`protocol.registerFileProtocol`",
+      "version": "10.0"
+    },
+    {
+      "anchor": "protocolregisterbufferprotocol",
+      "kind": "Other",
+      "mentionedApis": [],
+      "rawTitle": "`protocol.registerBufferProtocol`",
+      "summary": "",
+      "title": "`protocol.registerBufferProtocol`",
+      "version": "10.0"
+    },
+    {
+      "anchor": "protocolregisterstringprotocol",
+      "kind": "Other",
+      "mentionedApis": [],
+      "rawTitle": "`protocol.registerStringProtocol`",
+      "summary": "",
+      "title": "`protocol.registerStringProtocol`",
+      "version": "10.0"
+    },
+    {
+      "anchor": "protocolregisterhttpprotocol",
+      "kind": "Other",
+      "mentionedApis": [],
+      "rawTitle": "`protocol.registerHttpProtocol`",
+      "summary": "",
+      "title": "`protocol.registerHttpProtocol`",
+      "version": "10.0"
+    },
+    {
+      "anchor": "protocolregisterstreamprotocol",
+      "kind": "Other",
+      "mentionedApis": [],
+      "rawTitle": "`protocol.registerStreamProtocol`",
+      "summary": "",
+      "title": "`protocol.registerStreamProtocol`",
+      "version": "10.0"
+    },
+    {
+      "anchor": "protocolinterceptfileprotocol",
+      "kind": "Other",
+      "mentionedApis": [],
+      "rawTitle": "`protocol.interceptFileProtocol`",
+      "summary": "",
+      "title": "`protocol.interceptFileProtocol`",
+      "version": "10.0"
+    },
+    {
+      "anchor": "protocolinterceptstringprotocol",
+      "kind": "Other",
+      "mentionedApis": [],
+      "rawTitle": "`protocol.interceptStringProtocol`",
+      "summary": "",
+      "title": "`protocol.interceptStringProtocol`",
+      "version": "10.0"
+    },
+    {
+      "anchor": "protocolinterceptbufferprotocol",
+      "kind": "Other",
+      "mentionedApis": [],
+      "rawTitle": "`protocol.interceptBufferProtocol`",
+      "summary": "",
+      "title": "`protocol.interceptBufferProtocol`",
+      "version": "10.0"
+    },
+    {
+      "anchor": "protocolintercepthttpprotocol",
+      "kind": "Other",
+      "mentionedApis": [],
+      "rawTitle": "`protocol.interceptHttpProtocol`",
+      "summary": "",
+      "title": "`protocol.interceptHttpProtocol`",
+      "version": "10.0"
+    },
+    {
+      "anchor": "protocolinterceptstreamprotocol",
+      "kind": "Other",
+      "mentionedApis": [],
+      "rawTitle": "`protocol.interceptStreamProtocol`",
+      "summary": "The APIs are now synchronous and the optional callback is no longer needed. ```js // Deprecated protocol.registerFileProtocol(scheme, handler, () => { /* ... */ }) // Replace with protocol.registerFileProtocol(scheme, handler) ``` The registered or intercepted protocol does not have effect on curren…",
+      "title": "`protocol.interceptStreamProtocol`",
+      "version": "10.0"
+    },
+    {
+      "anchor": "protocolisprotocolhandled",
+      "kind": "Other",
+      "mentionedApis": [
+        "protocol.isProtocolRegistered",
+        "protocol.isProtocolIntercepted"
+      ],
+      "rawTitle": "`protocol.isProtocolHandled`",
+      "summary": "This API is deprecated and users should use `protocol.isProtocolRegistered` and `protocol.isProtocolIntercepted` instead. ```js // Deprecated protocol.isProtocolHandled(scheme).then(() => { /* ... */ }) // Replace with const isRegistered = protocol.isProtocolRegistered(scheme) const isIntercepted = …",
+      "title": "`protocol.isProtocolHandled`",
+      "version": "10.0"
+    },
+    {
+      "anchor": "default-changed-loading-non-context-aware-native-modules-in-the-renderer-process-is-disabled-by-default",
+      "kind": "Default Changed",
+      "mentionedApis": [
+        "app.allowRendererProcessReuse",
+        "false"
+      ],
+      "rawTitle": "Default Changed: Loading non-context-aware native modules in the renderer process is disabled by default",
+      "summary": "As of Electron 9 we do not allow loading of non-context-aware native modules in the renderer process. This is to improve security, performance and maintainability of Electron as a project. If this impacts you, you can temporarily set `app.allowRendererProcessReuse` to `false` to revert to the old be…",
+      "title": "Loading non-context-aware native modules in the renderer process is disabled by default",
+      "version": "9.0"
+    },
+    {
+      "anchor": "deprecated-browserwindow-extension-apis",
+      "kind": "Deprecated",
+      "mentionedApis": [
+        "BrowserWindow.addExtension(path)",
+        "BrowserWindow.addDevToolsExtension(path)",
+        "BrowserWindow.removeExtension(name)",
+        "BrowserWindow.removeDevToolsExtension(name)",
+        "BrowserWindow.getExtensions()",
+        "BrowserWindow.getDevToolsExtensions()",
+        "ses.loadExtension(path)",
+        "ses.removeExtension(extension_id)",
+        "ses.getAllExtensions()"
+      ],
+      "rawTitle": "Deprecated: `BrowserWindow` extension APIs",
+      "summary": "The following extension APIs have been deprecated: * `BrowserWindow.addExtension(path)` * `BrowserWindow.addDevToolsExtension(path)` * `BrowserWindow.removeExtension(name)` * `BrowserWindow.removeDevToolsExtension(name)` * `BrowserWindow.getExtensions()` * `BrowserWindow.getDevToolsExtensions()` Use…",
+      "title": "`BrowserWindow` extension APIs",
+      "version": "9.0"
+    },
+    {
+      "anchor": "removed-getwebcontents",
+      "kind": "Removed",
+      "mentionedApis": [],
+      "rawTitle": "Removed: `<webview>.getWebContents()`",
+      "summary": "This API, which was deprecated in Electron 8.0, is now removed. ```js // Removed in Electron 9.0 webview.getWebContents() // Replace with const { remote } = require('electron') remote.webContents.fromId(webview.getWebContentsId()) ```",
+      "title": "`<webview>.getWebContents()`",
+      "version": "9.0"
+    },
+    {
+      "anchor": "removed-webframesetlayoutzoomlevellimits",
+      "kind": "Removed",
+      "mentionedApis": [],
+      "rawTitle": "Removed: `webFrame.setLayoutZoomLevelLimits()`",
+      "summary": "Chromium has removed support for changing the layout zoom level limits, and it is beyond Electron's capacity to maintain it. The function was deprecated in Electron 8.x, and has been removed in Electron 9.x. The layout zoom level limits are now fixed at a minimum of 0.25 and a maximum of 5.0, as def…",
+      "title": "`webFrame.setLayoutZoomLevelLimits()`",
+      "version": "9.0"
+    },
+    {
+      "anchor": "behavior-changed-sending-non-js-objects-over-ipc-now-throws-an-exception",
+      "kind": "Behavior Changed",
+      "mentionedApis": [
+        "Element",
+        "Location",
+        "DOMMatrix",
+        "process.env",
+        "Stream",
+        "WebContents",
+        "BrowserWindow",
+        "WebFrame"
+      ],
+      "rawTitle": "Behavior Changed: Sending non-JS objects over IPC now throws an exception",
+      "summary": "In Electron 8.0, IPC was changed to use the Structured Clone Algorithm, bringing significant performance improvements. To help ease the transition, the old IPC serialization algorithm was kept and used for some objects that aren't serializable with Structured Clone. In particular, DOM objects (e.g. …",
+      "title": "Sending non-JS objects over IPC now throws an exception",
+      "version": "9.0"
+    },
+    {
+      "anchor": "api-changed-shellopenitem-is-now-shellopenpath",
+      "kind": "API Changed",
+      "mentionedApis": [
+        "shell.openItem",
+        "shell.openPath"
+      ],
+      "rawTitle": "API Changed: `shell.openItem` is now `shell.openPath`",
+      "summary": "The `shell.openItem` API has been replaced with an asynchronous `shell.openPath` API. You can see the original API proposal and reasoning [here](https://github.com/electron/governance/blob/main/wg-api/spec-documents/shell-openitem.md).",
+      "title": "`shell.openItem` is now `shell.openPath`",
+      "version": "9.0"
+    },
+    {
+      "anchor": "behavior-changed-values-sent-over-ipc-are-now-serialized-with-structured-clone-algorithm",
+      "kind": "Behavior Changed",
+      "mentionedApis": [
+        "ipcRenderer.send",
+        "ipcRenderer.sendSync",
+        "WebContents.send",
+        "postMessage",
+        "undefined",
+        "NaN",
+        "Infinity",
+        "-Infinity",
+        "null",
+        "Set",
+        "Map",
+        "Error",
+        "RegExp",
+        "{}",
+        "BigInt",
+        "Date",
+        "Uint8Array",
+        "Uint16Array",
+        "Uint32Array",
+        "Buffer",
+        "ArrayBuffer",
+        "Element",
+        "Location",
+        "DOMMatrix",
+        "process.env",
+        "Stream",
+        "WebContents",
+        "BrowserWindow",
+        "WebFrame"
+      ],
+      "rawTitle": "Behavior Changed: Values sent over IPC are now serialized with Structured Clone Algorithm",
+      "summary": "The algorithm used to serialize objects sent over IPC (through `ipcRenderer.send`, `ipcRenderer.sendSync`, `WebContents.send` and related methods) has been switched from a custom algorithm to V8's built-in [Structured Clone Algorithm][SCA], the same algorithm used to serialize messages for `postMess…",
+      "title": "Values sent over IPC are now serialized with Structured Clone Algorithm",
+      "version": "8.0"
+    },
+    {
+      "anchor": "deprecated-getwebcontents",
+      "kind": "Deprecated",
+      "mentionedApis": [
+        "remote",
+        "Invalid webContentsId: ${webContentsId}"
+      ],
+      "rawTitle": "Deprecated: `<webview>.getWebContents()`",
+      "summary": "This API is implemented using the `remote` module, which has both performance and security implications. Therefore its usage should be explicit. ```js // Deprecated webview.getWebContents() // Replace with const { remote } = require('electron') remote.webContents.fromId(webview.getWebContentsId()) `…",
+      "title": "`<webview>.getWebContents()`",
+      "version": "8.0"
+    },
+    {
+      "anchor": "deprecated-webframesetlayoutzoomlevellimits",
+      "kind": "Deprecated",
+      "mentionedApis": [],
+      "rawTitle": "Deprecated: `webFrame.setLayoutZoomLevelLimits()`",
+      "summary": "Chromium has removed support for changing the layout zoom level limits, and it is beyond Electron's capacity to maintain it. The function will emit a warning in Electron 8.x, and cease to exist in Electron 9.x. The layout zoom level limits are now fixed at a minimum of 0.25 and a maximum of 5.0, as …",
+      "title": "`webFrame.setLayoutZoomLevelLimits()`",
+      "version": "8.0"
+    },
+    {
+      "anchor": "deprecated-events-in-systempreferences",
+      "kind": "Other",
+      "mentionedApis": [
+        "systemPreferences",
+        "inverted-color-scheme-changed",
+        "high-contrast-color-scheme-changed",
+        "updated",
+        "nativeTheme"
+      ],
+      "rawTitle": "Deprecated events in `systemPreferences`",
+      "summary": "The following `systemPreferences` events have been deprecated: * `inverted-color-scheme-changed` * `high-contrast-color-scheme-changed` Use the new `updated` event on the `nativeTheme` module instead. ```js // Deprecated systemPreferences.on('inverted-color-scheme-changed', () => { /* ... */ }) syst…",
+      "title": "Deprecated events in `systemPreferences`",
+      "version": "8.0"
+    },
+    {
+      "anchor": "deprecated-methods-in-systempreferences",
+      "kind": "Deprecated",
+      "mentionedApis": [
+        "systemPreferences",
+        "systemPreferences.isDarkMode()",
+        "systemPreferences.isInvertedColorScheme()",
+        "systemPreferences.isHighContrastColorScheme()",
+        "nativeTheme",
+        "nativeTheme.shouldUseDarkColors",
+        "nativeTheme.shouldUseInvertedColorScheme",
+        "nativeTheme.shouldUseHighContrastColors"
+      ],
+      "rawTitle": "Deprecated: methods in `systemPreferences`",
+      "summary": "The following `systemPreferences` methods have been deprecated: * `systemPreferences.isDarkMode()` * `systemPreferences.isInvertedColorScheme()` * `systemPreferences.isHighContrastColorScheme()` Use the following `nativeTheme` properties instead: * `nativeTheme.shouldUseDarkColors` * `nativeTheme.sh…",
+      "title": "methods in `systemPreferences`",
+      "version": "8.0"
+    },
+    {
+      "anchor": "deprecated-atomio-node-headers-url",
+      "kind": "Deprecated",
+      "mentionedApis": [
+        "disturl",
+        ".npmrc",
+        "--dist-url"
+      ],
+      "rawTitle": "Deprecated: Atom.io Node Headers URL",
+      "summary": "This is the URL specified as `disturl` in a `.npmrc` file or as the `--dist-url` command line flag when building native Node modules. Both will be supported for the foreseeable future but it is recommended that you switch. Deprecated: https://atom.io/download/electron Replace with: https://electronj…",
+      "title": "Atom.io Node Headers URL",
+      "version": "7.0"
+    },
+    {
+      "anchor": "api-changed-sessionclearauthcache-no-longer-accepts-options",
+      "kind": "API Changed",
+      "mentionedApis": [
+        "session.clearAuthCache"
+      ],
+      "rawTitle": "API Changed: `session.clearAuthCache()` no longer accepts options",
+      "summary": "The `session.clearAuthCache` API no longer accepts options for what to clear, and instead unconditionally clears the whole cache. ```js // Deprecated session.clearAuthCache({ type: 'password' }) // Replace with session.clearAuthCache() ```",
+      "title": "`session.clearAuthCache()` no longer accepts options",
+      "version": "7.0"
+    },
+    {
+      "anchor": "api-changed-powermonitorquerysystemidlestate-is-now-powermonitorgetsystemidlestate",
+      "kind": "API Changed",
+      "mentionedApis": [],
+      "rawTitle": "API Changed: `powerMonitor.querySystemIdleState` is now `powerMonitor.getSystemIdleState`",
+      "summary": "```js // Removed in Electron 7.0 powerMonitor.querySystemIdleState(threshold, callback) // Replace with synchronous API const idleState = powerMonitor.getSystemIdleState(threshold) ```",
+      "title": "`powerMonitor.querySystemIdleState` is now `powerMonitor.getSystemIdleState`",
+      "version": "7.0"
+    },
+    {
+      "anchor": "api-changed-powermonitorquerysystemidletime-is-now-powermonitorgetsystemidletime",
+      "kind": "API Changed",
+      "mentionedApis": [],
+      "rawTitle": "API Changed: `powerMonitor.querySystemIdleTime` is now `powerMonitor.getSystemIdleTime`",
+      "summary": "```js // Removed in Electron 7.0 powerMonitor.querySystemIdleTime(callback) // Replace with synchronous API const idleTime = powerMonitor.getSystemIdleTime() ```",
+      "title": "`powerMonitor.querySystemIdleTime` is now `powerMonitor.getSystemIdleTime`",
+      "version": "7.0"
+    },
+    {
+      "anchor": "api-changed-webframesetisolatedworldinfo-replaces-separate-methods",
+      "kind": "API Changed",
+      "mentionedApis": [],
+      "rawTitle": "API Changed: `webFrame.setIsolatedWorldInfo` replaces separate methods",
+      "summary": "```js // Removed in Electron 7.0 webFrame.setIsolatedWorldContentSecurityPolicy(worldId, csp) webFrame.setIsolatedWorldHumanReadableName(worldId, name) webFrame.setIsolatedWorldSecurityOrigin(worldId, securityOrigin) // Replace with webFrame.setIsolatedWorldInfo( worldId, { securityOrigin: 'some_ori…",
+      "title": "`webFrame.setIsolatedWorldInfo` replaces separate methods",
+      "version": "7.0"
+    },
+    {
+      "anchor": "removed-marked-property-on-getblinkmemoryinfo",
+      "kind": "Removed",
+      "mentionedApis": [],
+      "rawTitle": "Removed: `marked` property on `getBlinkMemoryInfo`",
+      "summary": "This property was removed in Chromium 77, and as such is no longer available.",
+      "title": "`marked` property on `getBlinkMemoryInfo`",
+      "version": "7.0"
+    },
+    {
+      "anchor": "behavior-changed-webkitdirectory-attribute-for-now-lists-directory-contents",
+      "kind": "Behavior Changed",
+      "mentionedApis": [
+        "webkitdirectory",
+        "event.target.files",
+        "FileList",
+        "File",
+        "dialog.showOpenDialog"
+      ],
+      "rawTitle": "Behavior Changed: `webkitdirectory` attribute for `<input type=\"file\"/>` now lists directory contents",
+      "summary": "The `webkitdirectory` property on HTML file inputs allows them to select folders. Previous versions of Electron had an incorrect implementation where the `event.target.files` of the input returned a `FileList` that returned one `File` corresponding to the selected folder. As of Electron 7, that `Fil…",
+      "title": "`webkitdirectory` attribute for `<input type=\"file\"/>` now lists directory contents",
+      "version": "7.0"
+    },
+    {
+      "anchor": "api-changed-callback-based-versions-of-promisified-apis",
+      "kind": "API Changed",
+      "mentionedApis": [
+        "app.getFileIcon()",
+        "app.dock.show()",
+        "contentTracing.getCategories()",
+        "contentTracing.getTraceBufferUsage()",
+        "contentTracing.startRecording()",
+        "contentTracing.stopRecording()",
+        "contents.executeJavaScript()",
+        "cookies.flushStore()",
+        "cookies.get()",
+        "cookies.remove()",
+        "cookies.set()",
+        "debugger.sendCommand()",
+        "dialog.showCertificateTrustDialog()",
+        "inAppPurchase.getProducts()",
+        "inAppPurchase.purchaseProduct()",
+        "netLog.stopLogging()",
+        "session.clearAuthCache()",
+        "session.clearCache()",
+        "session.clearHostResolverCache()",
+        "session.clearStorageData()",
+        "session.getBlobData()",
+        "session.getCacheSize()",
+        "session.resolveProxy()",
+        "session.setProxy()",
+        "shell.openExternal()",
+        "webContents.loadFile()",
+        "webContents.loadURL()",
+        "webContents.hasServiceWorker()",
+        "webContents.printToPDF()",
+        "webContents.savePage()",
+        "webFrame.executeJavaScript()",
+        "webFrame.executeJavaScriptInIsolatedWorld()",
+        "webviewTag.executeJavaScript()",
+        "win.capturePage()",
+        "dialog.showMessageBox()",
+        "dialog.showMessageBoxSync()",
+        "dialog.showOpenDialog()",
+        "dialog.showOpenDialogSync()",
+        "dialog.showSaveDialog()",
+        "dialog.showSaveDialogSync()"
+      ],
+      "rawTitle": "API Changed: Callback-based versions of promisified APIs",
+      "summary": "Electron 5 and Electron 6 introduced Promise-based versions of existing asynchronous APIs and deprecated their older, callback-based counterparts. In Electron 7, all deprecated callback-based APIs are now removed. These functions now only return Promises: * `app.getFileIcon()` [#15742](https://githu…",
+      "title": "Callback-based versions of promisified APIs",
+      "version": "7.0"
+    },
+    {
+      "anchor": "api-changed-winsetmenunull-is-now-winremovemenu",
+      "kind": "API Changed",
+      "mentionedApis": [],
+      "rawTitle": "API Changed: `win.setMenu(null)` is now `win.removeMenu()`",
+      "summary": "```js // Deprecated win.setMenu(null) // Replace with win.removeMenu() ```",
+      "title": "`win.setMenu(null)` is now `win.removeMenu()`",
+      "version": "6.0"
+    },
+    {
+      "anchor": "api-changed-electronscreen-in-the-renderer-process-should-be-accessed-via-remote",
+      "kind": "API Changed",
+      "mentionedApis": [],
+      "rawTitle": "API Changed: `electron.screen` in the renderer process should be accessed via `remote`",
+      "summary": "```js // Deprecated require('electron').screen // Replace with require('electron').remote.screen ```",
+      "title": "`electron.screen` in the renderer process should be accessed via `remote`",
+      "version": "6.0"
+    },
+    {
+      "anchor": "api-changed-requireing-node-builtins-in-sandboxed-renderers-no-longer-implicitly-loads-the-remote-version",
+      "kind": "API Changed",
+      "mentionedApis": [],
+      "rawTitle": "API Changed: `require()`ing node builtins in sandboxed renderers no longer implicitly loads the `remote` version",
+      "summary": "```js // Deprecated require('child_process') // Replace with require('electron').remote.require('child_process') // Deprecated require('fs') // Replace with require('electron').remote.require('fs') // Deprecated require('os') // Replace with require('electron').remote.require('os') // Deprecated req…",
+      "title": "`require()`ing node builtins in sandboxed renderers no longer implicitly loads the `remote` version",
+      "version": "6.0"
+    },
+    {
+      "anchor": "deprecated-powermonitorquerysystemidlestate-replaced-with-powermonitorgetsystemidlestate",
+      "kind": "Deprecated",
+      "mentionedApis": [],
+      "rawTitle": "Deprecated: `powerMonitor.querySystemIdleState` replaced with `powerMonitor.getSystemIdleState`",
+      "summary": "```js // Deprecated powerMonitor.querySystemIdleState(threshold, callback) // Replace with synchronous API const idleState = powerMonitor.getSystemIdleState(threshold) ```",
+      "title": "`powerMonitor.querySystemIdleState` replaced with `powerMonitor.getSystemIdleState`",
+      "version": "6.0"
+    },
+    {
+      "anchor": "deprecated-powermonitorquerysystemidletime-replaced-with-powermonitorgetsystemidletime",
+      "kind": "Deprecated",
+      "mentionedApis": [],
+      "rawTitle": "Deprecated: `powerMonitor.querySystemIdleTime` replaced with `powerMonitor.getSystemIdleTime`",
+      "summary": "```js // Deprecated powerMonitor.querySystemIdleTime(callback) // Replace with synchronous API const idleTime = powerMonitor.getSystemIdleTime() ```",
+      "title": "`powerMonitor.querySystemIdleTime` replaced with `powerMonitor.getSystemIdleTime`",
+      "version": "6.0"
+    },
+    {
+      "anchor": "deprecated-appenablemixedsandbox-is-no-longer-needed",
+      "kind": "Deprecated",
+      "mentionedApis": [],
+      "rawTitle": "Deprecated: `app.enableMixedSandbox()` is no longer needed",
+      "summary": "```js // Deprecated app.enableMixedSandbox() ``` Mixed-sandbox mode is now enabled by default.",
+      "title": "`app.enableMixedSandbox()` is no longer needed",
+      "version": "6.0"
+    },
+    {
+      "anchor": "deprecated-traysethighlightmode",
+      "kind": "Deprecated",
+      "mentionedApis": [],
+      "rawTitle": "Deprecated: `Tray.setHighlightMode`",
+      "summary": "Under macOS Catalina our former Tray implementation breaks. Apple's native substitute doesn't support changing the highlighting behavior. ```js // Deprecated tray.setHighlightMode(mode) // API will be removed in v7.0 without replacement. ```",
+      "title": "`Tray.setHighlightMode`",
+      "version": "6.0"
+    },
+    {
+      "anchor": "default-changed-nodeintegration-and-webviewtag-default-to-false-contextisolation-defaults-to-true",
+      "kind": "Default Changed",
+      "mentionedApis": [
+        "webPreferences",
+        "contextIsolation",
+        "false",
+        "true",
+        "nodeIntegration",
+        "webviewTag"
+      ],
+      "rawTitle": "Default Changed: `nodeIntegration` and `webviewTag` default to false, `contextIsolation` defaults to true",
+      "summary": "The following `webPreferences` option default values are deprecated in favor of the new defaults listed below. | Property | Deprecated Default | New Default | |----------|--------------------|-------------| | `contextIsolation` | `false` | `true` | | `nodeIntegration` | `true` | `false` | | `webview…",
+      "title": "`nodeIntegration` and `webviewTag` default to false, `contextIsolation` defaults to true",
+      "version": "5.0"
+    },
+    {
+      "anchor": "behavior-changed-nodeintegration-in-child-windows-opened-via-nativewindowopen",
+      "kind": "Behavior Changed",
+      "mentionedApis": [
+        "nativeWindowOpen",
+        "nodeIntegrationInSubFrames",
+        "true"
+      ],
+      "rawTitle": "Behavior Changed: `nodeIntegration` in child windows opened via `nativeWindowOpen`",
+      "summary": "Child windows opened with the `nativeWindowOpen` option will always have Node.js integration disabled, unless `nodeIntegrationInSubFrames` is `true`.",
+      "title": "`nodeIntegration` in child windows opened via `nativeWindowOpen`",
+      "version": "5.0"
+    },
+    {
+      "anchor": "api-changed-registering-privileged-schemes-must-now-be-done-before-app-ready",
+      "kind": "API Changed",
+      "mentionedApis": [
+        "webFrame.registerURLSchemeAsPrivileged",
+        "webFrame.registerURLSchemeAsBypassingCSP",
+        "protocol.registerStandardSchemes",
+        "protocol.registerSchemesAsPrivileged"
+      ],
+      "rawTitle": "API Changed: Registering privileged schemes must now be done before app ready",
+      "summary": "Renderer process APIs `webFrame.registerURLSchemeAsPrivileged` and `webFrame.registerURLSchemeAsBypassingCSP` as well as browser process API `protocol.registerStandardSchemes` have been removed. A new API, `protocol.registerSchemesAsPrivileged` has been added and should be used for registering custo…",
+      "title": "Registering privileged schemes must now be done before app ready",
+      "version": "5.0"
+    },
+    {
+      "anchor": "deprecated-webframesetisolatedworld-replaced-with-webframesetisolatedworldinfo",
+      "kind": "Deprecated",
+      "mentionedApis": [],
+      "rawTitle": "Deprecated: `webFrame.setIsolatedWorld*` replaced with `webFrame.setIsolatedWorldInfo`",
+      "summary": "```js // Deprecated webFrame.setIsolatedWorldContentSecurityPolicy(worldId, csp) webFrame.setIsolatedWorldHumanReadableName(worldId, name) webFrame.setIsolatedWorldSecurityOrigin(worldId, securityOrigin) // Replace with webFrame.setIsolatedWorldInfo( worldId, { securityOrigin: 'some_origin', name: '…",
+      "title": "`webFrame.setIsolatedWorld*` replaced with `webFrame.setIsolatedWorldInfo`",
+      "version": "5.0"
+    },
+    {
+      "anchor": "api-changed-webframesetspellcheckprovider-now-takes-an-asynchronous-callback",
+      "kind": "API Changed",
+      "mentionedApis": [
+        "spellCheck",
+        "autoCorrectWord"
+      ],
+      "rawTitle": "API Changed: `webFrame.setSpellCheckProvider` now takes an asynchronous callback",
+      "summary": "The `spellCheck` callback is now asynchronous, and `autoCorrectWord` parameter has been removed. ```js // Deprecated webFrame.setSpellCheckProvider('en-US', true, { spellCheck: (text) => { return !spellchecker.isMisspelled(text) } }) // Replace with webFrame.setSpellCheckProvider('en-US', { spellChe…",
+      "title": "`webFrame.setSpellCheckProvider` now takes an asynchronous callback",
+      "version": "5.0"
+    },
+    {
+      "anchor": "api-changed-webcontentsgetzoomlevel-and-webcontentsgetzoomfactor-are-now-synchronous",
+      "kind": "API Changed",
+      "mentionedApis": [
+        "webContents.getZoomLevel",
+        "webContents.getZoomFactor"
+      ],
+      "rawTitle": "API Changed: `webContents.getZoomLevel` and `webContents.getZoomFactor` are now synchronous",
+      "summary": "`webContents.getZoomLevel` and `webContents.getZoomFactor` no longer take callback parameters, instead directly returning their number values. ```js // Deprecated webContents.getZoomLevel((level) => { console.log(level) }) // Replace with const level = webContents.getZoomLevel() console.log(level) `…",
+      "title": "`webContents.getZoomLevel` and `webContents.getZoomFactor` are now synchronous",
+      "version": "5.0"
+    },
+    {
+      "anchor": "appmakesingleinstance",
+      "kind": "Other",
+      "mentionedApis": [],
+      "rawTitle": "`app.makeSingleInstance`",
+      "summary": "```js // Deprecated app.makeSingleInstance((argv, cwd) => { /* ... */ }) // Replace with app.requestSingleInstanceLock() app.on('second-instance', (event, argv, cwd) => { /* ... */ }) ```",
+      "title": "`app.makeSingleInstance`",
+      "version": "4.0"
+    },
+    {
+      "anchor": "appreleasesingleinstance",
+      "kind": "Other",
+      "mentionedApis": [],
+      "rawTitle": "`app.releaseSingleInstance`",
+      "summary": "```js // Deprecated app.releaseSingleInstance() // Replace with app.releaseSingleInstanceLock() ```",
+      "title": "`app.releaseSingleInstance`",
+      "version": "4.0"
+    },
+    {
+      "anchor": "appgetgpuinfo",
+      "kind": "Other",
+      "mentionedApis": [
+        "basic"
+      ],
+      "rawTitle": "`app.getGPUInfo`",
+      "summary": "```js app.getGPUInfo('complete') // Now behaves the same with `basic` on macOS app.getGPUInfo('basic') ```",
+      "title": "`app.getGPUInfo`",
+      "version": "4.0"
+    },
+    {
+      "anchor": "win_delay_load_hook",
+      "kind": "Other",
+      "mentionedApis": [
+        "win_delay_load_hook",
+        "binding.gyp",
+        "Cannot find module"
+      ],
+      "rawTitle": "`win_delay_load_hook`",
+      "summary": "When building native modules for windows, the `win_delay_load_hook` variable in the module's `binding.gyp` must be true (which is the default). If this hook is not present, then the native module will fail to load on Windows, with an error message like `Cannot find module`. See the [native module gu…",
+      "title": "`win_delay_load_hook`",
+      "version": "4.0"
+    },
+    {
+      "anchor": "removed-ia32-linux-support",
+      "kind": "Removed",
+      "mentionedApis": [],
+      "rawTitle": "Removed: IA32 Linux support",
+      "summary": "Electron 18 will no longer run on 32-bit Linux systems. See [discontinuing support for 32-bit Linux](https://www.electronjs.org/blog/linux-32bit-support) for more information.",
+      "title": "IA32 Linux support",
+      "version": "4.0"
+    },
+    {
+      "anchor": "app",
+      "kind": "Other",
+      "mentionedApis": [],
+      "rawTitle": "`app`",
+      "summary": "```js // Deprecated app.getAppMemoryInfo() // Replace with app.getAppMetrics() // Deprecated const metrics = app.getAppMetrics() const { memory } = metrics[0] // Deprecated property ```",
+      "title": "`app`",
+      "version": "3.0"
+    },
+    {
+      "anchor": "browserwindow",
+      "kind": "Other",
+      "mentionedApis": [],
+      "rawTitle": "`BrowserWindow`",
+      "summary": "```js // Deprecated const optionsA = { webPreferences: { blinkFeatures: '' } } const windowA = new BrowserWindow(optionsA) // Replace with const optionsB = { webPreferences: { enableBlinkFeatures: '' } } const windowB = new BrowserWindow(optionsB) // Deprecated window.on('app-command', (e, cmd) => {…",
+      "title": "`BrowserWindow`",
+      "version": "3.0"
+    },
+    {
+      "anchor": "clipboard",
+      "kind": "Other",
+      "mentionedApis": [],
+      "rawTitle": "`clipboard`",
+      "summary": "```js // Deprecated clipboard.readRtf() // Replace with clipboard.readRTF() // Deprecated clipboard.writeRtf() // Replace with clipboard.writeRTF() // Deprecated clipboard.readHtml() // Replace with clipboard.readHTML() // Deprecated clipboard.writeHtml() // Replace with clipboard.writeHTML() ```",
+      "title": "`clipboard`",
+      "version": "3.0"
+    },
+    {
+      "anchor": "crashreporter",
+      "kind": "Other",
+      "mentionedApis": [],
+      "rawTitle": "`crashReporter`",
+      "summary": "```js // Deprecated crashReporter.start({ companyName: 'Crashly', submitURL: 'https://crash.server.com', autoSubmit: true }) // Replace with crashReporter.start({ companyName: 'Crashly', submitURL: 'https://crash.server.com', uploadToServer: true }) ```",
+      "title": "`crashReporter`",
+      "version": "3.0"
+    },
+    {
+      "anchor": "nativeimage",
+      "kind": "Other",
+      "mentionedApis": [],
+      "rawTitle": "`nativeImage`",
+      "summary": "```js // Deprecated nativeImage.createFromBuffer(buffer, 1.0) // Replace with nativeImage.createFromBuffer(buffer, { scaleFactor: 1.0 }) ```",
+      "title": "`nativeImage`",
+      "version": "3.0"
+    },
+    {
+      "anchor": "process",
+      "kind": "Other",
+      "mentionedApis": [],
+      "rawTitle": "`process`",
+      "summary": "```js // Deprecated const info = process.getProcessMemoryInfo() ```",
+      "title": "`process`",
+      "version": "3.0"
+    },
+    {
+      "anchor": "screen",
+      "kind": "Other",
+      "mentionedApis": [],
+      "rawTitle": "`screen`",
+      "summary": "```js // Deprecated screen.getMenuBarHeight() // Replace with screen.getPrimaryDisplay().workArea ```",
+      "title": "`screen`",
+      "version": "3.0"
+    },
+    {
+      "anchor": "session",
+      "kind": "Other",
+      "mentionedApis": [],
+      "rawTitle": "`session`",
+      "summary": "```js // Deprecated ses.setCertificateVerifyProc((hostname, certificate, callback) => { callback(true) }) // Replace with ses.setCertificateVerifyProc((request, callback) => { callback(0) }) ```",
+      "title": "`session`",
+      "version": "3.0"
+    },
+    {
+      "anchor": "tray",
+      "kind": "Other",
+      "mentionedApis": [],
+      "rawTitle": "`Tray`",
+      "summary": "```js // Deprecated tray.setHighlightMode(true) // Replace with tray.setHighlightMode('on') // Deprecated tray.setHighlightMode(false) // Replace with tray.setHighlightMode('off') ```",
+      "title": "`Tray`",
+      "version": "3.0"
+    },
+    {
+      "anchor": "webcontents",
+      "kind": "Other",
+      "mentionedApis": [],
+      "rawTitle": "`webContents`",
+      "summary": "```js // Deprecated webContents.openDevTools({ detach: true }) // Replace with webContents.openDevTools({ mode: 'detach' }) // Removed webContents.setSize(options) // There is no replacement for this API ```",
+      "title": "`webContents`",
+      "version": "3.0"
+    },
+    {
+      "anchor": "webframe",
+      "kind": "Other",
+      "mentionedApis": [],
+      "rawTitle": "`webFrame`",
+      "summary": "```js // Deprecated webFrame.registerURLSchemeAsSecure('app') // Replace with protocol.registerStandardSchemes(['app'], { secure: true }) // Deprecated webFrame.registerURLSchemeAsPrivileged('app', { secure: true }) // Replace with protocol.registerStandardSchemes(['app'], { secure: true }) ```",
+      "title": "`webFrame`",
+      "version": "3.0"
+    },
+    {
+      "anchor": "",
+      "kind": "Other",
+      "mentionedApis": [],
+      "rawTitle": "`<webview>`",
+      "summary": "```js // Removed webview.setAttribute('disableguestresize', '') // There is no replacement for this API // Removed webview.setAttribute('guestinstance', instanceId) // There is no replacement for this API // Keyboard listeners no longer work on webview tag webview.onkeydown = () => { /* handler */ }…",
+      "title": "`<webview>`",
+      "version": "3.0"
+    },
+    {
+      "anchor": "node-headers-url",
+      "kind": "Other",
+      "mentionedApis": [
+        "disturl",
+        ".npmrc",
+        "--dist-url"
+      ],
+      "rawTitle": "Node Headers URL",
+      "summary": "This is the URL specified as `disturl` in a `.npmrc` file or as the `--dist-url` command line flag when building native Node modules. Deprecated: https://atom.io/download/atom-shell Replace with: https://atom.io/download/electron",
+      "title": "Node Headers URL",
+      "version": "3.0"
+    },
+    {
+      "anchor": "autoupdater",
+      "kind": "Other",
+      "mentionedApis": [],
+      "rawTitle": "`autoUpdater`",
+      "summary": "```js // Deprecated autoUpdater.setFeedURL(url, headers) // Replace with autoUpdater.setFeedURL({ url, headers }) ```",
+      "title": "`autoUpdater`",
+      "version": "2.0"
+    },
+    {
+      "anchor": "browserwindow-1",
+      "kind": "Other",
+      "mentionedApis": [],
+      "rawTitle": "`BrowserWindow`",
+      "summary": "```js // Deprecated const optionsA = { titleBarStyle: 'hidden-inset' } const windowA = new BrowserWindow(optionsA) // Replace with const optionsB = { titleBarStyle: 'hiddenInset' } const windowB = new BrowserWindow(optionsB) ```",
+      "title": "`BrowserWindow`",
+      "version": "2.0"
+    },
+    {
+      "anchor": "menu",
+      "kind": "Other",
+      "mentionedApis": [],
+      "rawTitle": "`menu`",
+      "summary": "```js // Removed menu.popup(browserWindow, 100, 200, 2) // Replaced with menu.popup(browserWindow, { x: 100, y: 200, positioningItem: 2 }) ```",
+      "title": "`menu`",
+      "version": "2.0"
+    },
+    {
+      "anchor": "nativeimage-1",
+      "kind": "Other",
+      "mentionedApis": [],
+      "rawTitle": "`nativeImage`",
+      "summary": "```js // Removed nativeImage.toPng() // Replaced with nativeImage.toPNG() // Removed nativeImage.toJpeg() // Replaced with nativeImage.toJPEG() ```",
+      "title": "`nativeImage`",
+      "version": "2.0"
+    },
+    {
+      "anchor": "process-1",
+      "kind": "Other",
+      "mentionedApis": [
+        "process.versions.electron",
+        "process.version.chrome",
+        "process.versions"
+      ],
+      "rawTitle": "`process`",
+      "summary": "* `process.versions.electron` and `process.version.chrome` will be made read-only properties for consistency with the other `process.versions` properties set by Node.",
+      "title": "`process`",
+      "version": "2.0"
+    },
+    {
+      "anchor": "webcontents-1",
+      "kind": "Other",
+      "mentionedApis": [],
+      "rawTitle": "`webContents`",
+      "summary": "```js // Removed webContents.setZoomLevelLimits(1, 2) // Replaced with webContents.setVisualZoomLevelLimits(1, 2) ```",
+      "title": "`webContents`",
+      "version": "2.0"
+    },
+    {
+      "anchor": "webframe-1",
+      "kind": "Other",
+      "mentionedApis": [],
+      "rawTitle": "`webFrame`",
+      "summary": "```js // Removed webFrame.setZoomLevelLimits(1, 2) // Replaced with webFrame.setVisualZoomLevelLimits(1, 2) ```",
+      "title": "`webFrame`",
+      "version": "2.0"
+    },
+    {
+      "anchor": "-1",
+      "kind": "Other",
+      "mentionedApis": [],
+      "rawTitle": "`<webview>`",
+      "summary": "```js // Removed webview.setZoomLevelLimits(1, 2) // Replaced with webview.setVisualZoomLevelLimits(1, 2) ```",
+      "title": "`<webview>`",
+      "version": "2.0"
+    },
+    {
+      "anchor": "duplicate-arm-assets",
+      "kind": "Other",
+      "mentionedApis": [
+        "electron-v1.7.3-linux-arm.zip",
+        "electron-v1.7.3-linux-armv7l.zip",
+        "v7l"
+      ],
+      "rawTitle": "Duplicate ARM Assets",
+      "summary": "Each Electron release includes two identical ARM builds with slightly different filenames, like `electron-v1.7.3-linux-arm.zip` and `electron-v1.7.3-linux-armv7l.zip`. The asset with the `v7l` prefix was added to clarify to users which ARM version it supports, and to disambiguate it from future armv…",
+      "title": "Duplicate ARM Assets",
+      "version": "2.0"
+    }
+  ],
+  "source": {
+    "path": "docs/breaking-changes.md",
+    "ref": "main",
+    "repo": "electron/electron",
+    "sha": "216e7597a143606de86be9e3c1e312cf0557587f"
+  },
+  "stats": {
+    "byKind": {
+      "API Changed": 18,
+      "Behavior Changed": 48,
+      "Changed": 1,
+      "Default Changed": 9,
+      "Deprecated": 54,
+      "Other": 41,
+      "Removed": 63
+    },
+    "byVersion": {
+      "10.0": 18,
+      "11.0": 1,
+      "12.0": 8,
+      "13.0": 5,
+      "14.0": 7,
+      "15.0": 2,
+      "16.0": 2,
+      "17.0": 2,
+      "18.0": 1,
+      "19.0": 1,
+      "2.0": 9,
+      "20.0": 4,
+      "21.0": 2,
+      "22.0": 5,
+      "23.0": 5,
+      "24.0": 1,
+      "25.0": 3,
+      "26.0": 3,
+      "27.0": 7,
+      "28.0": 9,
+      "29.0": 4,
+      "3.0": 13,
+      "30.0": 6,
+      "31.0": 3,
+      "32.0": 3,
+      "33.0": 8,
+      "34.0": 1,
+      "35.0": 6,
+      "36.0": 9,
+      "37.0": 5,
+      "38.0": 6,
+      "39.0": 4,
+      "4.0": 5,
+      "40.0": 2,
+      "41.0": 3,
+      "42.0": 5,
+      "43.0": 6,
+      "44.0": 9,
+      "45.0": 6,
+      "46.0": 3,
+      "5.0": 6,
+      "6.0": 7,
+      "7.0": 8,
+      "8.0": 5,
+      "9.0": 6
+    },
+    "skippedOutsideVersion": 1,
+    "totalEntries": 234
+  }
+}

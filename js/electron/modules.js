@@ -10,6 +10,7 @@
 module.exports = [
   'app',
   'BrowserWindow',
+  'CommandLine',
   'contextBridge',
   'desktopCapturer',
   'dialog',

@@ -4,6 +4,11 @@
   "description": "零业务依赖的 JS/Node 基础模块集（与 pybase 对称）",
   "type": "commonjs",
   "private": true,
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./electron/snapshots/*.json": "./electron/snapshots/*.json"
+  },
   "scripts": {
     "test": "node --test tests/**/*.test.js"
   },

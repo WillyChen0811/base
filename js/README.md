@@ -15,22 +15,12 @@
 
 1. **快照层（本目录，已实现）**：纯机械地把 `electron-api.json` 里关心的模块/类，
    提取成精简、key 排序、可逐字节复现的 JSON。只回答"这个版本有什么"。
-2. **断代层（未实现）**：结合 breaking-changes 和 API History，回答"两个版本之间
-   变了什么、什么时候变的"。
+2. **断代层（`electron/history/`，已实现）**：结合 breaking-changes 和 API History，
+   回答"什么时候变的"。**不做归类判断**——"这算不算一个能力"是第 3 层的事。
 3. **实测层（未实现）**：手写记录的实测坑，回答"文档没说但踩过的问题"。
 
 第 2、3 层都要挂在第 1 层产出的 key 上（`ClassName#method` 这种形式），所以快照的
 key 规则一旦定下不要轻易改，改了要连带处理已有的挂靠数据。
-
-#### 用法
-
-```bash
-# 缺 raw 会自动用 gh cli 下载（需要已登录 gh，从 electron/electron 的 release 附件取）
-node electron/extract.js 43.3.0
-
-# 比较两个版本的快照，输出新增/删除/变更的 key
-node electron/diff.js 43.3.0 44.0.0
-```
 
 - `electron/modules.js`：收录哪些模块/类的清单，改这份，不要改提取逻辑。
 - `electron/raw/<version>.json`：下载下来的原始 `electron-api.json`（`.gitignore`
@@ -50,6 +40,130 @@ node electron/diff.js 43.3.0 44.0.0
 方法和属性共用同一个分隔符是因为摸底确认过收录范围内没有同名的方法+属性组合；
 事件单独用 `@`，避免和同名方法（如 `close()` 方法 / `close` 事件）撞 key。
 
+构造函数、以及被参数/返回值/属性引用到的 Structure，也挂在同一套规则下：
+
+| 场景 | 形式 | 例子 |
+|---|---|---|
+| 类构造函数 | `ClassName#constructor` | `BrowserWindow#constructor` |
+| Structure 属性 | `StructureName.属性名` | `BrowserWindowConstructorOptions.webPreferences` |
+
+Structure 只收"被收录模块/类引用到的"，不是 `electron-api.json` 里全部 174 项都收
+（v43.3.0 收录 18 个模块/类，传递闭包收出 60 个 Structure，1140 条 API）；顺着参数/
+返回值/属性的 **类型引用** 走，也顺着 Structure 的 `extends` 继承链走（如
+`BrowserWindowConstructorOptions extends BaseWindowConstructorOptions`）。
+
+electron-api.json 的 Class 条目本身已经是拍平的（子类的 `instanceMethods` 等
+数组里已经包含继承来的成员），但 Structure 不是——`BrowserWindowConstructorOptions`
+自己的 `properties` 只有 2 条，`width`/`height`/`show`/`x`/`y` 等 50 条都在
+`BaseWindowConstructorOptions` 里。所以这里做两件事：
+
+1. `extends` 目标（父 Structure）也收进来，自己作为独立容器出现在 `modules` 里，
+   带 `extends` 字段，有自己完整的 entries（比如 `BaseWindowConstructorOptions.width`
+   也存在）。
+2. 子 Structure 的 entries 是**拍平过的**——继承来的属性也生成
+   `BrowserWindowConstructorOptions.width` 这样的 key，entry 上带
+   `inheritedFrom: 'BaseWindowConstructorOptions'`；自己声明的没有这个字段。
+   子覆盖父同名属性时以子为准（如 `MouseWheelInputEvent` 重新声明了 `type` 的
+   `possibleValues`，拍平后 `MouseWheelInputEvent.type` 不带 `inheritedFrom`）。
+   两级继承（`MouseWheelInputEvent extends MouseInputEvent extends InputEvent`）
+   也会拍平到底，`inheritedFrom` 指向实际声明这个属性的那一级
+   （如 `modifiers` 只在 `InputEvent` 声明，`MouseWheelInputEvent.modifiers.
+   inheritedFrom === 'InputEvent'`，不是中间的 `MouseInputEvent`）。
+
+这样消费方问"BrowserWindow 能收哪些 options"一次查子的 key 就够，不用自己知道
+还要回溯到父类；第 3 层要挂"某个选项哪个版本才有"也挂在子的 key 上。`extends`
+目标不在收录范围内（比如 `IpcMainEvent extends Event`，`Event` 是 Node/DOM 内置
+类型，不在 `electron-api.json` 里）时链就停在那，没法拍平不存在的文档条目。
+
+快照顶层 `modules` 字段是 `{name, type, extends?}` 的数组，`type` 为
+`'Module' | 'Class' | 'Structure'`，可以看出哪些名字是被引用收进来的 Structure，
+`extends` 在有父 Structure 时才出现。
+
+### 断代层（三层设计的第 2 层）
+
+`electron/history/` 从 electron/electron 仓库机械拉取两份官方数据，解析、对到第
+1 层快照的 key 上。**不做人为归类**——只回答"什么时候变的"，不判断"这算不算一个
+能力"。
+
+**数据源 A：`docs/breaking-changes.md`（取 `main` 分支）。** 这份文档是累积的，
+从很早的版本一路记到最新（不用 tag 是因为 tag 对应的版本只能看到那之前的累积
+内容）。结构是 `## Breaking API Changes (44.0)` 这种版本段，下面挂
+`### Removed: xxx` / `### Deprecated: xxx` / `### Behavior Changed: xxx` /
+`### Default Changed: xxx` / `### API Changed: xxx` 这些条目；约 v14 及更早的
+版本段里，条目标题不带这个"Kind: 标题"前缀（自由文本，如 `` ### `webContents` ``），
+这类归一成 `kind: 'Other'`，不强行套一个不存在的分类。每条产出 `version`、`kind`、
+`title`、`anchor`（GitHub 风格的 header slug，用来跟 API History 的
+`breaking-changes-header` 对齐，slug 算法见 `electron/history/slug.js`，是拿文档
+里真实的内部锚点链接反推出来的，不是猜的）、`summary`（正文前 300 字左右）、
+`mentionedApis`（正文里所有反引号包住的片段，去重保序）。版本段之外的标题（如
+文档开头"Types of Breaking Changes"说明段）不当条目收，但计入
+`stats.skippedOutsideVersion`，不静默丢。
+
+**数据源 B：`docs/api/*.md` 里的 API History YAML 块（取 tag，与快照版本对齐，
+目前是 `v43.3.0`）。** 每个成员标题后面可能跟一个
+`` <!-- ```YAML history ... ``` --> `` 块，记 `added`/`changes`/`deprecated`，
+每条有 `pr-url`，可选 `description`、`breaking-changes-header`。解析时把 YAML 块
+归到它紧跟的那个标题，再把标题文本换算成第 1 层的 key：
+
+- `` `new BrowserWindow([options])` `` → 构造函数 → `BrowserWindow#constructor`
+- `` `win.setBounds(...)` `` → 实例方法（`win` 是文档手写的别名，跟
+  `electron-api.json` 里的 `instanceName` 字段对不上，单独维护在
+  `parse-api-history.js` 的 `MANUAL_PREFIX_ALIASES` 里）→ `BrowserWindow#setBounds`
+- `` `BrowserWindow.getAllWindows()` `` → 静态方法 → `BrowserWindow.getAllWindows`
+- `` `session.fromPartition(...)` `` → 模块方法 → `session.fromPartition`
+- `Event: 'console-message'` → 事件，容器看当前在哪个 `## Class: X` 段落里（没有
+  就退回文档 `# 模块名`）→ `WebContents@console-message`
+
+**覆盖稀是已知的**：15 个原收录模块里 6 个（`app`/`screen`/`session`/
+`system-preferences`/`web-request`/`web-utils`）完全没有 YAML 块，`web-contents`
+有 10 块——Electron 官方也不是每次改动都补 API History。解析不到 key 的块不静默
+丢，计入 `unresolved`（并标 `reason`：`module-level` 是块直接挂在文档 h1 模块名
+下、不属于任何成员，比如 `contextBridge.md` 开头那条；`unrecognized-heading` 是
+标题格式没认出来）。
+
+**已知的局限（如实记录，不是要立刻补的坑）**：不少弃用/变更只在
+breaking-changes.md 里用大白话提过，API History 里压根没打
+`breaking-changes-header`——比如 `WebContents` 的 `console-message` 事件弃用
+`level`/`message` 等位置参数，`docs/api/web-contents.md` 里那段只用行内
+`` _Deprecated_ `` 标记（第 1 层快照的 `additionalTags: stability_deprecated`
+已经收了这个信号），没有 YAML 块可关联。`historyOf(key)` 对这种情况有个文本兜底：
+breaking-changes 条目正文里提到的反引号词（`mentionedApis`）如果同时包含成员名和
+容器名，就当作大概率相关，标 `linkedVia: 'mention'`，跟通过
+`breaking-changes-header` 精确关联的（`linkedVia: 'breaking-changes-header'`）
+区分开——这是启发式，不保证准确，调用方可以自己决定要不要用。
+
+**产出**：`electron/history/breaking-changes.json`（`{source: {repo, path, ref,
+sha}, stats, entries}`，按 version 降序、同版本按文档出现顺序；`sha` 是拉取时
+`docs/breaking-changes.md@main` 所在的 commit，不记时间戳——时间戳会破坏"两次生成
+逐字节相同"）、`electron/history/api-history.json`（`{source, stats, byKey,
+unresolved}`）。两份都走 `stable-json`，`node electron/history/fetch.js` 重新拉取
+生成。
+
+### 用法
+
+```bash
+# 缺 raw 会自动用 gh cli 下载（需要已登录 gh，从 electron/electron 的 release 附件取）
+node electron/extract.js 43.3.0
+
+# 比较两个版本的快照，输出新增/删除/变更的 key
+node electron/diff.js 43.3.0 44.0.0
+
+# 重新拉取断代数据（需要已登录 gh）
+node electron/history/fetch.js
+```
+
+或者直接 `require('jsbase')`（见下面"安装"一节）：
+
+```js
+const { loadSnapshot, listSnapshots, diffSnapshots, loadHistory, historyOf } = require('jsbase');
+
+loadSnapshot('43.3.0');           // 第 1 层：某个版本的快照
+listSnapshots();                  // 已入库的版本号列表
+diffSnapshots(a, b);              // 两份快照的新增/删除/变更
+loadHistory();                    // 第 2 层：{ breakingChanges, apiHistory } 两份合起来
+historyOf('WebContents@console-message'); // 某个 key 的 API History + 关联的 breaking-changes 条目
+```
+
 ## 测试
 
 ```bash
@@ -58,6 +172,14 @@ cd js && node --test "tests/**/*.test.js"
 
 ## 安装
 
-本地开发：这个包目前不发布，直接在 `js/` 里跑脚本即可（无运行时依赖，全部用
-Node 内置模块）。`electron` 只作为 `peerDependencies` 声明，不会被安装——写成
-`dependencies` 会再拖一份几百 MB 的 Electron 下来，而且版本不一定和调用方一致。
+本地开发：这个包目前不发布，直接在 `js/` 里跑脚本即可，或者在调用方
+`package.json` 写 `"jsbase": "file:../base/js"` 之类的本地路径依赖后
+`require('jsbase')`（无运行时依赖，全部用 Node 内置模块）。`electron` 只作为
+`peerDependencies` 声明，不会被安装——写成 `dependencies` 会再拖一份几百 MB 的
+Electron 下来，而且版本不一定和调用方一致。
+
+包入口是 `index.js`（`package.json` 的 `main`/`exports` 指过去），`exports`
+只放开两条路径：`"."`（`index.js` 本身）和 `"./electron/snapshots/*.json"`
+（需要直接拿原始快照 JSON 的场景，比如前端展示）。其它内部路径（`electron/
+extract.js`、`electron/history/*.js` 等）不在 `exports` 里，调用方 require 不到，
+要用的功能都应该从 `index.js` 导出的函数走。

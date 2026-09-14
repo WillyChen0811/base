@@ -11,6 +11,14 @@ const path = require('node:path');
 const { snapshotPath, loadRaw } = require('./electron/extract');
 const { diffSnapshots } = require('./electron/diff');
 const { loadBreakingChanges, loadApiHistory, historyOf } = require('./electron/history/store');
+const {
+  listCapabilities,
+  capability,
+  checkCapabilities,
+} = require('./electron/capabilities');
+const { createSysproxy } = require('./os/sysproxy');
+const { createRootcert } = require('./os/rootcert');
+const { createCA } = require('./os/ca');
 
 const SNAPSHOT_DIR = path.join(__dirname, 'electron', 'snapshots');
 
@@ -49,4 +57,14 @@ module.exports = {
   loadHistory,
   historyOf,
   loadRaw,
+  // 第 3 层：能力台账
+  listCapabilities,
+  capability,
+  checkCapabilities,
+  // 不依赖 Electron 的地基（js/os/*，工厂函数，落地路径由调用方传）
+  os: {
+    sysproxy: createSysproxy,
+    rootcert: createRootcert,
+    ca: createCA,
+  },
 };

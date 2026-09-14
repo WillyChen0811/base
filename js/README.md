@@ -4,8 +4,10 @@
 
 ## 模块一览
 
-- `jsbase/electron`：Electron 版本 ↔ 能力台账，第 1 层——从官方 `electron-api.json`
-  提取精简、可 diff 的 API 快照。
+- `jsbase/electron`：Electron 版本 ↔ 能力台账，三层设计——第 1 层从官方
+  `electron-api.json` 提取精简、可 diff 的 API 快照，第 2 层断代（什么时候变
+  的），第 3 层手写能力台账（我想干什么、要用哪些 API、有什么已知的坑）。
+- `jsbase/os`：不依赖 Electron 的地基——系统代理、根证书、自签 CA。
 
 ### Electron API 快照（三层设计的第 1 层）
 
@@ -17,7 +19,9 @@
    提取成精简、key 排序、可逐字节复现的 JSON。只回答"这个版本有什么"。
 2. **断代层（`electron/history/`，已实现）**：结合 breaking-changes 和 API History，
    回答"什么时候变的"。**不做归类判断**——"这算不算一个能力"是第 3 层的事。
-3. **实测层（未实现）**：手写记录的实测坑，回答"文档没说但踩过的问题"。
+3. **能力台账（`electron/capabilities/`，已实现）**：手写 JSON，机器只校验、
+   不生成。回答"文档没说但踩过的问题"——**这一层才做归类判断**（"这算不算一个
+   能力"），前两层都不做。
 
 第 2、3 层都要挂在第 1 层产出的 key 上（`ClassName#method` 这种形式），所以快照的
 key 规则一旦定下不要轻易改，改了要连带处理已有的挂靠数据。
@@ -138,6 +142,71 @@ sha}, stats, entries}`，按 version 降序、同版本按文档出现顺序；`
 逐字节相同"）、`electron/history/api-history.json`（`{source, stats, byKey,
 unresolved}`）。两份都走 `stable-json`，`node electron/history/fetch.js` 重新拉取
 生成。
+
+### 能力台账（三层设计的第 3 层）
+
+`electron/capabilities/` 是手写的 JSON（`capabilities.json`），机器只负责校验、
+不负责生成——"这算不算一个能力"是人判断的事，不是从第 1/2 层机械推导出来的。
+
+每条"能力"= 一句人话说清"我想让 Electron 帮我干什么"，记下：
+
+- `requires`：干这件事要用到的 API（第 1 层快照的 key），必须全在快照里，
+  少一个都算数据错误；
+- `knownIssues`：已知的坑，每条 `{symptom, cause, fix, platform, since,
+  breakingChange}`。能对到第 2 层断代数据的填 `breakingChange`（
+  breaking-changes.json 的 anchor）和 `since`（对应版本号），两者必须能在
+  breaking-changes.json 里核对上；对不到的（纯实测踩出来的）`breakingChange:
+  null`，`cause` 照实写清楚是什么原因，不硬凑一个不存在的版本号。`platform`
+  取 `all` / `darwin` / `win32` / `linux`，需要具体系统版本时另加
+  `osVersion`（如 `"≥14.2"`）。
+- 不依赖 Electron API 的能力（比如改系统代理、装根证书）`requires` 写
+  `[]`，改用顶层 `os` 字段声明支持哪些平台。
+
+```js
+const { listCapabilities, capability, checkCapabilities } = require('jsbase');
+
+listCapabilities();               // 全部能力条目
+capability('mitm.https');         // 按 id 取一条
+checkCapabilities('43.3.0');      // 每条能力的 requires 在这个快照版本里是否全在
+```
+
+`electron/capabilities/index.js` 只管读数据、按 id 查、核对 requires——数据
+本身的准确性靠 `tests/electron-capabilities.test.js` 校验：requires 的 key
+必须在快照里存在、`breakingChange` 必须在 breaking-changes.json 里存在且
+`since` 与该条目的实际 `version` 一致、id 不能重复、`platform` 取值不能瞎写。
+
+### os/：不依赖 Electron 的地基
+
+`os/sysproxy.js`、`os/rootcert.js`、`os/ca.js` 是从 websubmit macClient 的
+`traffic/sysproxy.js`、`traffic/certmgr.js`、`traffic/ca.js` 原样搬过来的——
+这三份只依赖 Node 内置模块 + `node-forge`，逻辑上跟 Electron、跟 macClient
+的业务毫无关系，属于该待在 base 里的地基。
+
+搬的时候**逻辑、文案、平台分支一行都不改**，唯一改动是原来写死的
+`~/.filecore/traffic/...` 路径（CA 目录、状态文件）不再写死，改成工厂函数
+让调用方显式传入——跟 pybase 的规矩一致，base 不带项目默认值：
+
+```js
+const { os } = require('jsbase');
+
+const sysproxy = os.sysproxy('/path/to/sysproxy.json'); // 状态文件路径调用方给
+// CA 目录与主体名都由调用方给（名字会进用户的钥匙串，是项目身份，base 不带默认值）
+const names = { commonName: 'MyApp Recording Root CA', organizationName: 'MyApp' };
+const rootcert = os.rootcert('/path/to/ca-dir', names);
+const ca = os.ca('/path/to/ca-dir', names);               // 与 rootcert 同一目录、同一组名字
+
+await sysproxy.apply(8080);
+await rootcert.install();
+const { cert, key } = ca.certFor('example.com');
+```
+
+也可以按路径直接 require（`exports` 里 `./os/*` 已开放）：
+`require('jsbase/os/sysproxy')` 等。
+
+`node-forge` 是这个包第一个运行时依赖（`dependencies` 而非
+`peerDependencies`）：`os/ca.js` 自签证书要用到它做 RSA 密钥对与 X.509 证书
+的生成/签名，Node 内置模块没有这个能力，跟 `electron` 那种"调用方本来就会装"
+的情况不一样，只能老老实实声明依赖。
 
 ### 用法
 

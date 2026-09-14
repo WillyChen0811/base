@@ -1,0 +1,199 @@
+{
+  "capabilities": [
+    {
+      "id": "mitm.https",
+      "title": "抓自己窗口的 HTTPS",
+      "summary": "打开一个我们自己的浏览器窗口，里面所有请求（包括加密的）都能看到内容",
+      "requires": ["Session#setProxy", "Session#setCertificateVerifyProc"],
+      "knownIssues": [
+        {
+          "symptom": "自签证书握手直接失败，报 error:09000064:PEM routines:OPENSSL_internal:BAD_BASE64_DECODE，看不出是换行符的事",
+          "cause": "node-forge 产出的 PEM 用 \\r\\n 换行，Electron 里的 BoringSSL 只认 \\n",
+          "fix": "所有出去的 PEM 都统一转成 \\n（normalizePem）",
+          "platform": "all",
+          "since": null,
+          "breakingChange": null
+        },
+        {
+          "symptom": "证书主体带中文名字，载入证书时报 error:04800064:PEM routines::bad base64 decode，报错指向 base64，真凶其实是证书内容",
+          "cause": "node-forge 默认按 PrintableString 编码属性值，非 ASCII 字符会把 DER 编坏",
+          "fix": "证书主体（commonName 等）一律用英文",
+          "platform": "all",
+          "since": null,
+          "breakingChange": null
+        }
+      ]
+    },
+    {
+      "id": "browser.isolated",
+      "title": "窗口互不串号",
+      "summary": "多开自制浏览器，每个窗口的登录态、代理各是各的，互不干扰",
+      "requires": [
+        "session.fromPartition",
+        "BrowserWindow#constructor",
+        "BrowserWindowConstructorOptions.width",
+        "BrowserWindowConstructorOptions.height",
+        "BrowserWindowConstructorOptions.title",
+        "BrowserWindowConstructorOptions.webPreferences",
+        "WebPreferences.webviewTag",
+        "WebPreferences.contextIsolation",
+        "WebPreferences.nodeIntegration",
+        "WebPreferences.sandbox",
+        "WebPreferences.preload"
+      ],
+      "knownIssues": [
+        {
+          "symptom": "多开窗口后 webRequest 相关的拦截/记录互相顶掉，只有最后装的那个生效",
+          "cause": "一个 session 的每一类 webRequest 事件只能挂一个监听器，不是多个监听器都会被调用",
+          "fix": "每个窗口用独立分区（persist:traffic-<id>），登录态与 webRequest 钩子天然分开，不复用同一个 session",
+          "platform": "all",
+          "since": null,
+          "breakingChange": null
+        }
+      ]
+    },
+    {
+      "id": "console.capture",
+      "title": "收页面的 console",
+      "summary": "订阅被测页面里 console.log/warn/error 等输出，用于回放定位问题",
+      "requires": ["WebContents@console-message"],
+      "knownIssues": [
+        {
+          "symptom": "升级 Electron 后代码不报错，但收到的 level/message 全是空的，日志照打，内容全废",
+          "cause": "35.0 弃用了 console-message 事件的旧位置参数写法 (event, level, message, line, sourceId)，改成了单个 details 对象 (event, details: {level, message, lineNumber, sourceId, frame})；旧写法在新版里 level 拿到的其实是 details 对象、message 是 undefined",
+          "fix": "按新签名读 details.level / details.message / details.lineNumber / details.sourceId，两版都处理的话判 typeof 第二个参数是不是对象来分支",
+          "platform": "all",
+          "since": "35.0",
+          "breakingChange": "deprecated-level-message-line-and-sourceid-arguments-in-console-message-event-on-webcontents"
+        }
+      ]
+    },
+    {
+      "id": "screen.record",
+      "title": "录屏",
+      "summary": "把测试操作过程录成视频，画面 + 麦克风 + 被测系统声音三路各存各的",
+      "requires": [
+        "Session#setDisplayMediaRequestHandler",
+        "desktopCapturer.getSources",
+        "systemPreferences.getMediaAccessStatus"
+      ],
+      "knownIssues": [
+        {
+          "symptom": "macOS 上起录系统声音报 Info.plist 相关的权限错误",
+          "cause": "39.0 起 macOS ≥14.2 要在应用 Info.plist 里加 NSAudioCaptureUsageDescription 才能用 desktopCapturer 录系统音频",
+          "fix": "打包时给 Info.plist 加上 NSAudioCaptureUsageDescription 说明文案",
+          "platform": "darwin",
+          "osVersion": "≥14.2",
+          "since": "39.0",
+          "breakingChange": "behavior-changed-nsaudiocaptureusagedescription-should-be-included-in-your-apps-infoplist-file-to-use-desktopcapturer-macos-142"
+        },
+        {
+          "symptom": "Windows / Linux 上明明没有屏幕录制权限，systemPreferences.getMediaAccessStatus('screen') 却一直报 granted",
+          "cause": "这两个平台没有 macOS 那种「屏幕录制」授权机制，Electron 对它们恒返回 granted",
+          "fix": "权限检查只在 darwin 上当真，别的平台不能靠这个 API 判断能不能录",
+          "platform": "all",
+          "since": null,
+          "breakingChange": null
+        },
+        {
+          "symptom": "隐藏窗口开了离屏渲染（offscreen: true）后，desktopCapturer 的流拿不到，录像/性能截图那条路直接失败",
+          "cause": "离屏渲染下拿不到 desktopCapturer 的流",
+          "fix": "录屏、录性能报告用的隐藏窗口一律 offscreen: false",
+          "platform": "all",
+          "since": null,
+          "breakingChange": null
+        },
+        {
+          "symptom": "desktopCapturer.getSources 偶发回一个空数组（不报错，就是没有源），若直接把 sources[0] || null 传给 cb() 会让 cb 因为 video: null 不是合法类型而抛异常，外层 catch 里再调一次 cb() 又撞上 one-time callback was called more than once，兜底降级路径自己先崩了",
+          "cause": "这台机器上 desktopCapturer.getSources 有时候就是拿不到屏幕源，且 Electron 43 的 Streams.video 只认 Video | WebFrameMain，不接受 null",
+          "fix": "真拿不到源时干脆不给 video 这个键（不是给 null），只回音频；且用一个 called 标记保证 cb 全局只调一次",
+          "platform": "all",
+          "since": null,
+          "breakingChange": null
+        }
+      ]
+    },
+    {
+      "id": "file.path",
+      "title": "拖文件拿路径",
+      "summary": "用户把文件拖进窗口，拿到它在磁盘上的真实路径",
+      "requires": ["webUtils.getPathForFile"],
+      "knownIssues": [
+        {
+          "symptom": "升级 Electron 后 File 对象上取不到 path 属性了",
+          "cause": "32.0 移除了 File.path，取路径改走 webUtils.getPathForFile(file)",
+          "fix": "不再用 file.path，改用 require('electron').webUtils.getPathForFile(file)",
+          "platform": "all",
+          "since": "32.0",
+          "breakingChange": "removed-filepath"
+        }
+      ]
+    },
+    {
+      "id": "os.sysproxy",
+      "title": "改系统代理",
+      "summary": "全局抓包时把系统代理指到本地代理端口，抓完能原样还原",
+      "requires": [],
+      "os": ["darwin", "win32"],
+      "knownIssues": [
+        {
+          "symptom": "抓包结束、程序退出甚至崩溃之后，用户整台机器都上不了网，而且绝对想不到是我们干的",
+          "cause": "设了系统代理不还原；如果只记在内存里，程序崩了/被强杀内存就没了",
+          "fix": "动手之前把原样子记进状态文件（不只记内存），「还原」按钮任何时候都能点、认的是这份文件而不是这次会话是否开过抓包",
+          "platform": "all",
+          "since": null,
+          "breakingChange": null
+        },
+        {
+          "symptom": "macOS 上改代理时程序卡住/弹出系统授权框",
+          "cause": "networksetup 改代理要 root 权限",
+          "fix": "走 osascript ... with administrator privileges 弹一次系统授权框要用户确认；用户拒绝是正常选择，要如实报回去并给出手动设置的说明，不能假装成功",
+          "platform": "darwin",
+          "since": null,
+          "breakingChange": null
+        },
+        {
+          "symptom": "两次抓包之间原来的系统代理设置被覆盖丢失，最终还原出来的不是用户最初的样子",
+          "cause": "起抓包时如果发现状态文件已经在了，说明上次没还原干净；这时如果照旧覆盖写状态文件，就把「原本的样子」换成了「我们上次设的代理」，再也回不去",
+          "fix": "状态文件存在时不覆盖，直接复用",
+          "platform": "all",
+          "since": null,
+          "breakingChange": null
+        }
+      ]
+    },
+    {
+      "id": "os.rootcert",
+      "title": "装根证书",
+      "summary": "全局抓包要解密别的程序（非我们自己窗口）发出的 HTTPS，把自签 CA 装进系统信任库",
+      "requires": [],
+      "os": ["darwin", "win32"],
+      "knownIssues": [
+        {
+          "symptom": "（设计上的风险，不是报错）装上这张 CA 之后，理论上能签发任何网站的有效证书",
+          "cause": "根证书一旦被系统信任，就能中间人任意 HTTPS 连接",
+          "fix": "必须是用户明确点一下的动作才装，不能在开始抓包时偷偷装；「卸载」按钮要跟「安装」摆在一起，不能藏起来",
+          "platform": "all",
+          "since": null,
+          "breakingChange": null
+        },
+        {
+          "symptom": "Windows 用户照着 macOS 的「钥匙串」说法去找，压根找不到装证书的地方",
+          "cause": "macOS 叫「钥匙串」，Windows 叫「受信任的根证书颁发机构」，两边界面完全不同，手动指引不能共用一份文案",
+          "fix": "自动安装失败时的手动指引必须按平台分别写",
+          "platform": "all",
+          "since": null,
+          "breakingChange": null
+        },
+        {
+          "symptom": "以为装到了整台机器，其实只对当前登录用户生效（这是有意为之，不是坑，但容易被误解）",
+          "cause": "装的是当前用户的信任库（Windows -user Root 不需要管理员权限，macOS 装进登录钥匙串），不是整机级别",
+          "fix": "抓包是一个人在自己账号下干的活，没必要、也不该动整台机器的证书信任库",
+          "platform": "all",
+          "since": null,
+          "breakingChange": null
+        }
+      ]
+    }
+  ]
+}

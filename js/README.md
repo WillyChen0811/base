@@ -8,6 +8,8 @@
   `electron-api.json` 提取精简、可 diff 的 API 快照，第 2 层断代（什么时候变
   的），第 3 层手写能力台账（我想干什么、要用哪些 API、有什么已知的坑）。
 - `jsbase/os`：不依赖 Electron 的地基——系统代理、根证书、自签 CA。
+- 包入口的 `electron`：console 参数归一化、IPC 路由注册、浏览器实例；
+  `net`：HTTP/HTTPS 录制代理。运行时依赖和项目配置由调用方传入。
 
 ### Electron API 快照（三层设计的第 1 层）
 
@@ -208,7 +210,42 @@ const { cert, key } = ca.certFor('example.com');
 的生成/签名，Node 内置模块没有这个能力，跟 `electron` 那种"调用方本来就会装"
 的情况不一样，只能老老实实声明依赖。
 
-### 用法
+### 运行时地基
+
+```js
+const { electron, net } = require('jsbase');
+const { normalizeConsoleMessage, registerRoutes, BrowserInstance } = electron;
+const { RecordingProxy, parseUpstreamProxy, bypassProxy, MAX_BODY_BYTES } = net;
+
+const browser = new BrowserInstance('tab-1', {
+  electron: require('electron'),
+  partition: 'persist:myapp-tab-1',
+  shellFile: '/absolute/path/shell.html',
+  shellPreload: '/absolute/path/shell-preload.js',
+  guestPreload: '/absolute/path/guest-preload.js',
+  title: 'My browser', width: 1280, height: 900,
+  createProxy: ({ onRequest, onError, upstreamProxy }) => new RecordingProxy(
+    onRequest, onError, { upstreamProxy, certFor: ca.certFor },
+  ),
+});
+```
+
+示例里的 `ca` 由前面的 `os.ca(caDir, names)` 创建。外壳需要读取查询参数
+`partition`、`tabId`、`guestPreload` 和可选的 `url`，并用 `<webview>` 承载页面；
+实例发出 `request`、`console`、`step`、`changed` 和 `resized` 事件。
+
+`normalizeConsoleMessage(args)` 接收事件的全部参数，兼容旧位置参数、43.3.0
+仍同时发送位置参数的形态，以及只剩首个 details 对象的形态。
+`registerRoutes(ipcMain, routes, targetOf, after)` 保持原有成功/异常返回包装。
+
+浏览器实例与代理从 macClient 上移，macClient 保留配置适配层。CA 签发函数、
+Electron 对象、页面与 preload 路径、持久化分区和窗口配置由应用提供；加载
+jsbase 本身不会加载 Electron，也不会创建窗口或安装系统证书。
+
+代理记录保持原有字段与时间戳口径，方便已有消费者直接使用；本轮迁移保留
+正文上限、上游 TLS 策略和重试行为。业务中的会话、暂停、攒批与落库仍由消费者处理。
+
+### 命令行用法
 
 ```bash
 # 缺 raw 会自动用 gh cli 下载（需要已登录 gh，从 electron/electron 的 release 附件取）

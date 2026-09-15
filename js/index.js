@@ -1,10 +1,8 @@
 'use strict';
 
-// 包入口。三层设计对外只暴露这几个函数，调用方不用知道快照/断代数据
-// 分别存在哪个文件、用什么格式——具体文件布局（electron/snapshots/*.json、
-// electron/history/*.json）算内部实现，只有 electron/snapshots/*.json 额外
-// 走 exports 显式开放（见 package.json），是给需要直接 fetch 快照文件本身
-// 的场景（比如前端展示原始 JSON）用的，其它路径一律封死。
+// 包入口：台账查询函数，以及 electron/net/os 运行时地基。
+// 快照与断代数据的内部布局不属于调用契约；仅快照 JSON 和既有 os 子路径
+// 额外通过 package.json exports 开放，其余能力从这里取。
 
 const fs = require('node:fs');
 const path = require('node:path');
@@ -19,6 +17,10 @@ const {
 const { createSysproxy } = require('./os/sysproxy');
 const { createRootcert } = require('./os/rootcert');
 const { createCA } = require('./os/ca');
+const { normalizeConsoleMessage } = require('./electron/console-message');
+const { registerRoutes } = require('./electron/ipc');
+const { BrowserInstance } = require('./electron/browser-instance');
+const recordingProxy = require('./net/recording-proxy');
 
 const SNAPSHOT_DIR = path.join(__dirname, 'electron', 'snapshots');
 
@@ -61,6 +63,9 @@ module.exports = {
   listCapabilities,
   capability,
   checkCapabilities,
+  // 运行时依赖由调用方注入，普通 Node 加载包入口无需安装/启动 Electron。
+  electron: { normalizeConsoleMessage, registerRoutes, BrowserInstance },
+  net: recordingProxy,
   // 不依赖 Electron 的地基（js/os/*，工厂函数，落地路径由调用方传）
   os: {
     sysproxy: createSysproxy,

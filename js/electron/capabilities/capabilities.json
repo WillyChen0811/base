@@ -59,9 +59,9 @@
       "requires": ["WebContents@console-message"],
       "knownIssues": [
         {
-          "symptom": "升级 Electron 后代码不报错，但收到的 level/message 全是空的，日志照打，内容全废",
-          "cause": "35.0 弃用了 console-message 事件的旧位置参数写法 (event, level, message, line, sourceId)，改成了单个 details 对象 (event, details: {level, message, lineNumber, sourceId, frame})；旧写法在新版里 level 拿到的其实是 details 对象、message 是 undefined",
-          "fix": "按新签名读 details.level / details.message / details.lineNumber / details.sourceId，两版都处理的话判 typeof 第二个参数是不是对象来分支",
+          "symptom": "Electron 35+ 若仍按旧位置读参，现在会因弃用参数尚在而看似正常；等位置参数删除、只剩 details 时，代码不报错但会安静地收到空内容",
+          "cause": "35.0 弃用了 console-message 事件的旧签名 (event, level, message, line, sourceId)，新签名的 details 自己就是第一个参数、兼任 event，不是在 event 后再多一个参数。43.3.0 实测仍同时发送 [details, level, message, line, sourceId]，所以误跳过 args[0] 的代码会被旧位置参数暂时兜住",
+          "fix": "优先从第一个参数读 details.level / details.message / details.lineNumber / details.sourceId；兼容旧签名时按第一个参数是否具有 message/level 字段分支，不能只判是不是对象（旧 event 也是对象）",
           "platform": "all",
           "since": "35.0",
           "breakingChange": "deprecated-level-message-line-and-sourceid-arguments-in-console-message-event-on-webcontents"

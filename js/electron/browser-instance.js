@@ -20,6 +20,11 @@ class BrowserInstance extends EventEmitter {
     if (!electron.session || typeof electron.session.fromPartition !== 'function') {
       throw new TypeError('BrowserInstance 需要 options.electron.session');
     }
+    // screen 也要在这里验：它只在 contentSize() 里用，而那里拿不到就按 1 倍走，
+    // 失败方式是录像悄悄糊掉（见 contentSize 的注释），没有任何报错。
+    if (!electron.screen || typeof electron.screen.getDisplayNearestPoint !== 'function') {
+      throw new TypeError('BrowserInstance 需要 options.electron.screen');
+    }
     if (typeof options.createProxy !== 'function') {
       throw new TypeError('BrowserInstance 需要 options.createProxy');
     }

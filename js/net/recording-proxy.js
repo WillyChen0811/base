@@ -59,17 +59,6 @@ const DEST_TO_TYPE = {
 };
 
 /**
- * 把一段字节放进 JSON 记录里。
- *
- * **抓包收到的是任意字节**：GBK 的页面、二进制上传、压根不是文本的东西都有。
- * 而 JSON 塞不下裸字节，所以只有两条路——能当 UTF-8 文本就存文本，不能就
- * base64。以前一律 `buf.toString('utf8')`，非 UTF-8 的字节会被静默替换成
- * U+FFFD：一个 GBK 的表单提交抓下来是一串问号，**数据当场就毁了**，导出的
- * 脚本自然也是废的。
- *
- * 判定办法是解一遍再编回去比字节：能原样还原才是合法 UTF-8。
- */
-/**
  * 把一个连接错误说成人话。
  *
  * **不能只取 e.message**：Node 在 Happy Eyeballs（同时试 IPv4/IPv6）全部失败时
@@ -94,6 +83,17 @@ function describeError(e) {
   return parts.join(' ').trim() || String(e);
 }
 
+/**
+ * 把一段字节放进 JSON 记录里。
+ *
+ * **抓包收到的是任意字节**：GBK 的页面、二进制上传、压根不是文本的东西都有。
+ * 而 JSON 塞不下裸字节，所以只有两条路——能当 UTF-8 文本就存文本，不能就
+ * base64。以前一律 `buf.toString('utf8')`，非 UTF-8 的字节会被静默替换成
+ * U+FFFD：一个 GBK 的表单提交抓下来是一串问号，**数据当场就毁了**，导出的
+ * 脚本自然也是废的。
+ *
+ * 判定办法是解一遍再编回去比字节：能原样还原才是合法 UTF-8。
+ */
 function encodeBody(buf) {
   if (!buf || !buf.length) return { text: null, isBase64: 0 };
   const text = buf.toString('utf8');

@@ -8,4 +8,6 @@
 - sheets: 表格文件读取（.xlsx/.xls/.csv）
 - smb: SMB 客户端与文件抓取（连接、列目录、下载、上传、共享枚举）
 - crypto: 密码加密/解密（Fernet 对称加密）
+- cdpnet: Chrome DevTools Protocol 网络事件的纯映射/判断函数
+- playwright_launch: 按 cfg 拼 Playwright 启动/建 context 参数
 """

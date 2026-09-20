@@ -47,6 +47,11 @@ class BrowserInstance extends EventEmitter {
     this.window = null;
     this.guest = null;          // <webview> 的 webContents（被测页面本身）
     this.proxy = null;
+    this._proxyStartPromise = null;
+    this._proxyCandidate = null;
+    this._proxyStopPromises = new WeakMap();
+    this._disposed = false;
+    this._disposePromise = null;
     this.currentUrl = '';
   }
 
@@ -59,7 +64,11 @@ class BrowserInstance extends EventEmitter {
    * 重开会把登录态与已经点到的那一页全丢掉，而用户按的只是一个按钮。
    */
   async open({ url = '' } = {}) {
+    this._assertNotDisposed();
     await this._startProxy();
+    // dispose 可能发生在代理初始化的任意一个 await 里。代理那边会负责清理自己，
+    // 窗口这边也必须再验一次，不能让已经销毁的页签在旧 open 恢复后重新开窗。
+    this._assertNotDisposed();
 
     if (this.window && !this.window.isDestroyed()) {
       this.window.focus();
@@ -276,26 +285,86 @@ class BrowserInstance extends EventEmitter {
    * 里装根证书。这是自带浏览器相对 Burp 的便宜——服务的对象就是自己的窗口。
    */
   async _startProxy() {
+    this._assertNotDisposed();
     if (this.proxy) return;
+    // 多个 open 会一起走到这里（例如界面连点两次）。共享完整的初始化过程，既避免
+    // 起两个代理，也保证所有调用方看到同一个成功或失败结果。
+    if (this._proxyStartPromise) return this._proxyStartPromise;
+
+    const startPromise = this._initializeProxy();
+    this._proxyStartPromise = startPromise;
+    try {
+      await startPromise;
+    } finally {
+      if (this._proxyStartPromise === startPromise) this._proxyStartPromise = null;
+    }
+  }
+
+  async _initializeProxy() {
     let upstreamProxy = '';
     try { upstreamProxy = await this.getUpstreamProxy(); } catch (e) { /* 问不到就直连 */ }
+    this._assertNotDisposed();
 
     // **一律往外发，不在这里判断该不该记**：暂停、会话都是订阅者的事。
     // 这一层判断了，流量录制一暂停，画面与步骤也跟着停。
-    this.proxy = this.createProxy({
-      onRequest: (record) => this.emit('request', record),
-      onError: (message) => this.emit('error', message),
+    const proxy = this.createProxy({
+      onRequest: (record) => { if (!this._disposed) this.emit('request', record); },
+      onError: (message) => { if (!this._disposed) this.emit('error', message); },
       upstreamProxy,
     });
-    const port = await this.proxy.start();
-    const ses = this.electron.session.fromPartition(this.partition);
-    await ses.setProxy({
-      proxyRules: `http=127.0.0.1:${port};https=127.0.0.1:${port}`,
-      // 本机地址不要绕过代理：被测系统跑在本机是常事，绕过去就录不到了
-      proxyBypassRules: '<-loopback>',
-    });
-    // 0 = 采纳。这个分区的流量全部经我们的代理，证书本来就是我们签的
-    ses.setCertificateVerifyProc((_request, callback) => callback(0));
+    this._proxyCandidate = proxy;
+    let ses = null;
+    let proxyWasConfigured = false;
+    try {
+      // createProxy 是调用方注入的；即使它同步触发了 dispose，也不能再启动候选资源。
+      this._assertNotDisposed();
+      // RecordingProxy.start 自己包含多段异步 listen；它没结束时不能抢先 stop，
+      // 否则 start 后半段会继续使用已经被 stop 清空的 server。
+      const port = await proxy.start();
+      this._assertNotDisposed();
+
+      ses = this.electron.session.fromPartition(this.partition);
+      proxyWasConfigured = true;
+      await ses.setProxy({
+        proxyRules: `http=127.0.0.1:${port};https=127.0.0.1:${port}`,
+        // 本机地址不要绕过代理：被测系统跑在本机是常事，绕过去就录不到了
+        proxyBypassRules: '<-loopback>',
+      });
+      this._assertNotDisposed();
+      // 0 = 采纳。这个分区的流量全部经我们的代理，证书本来就是我们签的
+      ses.setCertificateVerifyProc((_request, callback) => callback(0));
+      this.proxy = proxy;
+      this._proxyCandidate = null;
+    } catch (error) {
+      // 候选代理绝不能留到下一次 open：否则失败会被误认成已经初始化成功。
+      await this._stopProxyOnce(proxy);
+      if (proxyWasConfigured && ses) await this._setDirectProxy(ses);
+      if (this._proxyCandidate === proxy) {
+        this._proxyCandidate = null;
+      }
+      throw error;
+    }
+  }
+
+  _assertNotDisposed() {
+    if (this._disposed) throw new Error('BrowserInstance 已销毁');
+  }
+
+  _stopProxyOnce(proxy) {
+    if (!proxy) return Promise.resolve();
+    let stopping = this._proxyStopPromises.get(proxy);
+    if (!stopping) {
+      stopping = Promise.resolve().then(() => proxy.stop()).catch(() => {});
+      this._proxyStopPromises.set(proxy, stopping);
+    }
+    return stopping;
+  }
+
+  async _setDirectProxy(ses = null) {
+    try {
+      const target = ses || this.electron.session.fromPartition(this.partition);
+      await target.setProxy({ mode: 'direct' });
+    } catch (e) { /* 撤不下来也要接着往下走 */ }
   }
 
   _bindGuest(guest) {
@@ -391,16 +460,30 @@ class BrowserInstance extends EventEmitter {
    * WebSocket 都不会自己断），回调不来就永远挂着，一路挂到界面上就是关页签时整个
    * 卡死——没人报错，只是没返回。
    */
-  async dispose() {
+  dispose() {
+    if (this._disposePromise) return this._disposePromise;
+    // 先立终态，再做任何异步清理。这样旧 open 与之后的新 open 都无法复活窗口。
+    this._disposed = true;
     this.removeAllListeners();
-    if (this.proxy) {
-      try { await this.proxy.stop(); } catch (e) { /* 停不下来也要接着往下走 */ }
+    this._disposePromise = this._dispose();
+    return this._disposePromise;
+  }
+
+  async _dispose() {
+    const proxy = this.proxy;
+    const candidate = this._proxyCandidate;
+
+    if (proxy) {
+      await this._stopProxyOnce(proxy);
       this.proxy = null;
     }
+    if (candidate) {
+      // start 与 stop 不能并发；setProxy 也必须等旧调用返回并回滚，才能保证 dispose
+      // 返回后同 partition 的新实例不会再被旧初始化覆盖。失败分支负责统一收口。
+      try { await this._proxyStartPromise; } catch (e) { /* 清理由初始化的失败分支完成 */ }
+    }
     // 分区的代理设置要撤回去，否则窗口再开就走一个已经没了的端口
-    try {
-      await this.electron.session.fromPartition(this.partition).setProxy({ mode: 'direct' });
-    } catch (e) { /* 同上 */ }
+    await this._setDirectProxy();
     if (this.window && !this.window.isDestroyed()) this.window.destroy();
     this.window = null;
     this.guest = null;

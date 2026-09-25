@@ -1,17 +1,9 @@
-"""pybase.office —— Windows + Office 2019 的 Word→PDF 转换服务（服务端 + 客户端）
+"""pybase.office —— Word→PDF 转换的基础能力：Word COM 驱动 + HTTP 协议 + 客户端
 
-## 为什么要有这层
-python-docx 只管填内容，算不出真实分页——目录页码、章节起始页这些排版结果只有
-Word 自己排一遍才知道。这个包用一台专职的 Windows + Office 虚拟机把"Word 排版
-+ 导出 PDF"做成局域网内的 HTTP 服务，调用方（backend、各端客户端）把 docx 字节
-发过去，收回带页数的 PDF 字节。
-
-## 部署形态
-一台 KVM 虚拟机：Windows 10 + Office 2019 专业版，自动登录桌面会话，
-`pybase.office.server` 由"登录时运行"的计划任务拉起——**不要做成 Windows 服务**，
-Word COM 自动化在 Session 0 / 服务账号下会挂死（原因见 `server` 模块文档字符串）。
-调用方运行在 macOS/Linux/Windows 的 backend 或客户端，走局域网 HTTP 调用这台机器。
-部署清单见 README「office 模块」一节。
+python-docx 算不出真实分页（目录页码、章节起始页），只有 Word 排一遍才知道。
+- `word`：驱动 Word 把 docx 转成 pdf 并统计页数（仅 Windows + Office）
+- `client`：调用转换服务的 HTTP 客户端（跨平台）
+- 服务本身（队列、看门狗、HTTP、部署）在独立项目 wordpdf 里，遵循下面的协议
 
 ## HTTP 协议
 
@@ -71,13 +63,6 @@ result = client.convert(docx_bytes, update_fields=True)
 result.pdf_bytes   # PDF 字节
 result.page_count  # 页数
 ```
-
-服务端只在 Windows 上、装了 `pip install pybase[office-server]`（引入 pywin32）
-之后能跑：
-
-```
-python -m pybase.office.server --host 0.0.0.0 --port 8765 --work-dir R:\\ --token xxx
-```
 """
 
 from .client import ConvertResult, WordPdfClient
@@ -91,15 +76,7 @@ from .errors import (
     PayloadTooLargeError,
     ServiceBusyError,
 )
-from .server import (
-    OfficeHTTPServer,
-    OfficeServerConfig,
-    OfficeService,
-    WordConverter,
-    WordCOMConverter,
-    main,
-    serve,
-)
+from .word import WordCOMConverter, WordConverter
 
 __all__ = [
     # 客户端
@@ -114,12 +91,7 @@ __all__ = [
     "AuthenticationError",
     "PayloadTooLargeError",
     "OfficeProtocolError",
-    # 服务端（真正跑起来仅限 Windows，但这些符号在其它平台也能安全 import）
-    "OfficeServerConfig",
-    "OfficeService",
-    "OfficeHTTPServer",
+    # Word 驱动（真正跑起来仅限 Windows，但在其它平台也能安全 import）
     "WordConverter",
     "WordCOMConverter",
-    "serve",
-    "main",
 ]

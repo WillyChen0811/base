@@ -35,12 +35,10 @@
 - 只有 `shares.py` 用 `pysmb`（列共享），其余都走 `smbprotocol`
 
 ### office
-- 转换服务不能注册成 Windows 服务：Session 0 下 Word COM 自动化会挂死，只能用计划任务
-  「用户登录时」启动
-- `memory_backed` 只能靠 `--work-dir-is-ramdisk` 显式声明，服务端不会自动推断盘符是不是内存盘
-- 非致命 warnings 必须原样透传给客户端，不能吞
+- 只放基础能力（协议、客户端、Word COM 驱动）；服务编排和部署在独立项目 `../wordpdf`，协议改动两边一起改
+- `word.py` 顶层只 import 标准库，`win32com`/`pythoncom` 延迟 import
+- 非致命 warnings 必须原样返回给调用方，不能吞
 - 客户端只重试"连不上"和 503，其余错误不重试
-- `server.py` 顶层只 import 标准库，`win32com`/`pythoncom` 延迟 import
 
 ### cdpnet / playwright_launch
 - 纯映射/判断函数，无状态、不带项目默认值；有状态的编排（事件聚合、并发控制、落库）留给调用方

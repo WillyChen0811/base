@@ -28,7 +28,7 @@ Homepage = "https://github.com/WillyChen0811/base"
 rpc-server = [
     "fastapi>=0.100.0",
 ]
-office-server = [
+office-word = [
     "pywin32>=306; sys_platform == 'win32'",
 ]
 dev = [

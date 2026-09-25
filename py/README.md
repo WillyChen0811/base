@@ -16,22 +16,13 @@
 - `pybase.crypto`：基于 Fernet 的密码加密/解密（`PasswordEncryption`，不带项目默认值）
 - `pybase.cdpnet`：Chrome DevTools Protocol 网络事件的纯映射/判断函数
 - `pybase.playwright_launch`：按 cfg 拼 Playwright 启动/建 context 参数的纯映射
-- `pybase.office`：Word→PDF 转换服务，服务端（Windows + Office 2019）与跨平台客户端
+- `pybase.office`：Word→PDF 基础能力：Word COM 驱动（Windows + Office）+ 转换服务客户端
 
-## office 模块：Word→PDF 转换
+## office 模块：Word→PDF
 
-python-docx 算不出真实分页，`pybase.office` 用专职的 Windows + Office 2019 虚拟机做局域网
-HTTP 服务：docx bytes 进、PDF bytes + 页数出。协议细节见 `pybase/office/__init__.py` 的模块
-文档字符串。
-
-虚拟机部署（Windows 10 + Office 2019）：
-
-1. 激活 Office，手动开一次 Word 点掉首启向导（否则自动化会卡住）
-2. 信任中心关闭受保护视图三项（Internet 文件/不安全位置/Outlook 附件）
-3. 自动登录桌面 + 计划任务「用户登录时」启动服务；**不要注册成 Windows 服务**（Session 0 下 Word COM 挂死）
-4. 关闭 Windows/Office 自动更新的强制重启
-5. 装内存盘（如 ImDisk），`--work-dir` 指过去并加 `--work-dir-is-ramdisk`（不加则 `memory_backed` 报 `false`）
-6. 可选：账号的 `TEMP`/`TMP` 也指到内存盘
+python-docx 算不出真实分页，要靠 Word 排一遍。`pybase.office.word` 驱动 Word COM 转 PDF 并
+统计页数（`pip install "pybase[office-word]"`，仅 Windows）；`WordPdfClient` 调用转换服务。
+服务本身（队列、看门狗、HTTP、部署）在独立项目 wordpdf，协议见 `pybase/office/__init__.py`。
 
 ```python
 from pybase.office import WordPdfClient
@@ -40,13 +31,6 @@ client = WordPdfClient("http://192.168.1.50:8765", token="xxx")
 result = client.convert(docx_bytes, update_fields=True)
 result.pdf_bytes    # PDF 字节
 result.page_count   # Word 实际排版后的页数
-```
-
-服务端启动（只能在部署好的 Windows 虚拟机上跑）：
-
-```bash
-pip install "pybase[office-server]"
-python -m pybase.office.server --host 0.0.0.0 --port 8765 --work-dir R:\ --work-dir-is-ramdisk --token xxx
 ```
 
 ## 安装

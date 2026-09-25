@@ -78,19 +78,11 @@ class UploadMixin:
         先写入同目录临时文件（.wsu 后缀，见 _tmp_names），校验大小一致后用 replace 原子替换，
         再把目标文件的时间设成调用方给的这几个值（不给就用 local_path 自己的）。
 
-        Args:
-            local_path: 本地文件路径（传档传的常是版本库里那份快照）
-            remote_path: 远程文件路径（相对共享根）
-            max_retries: 失败后的最大重试次数
-            byte_progress_callback: 单文件字节进度回调 callback(sent, total)，节流上报
-            mtime_ns / atime_ns / birthtime: 远端要带的时间戳，**由调用方在定版那一刻
-                现场 `os.stat` 好传进来**，不是在这里临上传前才读一次文件——正位文件在
-                上传排队等待期间可能已经被换成同样大小的另一份，这里再读就会把"旧内容 +
-                新时间"焊在一起。不给就退回 `local_path` 自己的时间（没有版本快照要
-                区分的普通上传）。
+        mtime_ns / atime_ns / birthtime **必须由调用方在定版那一刻现场 `os.stat` 好传进来**，
+        不能在这里临上传前才读一次文件——正位文件在上传排队等待期间可能已被换成同样大小的
+        另一份，这里再读就会把"旧内容 + 新时间"焊在一起。不给就退回 local_path 自己的时间。
 
-        Returns:
-            {success: bool, size: int, message?: str}
+        Returns: {success: bool, size: int, message?: str}
         """
         try:
             st_local = os.stat(local_path)

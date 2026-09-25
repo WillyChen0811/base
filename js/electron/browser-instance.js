@@ -110,17 +110,14 @@ class BrowserInstance extends EventEmitter {
     // **preload 与子 frame 支持在这里设**，不靠 <webview> 的属性：
     // `nodeIntegrationInSubFrames` 决定 preload 跑不跑进 iframe，而老系统几乎
     // 全是 iframe 框架页——不开的话内页里的操作**一条都采不到**（实测：框架页
-    // 只有一条"打开页面"，里面点保存、填标题全丢）。渲染进程也因此选不了
-    // preload，安全上更紧一点。
+    // 只有一条"打开页面"，里面点保存、填标题全丢）。
     this.window.webContents.on('will-attach-webview', (_event, webPreferences) => {
       webPreferences.preload = this.guestPreload;
       webPreferences.nodeIntegrationInSubFrames = true;
     });
-    // **外壳自己装好了也算一次状态变化**。`_changed()` 在窗口刚建出来时就发过
-    // 一次，可那时 shell.html 还没加载，`webContents.send` 是直接丢掉的——控制条
-    // 于是停在"什么都没在录"的默认样子上，「开始录」压根不出现。原先它靠被测
-    // 页面 did-finish-load 那一路兜住，而那是另一件事的副作用，空白页或页面加载
-    // 失败时就不成立了。
+    // **外壳自己装好了也算一次状态变化**：窗口刚建出来时发的那次 `_changed()`
+    // 会被丢掉（shell.html 还没加载，`webContents.send` 无人接），控制条会停在
+    // "什么都没在录"的默认样子上，「开始录」压根不出现。
     this.window.webContents.on('did-finish-load', () => this._changed());
     this.window.webContents.on('did-attach-webview', (_event, guest) => this._bindGuest(guest));
     // 录制中改了窗口大小，画面从那一刻起就带黑边了（帧尺寸是开录时定死的，
@@ -233,22 +230,15 @@ class BrowserInstance extends EventEmitter {
    * 窗口内容区现在多大。**录像按它锁帧尺寸**：不给尺寸的话帧多大完全由采集那边
    * 协商，比例与窗口对不上就补黑边——黑边会被编码进文件，既难看又白占码率。
    *
-   * **给的是物理像素，不是 `getContentSize()` 那个逻辑像素**。这一条原先是反着
-   * 写的（"按物理像素录出来同样码率反而更糊"），而那是推出来的、没验过——
-   * **糊的真正原因就在这儿**：Retina 上 scaleFactor=2，窗口 1280×835 实际是
-   * 2560×1670 个真实像素，拿 1280 当 maxWidth 交给 getUserMedia，采集那边就先
-   * 把画面**缩掉一半**再编码，回放时再放大回去，字自然是糊的。
-   * 本机实测（Electron 43.3.0，窗口 1280×835、scaleFactor=2、8fps）：
-   * 按逻辑像素录出来的帧是 1228×830，按物理像素是 2464×1670；同一段滚动画面
-   * 截同一块区域放到同样大小看，前者的「需求编号 GN-45.1」笔画糊成一团、
-   * 后者一眼可读。**分辨率是主因，不是码率**（同为 800kbps 时差别就已经这么大）。
+   * **给的是物理像素，不是 `getContentSize()` 那个逻辑像素**：Retina 上
+   * scaleFactor=2，窗口 1280×835 实际是 2560×1670 个真实像素，拿 1280 当
+   * maxWidth 交给 getUserMedia，采集那边会先把画面缩掉一半再编码，回放时再放大
+   * 回去，字就糊了（实测按逻辑像素录出来的字迹糊成一团，按物理像素一眼可读；
+   * 分辨率是主因，不是码率）。体积代价：一小时仍在几百 MB 量级，没有涨到"几个
+   * GB"。
    *
-   * 体积代价实测(8 秒、一直滚动的表格，最坏情形)：逻辑像素 341KB、物理像素
-   * 482KB；静止页面则是 118KB 对 258KB。换算成一小时仍在几百 MB 这个量级，
-   * 没有变成"几个 GB"。
-   *
-   * `cssWidth/cssHeight` 是窗口在界面上的大小，只用来对人说话（"把窗口从
-   * 1280×835 改成了…"）——跟用户说 2560×1670 他对不上自己看到的窗口。
+   * `cssWidth/cssHeight` 是窗口在界面上的大小，只用来对人说话——跟用户说物理
+   * 像素他对不上自己看到的窗口。
    *
    * 宽高**取偶数**：编码器对奇数尺寸各有各的脾气，差一个像素不值得去赌。
    */
@@ -384,14 +374,13 @@ class BrowserInstance extends EventEmitter {
 
     /**
      * 跳转也是一步操作。**由这一层发，不在页面里 hook `history.pushState`**：
-     * preload 跑在隔离世界，往那儿打的补丁拦不到页面自己的调用；而单页应用换
-     * 路由压根不触发 DOMContentLoaded，实测整场只有开头一条"打开页面"，看流水
-     * 完全看不出人从哪一页走到了哪一页。Electron 的 did-navigate-in-page 对
-     * pushState 与 hash 都报，这是现成的、也是唯一靠得住的信号。
+     * preload 跑在隔离世界，拦不到页面自己的调用；单页应用换路由也不触发
+     * DOMContentLoaded。Electron 的 did-navigate-in-page 对 pushState 与 hash
+     * 都报，是唯一靠得住的信号。
      *
-     * **时间戳取事件发生的那一刻**，文字晚 250ms 再取：单页应用是先换路由再改
-     * document.title 的，当场读到的还是上一页的标题。时间对得上就行，文字晚一
-     * 点没关系——步骤在时间轴上的位置按 ts 算。
+     * **时间戳取事件发生的那一刻**，文字晚 250ms 再取：单页应用先换路由再改
+     * document.title，当场读到的还是上一页的标题。步骤在时间轴上的位置按 ts 算，
+     * 文字晚一点没关系。
      */
     const emitNav = (url) => {
       const ts = Date.now();

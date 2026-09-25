@@ -1,9 +1,7 @@
 #!/usr/bin/env node
 'use strict';
 
-// 比较两个版本的快照，输出新增/删除/变更的 key。现在只有一个版本可用，
-// 用同一份快照自比对来验证脚本能跑、输出应为空。
-// 后面接第 2 层（断代）时，这里的输出就是"这次升级动了哪些 API"的机械底稿。
+// 比较两个版本的快照，输出新增/删除/变更的 key，是"这次升级动了哪些 API"的机械底稿。
 
 const path = require('node:path');
 const { snapshotPath } = require('./extract');

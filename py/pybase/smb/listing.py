@@ -63,12 +63,7 @@ class ListingMixin:
         directory_filter: Optional[Callable[[Dict], bool]] = None,
         strict: bool = False,
     ) -> Generator[Dict, None, None]:
-        """递归遍历目录
-
-        Args:
-            path: 起始路径
-            directory_filter: 目录过滤器，接收目录项 dict，返回 True 表示进入，False 表示跳过
-        """
+        """递归遍历目录。directory_filter 接收目录项 dict，返回 True 才进入，False 跳过。"""
         self._ensure_connection()
 
         try:
@@ -100,16 +95,7 @@ class ListingMixin:
         directory_filter: Optional[Callable[[Dict], bool]] = None,
         strict: bool = False,
     ) -> List[Dict]:
-        """扫描目录，返回所有文件和目录
-
-        Args:
-            path: 起始路径
-            callback: 进度回调函数 callback(count, current_path)
-            directory_filter: 目录过滤器
-
-        Returns:
-            文件和目录列表
-        """
+        """扫描目录，返回所有文件和目录。callback(count, current_path) 每 10 条上报一次进度。"""
         results = []
         count = 0
 

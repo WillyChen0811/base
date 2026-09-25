@@ -15,19 +15,9 @@ logger = logging.getLogger(__name__)
 
 
 def list_shares(address: str, username: str = "", password: str = "", port: int = 445) -> List[Dict]:
-    """列出服务器上的所有共享 (仍使用 pysmb)
+    """列出服务器上的所有共享 (仍使用 pysmb)，过滤掉系统共享（$结尾）和 IPC$。
 
-    smbprotocol/smbclient 没有高层的共享枚举 API（需手写 SRVSVC RPC），
-    而这是配置服务器时的一次性辅助、不走敏感数据，故保留 pysmb 实现。
-
-    Args:
-        address: 服务器地址
-        username: 用户名
-        password: 密码
-        port: 端口
-
-    Returns:
-        共享列表 [{"name": "共享名", "path": "//addr/共享名"}, ...]
+    返回 [{"name": "共享名", "path": "//addr/共享名"}, ...]
     """
     logger.info(f"开始列出共享: address={address}, username={username or '(空)'}, port={port}")
 

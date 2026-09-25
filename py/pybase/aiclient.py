@@ -24,6 +24,7 @@ def _join_endpoint(base_url: str, path: str) -> str:
 
 
 class LlmClient:
+    """OpenAI 兼容 chat.completions 客户端，标准库实现（无第三方依赖）。"""
 
     def __init__(
         self,

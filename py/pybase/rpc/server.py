@@ -99,14 +99,7 @@ class RPCDispatcher:
 
 
 def create_fastapi_rpc_router(dispatcher: RPCDispatcher):
-    """创建 FastAPI RPC 路由
-
-    Args:
-        dispatcher: RPC 分发器
-
-    Returns:
-        FastAPI APIRouter
-    """
+    """创建 FastAPI RPC 路由（挂载于 /rpc，另提供 /rpc/methods 列出已注册方法）。"""
     from fastapi import APIRouter, Request
     from fastapi.responses import JSONResponse
 
@@ -137,14 +130,7 @@ def create_fastapi_rpc_router(dispatcher: RPCDispatcher):
 
 
 def create_http_handler(dispatcher: RPCDispatcher):
-    """创建标准 HTTP 处理器（用于简单 HTTP 服务器）
-
-    Args:
-        dispatcher: RPC 分发器
-
-    Returns:
-        处理函数
-    """
+    """创建标准 HTTP 处理器（用于简单 HTTP 服务器），返回一个 str->str 的请求处理函数。"""
     def handle(request_body: str) -> str:
         try:
             body = json.loads(request_body)

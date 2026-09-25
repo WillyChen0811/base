@@ -1,9 +1,10 @@
-"""密码加密/解密工具模块
-
-使用 Fernet 对称加密来安全存储密码。
-密钥基于机器特征生成，存储在调用方指定的文件路径下。
+"""密码加密/解密工具模块 —— Fernet 对称加密，密钥存在调用方指定的文件路径下。
 
 本模块不带任何项目默认值——key_file、passphrase、fallback_salt 均由调用方传入。
+
+**坑**：实际密钥是 `_get_or_create_fernet` 生成/读取的随机 Fernet 密钥，与
+passphrase 无关——`_generate_key`/`_generate_machine_salt`（基于 passphrase +
+机器特征派生密钥）当前未被调用。换机器/丢失 key_file 都会导致旧密文无法解密。
 """
 
 import os
@@ -19,16 +20,10 @@ logger = logging.getLogger(__name__)
 
 
 class PasswordEncryption:
-    """密码加密/解密工具类"""
+    """基于 Fernet 的密码加解密工具。key_file 存在则复用，不存在则生成随机密钥并写入
+    （权限 0600）；passphrase/fallback_salt 目前仅用于生成机器盐值，不参与实际密钥。"""
 
     def __init__(self, key_file: str, passphrase: bytes, fallback_salt: bytes = b'pybase_default_salt_'):
-        """初始化加密工具
-
-        Args:
-            key_file: 加密密钥文件路径
-            passphrase: 派生密钥用的口令（项目自定义，不同项目应各不相同）
-            fallback_salt: 机器特征盐值生成失败时的兜底值
-        """
         self.key_path = Path(key_file).expanduser().resolve()
         self.key_path.parent.mkdir(parents=True, exist_ok=True)
         self._passphrase = passphrase
@@ -36,18 +31,11 @@ class PasswordEncryption:
         self._fernet = self._get_or_create_fernet()
 
     def _generate_machine_salt(self) -> bytes:
-        """生成基于机器特征的盐值
-
-        使用机器的 MAC 地址和主机名生成稳定的盐值
-        """
+        """基于 MAC 地址 + 主机名生成稳定盐值（不足 16 字节补零）。当前未被调用，见模块坑说明。"""
         try:
-            # 获取 MAC 地址
             mac = uuid.getnode().to_bytes(6, 'big')
-            # 获取主机名
             hostname = platform.node().encode('utf-8')
-            # 组合
             salt = mac + hostname
-            # 确保盐值长度至少 16 字节
             if len(salt) < 16:
                 salt = salt + b'0' * (16 - len(salt))
             return salt[:16]
@@ -56,60 +44,46 @@ class PasswordEncryption:
             return self._fallback_salt
 
     def _generate_key(self) -> bytes:
-        """生成加密密钥
-
-        基于机器特征生成密钥，确保在同一台机器上密钥稳定
-        """
+        """基于 passphrase + 机器盐值派生密钥。当前未被调用，见模块坑说明。"""
         password = self._passphrase
         salt = self._generate_machine_salt()
-        
+
         kdf = PBKDF2HMAC(
             algorithm=hashes.SHA256(),
             length=32,
             salt=salt,
             iterations=100000,
         )
-        
+
         key = kdf.derive(password)
         return Fernet.generate_key() if not key else Fernet(key).generate_key()
 
     def _get_or_create_fernet(self) -> Fernet:
-        """获取或创建 Fernet 加密器"""
+        """key_file 存在则读取复用；不存在或读取失败则生成随机密钥并写入（权限 0600）。"""
         if self.key_path.exists():
-            # 读取现有密钥
             try:
                 with open(self.key_path, 'rb') as f:
                     key = f.read()
                 return Fernet(key)
             except Exception as e:
                 logger.error(f"读取密钥失败: {e}")
-                # 如果读取失败，生成新密钥
-                
-        # 生成新密钥
+
         key = Fernet.generate_key()
         try:
             with open(self.key_path, 'wb') as f:
                 f.write(key)
-            # 设置文件权限为仅用户可读写
             os.chmod(self.key_path, 0o600)
             logger.info(f"已生成新的加密密钥: {self.key_path}")
         except Exception as e:
             logger.error(f"保存密钥失败: {e}")
-            
+
         return Fernet(key)
 
     def encrypt(self, password: str) -> str:
-        """加密密码
-        
-        Args:
-            password: 明文密码
-            
-        Returns:
-            加密后的密码（Base64 编码字符串）
-        """
+        """加密明文密码，返回 Base64 字符串；空字符串直接原样返回。"""
         if not password:
             return ""
-        
+
         try:
             encrypted = self._fernet.encrypt(password.encode('utf-8'))
             return encrypted.decode('utf-8')
@@ -118,17 +92,10 @@ class PasswordEncryption:
             raise ValueError(f"密码加密失败: {str(e)}")
 
     def decrypt(self, encrypted_password: str) -> str:
-        """解密密码
-        
-        Args:
-            encrypted_password: 加密的密码（Base64 编码字符串）
-            
-        Returns:
-            明文密码
-        """
+        """解密 encrypt() 产出的密文，返回明文；空字符串直接原样返回。"""
         if not encrypted_password:
             return ""
-        
+
         try:
             decrypted = self._fernet.decrypt(encrypted_password.encode('utf-8'))
             return decrypted.decode('utf-8')

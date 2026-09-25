@@ -17,14 +17,7 @@ class DownloadMixin:
     """下载与远端哈希。"""
 
     def download_file(self, path: str) -> bytes:
-        """下载文件到内存（只读共享模式，允许其他进程同时访问）
-
-        Args:
-            path: 文件路径
-
-        Returns:
-            文件内容 bytes
-        """
+        """下载文件到内存（只读共享模式，允许其他进程同时访问）"""
         self._ensure_connection()
         unc = self._unc(path)
         with smbclient.open_file(

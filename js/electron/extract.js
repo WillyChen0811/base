@@ -133,21 +133,12 @@ function simplifyParam(node) {
   return out;
 }
 
-// 稳定 key 规则（第 2/3 层要挂在这上面，规则一旦定下不要轻改）：
-//   模块方法/属性   name.memberName        如 app.getPath
-//   模块事件        name@event-name        如 app@will-finish-launching
-//   类实例方法/属性  ClassName#memberName   如 Session#setCertificateVerifyProc
-//   类实例事件      ClassName@event-name   如 WebContents@console-message
-//   类静态方法/属性  ClassName.memberName   如 BrowserWindow.getAllWindows
-// 方法与属性共用同一个分隔符（# 或 .）是因为摸底确认过两边同一模块/类内部
-// 没有同名的方法+属性组合（见 js/tests 的 no-collision 测试）；事件单独用 @，
-// 即使同名方法/事件（如 BrowserWindow 的 close() 方法与 close 事件）也不会撞 key。
-// 构造函数单独一种 kind：electron-api.json 把它放在 constructorMethod 字段，
-// 不在 instanceMethods 里，但语义上和实例方法一样挂在 `#` 下——用
-// `new BrowserWindow(...)` 时传的 options 也要能被第 2 层按 key 挂断代信息。
-// Structure 的属性（0b）复用 `.` 分隔符，和模块成员/类静态成员同一形式：
-// Structure 名大写开头、模块名小写开头，不会互相撞 key（extract() 里的撞车
-// 断言覆盖了全部 entries，包括这里新增的两类）。
+// 稳定 key 规则（第 2/3 层挂在这上面，定下不要轻改；完整规则表见 js/README.md）。
+// 事件单独用 `@`，即使同名方法/事件（如 close() 与 close 事件）也不会撞 key。
+// 构造函数单独一种 kind：electron-api.json 放在 constructorMethod 字段、不在
+// instanceMethods 里，但语义上和实例方法一样挂 `#`。
+// Structure 属性（0b）复用 `.`：Structure 名大写开头、模块名小写开头不会互撞
+// （extract() 里的撞车断言覆盖全部 entries）。
 const DOT_SCOPES = new Set(['static', 'module', 'structure']);
 
 function buildKey({ containerName, scope, kind, memberName }) {
@@ -229,24 +220,15 @@ function extractContainer(item) {
 
 // ---- 0b：被引用的 Structure，传递闭包收集 ----
 //
-// electron-api.json 里参数/返回值/属性的 type 字段只记 Structure 的名字
-// （如 "BrowserWindowConstructorOptions"），具体有哪些字段要去 Structure
-// 条目自己的 properties 里找。第 2 层要挂"某个选项哪个版本才有"，没有 key
-// 就无处可挂，所以这里把收录模块/类用到的 Structure 也展开成 entries——
-// 但只展开"被引用到"的，不是 electron-api.json 里全部 174 项都收。
-//
-// electron-api.json 的 Class 条目（instanceMethods 等 5 个数组）已经是拍平的
-// （子类自己不重复声明继承来的成员，但数组里已经包含父类成员，如
-// BrowserWindow 的 instanceMethods 比 BaseWindow 多，`BrowserWindow#setBounds`
-// 已经在里面），但 Structure 不是——BrowserWindowConstructorOptions 自己的
-// properties 只有 2 条，width/height/show/x/y 等 50 条都在
-// BaseWindowConstructorOptions 里，要靠 `extends` 字段才能找到。所以这里既
-// 顺着 type 引用走，也顺着 `extends` 链把父 Structure 收进来；extractStructure
-// 再把继承链拍平进子 Structure 自己的 entries（见下面 flattenStructureProperties），
-// 这样查"BrowserWindow 能传哪些 options"不用消费方自己知道去查父类。
-// extends 目标不是本次收录范围内的 Structure（比如 IpcMainEvent extends
-// Event——Event 是 Node/DOM 内置类型，不在 electron-api.json 里）时链就到此为止，
-// 没法拍平不存在的文档条目。
+// type 字段只记 Structure 名字，字段要去 Structure 自己的 properties 里找；
+// 第 2/3 层要挂"某选项哪个版本才有"，没有 key 就无处可挂，所以只展开
+// "被引用到"的 Structure（不是 electron-api.json 全部 174 项）。
+// Structure 与 Class 不同，不会预先拍平继承——BrowserWindowConstructorOptions
+// 自己的 properties 只有 2 条，width/height 等 50 条要顺着 `extends` 链去
+// BaseWindowConstructorOptions 找，所以这里既顺 type 引用、也顺 extends 链
+// 收集父 Structure，extractStructure 再拍平回子的 entries（详见 README
+// key 规则一节 / flattenStructureProperties）。extends 目标不在收录范围内时
+// （如 IpcMainEvent extends 内置的 Event）链到此为止。
 
 // 递归找出 type 结构（字符串/数组/对象）里出现的 Structure 名字，塞进 found。
 function walkTypeRefs(type, structNames, found) {
@@ -314,12 +296,9 @@ function collectReferencedStructures(byName, wantedNames) {
     for (const node of collectOwnNodes(item)) walkNodeRefs(node, structNames, found);
   }
 
-  // 再从已发现的 Structure 出发继续找：(a) 它自己 properties 里引用到的
-  // Structure（如 BrowserWindowConstructorOptions.webPreferences 指向
-  // WebPreferences），(b) 它 extends 的父 Structure（如
-  // BrowserWindowConstructorOptions -> BaseWindowConstructorOptions），
-  // 直到不再有新发现为止——两条线一起做传递闭包，因为父 Structure 自己的
-  // properties 也可能引用别的 Structure。
+  // 继续做传递闭包：(a) 已发现 Structure 自己 properties 引用到的 Structure，
+  // (b) 它 extends 的父 Structure，直到没有新发现——父 Structure 的 properties
+  // 也可能引用别的 Structure，所以两条线要一起收。
   const visited = new Set(found);
   let frontier = Array.from(found);
   while (frontier.length) {
@@ -376,10 +355,8 @@ function flattenStructureProperties(byName, item) {
 }
 
 // 把一个 Structure 条目的每个属性（含沿 extends 链继承来的）展开成一条快照
-// entry，key 形如 `BrowserWindowConstructorOptions.webPreferences`。继承来的
-// 属性带 `inheritedFrom: 声明它的祖先 Structure 名字`，自己声明的没有这个
-// 字段——第 3 层要挂"某个选项哪个版本才有"就挂在子的 key 上，不用消费方自己
-// 回溯继承链。
+// entry，key 形如 `BrowserWindowConstructorOptions.webPreferences`；继承来的
+// 属性带 `inheritedFrom`，自己声明的没有——消费方不用回溯继承链。
 function extractStructure(item, byName) {
   const entries = [];
   const flattened = flattenStructureProperties(byName, item);

@@ -16,28 +16,12 @@ class RPCClient:
     """JSON-RPC HTTP 客户端"""
 
     def __init__(self, endpoint: str, timeout: int = 30):
-        """
-        Args:
-            endpoint: RPC 服务地址 (如 http://localhost:8123/rpc)
-            timeout: 请求超时时间（秒）
-        """
         self.endpoint = endpoint.rstrip('/')
         self.timeout = timeout
         self._request_id = 0
 
     def call(self, method: str, **params) -> Any:
-        """调用 RPC 方法
-
-        Args:
-            method: 方法名 (如 tableTemplate.get)
-            **params: 参数
-
-        Returns:
-            调用结果
-
-        Raises:
-            RPCError: RPC 调用失败
-        """
+        """调用 RPC 方法（如 method="tableTemplate.get"），失败抛 RPCError。"""
         self._request_id += 1
         request_body = {
             "jsonrpc": "2.0",
@@ -69,14 +53,7 @@ class RPCClient:
         return response.get("result")
 
     def batch(self, calls: list) -> list:
-        """批量调用
-
-        Args:
-            calls: [(method, params), ...]
-
-        Returns:
-            结果列表
-        """
+        """批量调用，calls 为 [(method, params), ...]；单条失败对应位置返回 RPCError 而非抛出。"""
         requests = []
         for i, (method, params) in enumerate(calls):
             self._request_id += 1

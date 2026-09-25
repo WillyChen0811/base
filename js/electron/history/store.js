@@ -16,6 +16,8 @@ function loadApiHistory() {
   return require(path.join(__dirname, 'api-history.json'));
 }
 
+// 把快照 key 拆成 { container, member, kind }，例如 `BrowserWindow#setBounds`
+// -> { container: 'BrowserWindow', member: 'setBounds', kind: 'member' }。
 function parseKey(key) {
   let m = key.match(/^(.+)#constructor$/);
   if (m) return { container: m[1], member: 'constructor', kind: 'constructor' };

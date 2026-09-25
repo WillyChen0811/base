@@ -10,4 +10,5 @@
 - crypto: 密码加密/解密（Fernet 对称加密）
 - cdpnet: Chrome DevTools Protocol 网络事件的纯映射/判断函数
 - playwright_launch: 按 cfg 拼 Playwright 启动/建 context 参数
+- office: Word→PDF 转换服务（服务端 + 跨平台客户端）
 """

@@ -41,9 +41,8 @@ _STATUS_TO_ERROR = {
 class ConvertResult:
     """一次成功转换的结果。
 
-    warnings 是服务端转换过程中遇到的非致命问题（比如某个 TOC 更新失败），
-    这类失败服务端不会悄悄吞掉——收到的 PDF 状态码是 200，但目录页码之类的
-    东西可能不准，调用方该按需要提示用户或记日志，别当作"完全正常"。
+    warnings 非空时 PDF 内容可能不完全准（见 `pybase.office` 模块文档的 HTTP 协议
+    一节），调用方该按需要提示用户或记日志，别当作"完全正常"。
     """
     pdf_bytes: bytes
     page_count: int

@@ -121,10 +121,9 @@ class WordConverter(ABC):
     def convert(self, docx_path: str, pdf_path: str, update_fields: bool) -> "Tuple[int, list]":
         """把 docx_path 转成 pdf_path，返回 (页数, warnings)。
 
-        warnings 是转换过程中遇到的非致命问题（比如某个 TOC 更新失败、某段
-        StoryRange 更新域失败）——这些不该被吞掉再悄悄吐出一份"看起来正常、
-        其实目录页码是旧值"的 PDF，调用方（OfficeService）原样把它们带给
-        客户端。没有问题就返回空列表。硬失败（转换本身做不下去）仍然是抛异常。
+        warnings 是转换过程中的非致命问题，不吞掉、原样带给客户端（细节见
+        `WordCOMConverter._update_fields`）；没问题就返回空列表。硬失败（转换
+        本身做不下去）仍然是抛异常。
         """
 
     @abstractmethod
@@ -684,7 +683,7 @@ class OfficeServerConfig:
     # 建议指向内存盘盘符（部署清单见 README）；不传则退化为系统临时目录。
     work_dir: Optional[str] = None
     # 是不是内存盘由部署方显式声明（CLI: --work-dir-is-ramdisk），不推断——
-    # 见 OfficeService.__init__ 的注释。没声明就是 False，health() 如实报。
+    # 见 OfficeService.__init__ 的注释。
     work_dir_memory_backed: bool = False
     token: Optional[str] = None
     max_body_bytes: int = 100 * 1024 * 1024
@@ -793,8 +792,7 @@ class OfficeRequestHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(task.result or b"")))
         self.send_header("X-Page-Count", str(task.page_count if task.page_count is not None else 0))
         if task.warnings:
-            # 转换过程中的非致命问题（TOC 更新失败等）原样带给客户端，不悄悄
-            # 吞掉——JSON 数组 + URL 编码，因为 HTTP 头只认 ASCII 且不能换行。
+            # JSON 数组 + URL 编码：HTTP 头只认 ASCII 且不能换行。
             self.send_header("X-Warnings", quote(json.dumps(task.warnings, ensure_ascii=False)))
         self.end_headers()
         self.wfile.write(task.result or b"")
@@ -843,8 +841,6 @@ def serve(config: OfficeServerConfig, converter: Optional[WordConverter] = None)
         "已启用" if config.token else "未启用",
     )
     if not service._memory_backed:
-        # 没声明 --work-dir-is-ramdisk 就一律如实警告，不管 work_dir 是不是
-        # 传了自定义路径——传了路径不代表那是内存盘，见 OfficeService 的注释。
         logger.warning("工作目录未声明为内存盘，文档会短暂落到真实磁盘")
     try:
         httpd.serve_forever()
@@ -867,9 +863,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--work-dir-is-ramdisk", action="store_true",
-        help="显式声明 --work-dir 指向的是内存盘（如 ImDisk）。不加这个开关，"
-             "/health 的 memory_backed 一律如实报 False，即使传了 --work-dir——"
-             "Windows 上没有可靠的通用办法自动判断一个盘符是不是内存盘，只能靠部署方声明",
+        help="显式声明 --work-dir 指向的是内存盘（如 ImDisk）。不加则 /health 的"
+             "memory_backed 一律如实报 False，即使传了 --work-dir（原因见 OfficeService）",
     )
     p.add_argument("--token", default=None, help="共享 token；不传则 /convert 不做鉴权")
     p.add_argument("--max-body-mb", type=int, default=100, help="请求体大小上限（MB），默认 100")

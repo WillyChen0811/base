@@ -9,9 +9,9 @@ Word 自己排一遍才知道。这个包用一台专职的 Windows + Office 虚
 ## 部署形态
 一台 KVM 虚拟机：Windows 10 + Office 2019 专业版，自动登录桌面会话，
 `pybase.office.server` 由"登录时运行"的计划任务拉起——**不要做成 Windows 服务**，
-Word COM 自动化在 Session 0 / 服务账号下会挂死，这是 Office 自动化本身的限制，
-不是本包的设计选择。调用方运行在 macOS/Linux/Windows 的 backend 或客户端，走
-局域网 HTTP 调用这台机器。部署清单见 README「office 模块」一节。
+Word COM 自动化在 Session 0 / 服务账号下会挂死（原因见 `server` 模块文档字符串）。
+调用方运行在 macOS/Linux/Windows 的 backend 或客户端，走局域网 HTTP 调用这台机器。
+部署清单见 README「office 模块」一节。
 
 ## HTTP 协议
 
@@ -59,8 +59,7 @@ Word COM 自动化在 Session 0 / 服务账号下会挂死，这是 Office 自�
 
 见 `pybase.office.errors`：`ConnectionUnavailableError` / `ServiceBusyError` /
 `ConversionTimeoutError` / `ConversionFailedError` / `AuthenticationError` /
-`PayloadTooLargeError` / `OfficeProtocolError`。只对"连不上"和"忙(503)"做有限
-次退避重试，其余不重试——那些是确定性错误，重试结果不会变。
+`PayloadTooLargeError` / `OfficeProtocolError`。重试策略见 `WordPdfClient`。
 
 ## 用法
 

@@ -20,7 +20,10 @@
 - 同名同路径的实例共享同一块盘；Windows 分支会退化成落盘的临时目录
 
 ### crypto
-- 真实密钥是随机生成后存入 `key_file`；`passphrase` 不参与派生（`_generate_key` 未接入调用链）
+- 真实密钥是随机生成后存入 `key_file`；`passphrase` 不参与派生，仅为兼容签名保留
+- `key_file` 不存在才生成（原子创建，防并发覆盖）；读不了/内容无效抛 `KeyFileError`，绝不自动覆盖——
+  换不换由用户决定（先重启重试，仍不行由调用方调 `PasswordEncryption.regenerate`）
+- `fingerprint`（当前密钥 SHA-256）库不存，调用方存起来跟旧值比对，查"密钥是不是被换过"
 
 ### docx/oxml
 - 新建 `rPr`/`pPr`/`tcPr` 等子元素必须用 `ensure_child` 按 schema 顺序插入，禁止直接 `append`，

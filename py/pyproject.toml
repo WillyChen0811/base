@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "pybase"
 version = "0.1.0"
-description = "零业务依赖的基础模块：RPC 底座、内存盘、AI 客户端、docx 写作、表格读取、SMB、加密"
+description = "零业务依赖的基础模块：RPC 底座、内存盘、AI 客户端、docx 写作、表格读取、SMB、加密、Word→PDF 转换"
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}
@@ -27,6 +27,9 @@ Homepage = "https://github.com/WillyChen0811/base"
 [project.optional-dependencies]
 rpc-server = [
     "fastapi>=0.100.0",
+]
+office-server = [
+    "pywin32>=306; sys_platform == 'win32'",
 ]
 dev = [
     "pytest>=7.0.0",

@@ -126,8 +126,8 @@ class AppleSpeech:
         on_progress: "Callable[[str, float | None], None] | None" = None,
         max_cue_ms: int | None = None,
     ) -> Transcript:
-        """识别整个音频文件（AVAudioFile 能读的格式：wav/aiff/m4a/mp3/caf 等；
-        视频或 mkv/webm 先用 `pybase.media.extract_audio` 转出来）。
+        """识别整个音频文件。AVAudioFile 实测能读 wav/aiff/caf/m4a/mp3/flac/opus，
+        读不了 Matroska（webm/mkv/mka）和 ogg，这些先用 `pybase.media.extract_audio` 转出来。
 
         超时/取消沿用 `pybase.media` 的 `MediaTimeoutError`/`MediaCancelled`。
         `on_progress(stage, fraction)` 里 `stage` 是 `"installing"`（识别资源下载中）

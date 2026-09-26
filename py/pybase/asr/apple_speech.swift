@@ -94,7 +94,13 @@ func collect(_ tr: SpeechTranscriber, duration: Double? = nil) async throws {
 func runFile(_ identifier: String, _ path: String) async throws {
     let tr = try await transcriber(identifier, reporting: [])
     let analyzer = SpeechAnalyzer(modules: [tr])
-    let file = try AVAudioFile(forReading: URL(fileURLWithPath: path))
+    let file: AVAudioFile
+    do {
+        file = try AVAudioFile(forReading: URL(fileURLWithPath: path))
+    } catch {
+        // AVAudioFile 读不了 Matroska（webm/mkv）、ogg 等，系统报错只有一串错误码
+        fail("读不了音频文件（webm/mkv/ogg 等格式需先转成 wav/m4a）：\(path)")
+    }
     let duration = Double(file.length) / file.processingFormat.sampleRate
     async let results: Void = collect(tr, duration: duration)
     if let last = try await analyzer.analyzeSequence(from: file) {

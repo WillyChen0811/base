@@ -73,6 +73,14 @@
 - 测试样本不能放词典原文（出版方版权），照真实 class 结构手写假词条
 - `apple_xhtml` 只认牛津系 class；ElementTree 元素的真值看有没有子节点，判空必须 `is None`，不能用 `or` 串
 
+### asr
+- 不内置模型/locale 默认值；两个后端（Apple、mlx）接口必须保持一致，新后端照 `Stream`/`Transcript` 实现
+- Apple：SpeechAnalyzer 只有 Swift API，逻辑尽量留在 Python，Swift 辅助程序只做采集结果、按行吐 JSON；
+  改协议两边一起改。Locale 比较用 BCP 47（`Locale.identifier` 是 `zh_CN`，直接比永远不相等）
+- mlx：MLX 的 GPU stream 绑定线程，加载/识别/流式 `step` 必须在同一个线程（实例的专属线程），
+  别改成调用方线程或多线程池
+- 实时会话 with 退出只收尾不取结果，剩下的 final 留给 `results()`——别改回 `close()` 里清队列
+
 ### cdpnet / playwright_launch
 - 纯映射/判断函数，无状态、不带项目默认值；有状态的编排（事件聚合、并发控制、落库）留给调用方
 

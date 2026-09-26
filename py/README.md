@@ -1,7 +1,7 @@
 # pybase
 
 零业务依赖的 Python 基础模块集：RPC 底座、内存盘、AI 客户端、docx 写作、表格读取、SMB、
-加密、CDP/Playwright 纯函数、Word→PDF 转换、字幕与音视频。
+加密、CDP/Playwright 纯函数、Word→PDF 转换、字幕与音视频、语音识别。
 
 所有项目相关的默认值（密钥文件路径、内存盘名字等）都由调用方传入，本库只提供机制。
 
@@ -23,6 +23,9 @@
 - `pybase.media`：ffmpeg/ffprobe/ffsubsync 子进程封装：探测、按句截音频（含 padding）/截图、字幕自动对齐、
   网页 `<video>` 可播性判断（`playback_plan`，支持集合由调用方给）与转封装（`remux`）。
   外部工具需自行安装，路径可由调用方传入
+- `pybase.asr`：语音识别（中文/英文 × 整段/实时），两个后端同一套接口：`AppleSpeech`（macOS 26+ 系统自带
+  SpeechAnalyzer，零 pip 依赖，需 swiftc）与 `MlxAudio`（mlx-audio，Apple Silicon，`pip install "pybase[asr-mlx]"`）。
+  **不内置任何模型**，模型和 locale 由调用方给
 - `pybase.dictionary`：词典查询统一模型（`Entry`，必带出处与授权说明）+ 数据源适配器。**不内置任何词典数据**；
   目前有 `macos`（系统『词典』App 里已下载的词典，ctypes 直调，零依赖，仅限本机个人使用）
 
@@ -41,6 +44,29 @@ result.pdf_bytes    # PDF 字节
 result.page_count   # Word 实际排版后的页数
 ```
 
+## asr 模块：语音识别
+
+整段音频出 `Transcript`（`cues` 可直接当字幕用，`engine` 可填进字幕来源的 `TrackMetadata.engine`）；
+实时识别喂 s16le 单声道 PCM，取 `Hypothesis`（`text` 是当前这一段的完整文本，`final` 之后开始新的一段）。
+
+```python
+from pybase.asr import AppleSpeech, MlxAudio
+
+engine = AppleSpeech("zh-CN")                       # 或 MlxAudio("<HF 仓库名或本地目录>")
+transcript = engine.transcribe("talk.wav")          # 视频/mkv 先用 media.extract_audio 转出音频
+
+with engine.open_stream() as stream:                # 采样率见 stream.sample_rate
+    stream.feed(pcm_bytes)
+    for hyp in stream.results(): ...
+remaining = stream.results()                        # with 退出后收尾出的结果
+```
+
+| | `AppleSpeech` | `MlxAudio` |
+|---|---|---|
+| 语种 | 构造时给 locale（`zh-CN`/`en-US`…），不自动识别；`supported_locales()` 查可用的 | 由模型决定，参数经 `generate_kwargs` 透传 |
+| 整段时间戳 | 句级（按逐字时间切） | 由模型决定：Parakeet 句级，Whisper 段级，Qwen3-ASR 只有分块级 |
+| 实时 | 分段出临时/最终结果 | 仅带 `create_streaming_session` 的模型（Voxtral Realtime 等）；整个会话一段，结束时出 final |
+
 ## 安装
 
 `pip install pybase` 本身不拉任何第三方依赖——只装用得到的模块对应的 extra：
@@ -57,7 +83,7 @@ pip install -e "./py[all]"
 ```
 
 模块与 extra 对照表（没列出的模块——`rpc`（stdio/HTTP 部分）、`ramdisk`、`aiclient`、
-`cdpnet`、`playwright_launch`、`media`、`dictionary`——零第三方依赖，直接 `import` 即可）：
+`cdpnet`、`playwright_launch`、`media`、`dictionary`、`asr`（Apple 后端）——零第三方依赖，直接 `import` 即可）：
 
 | extra | 第三方依赖 | 覆盖模块 |
 |---|---|---|
@@ -69,6 +95,7 @@ pip install -e "./py[all]"
 | `office-word` | pywin32（仅 Windows） | `pybase.office.word` 的 Word COM 驱动 |
 | `rpc-server` | fastapi | `pybase.rpc.create_fastapi_rpc_router` |
 | `subtitle` | pysubs2 | `pybase.subtitle` |
+| `asr-mlx` | mlx-audio（仅 Apple Silicon） | `pybase.asr.MlxAudio` |
 | `all` | 以上全部 | —— |
 
 ## 测试

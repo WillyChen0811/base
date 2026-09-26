@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "pybase"
 version = "0.1.0"
-description = "零业务依赖的基础模块：RPC 底座、内存盘、AI 客户端、docx 写作、表格读取、SMB、加密、Word→PDF 转换、字幕与音视频、词典查询"
+description = "零业务依赖的基础模块：RPC 底座、内存盘、AI 客户端、docx 写作、表格读取、SMB、加密、Word→PDF 转换、字幕与音视频、语音识别、词典查询"
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}
@@ -46,9 +46,13 @@ rpc-server = [
 subtitle = [
     "pysubs2>=1.7.0",
 ]
+# asr 的 Apple 后端零 pip 依赖（系统自带 SpeechAnalyzer），只有 mlx 后端要装
+asr-mlx = [
+    "mlx-audio>=0.5.6; sys_platform == 'darwin' and platform_machine == 'arm64'",
+]
 # 引用自身 extras（pip >= 21.2），新增 extra 时只要在这里加名字，不会漏抄依赖
 all = [
-    "pybase[docx,sheets,smb,crypto,office,office-word,rpc-server,subtitle]",
+    "pybase[docx,sheets,smb,crypto,office,office-word,rpc-server,subtitle,asr-mlx]",
 ]
 dev = [
     "pytest>=7.0.0",
@@ -57,6 +61,9 @@ dev = [
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["pybase*"]
+
+[tool.setuptools.package-data]
+"pybase.asr" = ["*.swift"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -34,6 +34,39 @@ _CUE_TIMESTAMP_RE = re.compile(r"<(?:\d+:)?\d{2}:\d{2}\.\d{3}>")
 
 _TAG_RE = re.compile(r"</?[^<>\n]{0,300}>")
 
+# pysubs2 对畸形/越界的时间戳很宽松（分钟/秒 >= 60 也照单全收，按字面值硬算），
+# 会把畸形字幕悄悄接受、播出来时间全错还查不出来，所以在交给 pysubs2 之前自己
+# 按各自的格式规范先校验一遍。SRT 固定 `HH:MM:SS,mmm`（逗号、必须有时分）；
+# VTT 允许省略小时的 `MM:SS.mmm` 短形式（句点），但不管哪种形式，分钟/秒都必须
+# < 60、毫秒必须是三位——这条本次只管 SRT/VTT，ASS 等其他格式不在范围内。
+_SRT_TIMING_RE = re.compile(
+    r"^(?P<start>\d+:\d{2}:\d{2},\d{3})\s*-->\s*(?P<end>\d+:\d{2}:\d{2},\d{3})(?:\s+\S.*)?$"
+)
+_VTT_TIMING_RE = re.compile(
+    r"^(?P<start>(?:\d+:)?\d{2}:\d{2}\.\d{3})\s*-->\s*(?P<end>(?:\d+:)?\d{2}:\d{2}\.\d{3})(?:\s+\S.*)?$"
+)
+_TIME_COMPONENTS_RE = re.compile(r"^(?:\d+:)?(?P<minutes>\d{2}):(?P<seconds>\d{2})[.,]\d{3}$")
+
+
+def _check_timing_line(line: str, line_no: int, fmt: str) -> None:
+    stripped = line.strip()
+    regex = _SRT_TIMING_RE if fmt == "srt" else _VTT_TIMING_RE
+    match = regex.match(stripped)
+    if not match:
+        raise ValueError(f"Invalid subtitle timestamp at line {line_no}: {line!r}")
+    for key in ("start", "end"):
+        components = _TIME_COMPONENTS_RE.match(match.group(key))
+        if int(components["minutes"]) >= 60 or int(components["seconds"]) >= 60:
+            raise ValueError(f"Invalid subtitle timestamp at line {line_no}: {line!r}")
+
+
+def _validate_timestamps(text: str, fmt: str) -> None:
+    """扫描所有 `-->` 时间行，逐行按 `fmt`（'srt'/'vtt'）的格式规范校验。"""
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+    for line_no, line in enumerate(normalized.split("\n"), start=1):
+        if "-->" in line:
+            _check_timing_line(line, line_no, fmt)
+
 
 def _plain_text(raw: str) -> str:
     """把 pysubs2 的 `plaintext` 进一步清成纯台词：去 VTT 内联标签、解 HTML 实体。"""
@@ -86,17 +119,36 @@ def _resolve_text(path_or_text: str | Path, encoding: str | None) -> tuple[str, 
     return p.read_text(encoding=encoding or "utf-8-sig"), fmt
 
 
-def load(path_or_text: str | Path, format: str | None = None, encoding: str | None = None) -> list[Cue]:
+def load(
+    path_or_text: str | Path,
+    format: str | None = None,
+    encoding: str | None = None,
+    *,
+    strict: bool = True,
+) -> list[Cue]:
     """加载字幕，返回清洗后的 `Cue` 列表（按 start 排序、去空、去重复条目）。
 
     `path_or_text` 可以是文件路径也可以是字幕文本本身（判定规则见 `_resolve_text`）。
     `format` 显式指定时优先于路径扩展名/内容探测；两者都没有则交给 pysubs2 按内容
     自动识别。
+
+    `strict`（默认 `True`）控制是否在交给 pysubs2 之前校验 SRT/VTT 的时间戳格式
+    （分钟/秒必须 < 60、毫秒必须三位、分隔符必须匹配各自格式）。pysubs2 本身对
+    畸形/越界时间戳很宽松，会按字面值硬算，静默接受一条"分钟 99"这样的时间戳，
+    播放时全部错位、且无从觉察，所以默认严格拒绝；确实需要兼容这类文件（比如
+    只是想看看内容）时可传 `strict=False` 回退到 pysubs2 原本的宽松行为。只对
+    识别为 SRT/VTT 的输入生效，ASS 等其他格式不做这层校验。
     """
     pysubs2 = _pysubs2()
     text, guessed_format = _resolve_text(path_or_text, encoding)
     fmt = format or guessed_format
-    if fmt == "vtt" or (fmt is None and text.lstrip("\ufeff").startswith("WEBVTT")):
+    is_vtt = fmt == "vtt" or (fmt is None and text.lstrip("\ufeff").startswith("WEBVTT"))
+    if strict:
+        if is_vtt:
+            _validate_timestamps(text, "vtt")
+        elif fmt == "srt":
+            _validate_timestamps(text, "srt")
+    if is_vtt:
         text = _CUE_TIMESTAMP_RE.sub("", text)
     subs = pysubs2.SSAFile.from_string(text, format_=fmt)
     cues = [

@@ -143,6 +143,78 @@ def test_load_empty_text_returns_empty_list():
 
 
 # ---------------------------------------------------------------------------
+# io_: strict timestamp validation
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        # 缺时分：SRT 必须有 HH:MM:SS
+        "1\n00:01,000 --> 00:02,000\nx\n",
+        # 用了点号而不是逗号
+        "1\n00:00:01.000 --> 00:00:02.000\nx\n",
+        # 秒 >= 60
+        "1\n00:00:99,000 --> 00:01:40,000\nx\n",
+        # 分钟 >= 60
+        "1\n00:99:00,000 --> 01:40:00,000\nx\n",
+        # 毫秒不是三位
+        "1\n00:00:01,00 --> 00:00:02,000\nx\n",
+    ],
+)
+def test_load_srt_rejects_malformed_or_out_of_range_timestamps(content):
+    with pytest.raises(ValueError, match="Invalid subtitle timestamp"):
+        load(content, format="srt")
+
+
+def test_load_vtt_accepts_minute_form_but_rejects_out_of_range():
+    good = "WEBVTT\n\n00:01.000 --> 00:02.000\nx\n"
+    assert [c.text for c in load(good, format="vtt")] == ["x"]
+
+    bad = "WEBVTT\n\n00:99.000 --> 01:40.000\nx\n"
+    with pytest.raises(ValueError, match="Invalid subtitle timestamp"):
+        load(bad, format="vtt")
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        # 用了逗号而不是点号
+        "WEBVTT\n\n00:00:01,000 --> 00:00:02,000\nx\n",
+        # 秒 >= 60
+        "WEBVTT\n\n00:00:99.000 --> 00:01:40.000\nx\n",
+        # 毫秒不是三位
+        "WEBVTT\n\n00:00:01.00 --> 00:00:02.000\nx\n",
+    ],
+)
+def test_load_vtt_rejects_malformed_or_out_of_range_timestamps(content):
+    with pytest.raises(ValueError, match="Invalid subtitle timestamp"):
+        load(content, format="vtt")
+
+
+def test_load_strict_false_falls_back_to_lenient_pysubs2_behaviour():
+    # 严格模式下拒绝，但 strict=False 时按 pysubs2 原本的宽松规则放行（不校验范围）
+    bad = "1\n00:99:00,000 --> 01:40:00,000\nx\n"
+    cues = load(bad, format="srt", strict=False)
+    assert len(cues) == 1
+
+
+def test_load_vtt_cue_settings_after_timestamp_still_pass_strict_validation():
+    """VTT 时间行后面允许跟 cue settings（如 align/position），不能被当成格式错误。"""
+    content = (
+        "WEBVTT\n\n"
+        "00:00:00.000 --> 00:00:02.390 align:start position:0%\nhello\n"
+    )
+    assert [c.text for c in load(content, format="vtt")] == ["hello"]
+
+
+def test_load_srt_hour_over_99_is_still_accepted():
+    # 超长视频小时数可以超过两位，不该被拒绝
+    content = "1\n100:00:00,000 --> 100:00:01,000\nx\n"
+    assert [c.text for c in load(content, format="srt")] == ["x"]
+
+
+# ---------------------------------------------------------------------------
 # timing: shift / reset_timing
 # ---------------------------------------------------------------------------
 

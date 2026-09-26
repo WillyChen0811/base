@@ -1,7 +1,35 @@
 'use strict';
 
-const { EventEmitter } = require('node:events');
 const { findActiveCueIndex, nextAction } = require('./playback-plan');
+
+/**
+ * 最小事件分发。**不用 node:events**：这个类要跑在浏览器/Electron 渲染进程里，
+ * 那里没有 Node 模块（nodeIntegration 默认关）。
+ */
+class Emitter {
+  constructor() { this._listeners = new Map(); }
+
+  on(type, fn) {
+    if (!this._listeners.has(type)) this._listeners.set(type, new Set());
+    this._listeners.get(type).add(fn);
+    return this;
+  }
+
+  off(type, fn) {
+    const set = this._listeners.get(type);
+    if (set) set.delete(fn);
+    return this;
+  }
+
+  emit(type, payload) {
+    const set = this._listeners.get(type);
+    if (!set) return false;
+    for (const fn of [...set]) fn(payload);
+    return true;
+  }
+
+  removeAllListeners() { this._listeners.clear(); return this; }
+}
 
 /**
  * 包一个注入进来的 video 元素，按 playback-plan 的判断去驱动它。
@@ -30,7 +58,7 @@ const { findActiveCueIndex, nextAction } = require('./playback-plan');
  * `seeked` 事件把内部基准点拉回来；不然下一次判断"是否越过句末"会拿旧位置
  * 当作上一刻，逻辑就乱了。
  */
-class VideoController extends EventEmitter {
+class VideoController extends Emitter {
   constructor(video, options = {}) {
     super();
     if (!video || typeof video.play !== 'function' || typeof video.pause !== 'function'

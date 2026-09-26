@@ -11,4 +11,6 @@
 - cdpnet: Chrome DevTools Protocol 网络事件的纯映射/判断函数
 - playwright_launch: 按 cfg 拼 Playwright 启动/建 context 参数
 - office: Word→PDF 基础能力（Word COM 驱动 + 转换服务客户端）
+- subtitle: 字幕读写、YouTube 滚动字幕折叠、时间校准、时间索引、给大模型的时间戳文本
+- media: ffmpeg/ffprobe/ffsubsync 子进程封装（探测、按句截音频/截图、字幕自动对齐）
 """

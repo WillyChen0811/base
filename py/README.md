@@ -1,7 +1,7 @@
 # pybase
 
 零业务依赖的 Python 基础模块集：RPC 底座、内存盘、AI 客户端、docx 写作、表格读取、SMB、
-加密、CDP/Playwright 纯函数、Word→PDF 转换。
+加密、CDP/Playwright 纯函数、Word→PDF 转换、字幕与音视频。
 
 所有项目相关的默认值（密钥文件路径、内存盘名字等）都由调用方传入，本库只提供机制。
 
@@ -17,6 +17,10 @@
 - `pybase.cdpnet`：Chrome DevTools Protocol 网络事件的纯映射/判断函数
 - `pybase.playwright_launch`：按 cfg 拼 Playwright 启动/建 context 参数的纯映射
 - `pybase.office`：Word→PDF 基础能力：Word COM 驱动（Windows + Office）+ 转换服务客户端
+- `pybase.subtitle`：字幕读写（pysubs2，`pip install "pybase[subtitle]"`）、YouTube 自动字幕滚动折叠、
+  时间校准、时间索引（`CueIndex`）、给大模型的 `[MM:SS]` 文本与分块。时间单位一律整数毫秒
+- `pybase.media`：ffmpeg/ffprobe/ffsubsync 子进程封装：探测、按句截音频（含 padding）/截图、字幕自动对齐。
+  外部工具需自行安装，路径可由调用方传入
 
 ## office 模块：Word→PDF
 

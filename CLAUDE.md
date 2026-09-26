@@ -43,6 +43,17 @@
 - 非致命 warnings 必须原样返回给调用方，不能吞
 - 客户端只重试"连不上"和 503，其余错误不重试
 
+### subtitle
+- 借鉴外部方案先查协议：asbplayer（AGPL）、mpvacious（GPL）只能借语义，不能抄/改写代码
+- VTT 交给 pysubs2 前必须先剥逐词时间戳 `<00:00:01.000>`，否则整行被丢（YouTube 自动字幕满篇都是）
+- 滚动字幕相邻 cue 首尾相接不重叠，不能拿"时间重叠"当判据；`looks_rolling` 判否必须原样返回
+- `shift` 严格按给定偏移、允许负时间，负值只在写文件时丢弃/截断，不要改成"收窄偏移"
+
+### media
+- 子进程必须独立进程组、整组杀：ffsubsync 自己会起 ffmpeg，只杀父进程留孤儿
+- 临时产物名保留扩展名（`x.part.mp3`），ffmpeg/ffsubsync 按扩展名猜格式
+- 解析 ffsubsync 输出只认源码里的原文 `offset seconds:`，别用宽松正则（会吃到质量告警里的数）
+
 ### cdpnet / playwright_launch
 - 纯映射/判断函数，无状态、不带项目默认值；有状态的编排（事件聚合、并发控制、落库）留给调用方
 

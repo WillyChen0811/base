@@ -21,6 +21,8 @@
   时间校准、时间索引（`CueIndex`）、给大模型的 `[MM:SS]` 文本与分块。时间单位一律整数毫秒
 - `pybase.media`：ffmpeg/ffprobe/ffsubsync 子进程封装：探测、按句截音频（含 padding）/截图、字幕自动对齐。
   外部工具需自行安装，路径可由调用方传入
+- `pybase.dictionary`：词典查询统一模型（`Entry`，必带出处与授权说明）+ 数据源适配器。**不内置任何词典数据**；
+  目前有 `macos`（系统『词典』App 里已下载的词典，ctypes 直调，零依赖，仅限本机个人使用）
 
 ## office 模块：Word→PDF
 

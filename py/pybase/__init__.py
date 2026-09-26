@@ -13,4 +13,5 @@
 - office: Word→PDF 基础能力（Word COM 驱动 + 转换服务客户端）
 - subtitle: 字幕读写、YouTube 滚动字幕折叠、时间校准、时间索引、给大模型的时间戳文本
 - media: ffmpeg/ffprobe/ffsubsync 子进程封装（探测、按句截音频/截图、字幕自动对齐）
+- dictionary: 词典查询统一模型 + 数据源适配器（macOS 系统词典），不内置任何词典数据
 """

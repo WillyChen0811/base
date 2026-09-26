@@ -62,6 +62,8 @@
 - macOS：除 `DCSCopyTextDefinition` 外全是私有符号，必须特性探测；不指定词典的 `lookup` 不能碰私有符号
 - 列表里的词典不一定能查：`DCSDictionaryGetURL` 为空即未下载
 - 从 CFSet 里取出的 DCSDictionaryRef 不要带出 `_dictionary` 的 with 块；`DCSRecordCopyData` 必须传 version
+- 测试样本不能放词典原文（出版方版权），照真实 class 结构手写假词条
+- `apple_xhtml` 只认牛津系 class；ElementTree 元素的真值看有没有子节点，判空必须 `is None`，不能用 `or` 串
 
 ### cdpnet / playwright_launch
 - 纯映射/判断函数，无状态、不带项目默认值；有状态的编排（事件聚合、并发控制、落库）留给调用方

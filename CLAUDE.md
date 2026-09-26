@@ -56,6 +56,7 @@
   顺序 load → collapse_rolling → apply_corrections → shift，修正里的时间是平移前的时间轴
 - 变换 Cue 用 `dataclasses.replace`，别手写构造——漏字段会悄悄丢掉原文/修正标记
 - `load` 默认 `strict=True`：SRT/VTT 时间行交给 pysubs2 前先按规范校验（pysubs2 对越界时间戳照单全收）
+- `provenance.Meta.offset_ms`（自动对齐/手动整体偏移）只存数、不编排；旧 `.meta.json` 没这字段读成 0
 
 ### media
 - 子进程必须独立进程组、整组杀：ffsubsync 自己会起 ffmpeg，只杀父进程留孤儿

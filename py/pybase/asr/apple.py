@@ -15,8 +15,9 @@ import sys
 import tempfile
 import threading
 from pathlib import Path
+from typing import Callable
 
-from ..media._proc import discard, resolve_tool, run
+from ..media._proc import discard, resolve_tool, run, run_streaming
 from ._stream import Stream
 from ._text import clean, segment_cues
 from .models import AsrError, Hypothesis, Transcript, Word
@@ -122,24 +123,45 @@ class AppleSpeech:
         *,
         timeout: float = 3600,
         cancel_event: "threading.Event | None" = None,
+        on_progress: "Callable[[str, float | None], None] | None" = None,
+        max_cue_ms: int | None = None,
     ) -> Transcript:
         """识别整个音频文件（AVAudioFile 能读的格式：wav/aiff/m4a/mp3/caf 等；
         视频或 mkv/webm 先用 `pybase.media.extract_audio` 转出来）。
 
         超时/取消沿用 `pybase.media` 的 `MediaTimeoutError`/`MediaCancelled`。
+        `on_progress(stage, fraction)` 里 `stage` 是 `"installing"`（识别资源下载中）
+        或 `"transcribing"`，`fraction` 是 0..1 或 None（算不出时）；不给就不回调，
+        识别照常跑。`max_cue_ms` 见 `segment_cues`，不给就不限制单条字幕时长。
         """
-        result = run(
+        events: list[dict] = []
+
+        def handle(line: str) -> None:
+            line = line.strip()
+            if not line:
+                return
+            event = json.loads(line)
+            if "error" in event:
+                raise AsrError(event["error"])
+            progress = event.get("progress")
+            if progress is not None:
+                if on_progress is not None:
+                    on_progress(progress.get("stage", ""), progress.get("fraction"))
+                return
+            events.append(event)
+
+        result = run_streaming(
             [self._helper_path(), "file", self.locale, str(path)],
+            handle,
             timeout=timeout,
             cancel_event=cancel_event,
         )
-        events = _events(result.stdout)
         if result.returncode != 0:
             raise AsrError(f"识别失败：{(result.stderr or '').strip()[-2000:] or result.returncode}")
         finals = [e for e in events if "text" in e and e.get("final")]
         cues = []
         for e in finals:
-            cues += segment_cues(e["text"], e.get("start"), e.get("end"), _words(e))
+            cues += segment_cues(e["text"], e.get("start"), e.get("end"), _words(e), max_cue_ms)
         # 英文各段自带前导空格、中文没有，原样拼接即可
         text = clean("".join(e["text"] for e in finals))
         return Transcript(text=text, cues=tuple(cues), engine=self.name, language=self.locale)

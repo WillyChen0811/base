@@ -23,7 +23,7 @@ from pybase.media import (
     probe,
     snapshot,
 )
-from pybase.media._proc import run_to_file, tmp_path_for
+from pybase.media._proc import run_streaming, run_to_file, tmp_path_for
 
 FFMPEG = shutil.which("ffmpeg")
 FFPROBE = shutil.which("ffprobe")
@@ -249,6 +249,52 @@ def test_timeout_kills_grandchild_processes(tmp_path):
         time.sleep(0.1)
     os.kill(child_pid, 9)
     pytest.fail("孙进程在父进程被杀后仍然存活")
+
+
+def test_run_streaming_feeds_lines_as_they_come():
+    lines = []
+    result = run_streaming(
+        [sys.executable, "-c", "print('a'); print('b'); print('c')"],
+        lines.append,
+        timeout=5,
+    )
+    assert [l.strip() for l in lines] == ["a", "b", "c"]
+    assert result.returncode == 0
+
+
+def test_run_streaming_timeout_kills_process(tmp_path):
+    script = _sleepy_script(tmp_path)
+    marker = tmp_path / "marker.txt"
+    out = tmp_path / "out.bin"  # _sleepy_script 的第一个参数只是落盘目标，这里不看它
+
+    with pytest.raises(MediaTimeoutError):
+        run_streaming(
+            [sys.executable, str(script), str(out), str(marker), "2.0"], lambda line: None, timeout=0.3,
+        )
+    assert not marker.exists()  # 没等到 sleep 结束就被杀，marker 没写出来
+
+
+def test_run_streaming_cancel_kills_process(tmp_path):
+    script = _sleepy_script(tmp_path)
+    marker = tmp_path / "marker.txt"
+    out = tmp_path / "out.bin"
+    cancel_event = threading.Event()
+    threading.Timer(0.2, cancel_event.set).start()
+
+    with pytest.raises(MediaCancelled):
+        run_streaming(
+            [sys.executable, str(script), str(out), str(marker), "2.0"], lambda line: None,
+            timeout=10, cancel_event=cancel_event,
+        )
+    assert not marker.exists()
+
+
+def test_run_streaming_propagates_on_line_error():
+    def boom(line: str) -> None:
+        raise ValueError(f"bad line: {line.strip()}")
+
+    with pytest.raises(ValueError, match="bad line: hi"):
+        run_streaming([sys.executable, "-c", "print('hi')"], boom, timeout=5)
 
 
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="需要 ffmpeg")

@@ -53,7 +53,12 @@ result.page_count   # Word 实际排版后的页数
 from pybase.asr import AppleSpeech, MlxAudio
 
 engine = AppleSpeech("zh-CN")                       # 或 MlxAudio("<HF 仓库名或本地目录>")
-transcript = engine.transcribe("talk.wav")          # 视频/mkv 先用 media.extract_audio 转出音频
+transcript = engine.transcribe(                     # 视频/mkv 先用 media.extract_audio 转出音频
+    "talk.wav", on_progress=lambda stage, frac: ..., max_cue_ms=6000,
+)                                                    # on_progress 只有 AppleSpeech 有；
+                                                      # stage 是 "installing"（下载识别资源）或
+                                                      # "transcribing"，frac 是 0..1 或 None；
+                                                      # max_cue_ms 两家都支持，不给就不限制单条字幕时长
 
 with engine.open_stream() as stream:                # 采样率见 stream.sample_rate
     stream.feed(pcm_bytes)

@@ -26,12 +26,12 @@ def _load(model: str) -> Any:
     return load(model)
 
 
-def _cues(output: Any) -> list:
+def _cues(output: Any, max_cue_ms: int | None) -> list:
     sentences = getattr(output, "sentences", None)
     if sentences is not None:  # Parakeet 等 NeMo 系：AlignedResult
         cues = []
         for s in sentences:
-            cues += segment_cues(s.text, ms(s.start), ms(s.end))
+            cues += segment_cues(s.text, ms(s.start), ms(s.end), max_duration_ms=max_cue_ms)
         return cues
     cues = []
     for seg in getattr(output, "segments", None) or ():
@@ -39,7 +39,9 @@ def _cues(output: Any) -> list:
             Word(w.get("word", w.get("text", "")), ms(w.get("start")), ms(w.get("end")))
             for w in seg.get("words") or ()
         )
-        cues += segment_cues(seg.get("text", ""), ms(seg.get("start")), ms(seg.get("end")), words)
+        cues += segment_cues(
+            seg.get("text", ""), ms(seg.get("start")), ms(seg.get("end")), words, max_cue_ms
+        )
     return cues
 
 
@@ -84,12 +86,15 @@ class MlxAudio:
     def _call(self, fn):
         return self._executor.submit(fn).result()
 
-    def transcribe(self, path: str | os.PathLike) -> Transcript:
-        """识别整个音频文件。不支持中途取消（mlx-audio 的 generate 是一次阻塞调用）。"""
+    def transcribe(self, path: str | os.PathLike, *, max_cue_ms: int | None = None) -> Transcript:
+        """识别整个音频文件。不支持中途取消（mlx-audio 的 generate 是一次阻塞调用）。
+
+        `max_cue_ms` 见 `segment_cues`，不给就不限制单条字幕时长。
+        """
         output = self._call(lambda: self._model().generate(str(path), **self.generate_kwargs))
         return Transcript(
             text=clean(output.text or ""),
-            cues=tuple(_cues(output)),
+            cues=tuple(_cues(output, max_cue_ms)),
             engine=self.name,
             language=_language(output),
         )

@@ -284,10 +284,17 @@ def export(
 
 @dataclass(frozen=True)
 class Meta:
-    """旁车文件的内容：轨道元数据 + 修正列表 + schema 版本号。"""
+    """旁车文件的内容：轨道元数据 + 修正列表 + 整体偏移 + schema 版本号。
+
+    `offset_ms` 是自动对齐（如 `pybase.media.sync_subtitles`）或用户手动调整得到的
+    整体偏移，生效顺序仍是 load → collapse_rolling → apply_corrections → shift(offset_ms)：
+    修正锚点用平移前的时间轴，所以对齐结果不会让已有修正失效。这里只存这个数，
+    什么时候算、怎么应用是调用方的事。
+    """
 
     track: TrackMetadata = field(default_factory=TrackMetadata)
     corrections: tuple[Correction, ...] = ()
+    offset_ms: int = 0
     schema_version: int = _SCHEMA_VERSION
 
 
@@ -363,6 +370,7 @@ def _meta_to_dict(m: Meta) -> dict:
         "schema_version": m.schema_version,
         "track": _track_to_dict(m.track),
         "corrections": [_correction_to_dict(c) for c in m.corrections],
+        "offset_ms": m.offset_ms,
     }
 
 
@@ -370,6 +378,7 @@ def _meta_from_dict(d: dict) -> Meta:
     return Meta(
         track=_track_from_dict(d.get("track", {})),
         corrections=tuple(_correction_from_dict(c) for c in d.get("corrections", [])),
+        offset_ms=d.get("offset_ms", 0),  # 旧文件没这个字段，读成 0（没偏移）
         schema_version=d.get("schema_version", _SCHEMA_VERSION),
     )
 

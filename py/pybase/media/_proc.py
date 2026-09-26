@@ -96,7 +96,7 @@ _GROUP_KWARGS = (
 )
 
 
-def _kill(process: subprocess.Popen) -> None:
+def _kill(process: subprocess.Popen, *, drain: bool = True) -> None:
     try:
         if os.name == "nt":
             # Windows 没有进程组信号，taskkill /T 连子进程树一起杀
@@ -108,10 +108,80 @@ def _kill(process: subprocess.Popen) -> None:
             os.killpg(process.pid, signal.SIGKILL)
     except OSError:
         pass
-    try:
-        process.communicate(timeout=5)
-    except Exception:
-        pass
+    if drain:
+        # 调用方自己在读 stdout/stderr（run_streaming）时不能再用 communicate 抢读，
+        # 否则两边线程同时读同一个管道对象，行为未定义
+        try:
+            process.communicate(timeout=5)
+        except Exception:
+            pass
+
+
+def run_streaming(
+    cmd: Sequence[str],
+    on_line: Callable[[str], None],
+    *,
+    timeout: float,
+    cancel_event: "threading.Event | None" = None,
+    poll_interval: float = 0.2,
+) -> subprocess.CompletedProcess:
+    """跟 `run()` 语义一致（超时/取消都整组杀掉），但边跑边把 stdout 逐行喂给
+    `on_line`，用于需要实时进度的场景——`run()` 要等进程退出才能拿到输出。
+
+    stdout 在独立线程里读，主线程只按 `poll_interval` 轮询超时/取消，命中就杀掉
+    子进程（会让 stdout 读到 EOF，读线程随之结束）；stderr 也要开线程持续读走，
+    否则写满会堵住子进程。`on_line` 里抛的异常会在 stdout 线程读完后原样重新抛出。
+    """
+    process = subprocess.Popen(
+        list(cmd),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        **_GROUP_KWARGS,
+    )
+    stderr_chunks: list[str] = []
+    line_errors: list[BaseException] = []
+
+    def read_stdout() -> None:
+        try:
+            for line in process.stdout:
+                on_line(line)
+        except BaseException as exc:  # noqa: BLE001 - 转到主线程重新抛出
+            line_errors.append(exc)
+
+    def read_stderr() -> None:
+        stderr_chunks.append(process.stderr.read() or "")
+
+    out_thread = threading.Thread(target=read_stdout, daemon=True)
+    err_thread = threading.Thread(target=read_stderr, daemon=True)
+    out_thread.start()
+    err_thread.start()
+
+    started = time.monotonic()
+    killed: MediaError | None = None
+    while out_thread.is_alive():
+        out_thread.join(poll_interval)
+        if not out_thread.is_alive():
+            break
+        if cancel_event is not None and cancel_event.is_set():
+            killed = MediaCancelled(f"任务已取消：{cmd[0]}")
+            _kill(process, drain=False)
+            break
+        if time.monotonic() - started > timeout:
+            killed = MediaTimeoutError(f"命令超时（{timeout}s）：{cmd[0]}")
+            _kill(process, drain=False)
+            break
+
+    out_thread.join()
+    returncode = process.wait()
+    err_thread.join()
+    if killed is not None:
+        raise killed
+    if line_errors:
+        raise line_errors[0]
+    return subprocess.CompletedProcess(list(cmd), returncode, "", "".join(stderr_chunks))
 
 
 def discard(tmp: str | os.PathLike) -> None:

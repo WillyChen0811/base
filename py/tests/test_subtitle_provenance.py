@@ -266,6 +266,23 @@ def test_save_and_load_meta_roundtrip(tmp_path):
     assert srt.read_text(encoding="utf-8") == _PLAIN_SRT_SAMPLE
 
 
+def test_meta_offset_ms_roundtrips_and_defaults_to_zero(tmp_path):
+    from pybase.subtitle.provenance import Meta
+
+    srt = tmp_path / "video.srt"
+    assert load_meta(srt).offset_ms == 0  # 没有旁车文件时的默认值
+
+    save_meta(srt, Meta(offset_ms=-350))
+    assert load_meta(srt).offset_ms == -350
+
+
+def test_load_meta_missing_offset_field_defaults_to_zero(tmp_path):
+    # 旧版本写的旁车文件没有 offset_ms 字段，读回来不能报错，也不能当成有偏移
+    srt = tmp_path / "video.srt"
+    meta_path(srt).write_text('{"schema_version": 1, "track": {}, "corrections": []}', encoding="utf-8")
+    assert load_meta(srt).offset_ms == 0
+
+
 def test_save_meta_is_atomic_no_leftover_tmp_file(tmp_path):
     srt = tmp_path / "video.srt"
     save_meta(srt, load_meta(srt))

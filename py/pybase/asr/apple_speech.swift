@@ -3,14 +3,18 @@
 //
 // 协议：stdout 每行一个 JSON 对象；出错写一行 {"error": "..."} 并以非 0 退出。
 //   locales                        -> {"supported": [...], "installed": [...]}
-//   file   <locale> <path>         -> 若干 {"text", "start", "end", "final": true, "words": [...]}
+//   file   <locale> <path>         -> 若干 {"progress": {...}} 与 {"text", "start", "end", "final": true, "words": [...]}
 //   stream <locale> <sample_rate> [fast]
 //                                  -> 从 stdin 读 s16le 单声道 PCM，EOF 即结束输入；
 //                                     除 final 结果外还会有 "final": false 的临时结果。
 //                                     fast 开 fastResults：临时结果约 1s 一批（默认约一句一批），
 //                                     但临时文本更不准，final 不受影响
 // words 是逐词（中文逐字）的 {"text", "start", "end"}，按句切分交给 Python 做。
-// 时间单位整数毫秒；识别资源缺失时先下载，期间输出 {"status": "installing"}。
+// progress: {"stage": "installing"|"transcribing", "fraction": 0..1 或 null}——
+//   installing 是识别资源缺失时的下载进度（AssetInstallationRequest.progress），
+//   transcribing 是 file 模式下按已出结果时间 / 音频总时长估算的进度，stream 模式没有
+//   （不知道输入总长）。fraction 为 null 表示暂时算不出（刚开始下载还没有 fractionCompleted）。
+// 时间单位整数毫秒。
 import AVFoundation
 import Foundation
 import Speech
@@ -24,6 +28,12 @@ func emit(_ obj: [String: Any]) {
 func fail(_ message: String) -> Never {
     emit(["error": message])
     exit(1)
+}
+
+func progress(_ stage: String, _ fraction: Double?) {
+    var payload: [String: Any] = ["stage": stage]
+    if let fraction { payload["fraction"] = fraction }
+    emit(["progress": payload])
 }
 
 func ms(_ t: CMTime) -> Any {
@@ -41,16 +51,24 @@ func transcriber(_ identifier: String, reporting: Set<SpeechTranscriber.Reportin
         reportingOptions: reporting,
         attributeOptions: [.audioTimeRange]
     )
-    // 已装的也会拿到 request，只在确实没装时才提示；比较要用 BCP 47（Locale 自身的 identifier 是 zh_CN）
+    // 已装的也会拿到 request，只在确实没装时才提示下载进度；比较要用 BCP 47（Locale 自身的 identifier 是 zh_CN）
     let installed = await SpeechTranscriber.installedLocales.map { $0.identifier(.bcp47) }
-    if !installed.contains(locale.identifier(.bcp47)) { emit(["status": "installing"]) }
+    let needsInstall = !installed.contains(locale.identifier(.bcp47))
     if let request = try await AssetInventory.assetInstallationRequest(supporting: [tr]) {
+        var observation: NSKeyValueObservation?
+        if needsInstall {
+            progress("installing", nil)
+            observation = request.progress.observe(\.fractionCompleted) { p, _ in
+                progress("installing", p.fractionCompleted)
+            }
+        }
         try await request.downloadAndInstall()
+        observation?.invalidate()
     }
     return tr
 }
 
-func collect(_ tr: SpeechTranscriber) async throws {
+func collect(_ tr: SpeechTranscriber, duration: Double? = nil) async throws {
     for try await r in tr.results {
         emit([
             "text": String(r.text.characters),
@@ -66,6 +84,10 @@ func collect(_ tr: SpeechTranscriber) async throws {
                 ]
             },
         ])
+        // stream 模式不知道输入总长，不传 duration，也就不报 transcribing 进度
+        if let duration, duration > 0 {
+            progress("transcribing", r.range.end.seconds / duration)
+        }
     }
 }
 
@@ -73,7 +95,8 @@ func runFile(_ identifier: String, _ path: String) async throws {
     let tr = try await transcriber(identifier, reporting: [])
     let analyzer = SpeechAnalyzer(modules: [tr])
     let file = try AVAudioFile(forReading: URL(fileURLWithPath: path))
-    async let results: Void = collect(tr)
+    let duration = Double(file.length) / file.processingFormat.sampleRate
+    async let results: Void = collect(tr, duration: duration)
     if let last = try await analyzer.analyzeSequence(from: file) {
         try await analyzer.finalizeAndFinish(through: last)
     } else {

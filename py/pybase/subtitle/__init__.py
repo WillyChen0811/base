@@ -13,6 +13,24 @@ from .index import CueIndex, Slice
 from .io_ import dumps, load, save
 from .llm import Chunk, chunk, to_timestamped_text
 from .models import Cue
+from .provenance import (
+    Anchor,
+    anchor_of,
+    Correction,
+    Evidence,
+    Meta,
+    Origin,
+    OriginRecord,
+    TrackMetadata,
+    apply_corrections,
+    detect_origin,
+    export,
+    load_meta,
+    meta_path,
+    record_origin,
+    remove_correction,
+    save_meta,
+)
 from .rolling import collapse_rolling, looks_rolling
 from .timing import reset_timing, shift
 
@@ -30,4 +48,20 @@ __all__ = [
     "to_timestamped_text",
     "chunk",
     "Chunk",
+    "Origin",
+    "OriginRecord",
+    "TrackMetadata",
+    "record_origin",
+    "Evidence",
+    "detect_origin",
+    "Anchor",
+    "anchor_of",
+    "Correction",
+    "apply_corrections",
+    "remove_correction",
+    "export",
+    "Meta",
+    "meta_path",
+    "load_meta",
+    "save_meta",
 ]

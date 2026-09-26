@@ -15,6 +15,7 @@ Unlicense）：极短且文本已含在上一条里的过渡 cue 并进上一条
 """
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Iterable
 
 from .models import Cue
@@ -61,16 +62,18 @@ def collapse_rolling(cues: Iterable[Cue]) -> list[Cue]:
     for cue in values:
         if prev is not None and result and _is_transition(prev, cue):
             last = result[-1]
-            result[-1] = Cue(last.start, cue.end, last.text,
-                             last.original_start, cue.original_end)
+            result[-1] = replace(last, end=cue.end, original_end=cue.original_end,
+                                 user_edited=last.user_edited or cue.user_edited)
             continue  # prev 不前移：过渡 cue 的文本是上一条的子集
         text = cue.text
         if prev is not None and _carries_over(prev, cue):
             text = "\n".join(cue.text.split("\n")[1:])
         prev = cue
         if text.strip():
-            result.append(Cue(cue.start, cue.end, text, cue.original_start, cue.original_end))
+            # 折叠后的文本就是这条的"原文"：修正锚点建立在折叠之后
+            result.append(replace(cue, text=text, original_text=text))
         elif result:  # 整条都是承接下来的旧行：只延长上一条
             last = result[-1]
-            result[-1] = Cue(last.start, cue.end, last.text, last.original_start, cue.original_end)
+            result[-1] = replace(last, end=cue.end, original_end=cue.original_end,
+                                 user_edited=last.user_edited or cue.user_edited)
     return result

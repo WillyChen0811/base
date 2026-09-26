@@ -18,7 +18,8 @@
 - `pybase.playwright_launch`：按 cfg 拼 Playwright 启动/建 context 参数的纯映射
 - `pybase.office`：Word→PDF 基础能力：Word COM 驱动（Windows + Office）+ 转换服务客户端
 - `pybase.subtitle`：字幕读写（pysubs2，`pip install "pybase[subtitle]"`）、YouTube 自动字幕滚动折叠、
-  时间校准、时间索引（`CueIndex`）、给大模型的 `[MM:SS]` 文本与分块。时间单位一律整数毫秒
+  时间校准、时间索引（`CueIndex`）、给大模型的 `[MM:SS]` 文本与分块；字幕来源（人工/平台识别/本地识别/机器翻译）
+  与用户修正层，存旁车 `.meta.json`，原字幕文件不改。时间单位一律整数毫秒
 - `pybase.media`：ffmpeg/ffprobe/ffsubsync 子进程封装：探测、按句截音频（含 padding）/截图、字幕自动对齐、
   网页 `<video>` 可播性判断（`playback_plan`，支持集合由调用方给）与转封装（`remux`）。
   外部工具需自行安装，路径可由调用方传入

@@ -48,7 +48,7 @@
 - VTT 交给 pysubs2 前必须先剥逐词时间戳 `<00:00:01.000>`，否则整行被丢（YouTube 自动字幕满篇都是）
 - 滚动字幕相邻 cue 首尾相接不重叠，不能拿"时间重叠"当判据；`looks_rolling` 判否必须原样返回
 - `shift` 严格按给定偏移、允许负时间，负值只在写文件时丢弃/截断，不要改成"收窄偏移"
-- 来源：原字幕文件永不修改，来源历史和用户修正都在旁车 `.meta.json`；生效优先级 user > acquired > detected，
+- 来源：原字幕文件永不修改，来源历史和用户修正都在旁车 `.meta.json`；生效优先级 user > detected > acquired（证据优先于平台声明，X 把识别结果当普通字幕给），
   历史只追加；`detect_origin` 没证据必须返回 None，绝不当成 uploaded，且要喂未剥时间戳的原始文本
 - 修正锚点一律 `anchor_of(cue)`（original_start/end + original_text），不用当前文本/序号；
   顺序 load → collapse_rolling → apply_corrections → shift，修正里的时间是平移前的时间轴

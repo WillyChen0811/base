@@ -41,11 +41,12 @@ def test_effective_origin_prefers_user_over_acquired_and_detected():
     assert track.history[0].origin == "platform_asr"
 
 
-def test_effective_origin_acquired_beats_detected():
+def test_effective_origin_detected_evidence_beats_platform_claim():
+    """X 平台把识别结果当普通字幕给：下载器记 uploaded，内容里有识别特征，信证据。"""
     track = TrackMetadata()
-    track = record_origin(track, "platform_asr", "detected", at="t1")
-    track = record_origin(track, "uploaded", "acquired", at="t2")
-    assert track.effective_origin == "uploaded"
+    track = record_origin(track, "uploaded", "acquired", at="t1")
+    track = record_origin(track, "platform_asr", "detected", at="t2")
+    assert track.effective_origin == "platform_asr"
 
 
 def test_effective_origin_user_wins_even_if_recorded_before_detected():

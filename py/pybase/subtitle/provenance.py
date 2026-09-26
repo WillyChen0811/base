@@ -33,9 +33,11 @@ from .rolling import looks_rolling
 Origin = Literal["uploaded", "platform_asr", "local_asr", "machine_translation", "unknown"]
 DeterminedBy = Literal["acquired", "detected", "user"]
 
-# 生效优先级：user 的手动判断永远盖过自动推断，acquired（下载时拿到的元数据）
-# 又比内容推断（detected）更可信；历史全保留，这只决定"当前信谁"。
-_PRIORITY: dict[DeterminedBy, int] = {"detected": 0, "acquired": 1, "user": 2}
+# 生效优先级：user > detected > acquired。证据优先于声明：acquired 只是平台自称
+# （X 把语音识别结果当普通字幕给，下载器只能如实记成 uploaded），detected 只在
+# 内容里有确凿特征时才给结论（见 detect_origin），所以它压过平台的说法。
+# 历史全保留，这只决定"当前信谁"。
+_PRIORITY: dict[DeterminedBy, int] = {"acquired": 0, "detected": 1, "user": 2}
 
 _SCHEMA_VERSION = 1
 
@@ -73,7 +75,7 @@ class TrackMetadata:
 
     @property
     def effective_origin(self) -> Origin | None:
-        """按 user > acquired > detected 选出当前生效的来源；同优先级取列表里靠后的
+        """按 user > detected > acquired 选出当前生效的来源；同优先级取列表里靠后的
         （视为更新的判断）。没有任何历史记录时返回 None。"""
         best: OriginRecord | None = None
         for record in self.history:

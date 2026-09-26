@@ -249,3 +249,15 @@ def test_timeout_kills_grandchild_processes(tmp_path):
         time.sleep(0.1)
     os.kill(child_pid, 9)
     pytest.fail("孙进程在父进程被杀后仍然存活")
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="需要 ffmpeg")
+def test_probe_marks_cover_art(tmp_path):
+    src = tmp_path / "cover.mp3"
+    subprocess.run([
+        "ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "sine=d=1",
+        "-f", "lavfi", "-i", "color=c=red:s=64x64:d=1", "-map", "0", "-map", "1",
+        "-frames:v", "1", "-c:v", "mjpeg", "-disposition:v", "attached_pic", str(src),
+    ], check=True)
+    video = [s for s in probe(src)["streams"] if s["codec_type"] == "video"]
+    assert video and video[0].get("attached_pic") is True

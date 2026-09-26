@@ -21,6 +21,7 @@ const { normalizeConsoleMessage } = require('./electron/console-message');
 const { registerRoutes } = require('./electron/ipc');
 const { BrowserInstance } = require('./electron/browser-instance');
 const recordingProxy = require('./net/recording-proxy');
+const media = require('./media');
 
 const SNAPSHOT_DIR = path.join(__dirname, 'electron', 'snapshots');
 
@@ -66,6 +67,8 @@ module.exports = {
   // 运行时依赖由调用方注入，普通 Node 加载包入口无需安装/启动 Electron。
   electron: { normalizeConsoleMessage, registerRoutes, BrowserInstance },
   net: recordingProxy,
+  // 网页播放器基础件：播放计划、video 控制器、分词、Electron 本地媒体协议
+  media,
   // 不依赖 Electron 的地基（js/os/*，工厂函数，落地路径由调用方传）
   os: {
     sysproxy: createSysproxy,

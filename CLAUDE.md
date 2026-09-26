@@ -53,6 +53,9 @@
 - 子进程必须独立进程组、整组杀：ffsubsync 自己会起 ffmpeg，只杀父进程留孤儿
 - 临时产物名保留扩展名（`x.part.mp3`），ffmpeg/ffsubsync 按扩展名猜格式
 - 解析 ffsubsync 输出只认源码里的原文 `offset seconds:`，别用宽松正则（会吃到质量告警里的数）
+- ffprobe 分不清 mkv/webm（都报 `matroska,webm`），按 WebM 编码白名单区分，不能因调用方写了 webm 就放行 h264 的 mkv
+- mp3/m4a 的封面图是一条 `attached_pic` 视频流，判可播性时要忽略，否则播客音频全被判成要转码
+- `playback_plan` 不带默认支持集合（各播放端不同）；`-movflags +faststart` 只能给 mp4 系输出
 
 ### dictionary
 - 不内置任何词典数据，每条 `Entry` 必带 `source`/`rights`；新数据源先查数据本身的授权，不只看代码协议
@@ -80,3 +83,12 @@
   会同步抛错，导致主进程崩溃）
 - `contentSize()` 返回的是物理像素（已乘 `scaleFactor`），调用方不要再乘一遍，否则 Retina 录像会糊
 - `RecordingProxy.stop`/`dispose` 必须先 destroy 所有 socket 再 close server，顺序反了会挂死
+
+### media（网页播放器）
+- 播放计划的所有模式都按 `[prevMs, nowMs]` 区间穿越判断，不能只看瞬时值：否则暂停后续播反复触发，
+  循环模式下用户拖进度条会被拽回来
+- 驱动用 `requestVideoFrameCallback`，`timeupdate` 只是降级（每 150–250ms 一次，逐句暂停会停过头）；
+  rVFC/rAF 暂停后不再触发，靠 `play` 事件重挂；外部改 `currentTime` 靠 `seeked` 拉回基准
+- Electron 本地媒体协议必须 `stream: true` 且自己处理 Range（electron#38749，否则拖不动）；
+  不给 `bypassCSP`；哪些文件能读由调用方 `resolvePath` 决定
+- `segmentWords` 会把 `take-off` 拆成三段、`don't` 不拆，合并短语是界面层的事

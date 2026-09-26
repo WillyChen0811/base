@@ -9,6 +9,9 @@
 - `jsbase/os`：不依赖 Electron 的地基——系统代理（`sysproxy`）、根证书（`rootcert`）、自签 CA（`ca`）
 - 包入口 `electron`：console 参数归一化、IPC 路由注册、`BrowserInstance`
 - 包入口 `net`：HTTP/HTTPS 录制代理 `RecordingProxy`
+- 包入口 `media`：网页播放器基础件——播放计划（逐句暂停/单句循环/跳过空白/A-B 循环，纯函数）、
+  `VideoController`（包 `<video>`，逐帧驱动）、`segmentWords`（`Intl.Segmenter` 切可点的词）、
+  Electron 本地媒体协议（处理 Range，文件访问控制由调用方的 `resolvePath` 决定）。时间单位整数毫秒
 
 ## Electron API 快照三层
 

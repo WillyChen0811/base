@@ -19,7 +19,7 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       - name: Install pybase
-        run: pip install -e "./py[dev,rpc-server,subtitle]"
+        run: pip install -e "./py[dev,all]"
 
       - name: Run tests
         run: pytest py/tests

@@ -4,6 +4,8 @@
 
 - 零业务依赖：不写死任何项目相关的默认值（路径、密钥、CA 名字等），一律由调用方传入
 - 重依赖（`win32com`/`pythoncom`、`electron` 等）延迟 import，模块顶层只 import 标准库
+- 依赖按模块拆 extra：`[project].dependencies` 保持为空，新模块要第三方库就加同名 extra 并加进 `all`；
+  包的 `__init__` 不能连带 import 需要 extra 的子模块（用模块级 `__getattr__` 延迟，见 `office/__init__.py`）
 - 文档分层：README 只放不易变的模块一览/安装/测试/调用契约；会踩坑的约束进本文件；
   函数级说明进代码注释；实现细节和推导过程不写文档，留在代码里
 - 测试（改动后必须跑）：
@@ -53,6 +55,7 @@
 - 修正锚点一律 `anchor_of(cue)`（original_start/end + original_text），不用当前文本/序号；
   顺序 load → collapse_rolling → apply_corrections → shift，修正里的时间是平移前的时间轴
 - 变换 Cue 用 `dataclasses.replace`，别手写构造——漏字段会悄悄丢掉原文/修正标记
+- `load` 默认 `strict=True`：SRT/VTT 时间行交给 pysubs2 前先按规范校验（pysubs2 对越界时间戳照单全收）
 
 ### media
 - 子进程必须独立进程组、整组杀：ffsubsync 自己会起 ffmpeg，只杀父进程留孤儿

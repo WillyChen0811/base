@@ -65,7 +65,6 @@ result.page_count  # 页数
 ```
 """
 
-from .client import ConvertResult, WordPdfClient
 from .errors import (
     AuthenticationError,
     ConnectionUnavailableError,
@@ -77,6 +76,17 @@ from .errors import (
     ServiceBusyError,
 )
 from .word import WordCOMConverter, WordConverter
+
+# `client` 模块顶层 import requests——只装 `pybase[office-word]`（跑 Word COM，
+# 不碰 HTTP 客户端）的调用方不该被迫装它。WordPdfClient/ConvertResult 走
+# 模块级 __getattr__ 延迟到真正用到时才 import .client，`from pybase.office
+# import WordPdfClient` 这个既有写法不用改。
+def __getattr__(name: str):
+    if name in ("WordPdfClient", "ConvertResult"):
+        from . import client
+        return getattr(client, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 __all__ = [
     # 客户端

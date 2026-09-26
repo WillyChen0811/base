@@ -43,17 +43,33 @@ result.page_count   # Word 实际排版后的页数
 
 ## 安装
 
-**作为依赖引入**（推荐）：
+`pip install pybase` 本身不拉任何第三方依赖——只装用得到的模块对应的 extra：
 
 ```bash
-pip install git+ssh://git@github.com/WillyChen0811/base.git#subdirectory=py
+# 作为依赖引入（推荐），只装 docx + smb 两块能力
+pip install "pybase[docx,smb] @ git+ssh://git@github.com/WillyChen0811/base.git#subdirectory=py"
+
+# 本地开发（克隆后可编辑安装）
+pip install -e "./py[docx,smb]"
+
+# 全装（CI、类型检查等场景）
+pip install -e "./py[all]"
 ```
 
-**本地开发**（克隆后可编辑安装）：
+模块与 extra 对照表（没列出的模块——`rpc`（stdio/HTTP 部分）、`ramdisk`、`aiclient`、
+`cdpnet`、`playwright_launch`、`media`、`dictionary`——零第三方依赖，直接 `import` 即可）：
 
-```bash
-pip install -e ./py
-```
+| extra | 第三方依赖 | 覆盖模块 |
+|---|---|---|
+| `docx` | python-docx | `pybase.docx.oxml` |
+| `sheets` | openpyxl, xlrd | `pybase.sheets` |
+| `smb` | smbprotocol, pysmb, requests, urllib3 | `pybase.smb` |
+| `crypto` | cryptography | `pybase.crypto` |
+| `office` | requests | `pybase.office`（`WordPdfClient`，跨平台部分） |
+| `office-word` | pywin32（仅 Windows） | `pybase.office.word` 的 Word COM 驱动 |
+| `rpc-server` | fastapi | `pybase.rpc.create_fastapi_rpc_router` |
+| `subtitle` | pysubs2 | `pybase.subtitle` |
+| `all` | 以上全部 | —— |
 
 ## 测试
 

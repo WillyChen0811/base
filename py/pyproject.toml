@@ -10,29 +10,45 @@ readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}
 authors = [{name = "WillyChen0811"}]
-dependencies = [
-    "python-docx>=1.0.0",
-    "openpyxl>=3.1.0",
-    "xlrd>=2.0.1",
-    "cryptography>=44.0.0",
-    "smbprotocol>=1.10.0",
-    "pysmb>=1.2.9",
-    "requests>=2.31.0",
-    "urllib3>=2.0.0",
-]
+# 有意留空：`pip install pybase` 本身不拉任何第三方依赖，装哪个模块的能力
+# 就装对应的 extra（见下方 optional-dependencies 与 README「安装」一节）。
+dependencies = []
 
 [project.urls]
 Homepage = "https://github.com/WillyChen0811/base"
 
 [project.optional-dependencies]
+docx = [
+    "python-docx>=1.0.0",
+]
+sheets = [
+    "openpyxl>=3.1.0",
+    "xlrd>=2.0.1",
+]
+smb = [
+    "smbprotocol>=1.10.0",
+    "pysmb>=1.2.9",
+    "requests>=2.31.0",
+    "urllib3>=2.0.0",
+]
+crypto = [
+    "cryptography>=44.0.0",
+]
+office = [
+    "requests>=2.31.0",
+]
+office-word = [
+    "pywin32>=306; sys_platform == 'win32'",
+]
 rpc-server = [
     "fastapi>=0.100.0",
 ]
 subtitle = [
     "pysubs2>=1.7.0",
 ]
-office-word = [
-    "pywin32>=306; sys_platform == 'win32'",
+# 引用自身 extras（pip >= 21.2），新增 extra 时只要在这里加名字，不会漏抄依赖
+all = [
+    "pybase[docx,sheets,smb,crypto,office,office-word,rpc-server,subtitle]",
 ]
 dev = [
     "pytest>=7.0.0",

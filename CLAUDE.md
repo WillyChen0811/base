@@ -82,6 +82,17 @@
   别改成调用方线程或多线程池
 - 实时会话 with 退出只收尾不取结果，剩下的 final 留给 `results()`——别改回 `close()` 里清队列
 
+### digest
+- 时间戳只能由程序按句子编号从 cues 查回，别改成让模型直接写时间（会编造/对不上）
+- 不 import `aiclient`：模型调用经 `complete` 注入；越界/反向编号的条目丢弃，不猜着修
+
+### search
+- FTS5 trigram 对不足 3 字符的查询直接返回空，短词走 LIKE 兜底——中文最常见的 1~2 字查询全靠它
+- 查询词一律包成 FTS5 引号短语转义，不手写语法逃逸表
+- 向量按 `embed_model` + 维度过滤，不兼容的逐行跳过不报错（换模型后旧片段自然失效）；
+  语义候选先截断再进 RRF，否则全库弱相关片段会稀释排名
+- `LlmClient.embed` 用独立的 `embeddings_path`，不能从 chat 的 endpoint 反推
+
 ### cdpnet / playwright_launch
 - 纯映射/判断函数，无状态、不带项目默认值；有状态的编排（事件聚合、并发控制、落库）留给调用方
 

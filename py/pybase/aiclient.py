@@ -1,8 +1,10 @@
 """OpenAI 兼容接口客户端(标准库实现,filecore 与 backend 共用)。
 
-只做 chat.completions 一件事:非流式取完整文本,流式逐 delta 回调。
-json_mode 请求失败时自动降级为普通模式重试一次(部分本地服务不支持
-response_format)。
+chat.completions:非流式取完整文本,流式逐 delta 回调。json_mode 请求失败时自动
+降级为普通模式重试一次(部分本地服务不支持 response_format)。
+
+embeddings:批量文本转向量,按返回的 index 排回请求顺序(部分实现不保证顺序);
+返回数量跟输入数量不一致视为接口错误。
 """
 import json
 import threading
@@ -34,10 +36,13 @@ class LlmClient:
         model: str = None,
         temperature: float = 0.2,
         timeout: float = 600,
+        embeddings_path: str = "/v1/embeddings",
     ):
         if not base_url:
             raise AiRequestError("AI 接口地址未配置,请到 AI 设置页填写")
         self.endpoint = _join_endpoint(base_url, path)
+        # embeddings 走独立路径,跟 chat 的 path 各拼各的(不能从 self.endpoint 反推)
+        self.embeddings_endpoint = _join_endpoint(base_url, embeddings_path)
         self.api_key = api_key or ""
         self.model = model or None
         self.temperature = temperature
@@ -59,6 +64,60 @@ class LlmClient:
                 raise
             self._check_cancel(cancel_event)
             return self._request(messages, False, on_delta, cancel_event)
+
+    def embed(
+        self,
+        texts: List[str],
+        *,
+        model: Optional[str] = None,
+        cancel_event: Optional[threading.Event] = None,
+    ) -> List[List[float]]:
+        """把文本列表转成向量列表,按输入顺序返回(内部按响应的 index 排序)。"""
+        self._check_cancel(cancel_event)
+        if not texts:
+            return []
+        body = {"input": texts}
+        use_model = model or self.model
+        if use_model:
+            body["model"] = use_model
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        request = urllib.request.Request(
+            self.embeddings_endpoint,
+            data=json.dumps(body).encode("utf-8"),
+            headers=headers,
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                data = json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            detail = ""
+            try:
+                detail = exc.read().decode("utf-8", errors="replace")[:300]
+            except Exception:
+                pass
+            raise AiRequestError(
+                f"AI 接口返回 {exc.code}: {detail or exc.reason}"
+            ) from exc
+        except urllib.error.URLError as exc:
+            raise AiRequestError(
+                f"无法连接 AI 接口 {self.embeddings_endpoint}: {exc.reason}"
+            ) from exc
+        except TimeoutError as exc:
+            raise AiRequestError(f"AI 接口 {self.embeddings_endpoint} 响应超时") from exc
+
+        items = data.get("data") or []
+        if len(items) != len(texts):
+            raise AiRequestError(
+                f"AI 接口返回 {len(items)} 条向量,跟输入的 {len(texts)} 条文本数量不一致"
+            )
+        try:
+            ordered = sorted(items, key=lambda item: item["index"])
+        except (KeyError, TypeError) as exc:
+            raise AiRequestError("AI 接口返回的向量缺少 index 字段") from exc
+        return [item["embedding"] for item in ordered]
 
     # ---------- 内部 ----------
 

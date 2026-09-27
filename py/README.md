@@ -9,7 +9,7 @@
 
 - `pybase.rpc`：JSON-RPC 客户端/服务端底座（FastAPI 路由 / HTTP handler / stdio 三种服务端 + urllib 客户端）
 - `pybase.ramdisk`：内存级临时盘生命周期管理，支持同名同路径的多进程共享
-- `pybase.aiclient`：OpenAI 兼容 chat.completions 客户端（`LlmClient`）
+- `pybase.aiclient`：OpenAI 兼容客户端（`LlmClient`：chat.completions 与 embeddings）
 - `pybase.docx`：docx 格式属性写入（`oxml`）与模板渲染（`render`）
 - `pybase.sheets`：表格文件读取（`.xlsx`/`.xls`/`.csv`），统一读成 `[[str]]`，不做类型推断
 - `pybase.smb`：SMB/WebDAV/File Station 三通道文件抓取 + SMB 客户端（连接、列目录、下载、上传、共享枚举）
@@ -26,6 +26,10 @@
 - `pybase.asr`：语音识别（中文/英文 × 整段/实时），两个后端同一套接口：`AppleSpeech`（macOS 26+ 系统自带
   SpeechAnalyzer，零 pip 依赖，需 swiftc）与 `MlxAudio`（mlx-audio，Apple Silicon，`pip install "pybase[asr-mlx]"`）。
   **不内置任何模型**，模型和 locale 由调用方给
+- `pybase.digest`：给带时间戳的字幕生成带出处的总结（概览 + 章节 + 要点），模型只引用句子编号，时间由程序查回；
+  长字幕自动分块再汇总。模型调用由调用方注入（`complete(messages) -> str`）
+- `pybase.search`：字幕/文本片段的本地检索，关键词（SQLite FTS5）+ 语义（调用方注入的向量函数）RRF 融合，
+  中文 1~2 字查询也可用；`LlmClient.embed` 可作向量函数
 - `pybase.dictionary`：词典查询统一模型（`Entry`，必带出处与授权说明）+ 数据源适配器。**不内置任何词典数据**；
   目前有 `macos`（系统『词典』App 里已下载的词典，ctypes 直调，零依赖，仅限本机个人使用）
 
@@ -88,7 +92,7 @@ pip install -e "./py[all]"
 ```
 
 模块与 extra 对照表（没列出的模块——`rpc`（stdio/HTTP 部分）、`ramdisk`、`aiclient`、
-`cdpnet`、`playwright_launch`、`media`、`dictionary`、`asr`（Apple 后端）——零第三方依赖，直接 `import` 即可）：
+`cdpnet`、`playwright_launch`、`media`、`dictionary`、`digest`、`search`、`asr`（Apple 后端）——零第三方依赖，直接 `import` 即可）：
 
 | extra | 第三方依赖 | 覆盖模块 |
 |---|---|---|

@@ -110,6 +110,12 @@ CREATE TABLE IF NOT EXISTS scene_periods (
 );
 CREATE INDEX IF NOT EXISTS idx_scene_periods_start ON scene_periods(start_at);
 CREATE INDEX IF NOT EXISTS idx_scene_periods_open ON scene_periods(source, end_at);
+
+CREATE TABLE IF NOT EXISTS scene_settings (
+    scene_id INTEGER PRIMARY KEY,
+    updated_at REAL NOT NULL,
+    payload TEXT NOT NULL
+);
 """
 
 _SCHEMA_VERSION = 1
@@ -590,6 +596,27 @@ class Recorder:
                 "UPDATE scenes SET name = ?, name_norm = ? WHERE id = ?", (new_name, name_norm, scene_id)
             )
             self._con.commit()
+
+    def set_scene_settings(self, scene_id: int, settings: dict, *, at: float) -> None:
+        """整体替换某场景的设置（内容由调用方定义，例如进入该场景时额外启用的监测目标）。"""
+        payload = json.dumps(settings, ensure_ascii=False, sort_keys=True)
+        with self._lock:
+            if self._con.execute("SELECT 1 FROM scenes WHERE id = ?", (scene_id,)).fetchone() is None:
+                raise ValueError(f"场景不存在：{scene_id}")
+            self._con.execute(
+                "INSERT INTO scene_settings (scene_id, updated_at, payload) VALUES (?, ?, ?) "
+                "ON CONFLICT(scene_id) DO UPDATE SET updated_at = excluded.updated_at, payload = excluded.payload",
+                (scene_id, at, payload),
+            )
+            self._con.commit()
+
+    def scene_settings(self, scene_id: int) -> dict:
+        """某场景的设置；没设过返回空 dict。"""
+        with self._lock:
+            row = self._con.execute(
+                "SELECT payload FROM scene_settings WHERE scene_id = ?", (scene_id,)
+            ).fetchone()
+        return json.loads(row[0]) if row else {}
 
     def set_scene_note(self, scene_id: int, note: str) -> None:
         """改备注（可为空串）。"""

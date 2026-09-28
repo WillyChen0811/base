@@ -1345,3 +1345,18 @@ def test_set_scene_note_updates_and_rejects_missing():
     assert r.scenes(until=2)[0]["note"] == "开了 WG-A"
     with pytest.raises(ValueError):
         r.set_scene_note(999, "x")
+
+
+def test_scene_settings_roundtrip_and_replace(tmp_path):
+    from pybase.net.monitor.recorder import Recorder
+
+    path = str(tmp_path / "m.db")
+    r = Recorder(path)
+    sid = r.create_scene("公司", snapshot={}, at=1)
+    assert r.scene_settings(sid) == {}
+    r.set_scene_settings(sid, {"targets": [{"name": "nas", "host": "10.0.0.2", "port": 445}]}, at=2)
+    r.set_scene_settings(sid, {"targets": []}, at=3)  # 整体替换
+    r.close()
+    assert Recorder(path).scene_settings(sid) == {"targets": []}
+    with pytest.raises(ValueError):
+        Recorder(path).set_scene_settings(999, {}, at=4)

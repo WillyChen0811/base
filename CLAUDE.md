@@ -103,6 +103,9 @@
   只认字面 `default` 会把 Clash 接管误判成直连；macOS 带 `I` 标志的按接口限定路由不参与全局选路
 - 接口归属：WireGuard.app（App Store 版）`scutil --nc` 拿不到接口名/地址，只能靠调用方给的已知地址匹配；
   `owners`/`scenario`/`targets` 是派生采集器，由 `Monitor` 的 derived 阶段在同一轮按顺序算
+- `scene`（用户命名、手动进入/退出）与 `scenario`（自动识别的组合）是两套机制，别合并；
+  `delete_scene` 是软删，历史观测的 `scene_id` 保留编号不置空，否则历史断链
+- `diff.py` 比的是"配置"：忽略 `expire`、带 `%` 的链路本地路由、mihomo 连接/流量计数、owners 的 evidence
 
 ### cdpnet / playwright_launch
 - 纯映射/判断函数，无状态、不带项目默认值；有状态的编排（事件聚合、并发控制、落库）留给调用方

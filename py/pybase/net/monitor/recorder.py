@@ -13,6 +13,11 @@ vpn_services/netbird 这类基本不变的数据，绝大多数 tick 都只留�
 
 线程安全：整个实例一把可重入锁串行化所有读写，跟 `pybase.search.SearchIndex`
 同样的取舍——写操作本身互斥，个人监测场景的并发量也用不上真并发。
+
+`scenario` vs `scene`：`scenario`（见 `scenario.py`）是程序从快照自动识别出的网络
+组合（`key`/`label`），本文件不动它。`scene` 是用户自己命名、手动进入/退出的
+"使用场景"（比如"公司"“咖啡馆"），带一份调用方采集好的配置快照，用于按人的
+主观场景而不是自动识别的组合去分组监测数据——两者独立，互不依赖。
 """
 from __future__ import annotations
 
@@ -21,6 +26,7 @@ import json
 import sqlite3
 import statistics
 import threading
+import time
 from typing import Optional, Sequence
 
 from . import events as _events
@@ -34,7 +40,8 @@ _SCHEMA = """
 CREATE TABLE IF NOT EXISTS snapshots (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     at REAL NOT NULL,
-    source TEXT NOT NULL DEFAULT 'local'
+    source TEXT NOT NULL DEFAULT 'local',
+    scene_id INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_snapshots_at ON snapshots(at);
 
@@ -74,11 +81,46 @@ CREATE TABLE IF NOT EXISTS annotations (
     text TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_annotations_at ON annotations(at);
+
+CREATE TABLE IF NOT EXISTS scenes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    name_norm TEXT NOT NULL,
+    note TEXT NOT NULL DEFAULT '',
+    source TEXT NOT NULL DEFAULT 'local',
+    created_at REAL NOT NULL,
+    deleted INTEGER NOT NULL DEFAULT 0
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_scenes_source_name ON scenes(source, name_norm) WHERE deleted = 0;
+
+CREATE TABLE IF NOT EXISTS scene_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    scene_id INTEGER NOT NULL,
+    at REAL NOT NULL,
+    payload TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_scene_snapshots_scene ON scene_snapshots(scene_id, at);
+
+CREATE TABLE IF NOT EXISTS scene_periods (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    scene_id INTEGER NOT NULL,
+    source TEXT NOT NULL DEFAULT 'local',
+    start_at REAL NOT NULL,
+    end_at REAL
+);
+CREATE INDEX IF NOT EXISTS idx_scene_periods_start ON scene_periods(start_at);
+CREATE INDEX IF NOT EXISTS idx_scene_periods_open ON scene_periods(source, end_at);
 """
+
+_SCHEMA_VERSION = 1
 
 
 def _hash_of(payload_json: str) -> str:
     return hashlib.sha256(payload_json.encode("utf-8")).hexdigest()
+
+
+def _norm_name(name: str) -> str:
+    return name.strip().casefold()
 
 
 class Recorder:
@@ -90,7 +132,21 @@ class Recorder:
         self._lock = threading.RLock()
         with self._lock:
             self._con.executescript(_SCHEMA)
+            self._migrate()
             self._con.commit()
+
+    def _migrate(self) -> None:
+        """简单的 schema 版本迁移：`PRAGMA user_version` 记版本号，版本落后才补
+        旧库缺的列（新建库走 `_SCHEMA` 已经带全，这里检查后直接跳过、不会重复
+        `ALTER`）。新增表都用 `CREATE TABLE IF NOT EXISTS`，不需要走这里。
+        """
+        version = self._con.execute("PRAGMA user_version").fetchone()[0]
+        if version < 1:
+            cols = {row[1] for row in self._con.execute("PRAGMA table_info(snapshots)")}
+            if "scene_id" not in cols:
+                self._con.execute("ALTER TABLE snapshots ADD COLUMN scene_id INTEGER")
+            version = 1
+        self._con.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
 
     def __enter__(self) -> "Recorder":
         return self
@@ -114,7 +170,15 @@ class Recorder:
         以后的事。
         """
         with self._lock:
-            cur = self._con.execute("INSERT INTO snapshots(at, source) VALUES (?, ?)", (at, source))
+            scene_row = self._con.execute(
+                "SELECT scene_id FROM scene_periods WHERE source = ? AND end_at IS NULL "
+                "ORDER BY start_at DESC LIMIT 1",
+                (source,),
+            ).fetchone()
+            scene_id = scene_row[0] if scene_row else None
+            cur = self._con.execute(
+                "INSERT INTO snapshots(at, source, scene_id) VALUES (?, ?, ?)", (at, source, scene_id)
+            )
             snapshot_id = cur.lastrowid
             new_events: list[dict] = []
             for collector, payload in snapshot.items():
@@ -188,11 +252,14 @@ class Recorder:
             for at, kind, subject, before, after, src in rows
         ]
 
-    def probes(self, target: str, since: float, until: float) -> list[dict]:
+    def probes(
+        self, target: str, since: float, until: float, *, scene_id: Optional[int] = None
+    ) -> list[dict]:
         """某个 target 的探测时序（来自 `targets` 采集器）。
 
         `snapshot_items` 里 `targets` 可能是 `ref`（这一 tick 跟上一次完全一样，
         极少见），这里回填到最近一条 `full` 的 payload 上再取值，保证时序不断档。
+        `scene_id` 给了就只看那个用户命名场景下的观测（对应 `record()` 当时打的标）。
         """
         sql = """
         SELECT s.at,
@@ -203,10 +270,14 @@ class Recorder:
         FROM snapshots s
         JOIN snapshot_items si ON si.snapshot_id = s.id
         WHERE si.collector = 'targets' AND s.at BETWEEN ? AND ?
-        ORDER BY s.at
         """
+        params: list = [since, until]
+        if scene_id is not None:
+            sql += " AND s.scene_id = ?"
+            params.append(scene_id)
+        sql += " ORDER BY s.at"
         with self._lock:
-            rows = self._con.execute(sql, (since, until)).fetchall()
+            rows = self._con.execute(sql, params).fetchall()
         out: list[dict] = []
         for at, payload_json in rows:
             if payload_json is None:
@@ -333,3 +404,237 @@ class Recorder:
             self._con.execute("DELETE FROM snapshots WHERE at < ?", (older_than,))
             self._con.execute("DELETE FROM events WHERE at < ?", (older_than,))
             self._con.commit()
+
+    # ---------- 用户命名场景（scene，见类型区别说明） ----------
+
+    def create_scene(
+        self, name: str, *, note: str = "", snapshot: dict, at: float, source: str = _DEFAULT_SOURCE
+    ) -> int:
+        """新建一个用户命名场景，并存下第一份配置快照。`name` 按
+        `strip().casefold()` 规范化后在同一个 `source` 内唯一，重名抛 `ValueError`
+        （由 `scenes` 表上的部分唯一索引兜底，防并发重名）。返回场景 id。
+        """
+        name = name.strip()
+        if not name:
+            raise ValueError("场景名不能为空")
+        name_norm = _norm_name(name)
+        with self._lock:
+            existing = self._con.execute(
+                "SELECT id FROM scenes WHERE source = ? AND name_norm = ? AND deleted = 0",
+                (source, name_norm),
+            ).fetchone()
+            if existing is not None:
+                raise ValueError(f"场景名已存在：{name!r}")
+            try:
+                cur = self._con.execute(
+                    "INSERT INTO scenes(name, name_norm, note, source, created_at, deleted) "
+                    "VALUES (?, ?, ?, ?, ?, 0)",
+                    (name, name_norm, note, source, at),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise ValueError(f"场景名已存在：{name!r}") from exc
+            scene_id = cur.lastrowid
+            self._con.execute(
+                "INSERT INTO scene_snapshots(scene_id, at, payload) VALUES (?, ?, ?)",
+                (scene_id, at, json.dumps(snapshot, ensure_ascii=False)),
+            )
+            self._con.commit()
+            return scene_id
+
+    def capture_scene(self, scene_id: int, *, snapshot: dict, at: float) -> int:
+        """给已有场景追加一份配置快照（历史保留，不覆盖旧的）。返回快照 id。"""
+        with self._lock:
+            self._require_scene(scene_id)
+            cur = self._con.execute(
+                "INSERT INTO scene_snapshots(scene_id, at, payload) VALUES (?, ?, ?)",
+                (scene_id, at, json.dumps(snapshot, ensure_ascii=False)),
+            )
+            self._con.commit()
+            return cur.lastrowid
+
+    def _require_scene(self, scene_id: int) -> None:
+        row = self._con.execute("SELECT id FROM scenes WHERE id = ?", (scene_id,)).fetchone()
+        if row is None:
+            raise ValueError(f"场景不存在：{scene_id}")
+
+    def scene_snapshots(self, scene_id: int, *, include_data: bool = False) -> list[dict]:
+        """某个场景的历史快照列表，按时间升序。`include_data=False`（默认）只给
+        `id`/`at`/`size`（JSON 字符串长度）这份摘要，避免大快照把结果拖得很大；
+        要完整内容传 `include_data=True` 或单独调 `scene_snapshot(id)`。
+        """
+        with self._lock:
+            rows = self._con.execute(
+                "SELECT id, at, payload FROM scene_snapshots WHERE scene_id = ? ORDER BY at",
+                (scene_id,),
+            ).fetchall()
+        out = []
+        for sid, at, payload_json in rows:
+            item = {"id": sid, "at": at}
+            if include_data:
+                item["data"] = json.loads(payload_json)
+            else:
+                item["size"] = len(payload_json)
+            out.append(item)
+        return out
+
+    def scene_snapshot(self, snapshot_id: int) -> dict:
+        """单条快照的完整内容：`id`/`scene_id`/`at`/`data`。查不到抛 `ValueError`。"""
+        with self._lock:
+            row = self._con.execute(
+                "SELECT id, scene_id, at, payload FROM scene_snapshots WHERE id = ?", (snapshot_id,)
+            ).fetchone()
+        if row is None:
+            raise ValueError(f"快照不存在：{snapshot_id}")
+        sid, scene_id, at, payload_json = row
+        return {"id": sid, "scene_id": scene_id, "at": at, "data": json.loads(payload_json)}
+
+    def enter_scene(self, scene_id: int, *, at: float, source: str = _DEFAULT_SOURCE) -> None:
+        """进入场景：结束同一个 `source` 上一个仍打开的场景区间（如果有），再开一个
+        新区间。同一时刻每个 `source` 只有一个"当前场景"。区间落库，重开 `Recorder`
+        后 `current_scene()` 仍能读到——不需要额外的进程内状态。
+        """
+        with self._lock:
+            self._require_scene(scene_id)
+            self._close_open_period(source, at)
+            self._con.execute(
+                "INSERT INTO scene_periods(scene_id, source, start_at, end_at) VALUES (?, ?, ?, NULL)",
+                (scene_id, source, at),
+            )
+            self._con.commit()
+
+    def leave_scene(self, *, at: float, source: str = _DEFAULT_SOURCE) -> None:
+        """结束当前场景（如果有）；没有打开的场景区间就什么也不做。"""
+        with self._lock:
+            self._close_open_period(source, at)
+            self._con.commit()
+
+    def _close_open_period(self, source: str, at: float) -> None:
+        self._con.execute(
+            "UPDATE scene_periods SET end_at = ? WHERE source = ? AND end_at IS NULL", (at, source)
+        )
+
+    def current_scene(self, *, source: str = _DEFAULT_SOURCE) -> Optional[dict]:
+        """当前处于哪个场景（`source` 维度独立），没有就返回 `None`。"""
+        with self._lock:
+            row = self._con.execute(
+                "SELECT sp.scene_id, sp.start_at, sc.name, sc.note, sc.deleted "
+                "FROM scene_periods sp JOIN scenes sc ON sc.id = sp.scene_id "
+                "WHERE sp.source = ? AND sp.end_at IS NULL "
+                "ORDER BY sp.start_at DESC LIMIT 1",
+                (source,),
+            ).fetchone()
+        if row is None:
+            return None
+        scene_id, since, name, note, deleted = row
+        return {
+            "scene_id": scene_id, "name": name, "note": note, "since": since,
+            "source": source, "deleted": bool(deleted),
+        }
+
+    def scenes(self, *, source: Optional[str] = None, include_deleted: bool = False, until: Optional[float] = None) -> list[dict]:
+        """场景列表：`id`/`name`/`note`/`source`/快照数/首末快照时间/累计处于该场景的
+        时长（按 `scene_periods` 区间求和；仍打开的区间用 `until` —— 默认当前
+        时间 —— 收尾）。默认不列出已删除场景，传 `include_deleted=True` 看全部。
+        """
+        until = time.time() if until is None else until
+        sql = "SELECT id, name, note, source, deleted FROM scenes"
+        conds, params = [], []
+        if source is not None:
+            conds.append("source = ?")
+            params.append(source)
+        if not include_deleted:
+            conds.append("deleted = 0")
+        if conds:
+            sql += " WHERE " + " AND ".join(conds)
+        sql += " ORDER BY id"
+        with self._lock:
+            rows = self._con.execute(sql, params).fetchall()
+            out = []
+            for scene_id, name, note, scene_source, deleted in rows:
+                snap_row = self._con.execute(
+                    "SELECT COUNT(*), MIN(at), MAX(at) FROM scene_snapshots WHERE scene_id = ?",
+                    (scene_id,),
+                ).fetchone()
+                count, first_at, last_at = snap_row
+                periods = self._con.execute(
+                    "SELECT start_at, end_at FROM scene_periods WHERE scene_id = ? ORDER BY start_at",
+                    (scene_id,),
+                ).fetchall()
+                duration = sum((end if end is not None else until) - start for start, end in periods)
+                out.append({
+                    "id": scene_id, "name": name, "note": note, "source": scene_source,
+                    "deleted": bool(deleted), "snapshot_count": count,
+                    "first_snapshot_at": first_at, "last_snapshot_at": last_at,
+                    "duration": duration,
+                })
+        return out
+
+    def rename_scene(self, scene_id: int, new_name: str) -> None:
+        """改名，唯一性规则跟 `create_scene` 一样（同 `source` 内规范化后不重复）。"""
+        new_name = new_name.strip()
+        if not new_name:
+            raise ValueError("场景名不能为空")
+        name_norm = _norm_name(new_name)
+        with self._lock:
+            row = self._con.execute("SELECT source FROM scenes WHERE id = ?", (scene_id,)).fetchone()
+            if row is None:
+                raise ValueError(f"场景不存在：{scene_id}")
+            source = row[0]
+            dup = self._con.execute(
+                "SELECT id FROM scenes WHERE source = ? AND name_norm = ? AND deleted = 0 AND id != ?",
+                (source, name_norm, scene_id),
+            ).fetchone()
+            if dup is not None:
+                raise ValueError(f"场景名已存在：{new_name!r}")
+            self._con.execute(
+                "UPDATE scenes SET name = ?, name_norm = ? WHERE id = ?", (new_name, name_norm, scene_id)
+            )
+            self._con.commit()
+
+    def delete_scene(self, scene_id: int, *, at: Optional[float] = None) -> None:
+        """删除场景：标记 `deleted=1`（软删），场景本身的快照/区间都保留，历史
+        观测（`snapshots.scene_id`）也保留原编号不置空——置空会让"这条观测当时
+        在哪个场景"的历史断链，标记删除既能在 `scenes()` 里默认隐藏，又不影响
+        `scene_periods`/`probes(scene_id=...)` 回看旧数据。
+
+        `at` 给了就顺手关闭这个场景当前还打开着的区间（避免删除后区间永远开着）；
+        不给就不动区间，调用方自己决定要不要先 `leave_scene`。
+        """
+        with self._lock:
+            self._require_scene(scene_id)
+            self._con.execute("UPDATE scenes SET deleted = 1 WHERE id = ?", (scene_id,))
+            if at is not None:
+                self._con.execute(
+                    "UPDATE scene_periods SET end_at = ? WHERE scene_id = ? AND end_at IS NULL",
+                    (at, scene_id),
+                )
+            self._con.commit()
+
+    def scene_periods(self, since: float, until: float, *, source: Optional[str] = None) -> list[dict]:
+        """`[since, until]` 范围内的场景分段：每段处于哪个场景、起止、时长。跟
+        `scenarios()`（自动识别组合）是平行的两张表，互不影响。仍打开的区间用
+        `until` 收尾。
+        """
+        sql = (
+            "SELECT sp.scene_id, sc.name, sp.source, sp.start_at, sp.end_at, sc.deleted "
+            "FROM scene_periods sp JOIN scenes sc ON sc.id = sp.scene_id "
+            "WHERE sp.start_at <= ? AND (sp.end_at IS NULL OR sp.end_at >= ?)"
+        )
+        params: list = [until, since]
+        if source is not None:
+            sql += " AND sp.source = ?"
+            params.append(source)
+        sql += " ORDER BY sp.start_at"
+        with self._lock:
+            rows = self._con.execute(sql, params).fetchall()
+        out = []
+        for scene_id, name, src, start_at, end_at, deleted in rows:
+            end = until if end_at is None else end_at
+            seg_start, seg_end = max(start_at, since), min(end, until)
+            if seg_end < seg_start:
+                continue
+            out.append({
+                "scene_id": scene_id, "name": name, "source": src, "deleted": bool(deleted),
+                "start": seg_start, "end": seg_end, "duration": seg_end - seg_start,
+            })
+        return out

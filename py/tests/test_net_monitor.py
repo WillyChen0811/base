@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import socket
+import sqlite3
 import subprocess
 import tempfile
 import threading
@@ -1088,6 +1089,233 @@ def test_monitor_tick_runs_derived_after_primary_collectors():
     latest = rec.latest()
     assert latest["owners"]["owners"]["utun6"]["owner_kind"] == "mihomo_tun"
     assert latest["scenario"]["default_via"] == "clash_tun"
+    rec.close()
+
+
+# ---------------------------------------------------------------------------
+# Recorder：用户命名场景（scene），跟自动识别的 scenario 平行、互不影响
+# ---------------------------------------------------------------------------
+
+
+def test_create_scene_and_capture_more_snapshots(recorder):
+    scene_id = recorder.create_scene("公司", snapshot={"wifi": "corp-5g"}, at=1.0)
+    snap_id = recorder.capture_scene(scene_id, snapshot={"wifi": "corp-5g-v2"}, at=2.0)
+    snaps = recorder.scene_snapshots(scene_id)
+    assert len(snaps) == 2
+    assert snaps[-1]["id"] == snap_id
+    assert [s["at"] for s in snaps] == [1.0, 2.0]
+    assert "data" not in snaps[0]  # 默认摘要，不带完整内容
+    full = recorder.scene_snapshots(scene_id, include_data=True)
+    assert full[0]["data"] == {"wifi": "corp-5g"}
+    assert recorder.scene_snapshot(snap_id)["data"] == {"wifi": "corp-5g-v2"}
+
+
+def test_create_scene_duplicate_name_raises(recorder):
+    recorder.create_scene("公司", snapshot={}, at=1.0)
+    with pytest.raises(ValueError):
+        recorder.create_scene("  公司  ", snapshot={}, at=2.0)  # 首尾空白规范化后同名
+    with pytest.raises(ValueError):
+        recorder.create_scene("公司", snapshot={}, at=3.0)
+
+
+def test_create_scene_same_name_different_source_allowed(recorder):
+    a = recorder.create_scene("公司", snapshot={}, at=1.0, source="local")
+    b = recorder.create_scene("公司", snapshot={}, at=1.0, source="router-a")
+    assert a != b
+
+
+def test_enter_scene_auto_ends_previous(recorder):
+    home = recorder.create_scene("家", snapshot={}, at=0.0)
+    office = recorder.create_scene("公司", snapshot={}, at=0.0)
+    recorder.enter_scene(home, at=1.0)
+    recorder.enter_scene(office, at=5.0)
+    periods = recorder.scene_periods(0.0, 10.0)
+    assert len(periods) == 2
+    home_period = next(p for p in periods if p["scene_id"] == home)
+    office_period = next(p for p in periods if p["scene_id"] == office)
+    assert home_period["start"] == 1.0 and home_period["end"] == 5.0
+    assert office_period["start"] == 5.0 and office_period["end"] == 10.0  # 仍打开，用 until 收尾
+    assert recorder.current_scene()["scene_id"] == office
+
+
+def test_current_scene_none_when_never_entered(recorder):
+    assert recorder.current_scene() is None
+    recorder.create_scene("家", snapshot={}, at=0.0)
+    assert recorder.current_scene() is None
+
+
+def test_leave_scene_clears_current(recorder):
+    home = recorder.create_scene("家", snapshot={}, at=0.0)
+    recorder.enter_scene(home, at=1.0)
+    recorder.leave_scene(at=3.0)
+    assert recorder.current_scene() is None
+    periods = recorder.scene_periods(0.0, 10.0)
+    assert periods[0]["end"] == 3.0
+
+
+def test_current_scene_persists_across_reopen(tmp_path):
+    path = str(tmp_path / "scene.sqlite")
+    rec1 = Recorder(path)
+    scene_id = rec1.create_scene("家", snapshot={"x": 1}, at=0.0)
+    rec1.enter_scene(scene_id, at=1.0)
+    rec1.close()
+    rec2 = Recorder(path)
+    current = rec2.current_scene()
+    assert current is not None
+    assert current["scene_id"] == scene_id
+    assert current["name"] == "家"
+    rec2.close()
+
+
+def test_record_tags_observations_with_current_scene(recorder):
+    home = recorder.create_scene("家", snapshot={}, at=0.0)
+    recorder.record({"interfaces": {"error": None, "interfaces": []}}, at=1.0)  # 还没进场景
+    recorder.enter_scene(home, at=2.0)
+    recorder.record({"interfaces": {"error": None, "interfaces": [{"name": "en0", "status": "active", "ipv4": [], "ipv6": []}]}}, at=3.0)
+    rows = recorder._con.execute("SELECT at, scene_id FROM snapshots ORDER BY at").fetchall()
+    assert rows[0] == (1.0, None)
+    assert rows[1] == (3.0, home)
+
+
+def test_probes_scene_id_filter(recorder):
+    home = recorder.create_scene("家", snapshot={}, at=0.0)
+    office = recorder.create_scene("公司", snapshot={}, at=0.0)
+
+    def payload(status):
+        return {
+            "error": None,
+            "targets": [{"name": "t1", "error": None, "proxied": False,
+                         "route": {"interface": None}, "probe": {"status": status}}],
+        }
+
+    recorder.enter_scene(home, at=0.0)
+    recorder.record({"targets": payload("ok")}, at=1.0)
+    recorder.enter_scene(office, at=2.0)
+    recorder.record({"targets": payload("timeout")}, at=3.0)
+
+    home_probes = recorder.probes("t1", 0.0, 10.0, scene_id=home)
+    office_probes = recorder.probes("t1", 0.0, 10.0, scene_id=office)
+    assert [p["status"] for p in home_probes] == ["ok"]
+    assert [p["status"] for p in office_probes] == ["timeout"]
+    assert len(recorder.probes("t1", 0.0, 10.0)) == 2
+
+
+def test_scenes_lists_counts_and_duration(recorder):
+    home = recorder.create_scene("家", note="有猫", snapshot={"a": 1}, at=0.0)
+    recorder.capture_scene(home, snapshot={"a": 2}, at=5.0)
+    recorder.enter_scene(home, at=0.0)
+    recorder.leave_scene(at=10.0)
+    scenes = recorder.scenes(until=10.0)
+    assert len(scenes) == 1
+    s = scenes[0]
+    assert s["name"] == "家" and s["note"] == "有猫"
+    assert s["snapshot_count"] == 2
+    assert s["first_snapshot_at"] == 0.0 and s["last_snapshot_at"] == 5.0
+    assert s["duration"] == 10.0
+
+
+def test_rename_scene(recorder):
+    home = recorder.create_scene("家", snapshot={}, at=0.0)
+    recorder.rename_scene(home, "我家")
+    assert recorder.scenes()[0]["name"] == "我家"
+
+
+def test_rename_scene_duplicate_raises(recorder):
+    recorder.create_scene("家", snapshot={}, at=0.0)
+    office = recorder.create_scene("公司", snapshot={}, at=0.0)
+    with pytest.raises(ValueError):
+        recorder.rename_scene(office, "家")
+
+
+def test_delete_scene_soft_deletes_and_frees_name(recorder):
+    home = recorder.create_scene("家", snapshot={}, at=0.0)
+    recorder.enter_scene(home, at=1.0)
+    recorder.delete_scene(home, at=5.0)
+    # 默认列表不再出现，但可以带 include_deleted 看到，标记为已删除
+    assert recorder.scenes() == []
+    all_scenes = recorder.scenes(include_deleted=True)
+    assert all_scenes[0]["deleted"] is True
+    # 名字空出来，可以重新创建同名场景
+    new_home = recorder.create_scene("家", snapshot={}, at=6.0)
+    assert new_home != home
+    # 已打开的区间被关闭，不再是 current
+    assert recorder.current_scene() is None
+    periods = recorder.scene_periods(0.0, 10.0)
+    assert any(p["scene_id"] == home and p["end"] == 5.0 for p in periods)
+    # 历史观测里的 scene_id 保留，不置空/断链
+    recorder.record({"interfaces": {"error": None, "interfaces": []}}, at=2.0)
+
+
+def test_scene_capture_and_enter_require_existing_scene(recorder):
+    with pytest.raises(ValueError):
+        recorder.capture_scene(999, snapshot={}, at=1.0)
+    with pytest.raises(ValueError):
+        recorder.enter_scene(999, at=1.0)
+
+
+def test_scene_schema_migration_from_legacy_db(tmp_path):
+    """旧库（没有 scene 相关表/列）打开后自动补全，不丢旧数据。"""
+    path = str(tmp_path / "legacy.sqlite")
+    con = sqlite3.connect(path)
+    con.executescript(
+        """
+        CREATE TABLE snapshots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            at REAL NOT NULL,
+            source TEXT NOT NULL DEFAULT 'local'
+        );
+        CREATE TABLE snapshot_items (
+            snapshot_id INTEGER NOT NULL,
+            collector TEXT NOT NULL,
+            stored TEXT NOT NULL,
+            payload TEXT,
+            hash TEXT NOT NULL,
+            PRIMARY KEY (snapshot_id, collector)
+        );
+        CREATE TABLE latest (
+            collector TEXT PRIMARY KEY,
+            payload TEXT NOT NULL,
+            hash TEXT NOT NULL,
+            at REAL NOT NULL
+        );
+        CREATE TABLE events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            at REAL NOT NULL,
+            kind TEXT NOT NULL,
+            subject TEXT NOT NULL,
+            before TEXT,
+            after TEXT,
+            source TEXT NOT NULL DEFAULT 'local'
+        );
+        CREATE TABLE annotations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            at REAL NOT NULL,
+            source TEXT NOT NULL DEFAULT 'local',
+            text TEXT NOT NULL
+        );
+        """
+    )
+    con.execute(
+        "INSERT INTO snapshot_items(snapshot_id, collector, stored, payload, hash) "
+        "VALUES (1, 'interfaces', 'full', '{\"interfaces\": []}', 'h')"
+    )
+    con.execute("INSERT INTO snapshots(id, at, source) VALUES (1, 1.0, 'local')")
+    con.execute(
+        "INSERT INTO latest(collector, payload, hash, at) VALUES "
+        "('interfaces', '{\"interfaces\": []}', 'h', 1.0)"
+    )
+    con.commit()
+    con.close()
+
+    rec = Recorder(path)
+    # 旧数据没丢
+    assert rec.latest()["interfaces"]["interfaces"] == []
+    # 新表/新列可用
+    scene_id = rec.create_scene("家", snapshot={"x": 1}, at=2.0)
+    rec.enter_scene(scene_id, at=2.0)
+    rec.record({"interfaces": {"error": None, "interfaces": []}}, at=3.0)
+    row = rec._con.execute("SELECT scene_id FROM snapshots WHERE at = 3.0").fetchone()
+    assert row[0] == scene_id
     rec.close()
 
 

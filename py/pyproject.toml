@@ -50,9 +50,13 @@ subtitle = [
 asr-mlx = [
     "mlx-audio>=0.5.6; sys_platform == 'darwin' and platform_machine == 'arm64'",
 ]
+# net 只有生成/推导 WireGuard 密钥要 X25519，其余（隧道、诊断、监测）零依赖
+net = [
+    "cryptography>=44.0.0",
+]
 # 引用自身 extras（pip >= 21.2），新增 extra 时只要在这里加名字，不会漏抄依赖
 all = [
-    "pybase[docx,sheets,smb,crypto,office,office-word,rpc-server,subtitle,asr-mlx]",
+    "pybase[docx,sheets,smb,crypto,office,office-word,rpc-server,subtitle,asr-mlx,net]",
 ]
 dev = [
     "pytest>=7.0.0",

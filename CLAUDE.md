@@ -93,6 +93,13 @@
   语义候选先截断再进 RRF，否则全库弱相关片段会稀释排名
 - `LlmClient.embed` 用独立的 `embeddings_path`，不能从 chat 的 endpoint 反推
 
+### net
+- 只读采集绝不改网络设置；改路由/地址的命令一律走注入的 `runner`（root 由调用方解决）
+- UAPI 的密钥是 hex，`.conf` 里是 base64，两套编码别混；`last_handshake_time_sec=0` 表示从未握手，解析成 None
+- 真实 wireguard-go 的 socket 目录固定 `/var/run/wireguard`，`uapi_dir`/`WG_UAPI_DIR` 只是测试钩子
+- `classify_address` 必须先判 fake_ip/cgnat 再判 private：stdlib 把 198.18/15 算 private、100.64/10 不算
+- 采集器失败返回 `{"error": ...}` 不抛异常；recorder 按"最新值"哈希去重，不是比相邻两次快照
+
 ### cdpnet / playwright_launch
 - 纯映射/判断函数，无状态、不带项目默认值；有状态的编排（事件聚合、并发控制、落库）留给调用方
 

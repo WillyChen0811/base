@@ -30,6 +30,9 @@
   长字幕自动分块再汇总。模型调用由调用方注入（`complete(messages) -> str`）
 - `pybase.search`：字幕/文本片段的本地检索，关键词（SQLite FTS5）+ 语义（调用方注入的向量函数）RRF 融合，
   中文 1~2 字查询也可用；`LlmClient.embed` 可作向量函数
+- `pybase.net`：网络内核基础件。`wireguard`/`engine`/`routes`/`tunnel` 自建 WireGuard 隧道
+  （wireguard-go 用户态引擎，需 root；生成密钥要 `pip install "pybase[net]"`）；`diag` 路由查询、
+  地址分类、TCP 探测；`monitor` 采集接口/路由/DNS/代理/VPN/NetBird/mihomo/自定义目标，SQLite 记录并检测变化
 - `pybase.dictionary`：词典查询统一模型（`Entry`，必带出处与授权说明）+ 数据源适配器。**不内置任何词典数据**；
   目前有 `macos`（系统『词典』App 里已下载的词典，ctypes 直调，零依赖，仅限本机个人使用）
 
@@ -92,7 +95,7 @@ pip install -e "./py[all]"
 ```
 
 模块与 extra 对照表（没列出的模块——`rpc`（stdio/HTTP 部分）、`ramdisk`、`aiclient`、
-`cdpnet`、`playwright_launch`、`media`、`dictionary`、`digest`、`search`、`asr`（Apple 后端）——零第三方依赖，直接 `import` 即可）：
+`cdpnet`、`playwright_launch`、`media`、`dictionary`、`digest`、`search`、`asr`（Apple 后端）、`net`（密钥生成除外）——零第三方依赖，直接 `import` 即可）：
 
 | extra | 第三方依赖 | 覆盖模块 |
 |---|---|---|
@@ -104,6 +107,7 @@ pip install -e "./py[all]"
 | `office-word` | pywin32（仅 Windows） | `pybase.office.word` 的 Word COM 驱动 |
 | `rpc-server` | fastapi | `pybase.rpc.create_fastapi_rpc_router` |
 | `subtitle` | pysubs2 | `pybase.subtitle` |
+| `net` | cryptography | `pybase.net.wireguard` 的密钥生成/推导 |
 | `asr-mlx` | mlx-audio（仅 Apple Silicon） | `pybase.asr.MlxAudio` |
 | `all` | 以上全部 | —— |
 

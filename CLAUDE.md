@@ -105,6 +105,9 @@
   `owners`/`scenario`/`targets` 是派生采集器，由 `Monitor` 的 derived 阶段在同一轮按顺序算
 - `scene`（用户命名、手动进入/退出）与 `scenario`（自动识别的组合）是两套机制，别合并；
   `delete_scene` 是软删，历史观测的 `scene_id` 保留编号不置空，否则历史断链
+- 系统配置采集（`sysconfig`/`sysfiles`）优先于软件状态：SCDynamicStore 用一次 list + 一次批量 show 的
+  `scutil` 交互调用读全，不逐键起进程；服务 UUID 键名原样保留（是"谁改的"线索），展示时用 `service_names` 翻译
+- `ipconfig getsummary` 内嵌的 DHCP 报文自带花括号，只能按行抓字段；SSID/BSSID 被系统隐藏记为 "redacted"，不算失败
 - `diff.py` 比的是"配置"：忽略 `expire`、带 `%` 的链路本地路由、mihomo 连接/流量计数、owners 的 evidence
 
 ### cdpnet / playwright_launch

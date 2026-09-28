@@ -1334,3 +1334,14 @@ def test_default_interface_follows_clash_split_routes_not_literal_default():
     v6 = [route("default", "utun3", "UGcIg"), route("default", "en0", "UGcg")]
     assert _default_interface({"ipv6": v6}, "ipv6") == "en0"
     assert _default_interface({"error": "boom"}, "ipv4") is None
+
+
+def test_set_scene_note_updates_and_rejects_missing():
+    from pybase.net.monitor.recorder import Recorder
+
+    r = Recorder(":memory:")
+    sid = r.create_scene("家", note="旧", snapshot={}, at=1)
+    r.set_scene_note(sid, "开了 WG-A")
+    assert r.scenes(until=2)[0]["note"] == "开了 WG-A"
+    with pytest.raises(ValueError):
+        r.set_scene_note(999, "x")

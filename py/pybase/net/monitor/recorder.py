@@ -591,6 +591,14 @@ class Recorder:
             )
             self._con.commit()
 
+    def set_scene_note(self, scene_id: int, note: str) -> None:
+        """改备注（可为空串）。"""
+        with self._lock:
+            cur = self._con.execute("UPDATE scenes SET note = ? WHERE id = ?", (note, scene_id))
+            if cur.rowcount == 0:
+                raise ValueError(f"场景不存在：{scene_id}")
+            self._con.commit()
+
     def delete_scene(self, scene_id: int, *, at: Optional[float] = None) -> None:
         """删除场景：标记 `deleted=1`（软删），场景本身的快照/区间都保留，历史
         观测（`snapshots.scene_id`）也保留原编号不置空——置空会让"这条观测当时

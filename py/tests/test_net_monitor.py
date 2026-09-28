@@ -905,8 +905,10 @@ def _scenario_snapshot(*, wg=(), netbird_available=True, netbird_connected=False
             "error": None, "available": netbird_available,
             "connected": netbird_connected, "daemon_status": netbird_status,
         },
-        "mihomo": {"error": None, "mode": clash_mode, "tun_enabled": clash_tun},
-        "proxies": {"error": None, "system": {"HTTPPort": "7893"} if system_proxy else {}},
+        "mihomo": {"error": None, "mode": clash_mode, "tun_enabled": clash_tun, "listen_ports": [7893]},
+        "proxies": {"error": None, "system": (
+            {"HTTPEnable": "1", "HTTPProxy": "127.0.0.1", "HTTPPort": "7893"} if system_proxy
+            else {"FTPPassive": "1"})},
         "routes": {
             "error": None,
             "ipv4": [{"destination": "default", "interface": default_iface}] if default_iface else [],
@@ -1360,3 +1362,19 @@ def test_scene_settings_roundtrip_and_replace(tmp_path):
     assert Recorder(path).scene_settings(sid) == {"targets": []}
     with pytest.raises(ValueError):
         Recorder(path).set_scene_settings(999, {}, at=4)
+
+
+def test_summarize_scenario_system_proxy_judged_by_enable_flags_not_dict():
+    # 全关时 scutil --proxy 只剩 FTPPassive：不能判成"系统代理开着"，内核在跑也不算接管
+    sc = summarize_scenario(_scenario_snapshot(clash_mode="rule", default_iface="en0"))
+    assert sc.system_proxy is False and sc.system_proxy_to_clash is False
+    assert "未接管" in sc.label and "nosysproxy" in sc.key
+
+    sc = summarize_scenario(_scenario_snapshot(clash_mode="rule", system_proxy=True, default_iface="en0"))
+    assert sc.system_proxy_to_clash is True and "Clash 接管（系统代理" in sc.label
+
+    snap = _scenario_snapshot(default_iface="en0")
+    snap["proxies"] = {"error": None, "system": {"SOCKSEnable": "1", "SOCKSProxy": "10.0.0.9", "SOCKSPort": "1080"}}
+    sc = summarize_scenario(snap)
+    assert sc.system_proxy is True and sc.system_proxy_to_clash is False
+    assert "系统代理→10.0.0.9:1080" in sc.label and "sysproxy-other" in sc.key

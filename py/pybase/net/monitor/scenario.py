@@ -25,7 +25,8 @@ class Scenario:
     netbird_status: Optional[str]
     clash_mode: Optional[str]
     clash_tun: bool
-    system_proxy: bool
+    system_proxy: bool          # 系统代理是否真的开着
+    system_proxy_to_clash: bool  # 开着且指向本机 mihomo 在听的端口
     self_tunnels: tuple[str, ...]
     default_interface: Optional[str]
     default_via: str
@@ -54,6 +55,26 @@ def _route_network(destination: str, family: str):
         return ipaddress.ip_network(f"{addr}/{prefix or (128 if family == 'ipv6' else 32)}", strict=False)
     except ValueError:
         return None
+
+
+def _system_proxy_target(proxies: dict) -> Optional[tuple[str, int]]:
+    """系统代理实际开着时返回 (主机, 端口)，否则 None。
+
+    只看开关项：代理全关时 `scutil --proxy` 仍会留 `FTPPassive` 之类的无关键，
+    不能拿"字典非空"当作开启。自动代理配置（PAC）开着时主机记为 "pac"、端口 0。
+    """
+    if proxies.get("error"):
+        return None
+    system = proxies.get("system") or {}
+    for kind in ("HTTP", "HTTPS", "SOCKS"):
+        if str(system.get(f"{kind}Enable")) == "1":
+            try:
+                return str(system.get(f"{kind}Proxy") or ""), int(system.get(f"{kind}Port") or 0)
+            except ValueError:
+                return str(system.get(f"{kind}Proxy") or ""), 0
+    if str(system.get("ProxyAutoConfigEnable")) == "1":
+        return "pac", 0
+    return None
 
 
 def _default_interface(routes_payload: dict, family: str) -> Optional[str]:
@@ -103,7 +124,10 @@ def summarize_scenario(snapshot: Mapping[str, dict]) -> Scenario:
 
     clash_mode = mihomo.get("mode") if not mihomo.get("error") else None
     clash_tun = bool(not mihomo.get("error") and mihomo.get("tun_enabled"))
-    system_proxy = bool(not proxies.get("error") and proxies.get("system"))
+    system_proxy = _system_proxy_target(proxies)
+    listen_ports = set(mihomo.get("listen_ports") or ()) if clash_mode else set()
+    proxy_to_clash = bool(system_proxy and system_proxy[1] in listen_ports
+                          and system_proxy[0] in ("127.0.0.1", "localhost", "::1"))
 
     v4_iface = _default_interface(routes, "ipv4")
     v6_iface = _default_interface(routes, "ipv6")
@@ -113,7 +137,7 @@ def summarize_scenario(snapshot: Mapping[str, dict]) -> Scenario:
         "wg:" + (",".join(wireguard) if wireguard else "none"),
         "nb:" + (netbird_status or "off" if netbird_available else "absent"),
         f"clash:{clash_mode or 'off'}:{'tun' if clash_tun else 'notun'}:"
-        f"{'sysproxy' if system_proxy else 'nosysproxy'}",
+        f"{'sysproxy-clash' if proxy_to_clash else 'sysproxy-other' if system_proxy else 'nosysproxy'}",
         "self:" + (",".join(self_tunnels) if self_tunnels else "none"),
         f"via:{default_via}",
     ])
@@ -125,10 +149,14 @@ def summarize_scenario(snapshot: Mapping[str, dict]) -> Scenario:
         bits.append("NetBird 已连接")
     elif netbird_available:
         bits.append(f"NetBird {netbird_status or '未连接'}")
-    if clash_mode:
-        bits.append(f"Clash {clash_mode} 模式" + ("+TUN" if clash_tun else ""))
-    if system_proxy:
-        bits.append("系统代理已指向")
+    # 按"实际接管了什么"描述：内核在跑不等于在用
+    if clash_tun or proxy_to_clash:
+        how = "+".join(x for x, on in (("TUN", clash_tun), ("系统代理", proxy_to_clash)) if on)
+        bits.append(f"Clash 接管（{how}，{clash_mode} 模式）")
+    elif clash_mode:
+        bits.append("Clash 内核在运行但未接管")
+    if system_proxy and not proxy_to_clash:
+        bits.append(f"系统代理→{system_proxy[0]}:{system_proxy[1]}")
     if self_tunnels:
         bits.append("自建隧道 " + "+".join(self_tunnels))
     if not bits:
@@ -139,7 +167,8 @@ def summarize_scenario(snapshot: Mapping[str, dict]) -> Scenario:
         key=key, label=label, wireguard=wireguard,
         netbird_available=netbird_available, netbird_connected=netbird_connected,
         netbird_status=netbird_status, clash_mode=clash_mode, clash_tun=clash_tun,
-        system_proxy=system_proxy, self_tunnels=self_tunnels,
+        system_proxy=system_proxy is not None, system_proxy_to_clash=proxy_to_clash,
+        self_tunnels=self_tunnels,
         default_interface=v4_iface, default_via=default_via,
         ipv6_default_interface=v6_iface,
     )

@@ -458,6 +458,9 @@ def collect_mihomo(base_url: str, secret: Optional[str] = None, *, timeout: floa
         mode=configs.get("mode"),
         tun_enabled=bool(tun_cfg.get("enable")),
         tun_device=tun_cfg.get("device"),
+        # 内核在听的代理端口（0/缺省表示没开），用来判断系统代理是不是指向它
+        listen_ports=sorted({int(v) for v in (configs.get(k) for k in ("mixed-port", "port", "socks-port"))
+                             if str(v or "0").isdigit() and int(v or 0) > 0}),
         connections_count=len(conns),
         total_upload=total_upload,
         total_download=total_download,

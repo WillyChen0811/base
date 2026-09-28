@@ -57,7 +57,7 @@ def _route_network(destination: str, family: str):
         return None
 
 
-def _system_proxy_target(proxies: dict) -> Optional[tuple[str, int]]:
+def system_proxy_target(proxies: dict) -> Optional[tuple[str, int]]:
     """系统代理实际开着时返回 (主机, 端口)，否则 None。
 
     只看开关项：代理全关时 `scutil --proxy` 仍会留 `FTPPassive` 之类的无关键，
@@ -124,7 +124,7 @@ def summarize_scenario(snapshot: Mapping[str, dict]) -> Scenario:
 
     clash_mode = mihomo.get("mode") if not mihomo.get("error") else None
     clash_tun = bool(not mihomo.get("error") and mihomo.get("tun_enabled"))
-    system_proxy = _system_proxy_target(proxies)
+    system_proxy = system_proxy_target(proxies)
     listen_ports = set(mihomo.get("listen_ports") or ()) if clash_mode else set()
     proxy_to_clash = bool(system_proxy and system_proxy[1] in listen_ports
                           and system_proxy[0] in ("127.0.0.1", "localhost", "::1"))

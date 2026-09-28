@@ -5,7 +5,7 @@
 """
 from __future__ import annotations
 
-from . import collectors, sysconfig, sysfiles
+from . import collectors, sysconfig, sysfiles, watch
 from .diff import Change, diff_snapshots, summarize_changes
 from .recorder import Recorder
 from .runner import Monitor
@@ -15,6 +15,7 @@ __all__ = [
     "collectors",
     "sysconfig",
     "sysfiles",
+    "watch",
     "Recorder",
     "Monitor",
     "Scenario",

@@ -377,6 +377,23 @@ class Recorder:
             })
         return out
 
+    def add_events(self, events: list[dict]) -> None:
+        """直接写入一批事件（如 `watch.to_recorder_event` 的实时通知），不经快照比较。
+        每条需有 at/kind/subject，before/after 可缺省，source 缺省为本机。"""
+        rows = [
+            (ev["at"], ev["kind"], ev["subject"],
+             json.dumps(ev.get("before"), ensure_ascii=False),
+             json.dumps(ev.get("after"), ensure_ascii=False),
+             ev.get("source") or _DEFAULT_SOURCE)
+            for ev in events
+        ]
+        with self._lock:
+            self._con.executemany(
+                "INSERT INTO events(at, kind, subject, before, after, source) VALUES (?, ?, ?, ?, ?, ?)",
+                rows,
+            )
+            self._con.commit()
+
     def annotate(self, at: float, text: str, *, source: str = _DEFAULT_SOURCE) -> None:
         """手动备注（"在公司，开了 WG-B" 这类），跟自动采集完全独立的旁路记录。"""
         with self._lock:

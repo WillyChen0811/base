@@ -108,6 +108,11 @@
 - 系统配置采集（`sysconfig`/`sysfiles`）优先于软件状态：SCDynamicStore 用一次 list + 一次批量 show 的
   `scutil` 交互调用读全，不逐键起进程；服务 UUID 键名原样保留（是"谁改的"线索），展示时用 `service_names` 翻译
 - `ipconfig getsummary` 内嵌的 DHCP 报文自带花括号，只能按行抓字段；SSID/BSSID 被系统隐藏记为 "redacted"，不算失败
+- `diff.py`/`events.py` 共用同一套逐段比较函数（events 从 diff 复用），改规则只改 diff；dynamic_store 的
+  易变噪声（LinkQuality、扫描缓存、租约时间等）在 `_NOISE_*` 常量里，发现新噪声往里补
+- 实时监听（`watch.NetWatcher`）：长驻 `scutil` 不能关 stdin（EOF 等于 quit，n.watch 里也会退出）；
+  子进程赋值后要再查一次 stop_event，否则紧接着的 stop() 可能杀不到刚起的进程
+- 事件的 `source` 只表示"哪台机器"（本机 local）；监听来源 route/store 并进 kind（`live_route_*`/`live_store_*`）
 - `diff.py` 比的是"配置"：忽略 `expire`、带 `%` 的链路本地路由、mihomo 连接/流量计数、owners 的 evidence
 
 ### cdpnet / playwright_launch

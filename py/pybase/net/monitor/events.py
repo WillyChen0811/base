@@ -2,10 +2,17 @@
 不认识的采集器名字（调用方自定义的采集器）直接不产生事件，不报错。
 
 事件只是"发现了什么变了"，不做进一步编排（告警、通知都是调用方的事）。
+
+`dynamic_store`/`nwi`/`network_services`/`dhcp`/`gateway_mac`/`hosts`/`resolver`/
+`sysctl_net` 这几段的语义比较（含噪声忽略、服务名翻译）跟 `diff.py`
+（给人看的"两份快照对比"）是同一套规则，直接从那边 import `_diff_*` 函数复用，
+避免两份实现分头维护、悄悄漂移。
 """
 from __future__ import annotations
 
 from typing import Callable, Optional
+
+from . import diff as _diff
 
 
 def diff(collector: str, before: Optional[dict], after: dict, at: float) -> list[dict]:
@@ -140,6 +147,57 @@ def _diff_scenario(before: dict, after: dict, at: float) -> list[dict]:
     return [_event(at, "scenario_changed", "scenario", before.get("label"), after.get("label"))]
 
 
+def _real_changes(changes: list) -> list:
+    """过滤掉 `unavailable`（单项数据缺失/出错，不代表配置变了，不值得发事件）。"""
+    return [c for c in changes if c.kind in ("added", "removed", "changed")]
+
+
+def _diff_dynamic_store(before: dict, after: dict, at: float) -> list[dict]:
+    changes = _real_changes(_diff._diff_dynamic_store("dynamic_store", before, after))
+    return [_event(at, "dynamic_store_changed", c.subject, c.before, c.after) for c in changes]
+
+
+def _diff_nwi(before: dict, after: dict, at: float) -> list[dict]:
+    events: list[dict] = []
+    for c in _real_changes(_diff._diff_nwi("nwi", before, after)):
+        kind = "nwi_order_changed" if c.subject.endswith(".order") else "nwi_changed"
+        events.append(_event(at, kind, c.subject, c.before, c.after))
+    return events
+
+
+def _diff_network_services(before: dict, after: dict, at: float) -> list[dict]:
+    events: list[dict] = []
+    for c in _real_changes(_diff._diff_network_services("network_services", before, after)):
+        kind = "network_service_order_changed" if c.subject == "order" else "network_service_changed"
+        events.append(_event(at, kind, c.subject, c.before, c.after))
+    return events
+
+
+def _diff_dhcp(before: dict, after: dict, at: float) -> list[dict]:
+    changes = _real_changes(_diff._diff_dhcp("dhcp", before, after))
+    return [_event(at, "dhcp_changed", c.subject, c.before, c.after) for c in changes]
+
+
+def _diff_gateway_mac(before: dict, after: dict, at: float) -> list[dict]:
+    changes = _real_changes(_diff._diff_gateway_mac("gateway_mac", before, after))
+    return [_event(at, "gateway_mac_changed", c.subject, c.before, c.after) for c in changes]
+
+
+def _diff_hosts(before: dict, after: dict, at: float) -> list[dict]:
+    changes = _real_changes(_diff._diff_hosts("hosts", before, after))
+    return [_event(at, "hosts_changed", c.subject, c.before, c.after) for c in changes]
+
+
+def _diff_resolver(before: dict, after: dict, at: float) -> list[dict]:
+    changes = _real_changes(_diff._diff_resolver("resolver", before, after))
+    return [_event(at, "resolver_changed", c.subject, c.before, c.after) for c in changes]
+
+
+def _diff_sysctl_net(before: dict, after: dict, at: float) -> list[dict]:
+    changes = _real_changes(_diff._diff_sysctl_net("sysctl_net", before, after))
+    return [_event(at, "sysctl_net_changed", c.subject, c.before, c.after) for c in changes]
+
+
 _HANDLERS: dict[str, Callable[[dict, dict, float], list[dict]]] = {
     "interfaces": _diff_interfaces,
     "routes": _diff_routes,
@@ -150,4 +208,12 @@ _HANDLERS: dict[str, Callable[[dict, dict, float], list[dict]]] = {
     "mihomo": _diff_mihomo,
     "targets": _diff_targets,
     "scenario": _diff_scenario,
+    "dynamic_store": _diff_dynamic_store,
+    "nwi": _diff_nwi,
+    "network_services": _diff_network_services,
+    "dhcp": _diff_dhcp,
+    "gateway_mac": _diff_gateway_mac,
+    "hosts": _diff_hosts,
+    "resolver": _diff_resolver,
+    "sysctl_net": _diff_sysctl_net,
 }

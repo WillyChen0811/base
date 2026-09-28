@@ -322,3 +322,263 @@ def test_summarize_changes_spells_out_dict_field_changes():
                     {"status": "Disconnected", "enabled": True},
                     {"status": "Connected", "enabled": True})
     assert "WG-B.status：Disconnected→Connected" in summarize_changes([change])
+
+
+# ---------------------------------------------------------------------------
+# dynamic_store：字段级下钻、服务 UUID 翻译、噪声忽略（依据见 diff.py 里的
+# _NOISE_DYNAMIC_STORE_*_RE 注释：本机实测 LinkQuality/AutoJoinTimestamp/
+# CachedScanRecord/Lease 时间戳几秒内自己变，跟配置无关）
+# ---------------------------------------------------------------------------
+
+_UUID = "AAAA1111-2222-3333-4444-555555555555"
+
+
+def test_dynamic_store_field_drill_and_uuid_translation():
+    before = _ok(keys={
+        f"Setup:/Network/Service/{_UUID}": {"UserDefinedName": "My Ethernet"},
+        f"Setup:/Network/Service/{_UUID}/DNS": {"ServerAddresses": ["8.8.8.8"]},
+        "State:/Network/Global/IPv4": {"PrimaryInterface": "en0", "Router": "192.0.2.1"},
+    }, count=3)
+    after = _ok(keys={
+        f"Setup:/Network/Service/{_UUID}": {"UserDefinedName": "My Ethernet"},
+        f"Setup:/Network/Service/{_UUID}/DNS": {"ServerAddresses": ["1.1.1.1"]},
+        "State:/Network/Global/IPv4": {"PrimaryInterface": "utun6", "Router": "192.0.2.1"},
+    }, count=3)
+    changes = diff_snapshots({"dynamic_store": before}, {"dynamic_store": after})
+    by_subject = {c.subject: c for c in changes}
+    assert by_subject["State:/Network/Global/IPv4.PrimaryInterface"].after == "utun6"
+    assert "State:/Network/Global/IPv4.Router" not in by_subject  # Router 没变，不出现
+    dns_subject = f"Setup:/Network/Service/My Ethernet({_UUID[:8]})/DNS.ServerAddresses"
+    assert by_subject[dns_subject].after == ["1.1.1.1"]
+    # UserDefinedName 没变，服务本身这一条不产生变化
+    assert f"Setup:/Network/Service/My Ethernet({_UUID[:8]})" not in by_subject
+
+
+def test_dynamic_store_ignores_noise_link_quality_and_timestamps():
+    before = _ok(keys={
+        "State:/Network/Interface/en0/LinkQuality": {"LinkQuality": "100"},
+        "State:/Network/Interface/en0/AirPort": {
+            "AutoJoinTimestamp": "09/28/2026 10:00:00", "CachedScanRecord": "0xaa", "CHANNEL": "149",
+        },
+        "State:/Network/Service/X/DHCP": {"LeaseStartTime": "a", "LeaseExpirationTime": "b"},
+        "State:/Network/Interface/en0/NAT64": {
+            "PLATDiscoveryStartTime": "t1", "PLATDiscoveryCompletionTime": "t2",
+        },
+    }, count=4)
+    after = _ok(keys={
+        "State:/Network/Interface/en0/LinkQuality": {"LinkQuality": "42"},
+        "State:/Network/Interface/en0/AirPort": {
+            "AutoJoinTimestamp": "09/28/2026 12:00:00", "CachedScanRecord": "0xbb", "CHANNEL": "149",
+        },
+        "State:/Network/Service/X/DHCP": {"LeaseStartTime": "c", "LeaseExpirationTime": "d"},
+        "State:/Network/Interface/en0/NAT64": {
+            "PLATDiscoveryStartTime": "t3", "PLATDiscoveryCompletionTime": "t4",
+        },
+    }, count=4)
+    assert diff_snapshots({"dynamic_store": before}, {"dynamic_store": after}) == []
+
+
+def test_dynamic_store_added_removed_key():
+    before = _ok(keys={"State:/A": "1"}, count=1)
+    after = _ok(keys={"State:/A": "1", "State:/B": "2"}, count=2)
+    changes = diff_snapshots({"dynamic_store": before}, {"dynamic_store": after})
+    assert changes == [Change("dynamic_store", "added", "State:/B", None, "2")]
+
+
+def test_dynamic_store_error_is_unavailable():
+    before = {"error": "scutil 超时（5.0s）"}
+    after = _ok(keys={}, count=0)
+    changes = diff_snapshots({"dynamic_store": before}, {"dynamic_store": after})
+    assert changes == [Change("dynamic_store", "unavailable", "dynamic_store", "scutil 超时（5.0s）", None)]
+
+
+# ---------------------------------------------------------------------------
+# nwi：接口顺序变化（主网卡切换）、增删、flags/address/VPN server
+# ---------------------------------------------------------------------------
+
+
+def _nwi_iface(name, flags="0x5", address=None, vpn_server=None):
+    return {"name": name, "flags": {"value": flags, "names": []}, "address": address,
+            "vpn_server": vpn_server, "reach": None}
+
+
+def test_nwi_order_change_and_vpn_server_field_change():
+    before = _ok(
+        ipv4={"interfaces": [_nwi_iface("en0", address="203.0.113.5"),
+                              _nwi_iface("utun6", address="198.51.100.2", vpn_server="198.51.100.1")],
+              "reach": None},
+        ipv6={"interfaces": [], "reach": None},
+        interfaces=["en0", "utun6"],
+    )
+    after = _ok(
+        ipv4={"interfaces": [_nwi_iface("utun6", address="198.51.100.2", vpn_server="198.51.100.9"),
+                              _nwi_iface("en0", address="203.0.113.5")],
+              "reach": None},
+        ipv6={"interfaces": [], "reach": None},
+        interfaces=["utun6", "en0"],
+    )
+    changes = diff_snapshots({"nwi": before}, {"nwi": after})
+    by_subject = {c.subject: c for c in changes}
+    assert by_subject["ipv4.order"].before == ["en0", "utun6"]
+    assert by_subject["ipv4.order"].after == ["utun6", "en0"]
+    assert by_subject["ipv4.utun6.vpn_server"].after == "198.51.100.9"
+
+
+def test_nwi_interface_added_removed():
+    before = _ok(ipv4={"interfaces": [_nwi_iface("en0")], "reach": None},
+                 ipv6={"interfaces": [], "reach": None}, interfaces=["en0"])
+    after = _ok(ipv4={"interfaces": [_nwi_iface("en0"), _nwi_iface("utun6")], "reach": None},
+                ipv6={"interfaces": [], "reach": None}, interfaces=["en0", "utun6"])
+    changes = diff_snapshots({"nwi": before}, {"nwi": after})
+    kinds = {c.subject: c.kind for c in changes}
+    assert kinds["ipv4.utun6"] == "added"
+
+
+# ---------------------------------------------------------------------------
+# network_services：当前位置、服务增删/启用、顺序
+# ---------------------------------------------------------------------------
+
+
+def test_network_services_location_enabled_add_and_order():
+    before = _ok(
+        current_location="Automatic",
+        services=[{"name": "Wi-Fi", "enabled": True}, {"name": "iPhone USB", "enabled": False}],
+        order=[{"index": 1, "name": "Wi-Fi", "hardware_port": "Wi-Fi", "device": "en0"},
+               {"index": 2, "name": "iPhone USB", "hardware_port": "iPhone USB", "device": "en5"}],
+    )
+    after = _ok(
+        current_location="Office",
+        services=[{"name": "Wi-Fi", "enabled": False}, {"name": "iPhone USB", "enabled": False},
+                  {"name": "MyWireGuardTunnel", "enabled": True}],
+        order=[{"index": 1, "name": "iPhone USB", "hardware_port": "iPhone USB", "device": "en5"},
+               {"index": 2, "name": "Wi-Fi", "hardware_port": "Wi-Fi", "device": "en0"}],
+    )
+    changes = diff_snapshots({"network_services": before}, {"network_services": after})
+    by_subject = {c.subject: c for c in changes}
+    assert by_subject["current_location"].after == "Office"
+    assert by_subject["Wi-Fi.enabled"].after is False
+    assert by_subject["MyWireGuardTunnel"].kind == "added"
+    assert by_subject["order"].after == ["iPhone USB", "Wi-Fi"]
+
+
+# ---------------------------------------------------------------------------
+# dhcp：按接口比较关键字段，不比租约时间
+# ---------------------------------------------------------------------------
+
+
+def test_dhcp_field_change_and_ignores_lease_times():
+    before = _ok(interfaces={"en0": {
+        "error": None, "config_method": "DHCP", "router": "172.20.10.1", "domain_name": None,
+        "domain_name_server": ["172.20.10.1"], "ssid": "redacted",
+        "lease_start_time": "09/28/2026 15:28:49", "lease_expiration_time": "09/28/2026 16:28:49",
+    }})
+    after = _ok(interfaces={"en0": {
+        "error": None, "config_method": "DHCP", "router": "172.20.10.254", "domain_name": None,
+        "domain_name_server": ["172.20.10.1"], "ssid": "redacted",
+        "lease_start_time": "09/28/2026 16:00:00", "lease_expiration_time": "09/28/2026 17:00:00",
+    }})
+    changes = diff_snapshots({"dhcp": before}, {"dhcp": after})
+    assert changes == [Change("dhcp", "changed", "en0.router", "172.20.10.1", "172.20.10.254")]
+
+
+def test_dhcp_interface_error_is_unavailable():
+    before = _ok(interfaces={"en99": {"error": None, "config_method": "DHCP"}})
+    after = _ok(interfaces={"en99": {"error": "ipconfig_get_summary(en99) failed: interface doesn't exist"}})
+    changes = diff_snapshots({"dhcp": before}, {"dhcp": after})
+    assert changes == [Change("dhcp", "unavailable", "en99", None,
+                              "ipconfig_get_summary(en99) failed: interface doesn't exist")]
+
+
+# ---------------------------------------------------------------------------
+# gateway_mac：网关 MAC 变化是换网络的强信号
+# ---------------------------------------------------------------------------
+
+
+def test_gateway_mac_change():
+    before = _ok(gateways={"172.20.10.1": {"error": None, "mac": "aa:bb:cc:dd:ee:ff", "interface": "en0"}})
+    after = _ok(gateways={"172.20.10.1": {"error": None, "mac": "11:22:33:44:55:66", "interface": "en0"}})
+    changes = diff_snapshots({"gateway_mac": before}, {"gateway_mac": after})
+    assert changes == [Change("gateway_mac", "changed", "172.20.10.1", "aa:bb:cc:dd:ee:ff", "11:22:33:44:55:66")]
+
+
+def test_gateway_mac_lookup_failure_toggle_is_unavailable():
+    before = _ok(gateways={"172.20.10.1": {"error": None, "mac": "aa:bb:cc:dd:ee:ff", "interface": "en0"}})
+    after = _ok(gateways={"172.20.10.1": {"error": "arp 缓存里没有 172.20.10.1（未连通或已过期）"}})
+    changes = diff_snapshots({"gateway_mac": before}, {"gateway_mac": after})
+    assert changes[0].kind == "unavailable"
+
+
+# ---------------------------------------------------------------------------
+# hosts：按 IP 合并多行后比较条目；条目未变但 sha256 变了单独报一条
+# ---------------------------------------------------------------------------
+
+
+def test_hosts_entries_added_and_changed_merges_same_ip_lines():
+    before = _ok(entries=[{"ip": "127.0.0.1", "hostnames": ["localhost"]}], sha256="h1", mtime=1.0)
+    after = _ok(
+        entries=[
+            {"ip": "127.0.0.1", "hostnames": ["localhost"]},
+            {"ip": "127.0.0.1", "hostnames": ["view-localhost"]},
+            {"ip": "1.2.3.4", "hostnames": ["example.com"]},
+        ],
+        sha256="h2", mtime=2.0,
+    )
+    changes = diff_snapshots({"hosts": before}, {"hosts": after})
+    kinds = {c.subject: c.kind for c in changes}
+    assert kinds["1.2.3.4"] == "added"
+    assert kinds["127.0.0.1"] == "changed"
+
+
+def test_hosts_sha_changed_without_entry_change_reports_file():
+    before = _ok(entries=[{"ip": "127.0.0.1", "hostnames": ["localhost"]}], sha256="h1", mtime=1.0)
+    after = _ok(entries=[{"ip": "127.0.0.1", "hostnames": ["localhost"]}], sha256="h2", mtime=2.0)
+    changes = diff_snapshots({"hosts": before}, {"hosts": after})
+    assert changes == [Change("hosts", "changed", "file", "h1", "h2")]
+
+
+# ---------------------------------------------------------------------------
+# resolver：按域名比较
+# ---------------------------------------------------------------------------
+
+
+def test_resolver_domain_added_and_changed():
+    before = _ok(domains=[{"domain": "internal.example.com", "nameservers": ["10.0.0.1"],
+                            "ports": [], "search_order": []}])
+    after = _ok(domains=[
+        {"domain": "internal.example.com", "nameservers": ["10.0.0.2"], "ports": [], "search_order": []},
+        {"domain": "corp.example.com", "nameservers": ["10.0.1.1"], "ports": [], "search_order": []},
+    ])
+    changes = diff_snapshots({"resolver": before}, {"resolver": after})
+    by_subject = {c.subject: c for c in changes}
+    assert by_subject["internal.example.com.nameservers"].after == ["10.0.0.2"]
+    assert by_subject["corp.example.com"].kind == "added"
+
+
+# ---------------------------------------------------------------------------
+# sysctl_net：值变化
+# ---------------------------------------------------------------------------
+
+
+def test_sysctl_net_value_change():
+    before = _ok(values={"net.inet.ip.forwarding": {"error": None, "value": "0"}})
+    after = _ok(values={"net.inet.ip.forwarding": {"error": None, "value": "1"}})
+    changes = diff_snapshots({"sysctl_net": before}, {"sysctl_net": after})
+    assert changes == [Change("sysctl_net", "changed", "net.inet.ip.forwarding", "0", "1")]
+
+
+# ---------------------------------------------------------------------------
+# summarize_changes：hosts/nwi 的定制中文摘要
+# ---------------------------------------------------------------------------
+
+
+def test_summarize_hosts_and_nwi_readable():
+    before_hosts = _ok(entries=[], sha256="h1", mtime=1.0)
+    after_hosts = _ok(entries=[{"ip": "1.2.3.4", "hostnames": ["example.com"]}], sha256="h2", mtime=2.0)
+    before_nwi = _ok(ipv4={"interfaces": [_nwi_iface("en0"), _nwi_iface("utun6")], "reach": None},
+                      ipv6={"interfaces": [], "reach": None}, interfaces=["en0", "utun6"])
+    after_nwi = _ok(ipv4={"interfaces": [_nwi_iface("utun6"), _nwi_iface("en0")], "reach": None},
+                     ipv6={"interfaces": [], "reach": None}, interfaces=["utun6", "en0"])
+    text = summarize_changes(diff_snapshots(
+        {"hosts": before_hosts, "nwi": before_nwi}, {"hosts": after_hosts, "nwi": after_nwi}))
+    assert "hosts：新增 1 条（1.2.3.4 example.com）" in text
+    assert "ipv4 主网卡：en0→utun6" in text

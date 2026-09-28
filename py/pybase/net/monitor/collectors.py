@@ -452,15 +452,143 @@ def collect_mihomo(base_url: str, secret: Optional[str] = None, *, timeout: floa
         bucket["download"] += c.get("download", 0) or 0
     top_chains = sorted(by_chain.items(), key=lambda kv: kv[1]["upload"] + kv[1]["download"], reverse=True)[:10]
 
+    tun_cfg = configs.get("tun") or {}
     return _ok(
         version=version.get("version"),
         mode=configs.get("mode"),
-        tun_enabled=bool((configs.get("tun") or {}).get("enable")),
+        tun_enabled=bool(tun_cfg.get("enable")),
+        tun_device=tun_cfg.get("device"),
         connections_count=len(conns),
         total_upload=total_upload,
         total_download=total_download,
         top_chains=[{"chain": k, **v} for k, v in top_chains],
     )
+
+
+# ---------- interface owners ----------
+#
+# 虚拟接口（utun/wg/wt/netbird 等）归属于谁：mihomo TUN、WireGuard.app 的哪条隧道、
+# NetBird、自建隧道，还是判不出（unknown）。本机（macOS，WireGuard.app App Store 版 +
+# NetBird.app + ClashX Meta）实测过每条途径能拿到什么，见各分支注释。
+
+_VIRTUAL_IFACE_RE = re.compile(r"^(utun\d+|wg\d+|wt\d+|tun\d+|netbird\d*|tailscale\d*)$", re.IGNORECASE)
+
+
+def collect_interface_owners(
+    interfaces: dict,
+    vpn_services: Optional[dict] = None,
+    netbird: Optional[dict] = None,
+    mihomo: Optional[dict] = None,
+    *,
+    vpn_service_addresses: Optional[dict] = None,
+    self_tunnels: Optional[dict] = None,
+) -> dict:
+    """判定每个虚拟接口的归属，返回 `{ifname: {owner_kind, owner_name, evidence}}`。
+
+    这是"派生"采集器：入参是同一轮里其他采集器（`collect_interfaces`/
+    `collect_vpn_services`/`collect_netbird`/`collect_mihomo`）的返回值，不是自己再跑
+    系统命令，调用方（如 `Monitor` 的 `derived` 阶段）负责传入同一轮的新鲜结果。
+
+    实测结论（macOS，本机验证，见 base CLAUDE.md `net` 小节的汇报）：
+    - mihomo：`/configs` 的 `tun.device`（如 `utun6`）直接给了接口名，最可靠。
+    - WireGuard.app（App Store 版）：`scutil --nc show/status <uuid>` 只给连接统计
+      （ConnectCount 等）和 `RemoteAddress`，**不给接口名也不给本机分配的地址**——
+      配置存在沙盒里读不到。只能靠调用方另外提供的 `vpn_service_addresses`
+      （服务名 -> 已知地址）跟接口实际地址做交集匹配，都没有就是 `unknown`。
+    - NetBird：`netbird status --json` 的 `netbirdIp` 若命中某接口地址即为该接口。
+    - 自建隧道：调用方（`netcore tunnel status` 记的状态文件）自己知道 ifname，
+      通过 `self_tunnels`（ifname -> 名字）直接给出，不用猜。
+
+    `vpn_service_addresses`/`self_tunnels` 都不传时对应途径直接跳过，不报错。
+    """
+    if interfaces.get("error"):
+        return _fail("interfaces 采集失败，无法判断归属")
+    vpn_service_addresses = vpn_service_addresses or {}
+    self_tunnels = self_tunnels or {}
+
+    mihomo_device = None
+    if mihomo and not mihomo.get("error") and mihomo.get("tun_enabled"):
+        mihomo_device = mihomo.get("tun_device")
+
+    netbird_ip = None
+    if netbird and not netbird.get("error") and netbird.get("available") and netbird.get("netbird_ip"):
+        # netbirdIp 可能带 CIDR（如 "100.90.1.2/16"），归属匹配只看地址部分
+        netbird_ip = str(netbird["netbird_ip"]).split("/", 1)[0]
+
+    connected_services: list[dict] = []
+    if vpn_services and not vpn_services.get("error"):
+        connected_services = [
+            s for s in vpn_services.get("services", [])
+            if s.get("enabled") and s.get("status") == "Connected"
+        ]
+
+    owners: dict[str, dict] = {}
+    for iface in interfaces.get("interfaces", []):
+        name = iface.get("name")
+        if not name or not _VIRTUAL_IFACE_RE.match(name):
+            continue
+        addrs = {a["address"] for a in iface.get("ipv4", []) + iface.get("ipv6", []) if a.get("address")}
+
+        if mihomo_device and name == mihomo_device:
+            owners[name] = {
+                "owner_kind": "mihomo_tun", "owner_name": "mihomo",
+                "evidence": f"mihomo /configs tun.device={mihomo_device}",
+            }
+            continue
+        if name in self_tunnels:
+            owners[name] = {
+                "owner_kind": "self_tunnel", "owner_name": self_tunnels[name],
+                "evidence": "调用方给出的自建隧道接口映射（tunnel_state.json）",
+            }
+            continue
+        if netbird_ip and netbird_ip in addrs:
+            owners[name] = {
+                "owner_kind": "netbird", "owner_name": "netbird",
+                "evidence": f"接口地址命中 netbird status 的 netbirdIp={netbird_ip}",
+            }
+            continue
+        matched = None
+        for svc in connected_services:
+            known = set(vpn_service_addresses.get(svc.get("name"), ()))
+            if known & addrs:
+                matched = svc.get("name")
+                break
+        if matched:
+            owners[name] = {
+                "owner_kind": "wireguard", "owner_name": matched,
+                "evidence": f"接口地址命中调用方已知的 {matched} 地址（scutil 本身不给地址）",
+            }
+            continue
+        owners[name] = {
+            "owner_kind": "unknown", "owner_name": None,
+            "evidence": f"地址 {sorted(addrs)} 未匹配任何已知来源",
+        }
+    return _ok(owners=owners)
+
+
+def via_of(interface: Optional[str], owners: Optional[dict]) -> str:
+    """目标探测结果的出口归属标签：`clash_tun` / `wireguard:<名>` / `netbird` /
+    `self_tunnel:<名>` / `direct:<物理接口>` / `unknown`。
+
+    `owners` 只登记了识别到的虚拟接口；不在其中的接口一律当物理直连
+    （`direct:<接口>`），没有接口名时给 `unknown`。
+    """
+    if not interface:
+        return "unknown"
+    owners = owners or {}
+    o = owners.get(interface)
+    if o is None:
+        return f"direct:{interface}"
+    kind, name = o.get("owner_kind"), o.get("owner_name")
+    if kind == "mihomo_tun":
+        return "clash_tun"
+    if kind == "wireguard":
+        return f"wireguard:{name}"
+    if kind == "netbird":
+        return "netbird"
+    if kind == "self_tunnel":
+        return f"self_tunnel:{name}"
+    return "unknown"
 
 
 # ---------- targets ----------
@@ -472,10 +600,14 @@ def collect_targets(
     route_timeout: float = _TIMEOUT_DEFAULT,
     probe_timeout: float = _TIMEOUT_DEFAULT,
     max_workers: int = 8,
+    owners: Optional[dict] = None,
 ) -> dict:
     """对一批目标（`[{"name", "host", "port"}, ...]`）并发做路由+连通性检查。
 
     每个目标互不影响：单个目标解析/探测出错，结果里这一条带 `error`，其余照常。
+    `owners` 是 `collect_interface_owners` 的 `owners` 字段（同一轮的新鲜结果，
+    调用方传入），用来给每个目标标注 `via`（出口归属）；不传时 `via` 恒为
+    `"unknown"`（不知道出口接口，或不认识 owners）。
     """
     def probe_one(target: dict) -> dict:
         name, host, port = target.get("name"), target.get("host"), target.get("port")
@@ -490,6 +622,7 @@ def collect_targets(
                 "address_class": classify_address(host),
                 "route": None if route is None else route.__dict__,
                 "proxied": looks_proxied(route),
+                "via": via_of(route.interface if route else None, owners),
                 "probe": {
                     "status": probe.status,
                     "elapsed_ms": probe.elapsed_ms,

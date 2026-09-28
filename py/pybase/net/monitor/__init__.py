@@ -8,5 +8,6 @@ from __future__ import annotations
 from . import collectors
 from .recorder import Recorder
 from .runner import Monitor
+from .scenario import Scenario, scenario_envelope, summarize_scenario
 
-__all__ = ["collectors", "Recorder", "Monitor"]
+__all__ = ["collectors", "Recorder", "Monitor", "Scenario", "summarize_scenario", "scenario_envelope"]

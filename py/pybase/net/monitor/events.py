@@ -134,6 +134,12 @@ def _diff_targets(before: dict, after: dict, at: float) -> list[dict]:
     return events
 
 
+def _diff_scenario(before: dict, after: dict, at: float) -> list[dict]:
+    if before.get("key") == after.get("key"):
+        return []
+    return [_event(at, "scenario_changed", "scenario", before.get("label"), after.get("label"))]
+
+
 _HANDLERS: dict[str, Callable[[dict, dict, float], list[dict]]] = {
     "interfaces": _diff_interfaces,
     "routes": _diff_routes,
@@ -143,4 +149,5 @@ _HANDLERS: dict[str, Callable[[dict, dict, float], list[dict]]] = {
     "netbird": _diff_netbird,
     "mihomo": _diff_mihomo,
     "targets": _diff_targets,
+    "scenario": _diff_scenario,
 }

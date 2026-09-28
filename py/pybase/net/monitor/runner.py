@@ -6,13 +6,19 @@ from __future__ import annotations
 
 import threading
 import time
-from typing import Callable, Mapping
+from typing import Callable, Mapping, Optional
 
 
 class Monitor:
     """`collectors` 是 `{采集器名: 无参可调用 -> dict}` 的映射（用 `functools.partial`
     把主机列表、URL、secret 这些参数提前绑好）；每轮 `tick()` 依次调用，拼成一份
     快照交给 `recorder.record()`。
+
+    `derived` 是第二阶段：`{名字: Callable[[snapshot], dict]}`，拿到第一阶段已经
+    拼好的快照（按 dict 插入顺序依次算，后面的能看到前面 derived 算出的结果）
+    再算一份新条目——用于"这一项需要同一轮别的采集结果才能算"的场景（比如接口
+    归属需要 interfaces+vpn_services+netbird+mihomo 都是新鲜的，场景识别又需要
+    接口归属）。`derived` 里的函数同样不该抛异常，出错就在返回值里体现。
 
     `interval` 秒之间用 `stop_event.wait()` 休眠，`run()` 收到置位后立即退出，
     不会卡在长睡眠里；单次 `tick()` 拆出来方便测试，不必启动线程/循环。
@@ -24,16 +30,22 @@ class Monitor:
         recorder,
         *,
         interval: float,
+        derived: Optional[Mapping[str, Callable[[dict], dict]]] = None,
+        source: str = "local",
     ):
         self._collectors = dict(collectors)
+        self._derived = dict(derived or {})
         self._recorder = recorder
         self._interval = interval
+        self._source = source
 
     def tick(self, *, at: float | None = None) -> list[dict]:
         """跑一轮全部采集器，记录快照，返回这一轮产生的事件。"""
         at = time.time() if at is None else at
         snapshot = {name: fn() for name, fn in self._collectors.items()}
-        return self._recorder.record(snapshot, at=at)
+        for name, fn in self._derived.items():
+            snapshot[name] = fn(snapshot)
+        return self._recorder.record(snapshot, at=at, source=self._source)
 
     def run(self, stop_event: threading.Event) -> None:
         """阻塞循环，直到 `stop_event` 置位。调用方自己决定放哪个线程跑。"""

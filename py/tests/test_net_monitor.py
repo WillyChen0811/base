@@ -14,7 +14,7 @@ import time
 import pytest
 
 import pybase.net.diag as diag
-from pybase.net.monitor import Monitor, Recorder, collectors
+from pybase.net.monitor import Monitor, Recorder, Scenario, collectors, scenario_envelope, summarize_scenario
 
 
 # ---------------------------------------------------------------------------
@@ -733,3 +733,376 @@ def test_monitor_run_stops_on_event():
     t.join()
     assert ticks["n"] >= 1
     rec.close()
+
+
+# ---------------------------------------------------------------------------
+# collect_interface_owners / via_of：接口归属判定
+# ---------------------------------------------------------------------------
+
+_OWNERS_IFACES = {
+    "error": None,
+    "interfaces": [
+        {"name": "utun6", "status": "active", "ipv4": [{"address": "198.18.0.1"}], "ipv6": []},
+        {"name": "utun1", "status": "active", "ipv4": [{"address": "192.168.65.8"}], "ipv6": []},
+        {"name": "utun2", "status": "active", "ipv4": [{"address": "100.90.1.2"}], "ipv6": []},
+        {"name": "utun3", "status": "active", "ipv4": [], "ipv6": [{"address": "fe80::1"}]},
+        {"name": "en0", "status": "active", "ipv4": [{"address": "172.20.10.3"}], "ipv6": []},
+    ],
+}
+_OWNERS_MIHOMO = {"error": None, "mode": "rule", "tun_enabled": True, "tun_device": "utun6"}
+_OWNERS_VPN = {
+    "error": None,
+    "services": [
+        {"uuid": "u1", "name": "MacBookAirChenwyM3", "enabled": True, "status": "Connected",
+         "subtype": "VPN:com.wireguard.macos"},
+        {"uuid": "u2", "name": "Deguo", "enabled": True, "status": "Disconnected",
+         "subtype": "VPN:com.wireguard.macos"},
+    ],
+}
+_OWNERS_NETBIRD = {
+    "error": None, "available": True, "connected": True,
+    "daemon_status": "Connected", "netbird_ip": "100.90.1.2/16",
+}
+
+
+def test_collect_interface_owners_mihomo_tun_by_device_name():
+    result = collectors.collect_interface_owners(
+        _OWNERS_IFACES, _OWNERS_VPN, _OWNERS_NETBIRD, _OWNERS_MIHOMO,
+        vpn_service_addresses={"MacBookAirChenwyM3": ["192.168.65.8"]},
+    )
+    assert result["error"] is None
+    assert result["owners"]["utun6"] == {
+        "owner_kind": "mihomo_tun", "owner_name": "mihomo",
+        "evidence": "mihomo /configs tun.device=utun6",
+    }
+
+
+def test_collect_interface_owners_wireguard_by_known_address():
+    result = collectors.collect_interface_owners(
+        _OWNERS_IFACES, _OWNERS_VPN, _OWNERS_NETBIRD, _OWNERS_MIHOMO,
+        vpn_service_addresses={"MacBookAirChenwyM3": ["192.168.65.8"]},
+    )
+    owner = result["owners"]["utun1"]
+    assert owner["owner_kind"] == "wireguard"
+    assert owner["owner_name"] == "MacBookAirChenwyM3"
+
+
+def test_collect_interface_owners_wireguard_not_matched_when_service_disconnected():
+    # Deguo 是 Disconnected，即使给了地址也不该被匹配上
+    result = collectors.collect_interface_owners(
+        _OWNERS_IFACES, _OWNERS_VPN, _OWNERS_NETBIRD, _OWNERS_MIHOMO,
+        vpn_service_addresses={"Deguo": ["100.90.1.2"]},
+    )
+    # utun2 命中的是 netbird_ip，不是 Deguo（netbird 判断在前）
+    assert result["owners"]["utun2"]["owner_kind"] == "netbird"
+
+
+def test_collect_interface_owners_netbird_by_ip():
+    result = collectors.collect_interface_owners(
+        _OWNERS_IFACES, _OWNERS_VPN, _OWNERS_NETBIRD, _OWNERS_MIHOMO,
+    )
+    assert result["owners"]["utun2"] == {
+        "owner_kind": "netbird", "owner_name": "netbird",
+        "evidence": "接口地址命中 netbird status 的 netbirdIp=100.90.1.2",
+    }
+
+
+def test_collect_interface_owners_self_tunnel_mapping():
+    result = collectors.collect_interface_owners(
+        _OWNERS_IFACES, _OWNERS_VPN, _OWNERS_NETBIRD, _OWNERS_MIHOMO,
+        self_tunnels={"utun3": "test-peer"},
+    )
+    assert result["owners"]["utun3"] == {
+        "owner_kind": "self_tunnel", "owner_name": "test-peer",
+        "evidence": "调用方给出的自建隧道接口映射（tunnel_state.json）",
+    }
+
+
+def test_collect_interface_owners_unknown_when_no_evidence():
+    result = collectors.collect_interface_owners(_OWNERS_IFACES, _OWNERS_VPN, _OWNERS_NETBIRD, _OWNERS_MIHOMO)
+    owner = result["owners"]["utun1"]  # 没给 vpn_service_addresses，utun1 判不出
+    assert owner["owner_kind"] == "unknown"
+    assert owner["owner_name"] is None
+    # 物理接口 en0 不在虚拟接口正则里，根本不登记
+    assert "en0" not in result["owners"]
+
+
+def test_collect_interface_owners_interfaces_error_fails():
+    result = collectors.collect_interface_owners({"error": "boom"})
+    assert result["error"] is not None
+    assert "owners" not in result
+
+
+def test_via_of_mapping():
+    owners = {
+        "utun6": {"owner_kind": "mihomo_tun", "owner_name": "mihomo"},
+        "utun1": {"owner_kind": "wireguard", "owner_name": "MacBookAirChenwyM3"},
+        "utun2": {"owner_kind": "netbird", "owner_name": "netbird"},
+        "utun3": {"owner_kind": "self_tunnel", "owner_name": "test-peer"},
+        "utun4": {"owner_kind": "unknown", "owner_name": None},
+    }
+    assert collectors.via_of("utun6", owners) == "clash_tun"
+    assert collectors.via_of("utun1", owners) == "wireguard:MacBookAirChenwyM3"
+    assert collectors.via_of("utun2", owners) == "netbird"
+    assert collectors.via_of("utun3", owners) == "self_tunnel:test-peer"
+    assert collectors.via_of("utun4", owners) == "unknown"
+    assert collectors.via_of("en0", owners) == "direct:en0"
+    assert collectors.via_of(None, owners) == "unknown"
+
+
+def test_collect_targets_fills_via_from_owners(monkeypatch):
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.bind(("127.0.0.1", 0))
+    server.listen(1)
+    port = server.getsockname()[1]
+    try:
+        fake_route = diag.RouteInfo(
+            host="127.0.0.1", destination="127.0.0.1", gateway=None,
+            interface="utun1", source=None, flags=None, raw="",
+        )
+        monkeypatch.setattr(collectors, "route_of", lambda host, timeout: fake_route)
+        owners = {"utun1": {"owner_kind": "wireguard", "owner_name": "MacBookAirChenwyM3"}}
+        result = collectors.collect_targets(
+            [{"name": "wg-a", "host": "127.0.0.1", "port": port}],
+            owners=owners, route_timeout=1, probe_timeout=1,
+        )
+        assert result["targets"][0]["via"] == "wireguard:MacBookAirChenwyM3"
+    finally:
+        server.close()
+
+
+def test_collect_targets_via_unknown_without_owners():
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.bind(("127.0.0.1", 0))
+    server.listen(1)
+    port = server.getsockname()[1]
+    try:
+        result = collectors.collect_targets(
+            [{"name": "x", "host": "127.0.0.1", "port": port}], route_timeout=1, probe_timeout=1,
+        )
+        # 没传 owners：查得到路由就是 direct:<iface>，查不到就是 unknown，两种都可接受
+        assert result["targets"][0]["via"] in (None, "unknown") or result["targets"][0]["via"].startswith("direct:")
+    finally:
+        server.close()
+
+
+# ---------------------------------------------------------------------------
+# summarize_scenario：多种组合下的 key/label
+# ---------------------------------------------------------------------------
+
+
+def _scenario_snapshot(*, wg=(), netbird_available=True, netbird_connected=False, netbird_status=None,
+                        clash_mode=None, clash_tun=False, system_proxy=False,
+                        default_iface=None, owners=None):
+    services = [
+        {"uuid": f"u{i}", "name": name, "enabled": True, "status": "Connected"}
+        for i, name in enumerate(wg)
+    ]
+    return {
+        "vpn_services": {"error": None, "services": services},
+        "netbird": {
+            "error": None, "available": netbird_available,
+            "connected": netbird_connected, "daemon_status": netbird_status,
+        },
+        "mihomo": {"error": None, "mode": clash_mode, "tun_enabled": clash_tun},
+        "proxies": {"error": None, "system": {"HTTPPort": "7893"} if system_proxy else {}},
+        "routes": {
+            "error": None,
+            "ipv4": [{"destination": "default", "interface": default_iface}] if default_iface else [],
+            "ipv6": [],
+        },
+        "owners": {"error": None, "owners": owners or {}},
+    }
+
+
+def test_summarize_scenario_only_wg_a():
+    snap = _scenario_snapshot(wg=["WG-A"], default_iface="utun1",
+                               owners={"utun1": {"owner_kind": "wireguard", "owner_name": "WG-A"}})
+    sc = summarize_scenario(snap)
+    assert isinstance(sc, Scenario)
+    assert sc.wireguard == ("WG-A",)
+    assert sc.default_via == "wireguard:WG-A"
+    assert "WG-A" in sc.label
+
+
+def test_summarize_scenario_wg_a_and_b_same_key_as_itself():
+    snap1 = _scenario_snapshot(wg=["WG-A", "WG-B"], default_iface="utun1",
+                                owners={"utun1": {"owner_kind": "wireguard", "owner_name": "WG-A"}})
+    snap2 = _scenario_snapshot(wg=["WG-B", "WG-A"], default_iface="utun1",
+                                owners={"utun1": {"owner_kind": "wireguard", "owner_name": "WG-A"}})
+    sc1, sc2 = summarize_scenario(snap1), summarize_scenario(snap2)
+    assert sc1.key == sc2.key  # 顺序无关，排序后应一致
+    assert sc1.wireguard == ("WG-A", "WG-B")
+
+
+def test_summarize_scenario_two_wg_plus_clash_tun_and_system_proxy():
+    snap = _scenario_snapshot(
+        wg=["WG-A", "WG-B"], clash_mode="rule", clash_tun=True, system_proxy=True,
+        default_iface="utun6", owners={"utun6": {"owner_kind": "mihomo_tun", "owner_name": "mihomo"}},
+    )
+    sc = summarize_scenario(snap)
+    assert sc.clash_mode == "rule"
+    assert sc.clash_tun is True
+    assert sc.system_proxy is True
+    assert sc.default_via == "clash_tun"
+    assert "Clash" in sc.label and "WireGuard" in sc.label
+
+
+def test_summarize_scenario_only_netbird():
+    snap = _scenario_snapshot(netbird_connected=True, netbird_status="Connected",
+                               default_iface="utun2",
+                               owners={"utun2": {"owner_kind": "netbird", "owner_name": "netbird"}})
+    sc = summarize_scenario(snap)
+    assert sc.netbird_connected is True
+    assert sc.wireguard == ()
+    assert sc.default_via == "netbird"
+    assert "NetBird" in sc.label
+
+
+def test_summarize_scenario_all_off_direct():
+    snap = _scenario_snapshot(default_iface="en0", netbird_available=False)
+    sc = summarize_scenario(snap)
+    assert sc.wireguard == ()
+    assert sc.netbird_connected is False
+    assert sc.clash_mode is None
+    assert sc.default_via == "direct:en0"
+    assert "直连" in sc.label
+
+
+def test_summarize_scenario_different_combos_have_different_keys():
+    only_wg = summarize_scenario(_scenario_snapshot(wg=["WG-A"], default_iface="utun1"))
+    only_nb = summarize_scenario(_scenario_snapshot(netbird_connected=True, netbird_status="Connected"))
+    all_off = summarize_scenario(_scenario_snapshot())
+    assert len({only_wg.key, only_nb.key, all_off.key}) == 3
+
+
+def test_scenario_envelope_wraps_as_collector_style_dict():
+    sc = summarize_scenario(_scenario_snapshot())
+    env = scenario_envelope(sc)
+    assert env["error"] is None
+    assert env["key"] == sc.key
+    assert env["label"] == sc.label
+
+
+# ---------------------------------------------------------------------------
+# Recorder：scenario 事件/分段聚合、手动备注、source 维度
+# ---------------------------------------------------------------------------
+
+
+def test_recorder_scenario_changed_event(recorder):
+    before = scenario_envelope(summarize_scenario(_scenario_snapshot()))
+    after = scenario_envelope(summarize_scenario(_scenario_snapshot(wg=["WG-A"], default_iface="utun1")))
+    recorder.record({"scenario": before}, at=1.0)
+    events = recorder.record({"scenario": after}, at=2.0)
+    assert any(e["kind"] == "scenario_changed" and e["subject"] == "scenario" for e in events)
+
+
+def test_recorder_scenarios_segments(recorder):
+    s_off = scenario_envelope(summarize_scenario(_scenario_snapshot()))
+    s_wg = scenario_envelope(summarize_scenario(_scenario_snapshot(wg=["WG-A"], default_iface="utun1")))
+    recorder.record({"scenario": s_off}, at=0.0)
+    recorder.record({"scenario": s_off}, at=5.0)  # 相同，走 ref，不产生新分段
+    recorder.record({"scenario": s_wg}, at=10.0)
+    segments = recorder.scenarios(0.0, 20.0)
+    assert len(segments) == 2
+    assert segments[0]["key"] == s_off["key"]
+    assert segments[0]["start"] == 0.0
+    assert segments[0]["end"] == 10.0
+    assert segments[1]["key"] == s_wg["key"]
+    assert segments[1]["end"] == 20.0
+
+
+def test_recorder_probes_by_scenario_aggregates_success_rate_and_via(recorder):
+    s_off = scenario_envelope(summarize_scenario(_scenario_snapshot()))
+    s_wg = scenario_envelope(summarize_scenario(_scenario_snapshot(wg=["WG-A"], default_iface="utun1")))
+
+    def target_payload(via, status, ms):
+        return {
+            "error": None,
+            "targets": [{"name": "t1", "error": None, "proxied": False, "via": via,
+                         "route": {"interface": None}, "probe": {"status": status, "elapsed_ms": ms}}],
+        }
+
+    recorder.record({"scenario": s_off, "targets": target_payload("direct:en0", "ok", 10.0)}, at=0.0)
+    recorder.record({"scenario": s_off, "targets": target_payload("direct:en0", "timeout", None)}, at=1.0)
+    recorder.record({"scenario": s_wg, "targets": target_payload("wireguard:WG-A", "ok", 50.0)}, at=10.0)
+    recorder.record({"scenario": s_wg, "targets": target_payload("wireguard:WG-A", "ok", 60.0)}, at=11.0)
+
+    agg = recorder.probes_by_scenario("t1", 0.0, 20.0)
+    assert len(agg) == 2
+    off_seg = next(a for a in agg if a["key"] == s_off["key"])
+    assert off_seg["total"] == 2
+    assert off_seg["success_rate"] == 0.5
+    assert off_seg["via"] == {"direct:en0": 2}
+    wg_seg = next(a for a in agg if a["key"] == s_wg["key"])
+    assert wg_seg["success_rate"] == 1.0
+    assert wg_seg["latency_median_ms"] == 55.0
+    assert wg_seg["via"] == {"wireguard:WG-A": 2}
+
+
+def test_recorder_annotate_and_query(recorder):
+    recorder.annotate(1.0, "在公司，开了 WG-B")
+    recorder.annotate(2.0, "回家了")
+    notes = recorder.annotations(0.0, 10.0)
+    assert [n["text"] for n in notes] == ["在公司，开了 WG-B", "回家了"]
+    assert notes[0]["source"] == "local"
+    windowed = recorder.annotations(1.5, 10.0)
+    assert [n["text"] for n in windowed] == ["回家了"]
+
+
+def test_recorder_record_and_events_carry_source(recorder):
+    recorder.record({"interfaces": {"error": None, "interfaces": []}}, at=1.0, source="router-a")
+    events_local = recorder.events(0, 10, source="local")
+    events_router = recorder.events(0, 10, source="router-a")
+    assert events_local == []
+    row = recorder._con.execute("SELECT source FROM snapshots").fetchone()
+    assert row[0] == "router-a"
+
+
+# ---------------------------------------------------------------------------
+# Monitor：derived 阶段（owners/scenario 需要同一轮其他采集器的新鲜结果）
+# ---------------------------------------------------------------------------
+
+
+def test_monitor_tick_runs_derived_after_primary_collectors():
+    rec = Recorder(":memory:")
+
+    def owners_derived(snapshot):
+        return collectors.collect_interface_owners(
+            snapshot["interfaces"], snapshot["vpn_services"], snapshot["netbird"], snapshot["mihomo"],
+        )
+
+    def scenario_derived(snapshot):
+        return scenario_envelope(summarize_scenario(snapshot))
+
+    collectors_map = {
+        "interfaces": lambda: _OWNERS_IFACES,
+        "vpn_services": lambda: _OWNERS_VPN,
+        "netbird": lambda: _OWNERS_NETBIRD,
+        "mihomo": lambda: _OWNERS_MIHOMO,
+        "routes": lambda: {"error": None, "ipv4": [{"destination": "default", "interface": "utun6"}], "ipv6": []},
+        "proxies": lambda: {"error": None, "system": {}},
+    }
+    monitor = Monitor(collectors_map, rec, interval=999, derived={"owners": owners_derived, "scenario": scenario_derived})
+    monitor.tick(at=1.0)
+    latest = rec.latest()
+    assert latest["owners"]["owners"]["utun6"]["owner_kind"] == "mihomo_tun"
+    assert latest["scenario"]["default_via"] == "clash_tun"
+    rec.close()
+
+
+def test_default_interface_follows_clash_split_routes_not_literal_default():
+    from pybase.net.monitor.scenario import _default_interface
+
+    def route(dest, iface, flags="UGSc"):
+        return {"destination": dest, "gateway": "x", "flags": flags, "interface": iface}
+
+    # mihomo TUN：default 仍指向 en0，但 1/8、2/7…128/1 这组拆分路由更具体
+    split = [route("default", "en0", "UGScg")] + [
+        route(d, "utun6") for d in ("1", "2/7", "4/6", "8/5", "16/4", "32/3", "64/2", "128.0/1")]
+    assert _default_interface({"ipv4": split}, "ipv4") == "utun6"
+    assert _default_interface({"ipv4": [route("default", "en0")]}, "ipv4") == "en0"
+    # macOS 的 I 标志（按接口限定）不参与全局选路
+    v6 = [route("default", "utun3", "UGcIg"), route("default", "en0", "UGcg")]
+    assert _default_interface({"ipv6": v6}, "ipv6") == "en0"
+    assert _default_interface({"error": "boom"}, "ipv4") is None

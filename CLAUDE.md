@@ -99,6 +99,10 @@
 - 真实 wireguard-go 的 socket 目录固定 `/var/run/wireguard`，`uapi_dir`/`WG_UAPI_DIR` 只是测试钩子
 - `classify_address` 必须先判 fake_ip/cgnat 再判 private：stdlib 把 198.18/15 算 private、100.64/10 不算
 - 采集器失败返回 `{"error": ...}` 不抛异常；recorder 按"最新值"哈希去重，不是比相邻两次快照
+- 实际默认出口要对公网地址做最长前缀匹配：mihomo TUN 用 1/8…128/1 拆分路由盖过 `default` 而不改它，
+  只认字面 `default` 会把 Clash 接管误判成直连；macOS 带 `I` 标志的按接口限定路由不参与全局选路
+- 接口归属：WireGuard.app（App Store 版）`scutil --nc` 拿不到接口名/地址，只能靠调用方给的已知地址匹配；
+  `owners`/`scenario`/`targets` 是派生采集器，由 `Monitor` 的 derived 阶段在同一轮按顺序算
 
 ### cdpnet / playwright_launch
 - 纯映射/判断函数，无状态、不带项目默认值；有状态的编排（事件聚合、并发控制、落库）留给调用方

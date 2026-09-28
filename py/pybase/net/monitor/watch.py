@@ -149,6 +149,24 @@ def parse_route_block(lines: Sequence[str]) -> Optional[dict]:
     return {"kind": header, "subject": subject, "detail": detail}
 
 
+# 路由套接字上大量消息只是"查询/缓存"，不是配置变化：本机实测 20 秒就有几十条
+# RTM_GET/RTM_MISS（程序查路由、DNS 查询查不到），ARP/NDP 邻居缓存条目
+# （flags 带 LLINFO/WASCLONED）也在不停增删。它们会淹没真正的变化、触发多余的即时采集。
+_ROUTE_QUERY_KINDS = frozenset({"RTM_GET", "RTM_GET2", "RTM_MISS", "RTM_RESOLVE", "RTM_LOSING"})
+_ROUTE_CACHE_FLAGS = frozenset({"LLINFO", "WASCLONED"})
+
+
+def is_config_change(ev: "WatchEvent") -> bool:
+    """默认的路由事件过滤：只留真正改配置的消息（路由/地址/接口的增删改）。
+    监听器自身的状态事件（watcher_*）与 store 侧事件一律保留。"""
+    if ev.source != "route" or ev.kind.startswith("watcher_"):
+        return True
+    if ev.kind in _ROUTE_QUERY_KINDS:
+        return False
+    flags = set((ev.detail or {}).get("flags") or ())
+    return not (flags & _ROUTE_CACHE_FLAGS)
+
+
 def parse_route_text(text: str) -> list[dict]:
     """一次性解析一整段 `route -n monitor` 输出（按空行切块），跳过解析不出的块。
     主要给测试用；流式读取（子进程持续吐行）走 `_RouteBlockSplitter`。
@@ -333,7 +351,10 @@ class NetWatcher:
         scutil_bin: Optional[str] = None,
         restart_backoff: Sequence[float] = _DEFAULT_BACKOFF,
         stop_timeout: float = 5.0,
+        event_filter: Optional[Callable[["WatchEvent"], bool]] = is_config_change,
     ) -> None:
+        """`event_filter` 返回 False 的事件直接丢弃（不回调、不计入突发）；传 None 收全部。"""
+        self._event_filter = event_filter
         self._on_event = on_event
         self._on_burst = on_burst
         self._debounce = debounce
@@ -411,6 +432,8 @@ class NetWatcher:
     # ---------- 事件分发 + 突发合并 ----------
 
     def _dispatch(self, ev: WatchEvent) -> None:
+        if self._event_filter is not None and not self._event_filter(ev):
+            return
         try:
             self._on_event(ev)
         except Exception:  # noqa: BLE001 - 回调出错不该打断读取线程

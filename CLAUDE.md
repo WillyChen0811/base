@@ -112,6 +112,8 @@
   易变噪声（LinkQuality、扫描缓存、租约时间等）在 `_NOISE_*` 常量里，发现新噪声往里补
 - 实时监听（`watch.NetWatcher`）：长驻 `scutil` 不能关 stdin（EOF 等于 quit，n.watch 里也会退出）；
   子进程赋值后要再查一次 stop_event，否则紧接着的 stop() 可能杀不到刚起的进程
+- 路由套接字大量消息只是查询/缓存（RTM_GET/RTM_MISS、带 LLINFO/WASCLONED 的邻居缓存），默认 `is_config_change`
+  过滤掉，否则淹没真变化并触发多余的即时采集
 - 事件的 `source` 只表示"哪台机器"（本机 local）；监听来源 route/store 并进 kind（`live_route_*`/`live_store_*`）
 - `diff.py` 比的是"配置"：忽略 `expire`、带 `%` 的链路本地路由、mihomo 连接/流量计数、owners 的 evidence
 

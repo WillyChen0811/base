@@ -392,3 +392,18 @@ def test_netwatcher_start_twice_without_stop_raises(tmp_path):
             w.start()
     finally:
         w.stop()
+
+
+def test_default_filter_drops_route_queries_and_neighbor_cache():
+    from pybase.net.monitor.watch import is_config_change
+
+    def ev(kind, flags=(), source="route"):
+        return WatchEvent(at=1.0, source=source, kind=kind, subject="x", detail={"flags": list(flags)})
+
+    assert not is_config_change(ev("RTM_GET"))
+    assert not is_config_change(ev("RTM_MISS"))
+    assert not is_config_change(ev("RTM_ADD", ["UP", "HOST", "LLINFO", "WASCLONED"]))  # ARP 缓存
+    assert is_config_change(ev("RTM_ADD", ["UP", "GATEWAY", "STATIC"]))
+    assert is_config_change(ev("RTM_NEWADDR"))
+    assert is_config_change(ev("watcher_restarted"))
+    assert is_config_change(ev("changed", source="store"))

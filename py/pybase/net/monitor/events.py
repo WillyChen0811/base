@@ -147,6 +147,75 @@ def _diff_scenario(before: dict, after: dict, at: float) -> list[dict]:
     return [_event(at, "scenario_changed", "scenario", before.get("label"), after.get("label"))]
 
 
+def _dominant_exit(exits: dict) -> Optional[str]:
+    """出口分布里连接数最多的那个标签，代表这个应用"主要"走哪条路。"""
+    if not exits:
+        return None
+    return max(exits.items(), key=lambda kv: kv[1])[0]
+
+
+def _diff_apps(before: dict, after: dict, at: float) -> list[dict]:
+    """应用采集器（`collect_apps`）的事件：启停、进程实例的启动/退出、每个实例
+    主出口变化、每个域名每条路径的 ok/非 ok 切换，以及"多个域名的 router 路径
+    解析 IP 同时变了"汇总成一条路由器 fake-ip 重置事件。应用列表本身由调用方的
+    配置决定，两次快照之间增减应用不产生事件（那是改配置，不是网络变化）。
+
+    实例按 pid 对齐：同一个 pid 在前后两次快照都出现就是同一个实例，pid 消失/
+    出现就是这个实例退出/启动了（用户在不同终端窗口分别起了几份同一个应用，
+    这样才能各自独立地记录启停，而不是混成一个"应用"的开关）。
+
+    延迟/耗时/IP 这类每轮都会变的字段特意不参与这里的比较（否则每轮都会有一堆
+    事件），只在状态真的从通变不通（或反过来）时才记一条。
+    """
+    b_map = {a["name"]: a for a in before.get("apps", [])}
+    a_map = {a["name"]: a for a in after.get("apps", [])}
+    events: list[dict] = []
+    changed_router_domains: set[str] = set()
+
+    for name in sorted(set(b_map) & set(a_map)):
+        b, a = b_map[name], a_map[name]
+        if b.get("running") != a.get("running"):
+            kind = "app_started" if a.get("running") else "app_stopped"
+            events.append(_event(at, kind, name, b.get("running"), a.get("running")))
+
+        b_inst = {i["pid"]: i for i in b.get("instances") or []}
+        a_inst = {i["pid"]: i for i in a.get("instances") or []}
+        for pid in sorted(set(b_inst) - set(a_inst)):
+            inst = b_inst[pid]
+            subject = f"{name}:{inst.get('tty') or '?'}:{pid}"
+            events.append(_event(at, "app_instance_stopped", subject, inst, None))
+        for pid in sorted(set(a_inst) - set(b_inst)):
+            inst = a_inst[pid]
+            subject = f"{name}:{inst.get('tty') or '?'}:{pid}"
+            events.append(_event(at, "app_instance_started", subject, None, inst))
+        for pid in sorted(set(b_inst) & set(a_inst)):
+            bi, ai = b_inst[pid], a_inst[pid]
+            b_exit, a_exit = _dominant_exit(bi.get("exits") or {}), _dominant_exit(ai.get("exits") or {})
+            if a_exit is not None and b_exit != a_exit:
+                subject = f"{name}:{ai.get('tty') or '?'}:{pid}"
+                events.append(_event(at, "app_exit_changed", subject, b_exit, a_exit))
+
+        b_domains, a_domains = b.get("domains") or {}, a.get("domains") or {}
+        for host in sorted(set(b_domains) | set(a_domains)):
+            b_paths, a_paths = b_domains.get(host) or {}, a_domains.get(host) or {}
+            for path in sorted(set(b_paths) | set(a_paths)):
+                b_result, a_result = b_paths.get(path), a_paths.get(path)
+                if b_result is None or a_result is None:
+                    continue
+                b_status, a_status = b_result.get("status"), a_result.get("status")
+                if (b_status == "ok") != (a_status == "ok"):
+                    events.append(_event(at, "app_domain_status_changed", f"{name}:{host}:{path}", b_status, a_status))
+                if (
+                    path == "router" and b_status == "ok" and a_status == "ok"
+                    and b_result.get("ip") != a_result.get("ip")
+                ):
+                    changed_router_domains.add(host)
+
+    if len(changed_router_domains) >= 2:
+        events.append(_event(at, "router_fakeip_reset", "router", None, sorted(changed_router_domains)))
+    return events
+
+
 def _real_changes(changes: list) -> list:
     """过滤掉 `unavailable`（单项数据缺失/出错，不代表配置变了，不值得发事件）。"""
     return [c for c in changes if c.kind in ("added", "removed", "changed")]
@@ -207,6 +276,7 @@ _HANDLERS: dict[str, Callable[[dict, dict, float], list[dict]]] = {
     "netbird": _diff_netbird,
     "mihomo": _diff_mihomo,
     "targets": _diff_targets,
+    "apps": _diff_apps,
     "scenario": _diff_scenario,
     "dynamic_store": _diff_dynamic_store,
     "nwi": _diff_nwi,

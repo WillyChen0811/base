@@ -5,13 +5,16 @@
 """
 from __future__ import annotations
 
-from . import collectors, sysconfig, sysfiles, watch
+from . import apps, collectors, sysconfig, sysfiles, watch
+from .apps import collect_apps
 from .diff import Change, diff_snapshots, summarize_changes
 from .recorder import Recorder
 from .runner import Monitor
 from .scenario import Scenario, scenario_envelope, summarize_scenario, system_proxy_target
 
 __all__ = [
+    "apps",
+    "collect_apps",
     "collectors",
     "sysconfig",
     "sysfiles",

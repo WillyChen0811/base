@@ -33,6 +33,7 @@ import re
 import socket
 import ssl
 import struct
+import threading
 import time
 from typing import Callable, Optional, Sequence
 
@@ -532,7 +533,9 @@ def probe_router(
     return _finish_probe(host, ips[0], port, dns_ms, timeout, bind_iface=iface)
 
 
-def _lookup_clash_connection(clash_api: tuple[str, Optional[str]], host: str, timeout: float) -> Optional[dict]:
+def _lookup_clash_connection(
+    clash_api: tuple[str, Optional[str]], host: str, timeout: float, *, attempts: int = 3, retry_delay: float = 0.1,
+) -> Optional[dict]:
     """探测连接的 CONNECT 一成功，立刻去 mihomo 控制接口的 `/connections` 查
     这个 host 命中了哪条规则、走了哪条节点链——这是判断"为什么不通"的关键信息
     （比如 platform.claude.com 没配进 DOMAIN-SUFFIX 规则，落到"漏网之鱼"
@@ -541,17 +544,34 @@ def _lookup_clash_connection(clash_api: tuple[str, Optional[str]], host: str, ti
     的连接可能不止一条（同一域名先前的连接还没关），取最后一条（最新建立的，
     大概率就是我们自己这次探测）。查不到、mihomo 控制接口不通都不算错误，
     只是拿不到这份补充信息，返回 None。
+
+    已知局限（实测确认，不是这份代码的 bug）：mihomo 只有在**真正拨通目标
+    出站连接**之后才会把它登记进 `/connections`；如果目标恰好连不上（DIRECT
+    出站卡死/一直不返回，比如域名没配进任何 DOMAIN-SUFFIX 规则、落到"漏网之
+    鱼"分组又选了 DIRECT 这种典型场景），TLS 握手会一直卡到超时，而这条
+    连接全程都不会出现在 `/connections` 里——也就是说，恰恰是最需要看
+    "命中了哪条规则"的这类失败场景，这个办法可能查不到。目标连得通时（哪怕
+    最终 HTTP 状态码不是 200）这份信息是可靠的；进一步能覆盖"连不通"这类
+    场景的办法是接 mihomo 的 `/logs` 实时日志流（规则匹配在日志里发生得比
+    拨号早，不依赖连接是否拨通），本次没有实现，是已知待改进项。
     """
     base_url, secret = clash_api
-    try:
-        data = _mihomo_get(base_url, "/connections", secret, timeout)
-    except Exception:  # noqa: BLE001 - 补充信息拿不到不该影响探测本身的结果
-        return None
-    matches = [c for c in (data.get("connections") or []) if (c.get("metadata") or {}).get("host") == host]
-    if not matches:
-        return None
-    c = matches[-1]
-    return {"rule": c.get("rule"), "rule_payload": c.get("rulePayload"), "chains": c.get("chains")}
+    # 连接刚 CONNECT 成功那一刻，mihomo 可能还没把它登记进 /connections
+    # （内核要先真正拨通出站才会上榜，探测目标恰好不通时这一步本身就慢），
+    # 短暂重试几次比查一次就放弃靠谱得多；总共多等的时间在探测的 timeout
+    # 预算内可以忽略不计。
+    for attempt in range(attempts):
+        try:
+            data = _mihomo_get(base_url, "/connections", secret, timeout)
+        except Exception:  # noqa: BLE001 - 补充信息拿不到不该影响探测本身的结果
+            return None
+        matches = [c for c in (data.get("connections") or []) if (c.get("metadata") or {}).get("host") == host]
+        if matches:
+            c = matches[-1]
+            return {"rule": c.get("rule"), "rule_payload": c.get("rulePayload"), "chains": c.get("chains")}
+        if attempt < attempts - 1:
+            time.sleep(retry_delay)
+    return None
 
 
 def probe_clash(
@@ -565,6 +585,11 @@ def probe_clash(
     `clash_api` 给了（mihomo 控制接口的 `(base_url, secret)`）就额外查一次
     这个 host 命中的规则/节点链（见 `_lookup_clash_connection`），结果并进
     返回值的 `rule`/`rule_payload`/`chains`；不给就没有这几个字段。
+
+    这份查询跟接下来的 TLS 握手在一个后台线程里**并发**跑，不是查完了再做
+    TLS——mihomo 只有在真正拨通出站之后才会把连接登记进 `/connections`，
+    如果目标本身连不通（正是最值得诊断的情况！），TLS 握手会一直卡到
+    `timeout`，连接查询就有了同样长的时间窗口去反复重试，不需要额外等待。
     """
     t0 = time.monotonic()
     try:
@@ -588,10 +613,25 @@ def probe_clash(
     except OSError as exc:
         return {"status": "connect_timeout", "error": str(exc), "connect_ms": connect_ms}
 
-    rule_info = _lookup_clash_connection(clash_api, host, timeout) if clash_api else None
+    rule_holder: dict = {}
+    lookup_thread = None
+    if clash_api:
+        retry_delay = 0.2
+        attempts = max(1, int(timeout / retry_delay))
+
+        def _do_lookup() -> None:
+            info = _lookup_clash_connection(clash_api, host, timeout, attempts=attempts, retry_delay=retry_delay)
+            if info:
+                rule_holder.update(info)
+
+        lookup_thread = threading.Thread(target=_do_lookup, daemon=True)
+        lookup_thread.start()
+
     result = _finish_tls_head(sock, host, t0, connect_ms, None, timeout)
-    if rule_info:
-        result.update(rule_info)
+    if lookup_thread is not None:
+        lookup_thread.join(timeout=0.5)  # TLS 都跑完了，给查询线程一点收尾时间
+    if rule_holder:
+        result.update(rule_holder)
     return result
 
 

@@ -265,19 +265,44 @@ def test_lookup_clash_connection_finds_matching_host(monkeypatch):
              "chains": ["DIRECT"]},
         ]}
     monkeypatch.setattr(apps, "_mihomo_get", fake_mihomo_get)
-    info = apps._lookup_clash_connection(("http://127.0.0.1:9090", None), "platform.claude.com", 3.0)
+    info = apps._lookup_clash_connection(("http://127.0.0.1:9090", None), "platform.claude.com", 3.0, attempts=1)
     assert info == {"rule": "Match", "rule_payload": "漏网之鱼", "chains": ["DIRECT"]}
 
 
 def test_lookup_clash_connection_no_match_returns_none(monkeypatch):
     monkeypatch.setattr(apps, "_mihomo_get", lambda *a, **k: {"connections": []})
-    assert apps._lookup_clash_connection(("http://127.0.0.1:9090", None), "x.com", 3.0) is None
+    assert apps._lookup_clash_connection(("http://127.0.0.1:9090", None), "x.com", 3.0, attempts=1) is None
 
 
 def test_lookup_clash_connection_api_error_returns_none(monkeypatch):
     def raise_err(*a, **k):
         raise OSError("connection refused")
     monkeypatch.setattr(apps, "_mihomo_get", raise_err)
+    assert apps._lookup_clash_connection(("http://127.0.0.1:9090", None), "x.com", 3.0, attempts=1) is None
+
+
+def test_lookup_clash_connection_retries_until_connection_registered(monkeypatch):
+    """CONNECT 刚成功那一刻 mihomo 可能还没把连接登记进 /connections（要等它
+    真正拨通出站），第一次查不到不该立刻放弃。"""
+    calls = {"n": 0}
+
+    def fake_mihomo_get(base_url, path, secret, timeout):
+        calls["n"] += 1
+        if calls["n"] < 2:
+            return {"connections": None}
+        return {"connections": [{"metadata": {"host": "platform.claude.com"}, "rule": "Match",
+                                  "rulePayload": "漏网之鱼", "chains": ["DIRECT"]}]}
+
+    monkeypatch.setattr(apps, "_mihomo_get", fake_mihomo_get)
+    monkeypatch.setattr(apps.time, "sleep", lambda s: None)
+    info = apps._lookup_clash_connection(("http://127.0.0.1:9090", None), "platform.claude.com", 3.0)
+    assert info == {"rule": "Match", "rule_payload": "漏网之鱼", "chains": ["DIRECT"]}
+    assert calls["n"] == 2
+
+
+def test_lookup_clash_connection_gives_up_after_attempts_exhausted(monkeypatch):
+    monkeypatch.setattr(apps, "_mihomo_get", lambda *a, **k: {"connections": None})
+    monkeypatch.setattr(apps.time, "sleep", lambda s: None)
     assert apps._lookup_clash_connection(("http://127.0.0.1:9090", None), "x.com", 3.0) is None
 
 
@@ -293,7 +318,7 @@ def test_probe_clash_includes_rule_info_when_clash_api_given(monkeypatch):
             pass
 
     monkeypatch.setattr(apps.socket, "create_connection", lambda addr, timeout: _FakeConnectSocket())
-    monkeypatch.setattr(apps, "_lookup_clash_connection", lambda api, host, timeout: {
+    monkeypatch.setattr(apps, "_lookup_clash_connection", lambda api, host, timeout, **k: {
         "rule": "Match", "rule_payload": "漏网之鱼", "chains": ["DIRECT"],
     })
     monkeypatch.setattr(apps, "_finish_tls_head", lambda *a, **k: {"status": "tls_fail", "error": "boom"})

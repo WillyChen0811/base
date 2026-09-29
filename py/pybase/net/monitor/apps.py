@@ -38,7 +38,7 @@ from typing import Callable, Optional, Sequence
 
 from ..diag import classify_address, route_of
 from ...media._proc import MediaError, ToolNotFoundError, resolve_tool, run
-from .collectors import _fail, _ok, via_of
+from .collectors import _fail, _mihomo_get, _ok, via_of
 
 _TIMEOUT_DEFAULT = 3.0
 _HTTPS_PORT = 443
@@ -91,25 +91,55 @@ def list_processes() -> list[dict]:
         return []
 
 
-def _process_matches(patterns: Sequence[str], path: str) -> bool:
-    """`patterns` 里任意一条命中即算：先按前缀匹配（最常见、最快），前缀不中
+def _matching_pattern(patterns: Sequence[str], path: str) -> Optional[str]:
+    """`patterns` 里第一条命中的规则：先按前缀匹配（最常见、最快），前缀不中
     再当正则试一次（无效正则直接跳过，不报错——配置写错正则不该炸掉整个采集）。
+    返回命中的那条规则本身（后面判断"是不是主进程"要用），不命中返回 None。
     """
     for pat in patterns:
         if path.startswith(pat):
-            return True
+            return pat
+    for pat in patterns:
         try:
             if re.search(pat, path):
-                return True
+                return pat
         except re.error:
             continue
-    return False
+    return None
+
+
+def _process_matches(patterns: Sequence[str], path: str) -> bool:
+    return _matching_pattern(patterns, path) is not None
+
+
+def _is_main_process(pattern: str, path: str) -> bool:
+    """通用的"这是应用主进程，不是 Helper"判定。
+
+    标准 macOS app bundle 的主可执行文件恒在
+    `<bundle>.app/Contents/MacOS/<可执行文件名>`——比 bundle 路径前缀正好多出
+    `Contents`/`MacOS`/`<名字>` 三段。Helper（`Contents/Helpers/...`）、嵌套的
+    Helper bundle（`Contents/Frameworks/Foo Helper.app/Contents/MacOS/...`，
+    段数更多）都不满足这个形状，判不是主进程——这就是为什么 Claude 桌面版的
+    `Contents/Helpers/chrome-native-host`（Chrome 扩展的辅助进程）不会被误判
+    成"桌面版在运行"。
+
+    `pattern` 不是标准 `.app/` bundle 前缀（比如 Claude Code 那种 CLI 可执行
+    文件路径/版本号正则）时，没有"主进程 vs Helper"这一说，命中即算主进程。
+    """
+    if not pattern.endswith(".app/"):
+        return True
+    if not path.startswith(pattern):
+        return False
+    parts = [p for p in path[len(pattern):].split("/") if p]
+    return len(parts) == 3 and parts[0] == "Contents" and parts[1] == "MacOS"
 
 
 def match_processes(apps: Sequence[dict], processes: Sequence[dict]) -> dict[str, dict]:
     """按每个应用的 `process` 规则匹配进程，返回
-    `{app_name: {"running", "pids", "paths"}}`。一个应用常常带一堆 Helper
-    子进程，`process` 规则要能把它们都覆盖到（比如给一个共同的路径前缀）。
+    `{app_name: {"running", "pids", "main_pids", "paths"}}`。一个应用常常带
+    一堆 Helper 子进程，`process` 规则要能把它们都覆盖到（比如给一个共同的
+    路径前缀）；但"在不在运行"只看主进程（见 `_is_main_process`），Helper
+    单独活着不代表应用在运行。
     """
     matches: dict[str, dict] = {}
     for app in apps:
@@ -118,15 +148,22 @@ def match_processes(apps: Sequence[dict], processes: Sequence[dict]) -> dict[str
         if isinstance(patterns, str):
             patterns = [patterns]
         pids: list[int] = []
+        main_pids: list[int] = []
         paths: set[str] = set()
         for proc in processes:
             path = proc.get("path")
             if not path:
                 continue
-            if _process_matches(patterns, path):
-                pids.append(proc["pid"])
-                paths.add(path)
-        matches[name] = {"running": bool(pids), "pids": pids, "paths": sorted(paths)}
+            pat = _matching_pattern(patterns, path)
+            if pat is None:
+                continue
+            pids.append(proc["pid"])
+            paths.add(path)
+            if _is_main_process(pat, path):
+                main_pids.append(proc["pid"])
+        matches[name] = {
+            "running": bool(main_pids), "pids": pids, "main_pids": main_pids, "paths": sorted(paths),
+        }
     return matches
 
 
@@ -202,31 +239,30 @@ def _own_command_name(command: str) -> str:
     return exe.rsplit("/", 1)[-1] or "?"
 
 
-def _find_instance_root(pid: int, app_pids: set[int], details: dict[int, dict]) -> int:
-    """一个应用常常是"一堆互为父子的进程"（主进程 + Helper），只有父进程也不在
-    这个应用 pid 集合里的那个才是"实例的根"；同一个应用在不同终端各起一份时，
-    两边互相不是父子关系，会各自成为一个根，从而分成两个实例。
+_BACKGROUND_KEY = "background"
+
+
+def _instance_key(pid: int, details: dict[int, dict]) -> str:
+    """一个应用的进程按这个 key 分组成"实例"：挂在终端上的（`tty` 不是 `??`）
+    按 tty 分组——同一个应用在不同终端窗口各起一份，互相独立算不同实例；没挂
+    在终端上的（图形界面应用及其一堆 Helper 子进程，`tty` 都是 `??`）全部
+    归到同一个 `"background"` 分组，合并成应用唯一的一个实例——图形界面应用
+    不像终端里的 CLI 工具那样有"哪个窗口"的概念，进程树关系（谁是谁的
+    Helper）本身也不总是父子直连（沙盒化的 XPC Helper 经常挂在 launchd 下），
+    按 tty 分组比按进程树分组更可靠、也更符合用户对"这是同一个应用"的直觉。
     """
-    current = pid
-    seen: set[int] = set()
-    while True:
-        info = details.get(current)
-        if info is None:
-            return current
-        parent = info["ppid"]
-        if parent in app_pids and parent not in seen:
-            seen.add(current)
-            current = parent
-            continue
-        return current
+    tty = details.get(pid, {}).get("tty")
+    if not tty or tty == "??":
+        return _BACKGROUND_KEY
+    return tty
 
 
 def _find_owning_app(
-    pid: int, details: dict[int, dict], pid_to_owner: dict[int, tuple[str, int]], *, max_depth: int = 20,
-) -> Optional[tuple[str, int, str]]:
+    pid: int, details: dict[int, dict], pid_to_owner: dict[int, tuple[str, str]], *, max_depth: int = 20,
+) -> Optional[tuple[str, str, str]]:
     """一个联网但自己没匹配到任何应用的进程，沿父进程链往上找，看是不是某个
     已识别应用的子孙（比如 Claude Code 调用的 `git`/`curl`）。找到就返回
-    `(应用名, 实例根 pid, 这个子进程自己的命令名)`，用于打 `child:<名字>` 标签；
+    `(应用名, 实例 key, 这个子进程自己的命令名)`，用于打 `child:<名字>` 标签；
     走到 launchd（pid 1）或链断了还没找到就返回 None——不是任何已知应用的子进程。
     """
     own_command = details.get(pid, {}).get("command", "")
@@ -496,12 +532,39 @@ def probe_router(
     return _finish_probe(host, ips[0], port, dns_ms, timeout, bind_iface=iface)
 
 
+def _lookup_clash_connection(clash_api: tuple[str, Optional[str]], host: str, timeout: float) -> Optional[dict]:
+    """探测连接的 CONNECT 一成功，立刻去 mihomo 控制接口的 `/connections` 查
+    这个 host 命中了哪条规则、走了哪条节点链——这是判断"为什么不通"的关键信息
+    （比如 platform.claude.com 没配进 DOMAIN-SUFFIX 规则，落到"漏网之鱼"
+    分组，而那个分组选的是 DIRECT，TLS 就可能失败）。查询发生在我们自己的
+    探测连接还开着的时候，这条连接理应已经在 mihomo 的连接列表里；`host` 相同
+    的连接可能不止一条（同一域名先前的连接还没关），取最后一条（最新建立的，
+    大概率就是我们自己这次探测）。查不到、mihomo 控制接口不通都不算错误，
+    只是拿不到这份补充信息，返回 None。
+    """
+    base_url, secret = clash_api
+    try:
+        data = _mihomo_get(base_url, "/connections", secret, timeout)
+    except Exception:  # noqa: BLE001 - 补充信息拿不到不该影响探测本身的结果
+        return None
+    matches = [c for c in (data.get("connections") or []) if (c.get("metadata") or {}).get("host") == host]
+    if not matches:
+        return None
+    c = matches[-1]
+    return {"rule": c.get("rule"), "rule_payload": c.get("rulePayload"), "chains": c.get("chains")}
+
+
 def probe_clash(
     host: str, *, proxy_host: str, proxy_port: int, port: int = _HTTPS_PORT, timeout: float = _TIMEOUT_DEFAULT,
+    clash_api: Optional[tuple[str, Optional[str]]] = None,
 ) -> dict:
     """经 mihomo 的 http/mixed 端口发 `CONNECT`，隧道建立后在里面做 TLS/HEAD——
     看 Clash 自己的出站（不管它内部选了直连还是代理规则）通不通。只有 mihomo 在
     跑（调用方传了 `clash_proxy`）才会走到这里。
+
+    `clash_api` 给了（mihomo 控制接口的 `(base_url, secret)`）就额外查一次
+    这个 host 命中的规则/节点链（见 `_lookup_clash_connection`），结果并进
+    返回值的 `rule`/`rule_payload`/`chains`；不给就没有这几个字段。
     """
     t0 = time.monotonic()
     try:
@@ -524,7 +587,12 @@ def probe_clash(
         return {"status": "connect_timeout", "error": "CONNECT 超时", "connect_ms": connect_ms}
     except OSError as exc:
         return {"status": "connect_timeout", "error": str(exc), "connect_ms": connect_ms}
-    return _finish_tls_head(sock, host, t0, connect_ms, None, timeout)
+
+    rule_info = _lookup_clash_connection(clash_api, host, timeout) if clash_api else None
+    result = _finish_tls_head(sock, host, t0, connect_ms, None, timeout)
+    if rule_info:
+        result.update(rule_info)
+    return result
 
 
 def _safe_probe(fn: Callable[..., dict], *args, **kwargs) -> dict:
@@ -542,6 +610,15 @@ def _safe_probe(fn: Callable[..., dict], *args, **kwargs) -> dict:
 # ---------------------------------------------------------------------------
 
 
+def _representative_pid(members: Sequence[int], main_pids: set[int]) -> int:
+    """一组成员 pid 里挑一个代表（展示用的 pid/cwd/command）：优先挑主进程
+    （见 `_is_main_process`），没有主进程（比如子进程还没归属完）就随便挑一个
+    确定性的最小 pid，保证同一份快照多次格式化结果一致。
+    """
+    candidates = [p for p in members if p in main_pids] or list(members)
+    return min(candidates)
+
+
 def collect_apps(
     apps: Sequence[dict],
     *,
@@ -549,6 +626,7 @@ def collect_apps(
     router_iface: Optional[str] = None,
     router_dns: Optional[str] = None,
     clash_proxy: Optional[tuple[str, int]] = None,
+    clash_api: Optional[tuple[str, Optional[str]]] = None,
     timeout: float = _TIMEOUT_DEFAULT,
     max_workers: int = 8,
     process_lister: Callable[[], list[dict]] = list_processes,
@@ -556,14 +634,15 @@ def collect_apps(
     connection_lister: Callable[..., dict[int, list[tuple[str, int]]]] = list_established_connections,
     cwd_lister: Callable[[Sequence[int]], dict[int, str]] = cwd_of_pids,
 ) -> dict:
-    """按应用采集：每个应用当前有哪些进程实例（区分终端窗口/pid，不是笼统一份
-    "在不在跑"）、各自的连接出口分布，以及代表域名的 system/router/clash 三条
-    路径连通性。
+    """按应用采集：每个应用当前有哪些进程实例、各自的连接出口分布，以及代表
+    域名的 system/router/clash 三条路径连通性。
 
-    `apps` 每项至少 `{"name", "process": [...], "domains": [...]}`。同一个应用的
-    进程如果互为父子（典型的"主进程 + Helper"），会被合并成一个实例，实例的
-    根进程给出 pid/tty/cwd/命令行；应用在多个终端窗口各起一份（比如两个
-    ttys 各自的 Claude Code）互相不是父子关系，会分成多个实例。
+    `apps` 每项至少 `{"name", "process": [...], "domains": [...]}`。进程实例
+    按 `_instance_key` 分组：挂在终端上的按 tty 分组（同一应用在不同终端窗口
+    各起一份，各自独立成实例），没挂终端的图形界面应用（及其一堆 Helper）
+    全部合并成一个 `"background"` 实例——图形界面应用没有"哪个窗口"的概念，
+    这样才不会把 Safari/微信/Chrome 的多个 Helper 进程拆成好几个"实例"。
+    "运行中"只看主进程是否存在（`match_processes`），Helper 单独活着不算数。
 
     联网但自己没匹配到任何应用的进程（比如 Claude Code 调用的 `git`），沿父
     进程链找到属于哪个应用的哪个实例后，归到该实例下、标 `child:<命令名>`；
@@ -572,7 +651,10 @@ def collect_apps(
 
     `router_iface`/`router_dns` 不给就跳过 router 路径；`clash_proxy`
     （`(host, port)`）不给就跳过 clash 路径——调用方自己先判断 mihomo 在不在
-    跑，不在跑就不传，不是这里瞎猜。同一个域名被多个应用共用时只探测一次。
+    跑，不在跑就不传，不是这里瞎猜。`clash_api` 给了就额外把 clash 路径命中的
+    规则/节点链也记下来（见 `probe_clash`）。同一个域名被多个应用共用时只
+    探测一次，且域名探测结果是**应用级别**的一份，不挂在具体某个实例下
+    （实例可以有好几个，但"这个应用的代表域名通不通"是应用整体的属性）。
     """
     try:
         processes = process_lister()
@@ -593,27 +675,36 @@ def collect_apps(
     clash_ports = (clash_proxy[1],) if clash_proxy else ()
     route_cache: dict[str, str] = {}
 
-    # 第一步：每个应用把自己匹配到的 pid 按父子关系分组成实例（root -> members）
-    pid_to_owner: dict[int, tuple[str, int]] = {}  # pid -> (app_name, 实例根 pid)
-    app_roots: dict[str, dict[int, list[int]]] = {}
+    # 第一步：每个应用把自己匹配到的 pid 按 `_instance_key`（tty 或
+    # "background"）分组成实例
+    pid_to_owner: dict[int, tuple[str, str]] = {}  # pid -> (app_name, 实例 key)
+    app_groups: dict[str, dict[str, list[int]]] = {}
     for app in apps:
         name = app["name"]
-        pids = set(proc_matches.get(name, {}).get("pids", []))
-        roots: dict[int, list[int]] = {}
+        pids = proc_matches.get(name, {}).get("pids", [])
+        groups: dict[str, list[int]] = {}
         for pid in pids:
-            root = _find_instance_root(pid, pids, details)
-            roots.setdefault(root, []).append(pid)
-            pid_to_owner[pid] = (name, root)
-        app_roots[name] = roots
+            key = _instance_key(pid, details)
+            groups.setdefault(key, []).append(pid)
+            pid_to_owner[pid] = (name, key)
+        app_groups[name] = groups
 
-    cwd_targets = [root for roots in app_roots.values() for root in roots]
+    # 代表 pid（展示用）才需要查 cwd，不用对分组里每个成员都查一遍
+    representative_pids = {
+        name: {
+            key: _representative_pid(members, set(proc_matches.get(name, {}).get("main_pids", [])))
+            for key, members in groups.items()
+        }
+        for name, groups in app_groups.items()
+    }
+    cwd_targets = [pid for reps in representative_pids.values() for pid in reps.values()]
     try:
         cwd_map = cwd_lister(cwd_targets) if cwd_targets else {}
     except Exception:  # noqa: BLE001 - cwd 拿不到不是致命错误
         cwd_map = {}
 
     # 第二步：联网但自己没被任何应用匹配到的进程，尝试沿父进程链归属到某个应用实例
-    child_owner: dict[int, tuple[str, int, str]] = {}  # pid -> (app_name, 实例根 pid, 自己的命令名)
+    child_owner: dict[int, tuple[str, str, str]] = {}  # pid -> (app_name, 实例 key, 自己的命令名)
     for pid in connections:
         if pid in pid_to_owner or not connections.get(pid):
             continue
@@ -635,6 +726,7 @@ def collect_apps(
         if clash_proxy:
             paths["clash"] = _safe_probe(
                 probe_clash, host, proxy_host=clash_proxy[0], proxy_port=clash_proxy[1], timeout=timeout,
+                clash_api=clash_api,
             )
         return host, paths
 
@@ -650,22 +742,26 @@ def collect_apps(
         name = app["name"]
         match = proc_matches.get(name, {"running": False, "pids": [], "paths": []})
         instances = []
-        for root, members in app_roots.get(name, {}).items():
+        for key, members in app_groups.get(name, {}).items():
+            rep = representative_pids[name][key]
             exits = app_exits(members, connections, owners, clash_ports, route_cache=route_cache)
-            for cpid, (capp, croot, ccomm) in child_owner.items():
-                if capp == name and croot == root:
+            for cpid, (capp, ckey, ccomm) in child_owner.items():
+                if capp == name and ckey == key:
                     label = f"child:{ccomm}"
                     exits[label] = exits.get(label, 0) + len(connections.get(cpid, []))
-            info = details.get(root, {})
+            info = details.get(rep, {})
             instances.append({
-                "pid": root,
-                "tty": info.get("tty"),
-                "cwd": cwd_map.get(root),
+                "id": key,
+                "pid": rep,
+                "tty": None if key == _BACKGROUND_KEY else key,
+                "cwd": cwd_map.get(rep),
                 "command": info.get("command"),
                 "member_pids": sorted(members),
                 "exits": exits,
             })
-        instances.sort(key=lambda i: i["pid"])
+        # background（图形界面应用）排最前，其余按 tty 名字排序，保证同一份
+        # 快照多次格式化顺序稳定
+        instances.sort(key=lambda i: (i["id"] != _BACKGROUND_KEY, i["id"]))
         result_apps.append({
             "name": name,
             "running": match["running"],

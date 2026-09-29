@@ -252,6 +252,81 @@ def test_safe_probe_catches_exceptions():
 
 
 # ---------------------------------------------------------------------------
+# clash 路径：命中规则/节点链查询
+# ---------------------------------------------------------------------------
+
+
+def test_lookup_clash_connection_finds_matching_host(monkeypatch):
+    def fake_mihomo_get(base_url, path, secret, timeout):
+        assert path == "/connections"
+        return {"connections": [
+            {"metadata": {"host": "other.com"}, "rule": "Match", "rulePayload": "", "chains": ["DIRECT"]},
+            {"metadata": {"host": "platform.claude.com"}, "rule": "Match", "rulePayload": "漏网之鱼",
+             "chains": ["DIRECT"]},
+        ]}
+    monkeypatch.setattr(apps, "_mihomo_get", fake_mihomo_get)
+    info = apps._lookup_clash_connection(("http://127.0.0.1:9090", None), "platform.claude.com", 3.0)
+    assert info == {"rule": "Match", "rule_payload": "漏网之鱼", "chains": ["DIRECT"]}
+
+
+def test_lookup_clash_connection_no_match_returns_none(monkeypatch):
+    monkeypatch.setattr(apps, "_mihomo_get", lambda *a, **k: {"connections": []})
+    assert apps._lookup_clash_connection(("http://127.0.0.1:9090", None), "x.com", 3.0) is None
+
+
+def test_lookup_clash_connection_api_error_returns_none(monkeypatch):
+    def raise_err(*a, **k):
+        raise OSError("connection refused")
+    monkeypatch.setattr(apps, "_mihomo_get", raise_err)
+    assert apps._lookup_clash_connection(("http://127.0.0.1:9090", None), "x.com", 3.0) is None
+
+
+def test_probe_clash_includes_rule_info_when_clash_api_given(monkeypatch):
+    class _FakeConnectSocket(_FakePlainSocket):
+        def __init__(self):
+            self.sent = None
+        def recv(self, n):
+            return b"HTTP/1.1 200 Connection Established\r\n\r\n"
+        def sendall(self, data):
+            self.sent = data
+        def close(self):
+            pass
+
+    monkeypatch.setattr(apps.socket, "create_connection", lambda addr, timeout: _FakeConnectSocket())
+    monkeypatch.setattr(apps, "_lookup_clash_connection", lambda api, host, timeout: {
+        "rule": "Match", "rule_payload": "漏网之鱼", "chains": ["DIRECT"],
+    })
+    monkeypatch.setattr(apps, "_finish_tls_head", lambda *a, **k: {"status": "tls_fail", "error": "boom"})
+
+    result = apps.probe_clash(
+        "platform.claude.com", proxy_host="127.0.0.1", proxy_port=7893,
+        clash_api=("http://127.0.0.1:9090", None),
+    )
+    assert result["status"] == "tls_fail"
+    assert result["rule"] == "Match"
+    assert result["chains"] == ["DIRECT"]
+
+
+def test_probe_clash_skips_rule_lookup_without_clash_api(monkeypatch):
+    class _FakeConnectSocket(_FakePlainSocket):
+        def recv(self, n):
+            return b"HTTP/1.1 200 Connection Established\r\n\r\n"
+        def sendall(self, data):
+            pass
+        def close(self):
+            pass
+
+    monkeypatch.setattr(apps.socket, "create_connection", lambda addr, timeout: _FakeConnectSocket())
+    called = []
+    monkeypatch.setattr(apps, "_lookup_clash_connection", lambda *a, **k: called.append(1))
+    monkeypatch.setattr(apps, "_finish_tls_head", lambda *a, **k: {"status": "ok"})
+
+    result = apps.probe_clash("x.com", proxy_host="127.0.0.1", proxy_port=7893)
+    assert "rule" not in result
+    assert called == []
+
+
+# ---------------------------------------------------------------------------
 # collect_apps 装配
 # ---------------------------------------------------------------------------
 
@@ -330,16 +405,16 @@ def test_collect_apps_probes_router_and_clash_when_configured(monkeypatch):
     assert set(domains) == {"system", "router", "clash"}
 
 
-def test_collect_apps_merges_helper_processes_into_one_instance(monkeypatch):
-    """主进程 + Helper 子进程互为父子，算同一个实例；同一应用在两个不同终端各
-    起一份（互不为父子）则分成两个实例。"""
-    apps_cfg = [{"name": "微信", "process": ["/WeChat.app/"], "domains": []}]
+def test_collect_apps_merges_background_processes_into_one_instance(monkeypatch):
+    """图形界面应用（tty 全是 ??）不管起了几个进程/Helper，也不管是不是互为
+    父子，一律合并成唯一一个 "background" 实例——不按进程树拆分。"""
+    apps_cfg = [{"name": "微信", "process": ["/Applications/WeChat.app/"], "domains": []}]
 
     def fake_process_lister():
         return [
             {"pid": 10, "path": "/Applications/WeChat.app/Contents/MacOS/WeChat"},
             {"pid": 11, "path": "/Applications/WeChat.app/Contents/Frameworks/Helper.app/Helper"},
-            {"pid": 20, "path": "/Applications/WeChat.app/Contents/MacOS/WeChat"},
+            {"pid": 20, "path": "/Applications/WeChat.app/Contents/MacOS/WeChat"},  # 不是任何人的子进程
         ]
 
     details = _fake_details({
@@ -353,10 +428,87 @@ def test_collect_apps_merges_helper_processes_into_one_instance(monkeypatch):
         process_detail_lister=lambda: details, cwd_lister=lambda pids: {},
     )
     instances = result["apps"][0]["instances"]
-    roots = sorted(i["pid"] for i in instances)
-    assert roots == [10, 20]
-    inst10 = next(i for i in instances if i["pid"] == 10)
-    assert inst10["member_pids"] == [10, 11]
+    assert len(instances) == 1
+    inst = instances[0]
+    assert inst["id"] == "background"
+    assert inst["tty"] is None
+    assert inst["member_pids"] == [10, 11, 20]
+    # 代表 pid 优先选主进程（Contents/MacOS/WeChat），不是随便一个
+    assert inst["pid"] in (10, 20)
+
+
+def test_collect_apps_terminal_instances_split_by_tty(monkeypatch):
+    """终端里的应用（tty 不是 ??）按 tty 分组——两个不同终端窗口各起一份
+    Claude Code，应该是两个独立实例。"""
+    apps_cfg = [{"name": "Claude Code", "process": [r"/claude/versions/"], "domains": []}]
+
+    def fake_process_lister():
+        return [
+            {"pid": 100, "path": "/x/claude/versions/2.1.284"},
+            {"pid": 200, "path": "/x/claude/versions/2.1.284"},
+        ]
+
+    details = _fake_details({
+        100: (1, "ttys000", "claude"),
+        200: (1, "ttys001", "claude --resume abc"),
+    })
+    monkeypatch.setattr(apps, "route_of", lambda host, *, timeout: None)
+    result = apps.collect_apps(
+        apps_cfg, process_lister=fake_process_lister, connection_lister=lambda: {},
+        process_detail_lister=lambda: details, cwd_lister=lambda pids: {},
+    )
+    instances = result["apps"][0]["instances"]
+    assert {i["id"] for i in instances} == {"ttys000", "ttys001"}
+    assert {i["tty"] for i in instances} == {"ttys000", "ttys001"}
+
+
+def test_collect_apps_main_process_required_for_running(monkeypatch):
+    """只有 Helper 在跑（比如 Chrome 扩展的辅助进程），主进程没跑，不算应用
+    在运行——复现"Claude 桌面版误判为在运行"的真实 bug。"""
+    apps_cfg = [{"name": "Claude", "process": ["/Applications/Claude.app/"], "domains": []}]
+
+    def fake_process_lister():
+        return [{"pid": 5, "path": "/Applications/Claude.app/Contents/Helpers/chrome-native-host"}]
+
+    details = _fake_details({5: (1, "??", "/Applications/Claude.app/Contents/Helpers/chrome-native-host")})
+    result = apps.collect_apps(
+        apps_cfg, process_lister=fake_process_lister, connection_lister=lambda: {},
+        process_detail_lister=lambda: details, cwd_lister=lambda pids: {},
+    )
+    app = result["apps"][0]
+    assert app["running"] is False
+    assert app["pid_count"] == 1  # Helper 还是算在 pid_count 里，只是不算"运行中"
+
+
+def test_collect_apps_running_true_when_main_process_present(monkeypatch):
+    apps_cfg = [{"name": "Claude", "process": ["/Applications/Claude.app/"], "domains": []}]
+
+    def fake_process_lister():
+        return [
+            {"pid": 5, "path": "/Applications/Claude.app/Contents/Helpers/chrome-native-host"},
+            {"pid": 6, "path": "/Applications/Claude.app/Contents/MacOS/Claude"},
+        ]
+
+    details = _fake_details({
+        5: (1, "??", "helper"),
+        6: (1, "??", "Claude"),
+    })
+    result = apps.collect_apps(
+        apps_cfg, process_lister=fake_process_lister, connection_lister=lambda: {},
+        process_detail_lister=lambda: details, cwd_lister=lambda pids: {},
+    )
+    assert result["apps"][0]["running"] is True
+
+
+def test_is_main_process_nested_helper_bundle_excluded():
+    prefix = "/Applications/Foo.app/"
+    nested = prefix + "Contents/Frameworks/Foo Helper.app/Contents/MacOS/Foo Helper"
+    assert apps._is_main_process(prefix, nested) is False
+    assert apps._is_main_process(prefix, prefix + "Contents/MacOS/Foo") is True
+
+
+def test_is_main_process_non_bundle_pattern_always_main():
+    assert apps._is_main_process(r"/\.local/share/claude/versions/", "/x/.local/share/claude/versions/2.1.284")
 
 
 def test_collect_apps_attributes_child_process_connections(monkeypatch):
@@ -423,8 +575,11 @@ def test_collect_apps_background_unmatched_process_not_in_terminal_other(monkeyp
 # ---------------------------------------------------------------------------
 
 
-def _instance(pid, *, tty="ttys001", exits=None):
-    return {"pid": pid, "tty": tty, "cwd": None, "command": None, "member_pids": [pid], "exits": exits or {}}
+def _instance(pid, *, tty="ttys001", exits=None, id_=None):
+    return {
+        "id": id_ if id_ is not None else (tty or "background"),
+        "pid": pid, "tty": tty, "cwd": None, "command": None, "member_pids": [pid], "exits": exits or {},
+    }
 
 
 def _app(name, *, running=True, instances=None, domains=None):
@@ -444,11 +599,21 @@ def test_diff_apps_start_stop():
 
 
 def test_diff_apps_instance_started_and_stopped():
-    before = _envelope(_app("Claude Code", instances=[_instance(100)]))
-    after = _envelope(_app("Claude Code", instances=[_instance(200)]))
+    before = _envelope(_app("Claude Code", instances=[_instance(100, tty="ttys000")]))
+    after = _envelope(_app("Claude Code", instances=[_instance(200, tty="ttys001")]))
     evs = events.diff("apps", before, after, _at())
     kinds = {e["kind"] for e in evs}
     assert kinds == {"app_instance_stopped", "app_instance_started"}
+
+
+def test_diff_apps_background_instance_pid_churn_is_not_a_restart():
+    """background 实例（图形界面应用）底下的代表 pid 换了（比如原来选中的
+    Helper 退出，换另一个 pid 代表），只要 id 还是 "background"，不该被当成
+    实例重启——这是按 tty/background 而不是按 pid 对齐实例的意义所在。"""
+    before = _envelope(_app("微信", instances=[_instance(10, tty=None, id_="background")]))
+    after = _envelope(_app("微信", instances=[_instance(20, tty=None, id_="background")]))
+    evs = events.diff("apps", before, after, _at())
+    assert not any(e["kind"] in ("app_instance_started", "app_instance_stopped") for e in evs)
 
 
 def test_diff_apps_exit_changed():

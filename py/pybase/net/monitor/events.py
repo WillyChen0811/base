@@ -160,9 +160,12 @@ def _diff_apps(before: dict, after: dict, at: float) -> list[dict]:
     解析 IP 同时变了"汇总成一条路由器 fake-ip 重置事件。应用列表本身由调用方的
     配置决定，两次快照之间增减应用不产生事件（那是改配置，不是网络变化）。
 
-    实例按 pid 对齐：同一个 pid 在前后两次快照都出现就是同一个实例，pid 消失/
-    出现就是这个实例退出/启动了（用户在不同终端窗口分别起了几份同一个应用，
-    这样才能各自独立地记录启停，而不是混成一个"应用"的开关）。
+    实例按 `id` 对齐（`collect_apps` 里的实例 key：tty，或图形界面应用统一的
+    `"background"`），不是按 pid——`background` 实例底下的 pid 本来就会随
+    Helper 进程起停而变，用 pid 对齐会把正常的 Helper 进退当成"应用重启"，
+    产生大量假事件。同一个 `id` 在前后两次快照都出现就是同一个实例，`id`
+    消失/出现才是这个实例退出/启动了（用户在不同终端窗口分别起了几份同一个
+    应用，各自独立记录启停）。
 
     延迟/耗时/IP 这类每轮都会变的字段特意不参与这里的比较（否则每轮都会有一堆
     事件），只在状态真的从通变不通（或反过来）时才记一条。
@@ -178,22 +181,19 @@ def _diff_apps(before: dict, after: dict, at: float) -> list[dict]:
             kind = "app_started" if a.get("running") else "app_stopped"
             events.append(_event(at, kind, name, b.get("running"), a.get("running")))
 
-        b_inst = {i["pid"]: i for i in b.get("instances") or []}
-        a_inst = {i["pid"]: i for i in a.get("instances") or []}
-        for pid in sorted(set(b_inst) - set(a_inst)):
-            inst = b_inst[pid]
-            subject = f"{name}:{inst.get('tty') or '?'}:{pid}"
-            events.append(_event(at, "app_instance_stopped", subject, inst, None))
-        for pid in sorted(set(a_inst) - set(b_inst)):
-            inst = a_inst[pid]
-            subject = f"{name}:{inst.get('tty') or '?'}:{pid}"
-            events.append(_event(at, "app_instance_started", subject, None, inst))
-        for pid in sorted(set(b_inst) & set(a_inst)):
-            bi, ai = b_inst[pid], a_inst[pid]
+        b_inst = {i.get("id", i.get("pid")): i for i in b.get("instances") or []}
+        a_inst = {i.get("id", i.get("pid")): i for i in a.get("instances") or []}
+        for key in sorted(set(b_inst) - set(a_inst)):
+            inst = b_inst[key]
+            events.append(_event(at, "app_instance_stopped", f"{name}:{key}", inst, None))
+        for key in sorted(set(a_inst) - set(b_inst)):
+            inst = a_inst[key]
+            events.append(_event(at, "app_instance_started", f"{name}:{key}", None, inst))
+        for key in sorted(set(b_inst) & set(a_inst)):
+            bi, ai = b_inst[key], a_inst[key]
             b_exit, a_exit = _dominant_exit(bi.get("exits") or {}), _dominant_exit(ai.get("exits") or {})
             if a_exit is not None and b_exit != a_exit:
-                subject = f"{name}:{ai.get('tty') or '?'}:{pid}"
-                events.append(_event(at, "app_exit_changed", subject, b_exit, a_exit))
+                events.append(_event(at, "app_exit_changed", f"{name}:{key}", b_exit, a_exit))
 
         b_domains, a_domains = b.get("domains") or {}, a.get("domains") or {}
         for host in sorted(set(b_domains) | set(a_domains)):

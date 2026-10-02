@@ -5,7 +5,8 @@ import shutil
 import zipfile
 import tempfile
 import logging
-from typing import Dict, Any
+from io import BytesIO
+from typing import Any, Dict, Optional
 
 # 配置日志
 logger = logging.getLogger(__name__)
@@ -54,7 +55,7 @@ def escape_xml(text: str) -> str:
     """转义 XML 特殊字符"""
     if not isinstance(text, str):
         return str(text)
-    
+
     return text.replace("&", "&amp;") \
                .replace("<", "&lt;") \
                .replace(">", "&gt;") \
@@ -76,41 +77,59 @@ def preprocess_text(text: str) -> str:
 
     return result
 
+
 def render_template(
     template_path: str,
-    output_path: str,
-    data: Dict[str, Any]
-) -> None:
+    *args: Any,
+    output_path: Optional[str] = None,
+    data: Optional[Dict[str, Any]] = None,
+) -> Optional[bytes]:
     """渲染 Word 模板：对 data 里的每个"标记": "值"，在 document.xml/header*.xml/footer*.xml
-    里做字符串替换，输出到 output_path。调用前需确保模板已做过标记清洗（见 clean_xml_content）。
+    里做字符串替换。调用前需确保模板已做过标记清洗（见 clean_xml_content）。
+
+    给了 output_path 就写文件并返回 None；不给就返回渲染后的 bytes（不落盘，取代原来
+    单独的 render_template_to_bytes）。
+
+    为兼容外部仓库里已有的调用方，支持两种参数形态（按位置参数个数区分，不要混用）：
+    - 新：render_template(template_path, data, output_path=None)
+    - 旧：render_template(template_path, output_path, data)  # output_path 可以是 None
     """
+    if len(args) == 2:
+        if output_path is not None or data is not None:
+            raise TypeError("render_template: 不能同时用位置参数和 output_path/data 关键字传参")
+        output_path, data = args
+    elif len(args) == 1:
+        if data is not None:
+            raise TypeError("render_template: data 不能重复传入")
+        data = args[0]
+    elif len(args) != 0:
+        raise TypeError(
+            f"render_template: 除 template_path 外最多接受 2 个位置参数，收到 {len(args)} 个"
+        )
+
+    if data is None:
+        raise TypeError("render_template: 缺少 data 参数")
+
     if not os.path.exists(template_path):
         raise FileNotFoundError(f"模板文件不存在: {template_path}")
 
+    replacements = {}
+    for k, v in data.items():
+        key = str(k)
+        value = preprocess_text(str(v) if v is not None else "")
+        replacements[key] = value
+
     temp_dir = tempfile.mkdtemp()
-    temp_docx = os.path.join(temp_dir, "temp.docx")
-
     try:
-        shutil.copy2(template_path, temp_docx)
-
-        replacements = {}
-        for k, v in data.items():
-            key = str(k)
-            value = preprocess_text(str(v) if v is not None else "")
-            replacements[key] = value
-
-        target_files = []
-
-        with zipfile.ZipFile(temp_docx, 'r') as zip_ref:
+        with zipfile.ZipFile(template_path, 'r') as zip_ref:
             file_list = zip_ref.namelist()
-            for file_name in file_list:
-                if file_name == 'word/document.xml' or \
-                   file_name.startswith('word/header') or \
-                   file_name.startswith('word/footer'):
-                    target_files.append(file_name)
-
-        # zipfile 不支持原地改单个成员，只能整体解压、改文件、重新打包
-        with zipfile.ZipFile(temp_docx, 'r') as zip_ref:
+            target_files = [
+                name for name in file_list
+                if name == 'word/document.xml'
+                or name.startswith('word/header')
+                or name.startswith('word/footer')
+            ]
+            # zipfile 不支持原地改单个成员，只能整体解压、改文件、重新打包
             zip_ref.extractall(temp_dir)
 
         for rel_path in target_files:
@@ -129,79 +148,26 @@ def render_template(
             with open(xml_path, 'w', encoding='utf-8') as f:
                 f.write(content)
 
-        with zipfile.ZipFile(output_path, 'w', zipfile.ZIP_DEFLATED) as zip_out:
+        # 打包输出：给了 output_path 就落盘，否则打到内存返回 bytes
+        zip_target = output_path if output_path is not None else BytesIO()
+        with zipfile.ZipFile(zip_target, 'w', zipfile.ZIP_DEFLATED) as zip_out:
             for root, dirs, files in os.walk(temp_dir):
                 for file in files:
-                    if file == "temp.docx":  # 跳过临时 docx 本身，别把它打进输出
-                        continue
-
                     file_path = os.path.join(root, file)
                     arcname = os.path.relpath(file_path, temp_dir)
                     zip_out.write(file_path, arcname)
+
+        if output_path is not None:
+            return None
+        return zip_target.getvalue()
 
     except Exception as e:
         logger.error(f"模板渲染失败: {str(e)}")
-        raise e
+        raise
     finally:
         shutil.rmtree(temp_dir)
 
 
-def render_template_to_bytes(
-    template_path: str,
-    data: Dict[str, Any]
-) -> bytes:
-    """同 render_template，但直接返回渲染后的字节数据（不落盘输出文件）。"""
-    from io import BytesIO
-
-    if not os.path.exists(template_path):
-        raise FileNotFoundError(f"模板文件不存在: {template_path}")
-
-    temp_dir = tempfile.mkdtemp()
-
-    try:
-        # 预处理替换数据
-        replacements = {}
-        for k, v in data.items():
-            key = str(k)
-            value = preprocess_text(str(v) if v is not None else "")
-            replacements[key] = value
-
-        # 解压模板
-        with zipfile.ZipFile(template_path, 'r') as zip_ref:
-            zip_ref.extractall(temp_dir)
-
-        # 需要处理的 XML 文件
-        target_files = []
-        for item in os.listdir(os.path.join(temp_dir, 'word')):
-            if item == 'document.xml' or item.startswith('header') or item.startswith('footer'):
-                target_files.append(os.path.join('word', item))
-
-        # 执行替换
-        for rel_path in target_files:
-            xml_path = os.path.join(temp_dir, rel_path)
-            if not os.path.exists(xml_path):
-                continue
-
-            with open(xml_path, 'r', encoding='utf-8') as f:
-                content = f.read()
-
-            for marker, value in replacements.items():
-                if marker in content:
-                    content = content.replace(marker, value)
-
-            with open(xml_path, 'w', encoding='utf-8') as f:
-                f.write(content)
-
-        # 打包到内存
-        output_buffer = BytesIO()
-        with zipfile.ZipFile(output_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_out:
-            for root, dirs, files in os.walk(temp_dir):
-                for file in files:
-                    file_path = os.path.join(root, file)
-                    arcname = os.path.relpath(file_path, temp_dir)
-                    zip_out.write(file_path, arcname)
-
-        return output_buffer.getvalue()
-
-    finally:
-        shutil.rmtree(temp_dir)
+def render_template_to_bytes(template_path: str, data: Dict[str, Any]) -> bytes:
+    """已废弃，改用 render_template(template_path, data)（不传 output_path 即返回 bytes）。"""
+    return render_template(template_path, data)

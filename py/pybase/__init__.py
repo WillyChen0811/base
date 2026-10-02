@@ -14,4 +14,9 @@
 - subtitle: 字幕读写、YouTube 滚动字幕折叠、时间校准、时间索引、给大模型的时间戳文本
 - media: ffmpeg/ffprobe/ffsubsync 子进程封装（探测、按句截音频/截图、字幕自动对齐）
 - dictionary: 词典查询统一模型 + 数据源适配器（macOS 系统词典），不内置任何词典数据
+- storage: 存储接口（本地/挂载盘/SMB/HTTPS 等通道统一成一套读写方法），上层逻辑与连接方式解耦
+- fileops: 基于 storage 的拷贝 copy_file（临时文件 + 原子转正，不覆盖冲突；verify 开关做哈希核对，默认关）与有前提的删除
+- retry: 等资源恢复（间隔由调用方给）+ 断线不计次的重试
+- inventory: 基于 storage 的目录树清单与"路径+大小 / 同名+大小"两级比对
+- timemachine: macOS Time Machine 备份路径识别、APFS 快照列表与只读挂载
 """

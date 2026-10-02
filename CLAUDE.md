@@ -146,3 +146,17 @@
 - Electron 本地媒体协议必须 `stream: true` 且自己处理 Range（electron#38749，否则拖不动）；
   不给 `bypassCSP`；哪些文件能读由调用方 `resolvePath` 决定
 - `segmentWords` 会把 `take-off` 拆成三段、`don't` 不拆，合并短语是界面层的事
+
+### storage / fileops / retry / inventory
+- 上层逻辑只认 `Storage` 接口，不许在 fileops/inventory 里写死本地路径或某种协议；连接方式（挂载、SMB 协议、HTTPS、
+  隧道）只出现在 `Storage` 实现里
+- 网络盘掉线后挂载点目录常常还在、只是空的：`LocalStorage` 判可用要给 `mount_point` 查 `ismount`，不能只看 `is_dir`；
+  `stat` 遇连接问题必须抛 `OSError`，不能返回 None（None 表示"确实不存在"，会被当成"对方没有"）
+- 拷贝只有 `copy_file` 一个函数，校验是 `verify` 开关（默认关），不要再加 `copy_verified` 之类的平行函数
+- `copy_file` 目标已存在且判定不同一律 `conflict`，不加"强制覆盖"开关；正式名只在临时文件写完后 `replace`
+- `retry_call` 资源不可用期间不计次数；等待间隔没有默认值（交互几秒、过夜批处理十几分钟，由调用方定）
+- inventory 的"同名+大小"只是快速判断，不是内容证明；修改时间不参与比对
+
+### timemachine
+- 系统常已把快照挂在 `/Volumes/.timemachine/<UUID>/`，再 `mount_apfs` 同一快照报 Resource busy：先查挂载表复用
+- 自己挂一律 `rdonly,nobrowse`；快照里卷名随系统版本不同（`Macintosh HD - Data`/`Data`），不要写死

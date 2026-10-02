@@ -6,8 +6,8 @@
 
 const fs = require('node:fs');
 const path = require('node:path');
-const { snapshotPath, loadRaw } = require('./electron/extract');
-const { diffSnapshots } = require('./electron/diff');
+const { loadRaw } = require('./electron/extract');
+const { diffSnapshots, loadSnapshot } = require('./electron/diff');
 const { loadBreakingChanges, loadApiHistory, historyOf } = require('./electron/history/store');
 const {
   listCapabilities,
@@ -25,15 +25,7 @@ const media = require('./media');
 
 const SNAPSHOT_DIR = path.join(__dirname, 'electron', 'snapshots');
 
-// 第 1 层：加载某个 Electron 版本的快照。
-function loadSnapshot(version) {
-  const file = snapshotPath(version);
-  if (!fs.existsSync(file)) {
-    throw new Error(`快照不存在，先跑 node electron/extract.js ${version}：${file}`);
-  }
-  return JSON.parse(fs.readFileSync(file, 'utf8'));
-}
-
+// 第 1 层：加载某个 Electron 版本的快照（实现见 electron/diff.js，这里直接复用）。
 // 列出已入库的快照版本号（从 electron/snapshots 目录机械读取，不含 raw）。
 function listSnapshots() {
   if (!fs.existsSync(SNAPSHOT_DIR)) return [];

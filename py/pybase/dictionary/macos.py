@@ -79,12 +79,15 @@ def available() -> bool:
     return True
 
 
-def lookup(term: str, *, dictionary: str | None = None) -> Entry | None:
+def lookup(
+    term: str, *, dictionary: str | None = None, with_html: bool = False
+) -> Entry | None:
     """查一个词，返回 `Entry`；查不到返回 `None`。
 
     不给 `dictionary`：走公开 API `DCSCopyTextDefinition(NULL, ...)`，查的
     是用户在『词典』App 里启用的词典中第一个命中的——系统不告诉调用方
-    具体命中了哪本，所以返回的 `Entry.dictionary` 是 `None`。
+    具体命中了哪本，所以返回的 `Entry.dictionary` 是 `None`。此路径不碰
+    任何私有符号，`with_html=True` 必须搭配 `dictionary` 一起给。
 
     给 `dictionary`（词典的显示名，如 "牛津英汉汉英词典"）：走私有 API
     按名字找到该词典再查。这本词典必须在 `list_dictionaries()` 的结果里
@@ -94,9 +97,26 @@ def lookup(term: str, *, dictionary: str | None = None) -> Entry | None:
     注意：公开 API 对短语是模糊匹配，返回的词头可能和查询词不同（比如查
     "take off" 命中的是名词词条 "take-off"），`Entry.headword` 会反映实际
     命中的词头。
+
+    `with_html=True`（必须同时给 `dictionary`，否则抛 `ValueError`）：在上面
+    的基础上再走私有 API `DCSCopyRecordsForSearchString` + `DCSRecordCopyData`
+    取一份 HTML 正文。本机在已下载的英语词典（New Oxford American
+    Dictionary、Oxford Dictionary of English）上验证稳定：命中的 HTML 里带
+    `<span class="x_xoh">ORIGIN` 等结构化词源信息，比纯文本更适合展示；
+    中文类词典（牛津英汉汉英、成语词典等）本机也验证可查，但未见到词源
+    标记，是否所有词典都带取决于该词典本身排版，不保证。
+
+    只取第一条命中记录（一个词可能有多个义项/词性，各是一条独立记录）。
+    HTML 里 `d:title` 属性给出的词头是词典自己标注的，比 `parse_headword`
+    的文本启发式更可靠，能解析到就优先用它覆盖 `Entry.headword`。
+
+    私有 records API 没命中（但按词典查询命中了）时不算失败，退化成不带
+    `html` 的普通 `Entry`；两边都没命中才返回 `None`。
     """
     if not term:
         raise ValueError("term 不能为空")
+    if with_html and not dictionary:
+        raise ValueError("dictionary 不能为空——HTML 查询必须指定具体词典")
     cf, cs = _ensure_loaded()
     if dictionary is None:
         text = _copy_text_definition(cf, cs, None, term)
@@ -107,7 +127,7 @@ def lookup(term: str, *, dictionary: str | None = None) -> Entry | None:
         source = f"macOS 词典：{dictionary}"
     if text is None:
         return None
-    return Entry(
+    entry = Entry(
         query=term,
         text=text,
         source=source,
@@ -115,37 +135,19 @@ def lookup(term: str, *, dictionary: str | None = None) -> Entry | None:
         headword=parse_headword(text),
         dictionary=dictionary,
     )
-
-
-def lookup_html(term: str, dictionary: str) -> Entry | None:
-    """按指定词典查词，在 `lookup` 的基础上补一份 HTML 正文。
-
-    走私有 API `DCSCopyRecordsForSearchString` + `DCSRecordCopyData`，本机
-    在已下载的英语词典（New Oxford American Dictionary、Oxford Dictionary
-    of English）上验证稳定：命中的 HTML 里带 `<span class="x_xoh">ORIGIN`
-    等结构化词源信息，比纯文本更适合展示；中文类词典（牛津英汉汉英、
-    成语词典等）本机也验证可查，但未见到词源标记，是否所有词典都带取决
-    于该词典本身排版，不保证。
-
-    只取第一条命中记录（一个词可能有多个义项/词性，各是一条独立记录）。
-    HTML 里 `d:title` 属性给出的词头是词典自己标注的，比 `parse_headword`
-    的文本启发式更可靠，能解析到就优先用它覆盖 `Entry.headword`。
-
-    私有 records API 没命中（但公开/按词典查询命中了）时不算失败，退化
-    成不带 `html` 的普通 `Entry`；两边都没命中才返回 `None`。
-    """
-    if not dictionary:
-        raise ValueError("dictionary 不能为空——HTML 查询必须指定具体词典")
-    entry = lookup(term, dictionary=dictionary)
-    if entry is None:
-        return None
-    cf, cs = _ensure_loaded()
+    if not with_html:
+        return entry
     with _dictionary(cf, cs, dictionary) as dict_ref:
         html = _copy_html_record(cf, cs, dict_ref, term)
     if html is None:
         return entry
     headword = _parse_html_title(html) or entry.headword
     return replace(entry, html=html, headword=headword)
+
+
+def lookup_html(term: str, dictionary: str) -> Entry | None:
+    """已废弃，改用 `lookup(term, dictionary=dictionary, with_html=True)`。"""
+    return lookup(term, dictionary=dictionary, with_html=True)
 
 
 def list_dictionaries() -> list[DictionaryInfo]:

@@ -117,6 +117,12 @@ def test_lookup_html_requires_dictionary_name():
         macos.lookup_html("apple", "")
 
 
+def test_lookup_with_html_requires_dictionary_name():
+    # lookup_html 现在是 lookup(with_html=True) 的薄别名，校验规则要一致。
+    with pytest.raises(ValueError):
+        macos.lookup("apple", with_html=True)
+
+
 # ---------------------------------------------------------------------------
 # 真实系统词典：需要 macOS 且框架能加载
 # ---------------------------------------------------------------------------
@@ -159,3 +165,18 @@ def test_lookup_unknown_dictionary_name_raises():
 def test_lookup_html_unknown_dictionary_name_raises():
     with pytest.raises(macos.DictionaryUnavailable):
         macos.lookup_html("apple", "__一个肯定不存在的词典名__")
+
+
+@requires_macos_dictionary
+def test_lookup_with_html_true_matches_deprecated_lookup_html_alias():
+    installed = [d.name for d in macos.list_dictionaries() if d.installed]
+    if not installed:
+        pytest.skip("本机没有任何已下载、可查的系统词典")
+    for name in installed:
+        via_switch = macos.lookup("hello", dictionary=name, with_html=True)
+        if via_switch is not None:
+            break
+    else:
+        pytest.skip("本机已下载词典都查不到 hello（词库内容因人而异）")
+    via_alias = macos.lookup_html("hello", name)
+    assert via_switch == via_alias

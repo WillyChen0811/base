@@ -54,9 +54,16 @@ asr-mlx = [
 net = [
     "cryptography>=44.0.0",
 ]
+db = [
+    "sqlalchemy>=2.0.36",
+]
+postgres = [
+    "pybase[db]",
+    "psycopg[binary]>=3.2",
+]
 # 引用自身 extras（pip >= 21.2），新增 extra 时只要在这里加名字，不会漏抄依赖
 all = [
-    "pybase[docx,sheets,smb,crypto,office,office-word,rpc-server,subtitle,asr-mlx,net]",
+    "pybase[docx,sheets,smb,crypto,office,office-word,rpc-server,subtitle,asr-mlx,net,db,postgres]",
 ]
 dev = [
     "pytest>=7.0.0",

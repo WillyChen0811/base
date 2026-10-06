@@ -119,6 +119,8 @@ pip install -e "./py[all]"
 | `rpc-server` | fastapi | `pybase.rpc.create_fastapi_rpc_router` |
 | `subtitle` | pysubs2 | `pybase.subtitle` |
 | `net` | cryptography | `pybase.net.wireguard` 的密钥生成/推导 |
+| `db` | sqlalchemy | `pybase.db`（引擎/会话、方言无关的表结构操作、upsert、库身份标记） |
+| `postgres` | `db` + psycopg[binary] | `pybase.db` 连 PostgreSQL |
 | `asr-mlx` | mlx-audio（仅 Apple Silicon） | `pybase.asr.MlxAudio` |
 | `all` | 以上全部 | —— |
 

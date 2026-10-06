@@ -160,3 +160,12 @@
 ### timemachine
 - 系统常已把快照挂在 `/Volumes/.timemachine/<UUID>/`，再 `mount_apfs` 同一快照报 Resource busy：先查挂载表复用
 - 自己挂一律 `rdonly,nobrowse`；快照里卷名随系统版本不同（`Macintosh HD - Data`/`Data`），不要写死
+
+### db
+- 只放零业务的方言无关操作；业务表结构、升级脚本、身份取值都留在调用方
+- 函数的 `bind` 可传 Engine / Connection / Session：给 Engine 自己提交，给 Connection/Session 并入调用方事务，绝不自行提交
+- SQLite 引擎在 `make_engine` 里关掉 pysqlite 隐式事务并显式 BEGIN，DDL 才能随事务回滚；别绕开 `make_engine` 自己 `create_engine`
+- SQLite 删唯一约束/改可空性只能重建表（`schema._rebuild_sqlite`），只带普通列索引，表达式/部分索引、触发器不带
+- upsert 的受影响行数靠 `RETURNING` 数，不用 `cursor.rowcount`（psycopg 下带自增主键时是 -1）
+- 身份标记不覆盖：已有且不同一律抛 `IdentityMismatch`；无标记行为由 `check_identity(on_missing=)` 选
+- PostgreSQL 测试连本机、建 `pybase_test_*` 临时库，连不上 skip

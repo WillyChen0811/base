@@ -53,6 +53,7 @@ def make_engine(
     pool_recycle: int = 1800,
     pool_timeout: float = 30.0,
     connect_args: Optional[Dict[str, Any]] = None,
+    application_name: Optional[str] = None,
 ) -> Engine:
     """按 URL 建引擎。
 
@@ -61,6 +62,7 @@ def make_engine(
         sqlite_wal: 文件库连接时 ``PRAGMA journal_mode=WAL``（读不再被写阻塞）。
         pool_size / max_overflow / pool_recycle / pool_timeout: 仅 PostgreSQL 用。
         connect_args: 追加给驱动的参数，覆盖本函数的默认值。
+        application_name: 仅 PostgreSQL，传给连接（审计里据此区分写入方）；SQLite 忽略。
 
     Raises:
         DriverNotInstalled: 要连 PostgreSQL（psycopg）但没装驱动。
@@ -78,6 +80,8 @@ def make_engine(
             raise DriverNotInstalled(
                 "连接 PostgreSQL 需要 psycopg 3，请安装："
                 "pip install \"pybase[postgres]\"")
+        if application_name:
+            connect_args = {"application_name": application_name, **(connect_args or {})}
         engine = create_engine(
             url, echo=echo, pool_pre_ping=True, pool_size=pool_size,
             max_overflow=max_overflow, pool_recycle=pool_recycle,

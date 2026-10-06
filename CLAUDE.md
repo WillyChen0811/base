@@ -169,3 +169,4 @@
 - upsert 的受影响行数靠 `RETURNING` 数，不用 `cursor.rowcount`（psycopg 下带自增主键时是 -1）
 - 身份标记不覆盖：已有且不同一律抛 `IdentityMismatch`；无标记行为由 `check_identity(on_missing=)` 选
 - PostgreSQL 测试连本机、建 `pybase_test_*` 临时库，连不上 skip
+- 审计（`audit`）仅 PostgreSQL：触发器挂业务表，写入 `audit.row_log`；SQLite 上返回 False/空列表不报错。上下文键靠 `SET LOCAL`（`set_audit_context` 要传 Connection/Session），`make_engine(application_name=)` 区分写入方

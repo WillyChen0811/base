@@ -21,6 +21,8 @@ from pybase.media import (
     ToolNotFoundError,
     extract_audio,
     probe,
+    resolve_tool,
+    run,
     snapshot,
 )
 from pybase.media._proc import run_streaming, run_to_file, tmp_path_for
@@ -307,3 +309,28 @@ def test_probe_marks_cover_art(tmp_path):
     ], check=True)
     video = [s for s in probe(src)["streams"] if s["codec_type"] == "video"]
     assert video and video[0].get("attached_pic") is True
+
+
+def test_run_and_resolve_tool_are_public_reexports():
+    """公开路径 pybase.media 导出的 run/resolve_tool 就是 _proc 里的同一对象。"""
+    from pybase.media import _proc
+
+    assert run is _proc.run
+    assert resolve_tool is _proc.resolve_tool
+
+
+def test_resolve_tool_missing_raises_tool_not_found():
+    with pytest.raises(ToolNotFoundError, match="no-such-tool-xyz"):
+        resolve_tool(None, "no-such-tool-xyz")
+    with pytest.raises(ToolNotFoundError):
+        resolve_tool("/no/such/tool-binary", "whatever")
+
+
+def test_run_returns_stderr_text_and_does_not_check_returncode():
+    result = run(
+        [sys.executable, "-c", "import sys; print('to-err', file=sys.stderr); sys.exit(3)"],
+        timeout=10,
+    )
+    assert result.returncode == 3  # 非零不抛，由调用方自己判断
+    assert "to-err" in result.stderr
+    assert isinstance(result.stderr, str)

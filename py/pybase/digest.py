@@ -167,17 +167,9 @@ def compute_source_hash(cues: Sequence[Cue]) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _format_ts(ms: int) -> str:
-    total_seconds = ms // 1000
-    hours, rem = divmod(total_seconds, 3600)
-    minutes, seconds = divmod(rem, 60)
-    if hours:
-        return f"{hours}:{minutes:02d}:{seconds:02d}"
-    return f"{minutes:02d}:{seconds:02d}"
-
-
 def _numbered_line(index: int, cue: Cue) -> str:
-    return f"[{index}] ({_format_ts(cue.start)}) {cue.text.replace(chr(10), ' ')}"
+    # 只给编号不给时间：时间占约四成字数，还诱导模型自己写时间区间
+    return f"[{index}] {cue.text.replace(chr(10), ' ')}"
 
 
 def _split_chunks(cues: Sequence[Cue], max_chars: int) -> list[list[int]]:
@@ -215,19 +207,38 @@ _JSON_SHAPE = (
 
 def _system_prompt(language: str) -> str:
     return (
-        "你是视频内容总结助手，输入是带编号的字幕行，格式为 `[编号] (时间) 文本`。"
-        "章节和要点只能引用给出的编号来定位起止，绝不能自己编时间戳；"
+        "你是课程内容整理助手。输入是带编号的字幕，每行格式是 `[编号] 文本`，"
+        "编号按时间顺序排列。引用位置时只能用这些编号，不要写任何时间或时间区间。"
         f"输出语言：{language}。严格输出 JSON，不要用 markdown 代码块包裹，不要输出任何多余文字。"
     )
 
 
-def _chunk_user_prompt(numbered_text: str, language: str) -> str:
+def _chunk_user_prompt(
+    numbered_text: str,
+    language: str,
+    *,
+    whole: bool,
+    first_index: int,
+    last_index: int,
+) -> str:
+    scope = "整段内容" if whole else "这一段"
+    takeaway_count = "10–20" if whole else "3–6"
     return (
         "以下是一段字幕，每行一句，已经按顺序编号：\n\n"
         f"{numbered_text}\n\n"
-        f"请用{language}分析这段内容，划分出章节、提炼要点，严格输出如下 JSON：\n"
-        f"{_JSON_SHAPE}\n"
-        "start/end 必须是上面出现过的编号且 start <= end，不要引用没出现过的编号。"
+        f"请用{language}分析这段内容，划分出章节、提炼要点，满足以下要求：\n"
+        f"1. overview：用 3–5 句话概述{scope}。\n"
+        "2. chapters：按讲的内容划分，在话题切换、换题目、换问题的地方分章，"
+        "不要按长度平均切，也不要为凑章数硬拆或硬并；按时间顺序、前后相接，"
+        f"合起来覆盖整段：第一章 start 必须是 {first_index}，"
+        f"最后一章 end 必须是 {last_index}，相邻两章既不漏编号也不重叠；"
+        "每章一般 3–15 分钟的内容。title 要具体：在讲题就写出第几题、哪一问、"
+        "考什么知识点（例如\"试题三第 2 问：数据流图局部出错定位\"），"
+        "不要写\"习题讲解\"\"知识点串讲\"这类空话；"
+        "summary 用 2–4 句说清这一章具体讲了什么。\n"
+        f"3. takeaways：挑 {takeaway_count} 条最值得记住的知识点，每条引用编号区间。\n"
+        f"严格输出如下 JSON：\n{_JSON_SHAPE}\n"
+        "start/end 必须是上面出现过的编号、闭区间、start <= end，不要引用没出现过的编号。"
     )
 
 
@@ -236,8 +247,14 @@ def _merge_user_prompt(sections_text: str, language: str) -> str:
         "以下是一段长字幕切成若干块后，每块各自分析出的结果（编号仍是原字幕的全局编号，"
         "没有重新编号）：\n\n"
         f"{sections_text}\n\n"
-        f"请用{language}把这些块的结果合并成整段视频统一的总结，严格输出如下 JSON：\n"
-        f"{_JSON_SHAPE}\n"
+        f"请用{language}把这些块的结果合并成整段视频统一的总结，满足以下要求：\n"
+        "1. chapters：按讲的内容划分，在话题切换、换题目、换问题的地方分章，"
+        "不要按长度平均切，也不要为凑章数硬拆或硬并；章节按时间顺序前后相接，"
+        "合起来覆盖整段，相邻两章既不漏编号也不重叠。"
+        "title 要具体：写出第几题、哪一问、考什么知识点，"
+        "不要写\"习题讲解\"\"知识点串讲\"这类空话；summary 用 2–4 句说清这一章具体讲了什么。\n"
+        "2. takeaways：挑 10–20 条最值得记住的知识点，每条引用编号区间。\n"
+        f"严格输出如下 JSON：\n{_JSON_SHAPE}\n"
         "start/end 必须引用上面已经出现过的编号，不要编造新的编号。"
     )
 
@@ -389,10 +406,13 @@ def summarize(
     """给 cues 生成带出处的总结（章节 + 要点）。
 
     `complete` 是 `messages(list[dict]) -> 回复文本` 的依赖注入，不 import
-    `pybase.aiclient`；调用方可传 `lambda messages: client.chat(messages, json_mode=True)`。
+    `pybase.aiclient`；建议调用方传 `lambda messages: client.chat(messages, json_mode=False)`——
+    有的本地服务（实测 oMLX + Qwen3）开了 response_format=json_object 会关掉模型的思考、
+    甚至把思考内容塞进 JSON 键名里，而本模块的解析本来就能从普通文本里挖出 JSON。
     `language`/`max_chars` 必传，无默认值。`model`/`created_at` 是可选的透传字符串，
     只落进返回的 `Digest`，本函数不做任何取值/取时间的逻辑（保持可测、零业务依赖）。
 
+    上下文够大的模型建议把 `max_chars` 设大，让整段一次处理，效果明显好于分块。
     长度超过 `max_chars` 会先分块各自总结再合一次汇总；`on_progress(done, total)`
     只报"分块总结"这一段的进度（`total` 是块数），汇总那一次调用不算进度。
     """
@@ -414,11 +434,17 @@ def summarize(
         return complete(messages)
 
     if total == 1:
-        numbered = "\n".join(_numbered_line(i, cues[i]) for i in chunks[0])
+        indices = chunks[0]
+        numbered = "\n".join(_numbered_line(i, cues[i]) for i in indices)
         raw = call(
             [
                 {"role": "system", "content": _system_prompt(language)},
-                {"role": "user", "content": _chunk_user_prompt(numbered, language)},
+                {
+                    "role": "user",
+                    "content": _chunk_user_prompt(
+                        numbered, language, whole=True, first_index=indices[0], last_index=indices[-1]
+                    ),
+                },
             ]
         )
         if on_progress:
@@ -434,7 +460,12 @@ def summarize(
             raw = call(
                 [
                     {"role": "system", "content": _system_prompt(language)},
-                    {"role": "user", "content": _chunk_user_prompt(numbered, language)},
+                    {
+                        "role": "user",
+                        "content": _chunk_user_prompt(
+                            numbered, language, whole=False, first_index=indices[0], last_index=indices[-1]
+                        ),
+                    },
                 ]
             )
             try:

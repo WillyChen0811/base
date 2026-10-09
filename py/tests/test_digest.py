@@ -10,6 +10,7 @@ import threading
 import pytest
 
 from pybase.digest import (
+    _numbered_line,
     Chapter,
     Digest,
     DigestCancelled,
@@ -97,9 +98,9 @@ def test_summarize_extracts_json_from_surrounding_prose_without_code_block():
 
 
 def test_summarize_multi_chunk_calls_map_then_reduce():
-    # 每行编号文本形如 "[0] (00:00) line 0"，长度约 20 字符；max_chars 设小一点强制多块
+    # 每行编号文本形如 "[0] line 0"（去时间后约 10 字符）；max_chars 设小一点强制多块
     cues = _cues(10)
-    line_len = len(f"[0] (00:00) {cues[0].text}") + 1
+    line_len = len(f"[0] {cues[0].text}") + 1
     max_chars = line_len * 4  # 大约每块 4 句，10 句切成 3 块左右
 
     calls = []
@@ -153,6 +154,64 @@ def test_summarize_single_call_when_everything_fits_one_chunk():
 
     summarize(cues, complete, language="zh", max_chars=1_000_000)
     assert len(calls) == 1  # 块数为 1 时只调用一次，不做多余的汇总请求
+
+
+# ---------------------------------------------------------------------------
+# 编号行与提示词
+# ---------------------------------------------------------------------------
+
+
+def test_numbered_line_has_no_timestamp():
+    line = _numbered_line(3, Cue(start=3_723_000, end=3_724_000, text="第一句\n第二句"))
+    assert line == "[3] 第一句 第二句"  # 只给编号，不带时间
+
+
+def test_whole_prompt_requires_content_based_chapters_and_10_to_20_takeaways():
+    cues = _cues(5)
+    captured = []
+
+    def complete(messages):
+        content = messages[1]["content"]
+        captured.append(content)
+        return _json_reply(
+            {"overview": "o", "chapters": [{"title": "c", "summary": "s", "start": 0, "end": 4}], "takeaways": []}
+        )
+
+    summarize(cues, complete, language="zh", max_chars=1_000_000)
+    assert len(captured) == 1
+    content = captured[0]
+    assert "不要按长度平均切" in content
+    assert "第一章 start 必须是 0" in content
+    assert "最后一章 end 必须是 4" in content
+    assert "10–20" in content
+    assert "3–6" not in content
+
+
+def test_per_chunk_prompt_uses_fewer_takeaways():
+    cues = _cues(10)
+    line_len = len(f"[0] {cues[0].text}") + 1
+    max_chars = line_len * 4  # 强制多块
+    captured = []
+
+    def complete(messages):
+        content = messages[1]["content"]
+        captured.append(content)
+        return _json_reply(
+            {
+                "overview": "o",
+                "chapters": [{"title": "c", "summary": "s", "start": 0, "end": 0}],
+                "takeaways": [{"text": "t", "start": 0, "end": 0}],
+            }
+        )
+
+    summarize(cues, complete, language="zh", max_chars=max_chars)
+    chunk_contents = [c for c in captured if "切成若干块后" not in c]
+    assert chunk_contents and len(chunk_contents) < len(captured)  # 确实走了分块 + 汇总
+    for content in chunk_contents:
+        assert "3–6" in content
+        assert "10–20" not in content
+        assert "第一章 start 必须是" in content
+        assert "最后一章 end 必须是" in content
 
 
 # ---------------------------------------------------------------------------
@@ -277,7 +336,7 @@ def test_cancel_before_call_raises_digest_cancelled():
 
 def test_cancel_mid_multi_chunk_stops_before_next_call():
     cues = _cues(10)
-    line_len = len(f"[0] (00:00) {cues[0].text}") + 1
+    line_len = len(f"[0] {cues[0].text}") + 1
     max_chars = line_len * 4
     event = threading.Event()
     calls = []

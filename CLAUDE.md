@@ -11,6 +11,7 @@
 - 测试（改动后必须跑）：
   - `cd py && python -m pytest tests`
   - `cd js && node --test "tests/**/*.test.js"`
+  - `cd go && go test ./...`
 
 ## pybase
 
@@ -146,3 +147,13 @@
 - Electron 本地媒体协议必须 `stream: true` 且自己处理 Range（electron#38749，否则拖不动）；
   不给 `bypassCSP`；哪些文件能读由调用方 `resolvePath` 决定
 - `segmentWords` 会把 `take-off` 拆成三段、`don't` 不拆，合并短语是界面层的事
+
+## gobase
+
+- 模块路径 `github.com/WillyChen0811/base/go`；本机 Go 工具链在 `~/.local/go`
+- 必须能交叉编译到 `darwin/arm64` 和 `ios/arm64`（`CGO_ENABLED=0`）：不用 cgo，不碰系统 tun/路由，网络一律走程序内网络栈
+- WireGuard 的程序内网络栈在主模块 `golang.zx2c4.com/wireguard` 的 `tun/netstack` 包里；
+  不要 `go get golang.zx2c4.com/wireguard/tun/netstack`，那会拉到 2022 年单独发布的旧模块
+- 监听一律只绑 127.0.0.1；测试只用本机回环和程序内网络栈，不需要 root
+- 依赖只用 MIT/BSD/Apache/ISC 这类宽松协议，新增前先看模块缓存里的 LICENSE
+

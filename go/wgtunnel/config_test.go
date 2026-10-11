@@ -121,6 +121,12 @@ func TestErrors(t *testing.T) {
 		{"MTU 不是数字", "[Interface]\nPrivateKey=" + keyA + "\nAddress=10.0.0.2/32\nMTU=abc\n", 4, "MTU"},
 		{"Endpoint 没端口", "[Interface]\nPrivateKey=" + keyA + "\nAddress=10.0.0.2/32\n[Peer]\nPublicKey=" + keyB + "\nEndpoint=1.2.3.4\n", 6, "Endpoint"},
 		{"两个 Interface", "[Interface]\nPrivateKey=" + keyA + "\nAddress=10.0.0.2/32\n[Interface]\n", 4, "Interface"},
+		{"缺等号的行", "[Interface]\nPrivateKey=" + keyA + "\nAddress=10.0.0.2/32\nListenPort\n", 4, "ListenPort"},
+		{"Endpoint 端口不是数字", "[Interface]\nPrivateKey=" + keyA + "\nAddress=10.0.0.2/32\n[Peer]\nPublicKey=" + keyB + "\nEndpoint=1.2.3.4:abc\n", 6, "Endpoint"},
+		{"Endpoint 端口超范围", "[Interface]\nPrivateKey=" + keyA + "\nAddress=10.0.0.2/32\n[Peer]\nPublicKey=" + keyB + "\nEndpoint=1.2.3.4:70000\n", 6, "Endpoint"},
+		{"MTU 超范围", "[Interface]\nPrivateKey=" + keyA + "\nAddress=10.0.0.2/32\nMTU=100\n", 4, "MTU"},
+		{"ListenPort 负数", "[Interface]\nPrivateKey=" + keyA + "\nAddress=10.0.0.2/32\nListenPort=-1\n", 4, "ListenPort"},
+		{"Keepalive 负数", "[Interface]\nPrivateKey=" + keyA + "\nAddress=10.0.0.2/32\n[Peer]\nPublicKey=" + keyB + "\nPersistentKeepalive=-5\n", 6, "PersistentKeepalive"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -205,5 +211,45 @@ func TestNoKeyLeak(t *testing.T) {
 	_, err = ParseConfig([]byte("[Interface]\nPrivateKey=" + keyA + "x\nAddress=10.0.0.2/32\n"))
 	if err == nil || strings.Contains(err.Error(), keyA) {
 		t.Errorf("错误信息不能包含密钥原文: %v", err)
+	}
+}
+
+// 显式写的 /0 要原样保留，不能当成"没写前缀"
+func TestExplicitZeroPrefix(t *testing.T) {
+	c, err := ParseConfig([]byte("[Interface]\nPrivateKey=" + keyA + "\nAddress=0.0.0.0/0, ::/0, fd00::5\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"0.0.0.0/0", "::/0", "fd00::5/128"}
+	if len(c.Addresses) != 3 {
+		t.Fatalf("Addresses = %v", c.Addresses)
+	}
+	for i, w := range want {
+		if c.Addresses[i].String() != w {
+			t.Errorf("Addresses[%d] = %v, want %s", i, c.Addresses[i], w)
+		}
+	}
+}
+
+// 主机名解析成 IPv6 时，UAPI 里的端点也要带方括号
+func TestUAPIResolvedIPv6(t *testing.T) {
+	c, err := ParseConfig([]byte("[Interface]\nPrivateKey=" + keyA + "\nAddress=10.0.0.2/32\n[Peer]\nPublicKey=" + keyB + "\nEndpoint=v6.example.com:51820\nAllowedIPs=10.0.0.0/24\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := c.UAPI(func(string) (netip.Addr, error) { return netip.MustParseAddr("2001:db8::2"), nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(got, "endpoint=[2001:db8::2]:51820\n") {
+		t.Errorf("UAPI = %s", got)
+	}
+}
+
+// 直接构造（没经过 ParseConfig）的 Config 里密钥坏了，UAPI 要报错而不是输出空密钥
+func TestUAPIBadKey(t *testing.T) {
+	c := &Config{PrivateKey: "not-base64", Addresses: []netip.Prefix{netip.MustParsePrefix("10.0.0.2/32")}}
+	if _, err := c.UAPI(nil); err == nil {
+		t.Error("应报错")
 	}
 }

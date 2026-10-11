@@ -253,3 +253,99 @@ func TestUAPIBadKey(t *testing.T) {
 		t.Error("应报错")
 	}
 }
+
+// 误把裸密钥粘进小节时，报错也不能带出密钥
+func TestNoKeyLeakOnBadLine(t *testing.T) {
+	for _, line := range []string{keyA, strings.TrimRight(keyA, "=")} {
+		_, err := ParseConfig([]byte("[Interface]\n" + line + "\n"))
+		if err == nil {
+			t.Fatal("应报错")
+		}
+		if strings.Contains(err.Error(), keyA[:16]) {
+			t.Errorf("错误信息泄漏了密钥: %v", err)
+		}
+	}
+}
+
+func TestUAPIDefaultLookupKeepsIPv4(t *testing.T) {
+	c, err := ParseConfig([]byte("[Interface]\nPrivateKey=" + keyA + "\nAddress=10.0.0.2/32\n[Peer]\nPublicKey=" + keyB + "\nEndpoint=localhost:51820\nAllowedIPs=10.0.0.0/24\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := c.UAPI(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(got, "::ffff:") {
+		t.Errorf("IPv4 不应变成映射地址: %s", got)
+	}
+}
+
+func TestUAPIBadEndpointPort(t *testing.T) {
+	for _, ep := range []string{"h.example.com:abc", "h.example.com:70000", "1.2.3.4:0"} {
+		c := &Config{PrivateKey: keyA, Addresses: []netip.Prefix{netip.MustParsePrefix("10.0.0.2/32")},
+			Peers: []Peer{{PublicKey: keyB, Endpoint: ep}}}
+		if _, err := c.UAPI(func(string) (netip.Addr, error) { return netip.MustParseAddr("1.2.3.4"), nil }); err == nil {
+			t.Errorf("Endpoint %q 应报错", ep)
+		}
+	}
+}
+
+// 没有 Endpoint 的对端（服务器端常见），UAPI 不能输出空的 endpoint= 行
+func TestUAPINoEndpoint(t *testing.T) {
+	c, err := ParseConfig([]byte("[Interface]\nPrivateKey=" + keyA + "\nAddress=10.0.0.1/32\nListenPort=51820\n[Peer]\nPublicKey=" + keyB + "\nAllowedIPs=10.0.0.2/32\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := c.UAPI(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(got, "endpoint=") {
+		t.Errorf("不应有 endpoint 行: %s", got)
+	}
+}
+
+func TestDNSEmptyItems(t *testing.T) {
+	c, err := ParseConfig([]byte("[Interface]\nPrivateKey=" + keyA + "\nAddress=10.0.0.2/32\nDNS = 8.8.8.8, ,lan,\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(c.DNS) != 1 || len(c.DNSSearch) != 1 || c.DNSSearch[0] != "lan" {
+		t.Errorf("DNS=%v DNSSearch=%q", c.DNS, c.DNSSearch)
+	}
+}
+
+// 和 wg 一致：AllowedIPs 里的裸 IP 按 /32、/128
+func TestAllowedIPsBareAddr(t *testing.T) {
+	c, err := ParseConfig([]byte("[Interface]\nPrivateKey=" + keyA + "\nAddress=10.0.0.2/32\n[Peer]\nPublicKey=" + keyB + "\nAllowedIPs=10.0.0.5, fd00::9, 0.0.0.0/0\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"10.0.0.5/32", "fd00::9/128", "0.0.0.0/0"}
+	got := c.Peers[0].AllowedIPs
+	if len(got) != 3 {
+		t.Fatalf("AllowedIPs = %v", got)
+	}
+	for i, w := range want {
+		if got[i].String() != w {
+			t.Errorf("AllowedIPs[%d] = %v, want %s", i, got[i], w)
+		}
+	}
+}
+
+// [Interface] 写在 [Peer] 后面：要报在那一行，且不能说成"第二个"
+func TestInterfaceAfterPeer(t *testing.T) {
+	_, err := ParseConfig([]byte("[Peer]\nPublicKey=" + keyB + "\n[Interface]\nPrivateKey=" + keyA + "\nAddress=10.0.0.2/32\n"))
+	var ce *ConfigError
+	if !errors.As(err, &ce) || ce.Line != 3 || strings.Contains(err.Error(), "第二个") {
+		t.Errorf("err = %v", err)
+	}
+}
+
+// Windows 记事本存的 UTF-8 BOM 要能识别
+func TestBOM(t *testing.T) {
+	if _, err := ParseConfig([]byte("\xEF\xBB\xBF[Interface]\nPrivateKey=" + keyA + "\nAddress=10.0.0.2/32\n")); err != nil {
+		t.Errorf("带 BOM 的配置应能解析: %v", err)
+	}
+}

@@ -9,7 +9,9 @@ require (
 )
 
 require (
+	github.com/coder/websocket v1.8.15 // indirect
 	github.com/google/btree v1.1.2 // indirect
+	github.com/things-go/go-socks5 v0.1.3 // indirect
 	golang.org/x/sys v0.49.0 // indirect
 	golang.org/x/time v0.7.0 // indirect
 	golang.zx2c4.com/wintun v0.0.0-20230126152724-0fa3db229ce2 // indirect

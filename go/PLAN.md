@@ -1,5 +1,11 @@
 # 计划：base 应用级 WireGuard + xxyi 内置 tmux 终端
 
+## 进度（2026-10-11 夜）
+- T0–T5 完成（base 分支 feat/wgtunnel）：配置解析、隧道核心、SOCKS 口、SSH 终端+WebSocket 桥、wgtund 助手。
+- T6、T7 完成（xxyi 分支 feat/terminal）：助手看护、/api/terminal、多会话终端页面。Ubuntu 上端到端试跑通过（直连测试 SSH 服务器）。
+- 待做：T8 在 Mac 上用真实 WireGuard 配置验收；第二期 ai-browser 按窗口走 SOCKS；第三期 gomobile 打包 iOS（需 Mac/Xcode）。
+
+
 ## 目标与分期
 - 第一期（最小可用）：Mac 上的 xxyi 开一条应用内 WireGuard 隧道，点一下就在 xxyi 页面里连上 Ubuntu 的 tmux。
 - 第二期：多条隧道同时开，每条一个本地 SOCKS5 口；ai-browser 的 Electron 浏览器按窗口/实例指定走哪条隧道。

@@ -241,3 +241,36 @@ func TestClose(t *testing.T) {
 		t.Error("Close 后不应再接受连接")
 	}
 }
+
+// 只许 CONNECT：UDP ASSOCIATE 会绕过隧道直接走本机网络，必须拒绝
+func TestOnlyConnect(t *testing.T) {
+	s := start(t, &fakeDialer{target: echo(t)}, Options{})
+	for _, cmd := range []byte{2, 3} { // 2=BIND 3=UDP ASSOCIATE
+		c, err := net.DialTimeout("tcp", s.Addr().String(), 5*time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		c.SetDeadline(time.Now().Add(5 * time.Second))
+		c.Write([]byte{5, 1, 0})
+		greet := make([]byte, 2)
+		if _, err := io.ReadFull(c, greet); err != nil || greet[1] != 0 {
+			t.Fatalf("握手失败 %v %v", greet, err)
+		}
+		c.Write([]byte{5, cmd, 0, 1, 0, 0, 0, 0, 0, 0})
+		rep := make([]byte, 2)
+		if _, err := io.ReadFull(c, rep); err == nil && rep[1] == 0 {
+			t.Errorf("命令 %d 应被拒绝，却回了成功", cmd)
+		}
+		c.Close()
+	}
+}
+
+// 用户名和密码只设一个：配置错误，Listen 直接报错（否则空用户名就能登录）
+func TestHalfCredentials(t *testing.T) {
+	for _, o := range []Options{{Username: "u"}, {Password: "p"}} {
+		if s, err := Listen("127.0.0.1:0", &fakeDialer{}, o); err == nil {
+			s.Close()
+			t.Errorf("%+v 应报错", o)
+		}
+	}
+}

@@ -386,6 +386,16 @@ func TestBadConfig(t *testing.T) {
 		"socks 监听非回环地址": func(c map[string]any) {
 			c["socks"] = map[string]string{"home": "0.0.0.0:0"}
 		},
+		"主机名为空": func(c map[string]any) {
+			c["hosts"].([]map[string]any)[0]["name"] = ""
+		},
+		"主机名重复": func(c map[string]any) {
+			h := c["hosts"].([]map[string]any)
+			c["hosts"] = append(h, h[0])
+		},
+		"主机地址没端口": func(c map[string]any) {
+			c["hosts"].([]map[string]any)[0]["addr"] = "10.99.0.1"
+		},
 		"缺 known_hosts": func(c map[string]any) {
 			delete(c, "known_hosts")
 		},
@@ -412,5 +422,23 @@ func TestBadTunnelFile(t *testing.T) {
 	err := Run(context.Background(), f.dir, strings.NewReader(""), io.Discard)
 	if err == nil || !strings.Contains(err.Error(), "broken.conf") {
 		t.Errorf("应报错并带文件名，得到 %v", err)
+	}
+}
+
+// 页面和助手端口不同：白名单来源要拿到 CORS 头，其他来源不给
+func TestCORS(t *testing.T) {
+	f := newFixture(t, nil)
+	st, _, _ := run(t, f.dir)
+	for origin, want := range map[string]string{"http://127.0.0.1:8765": "http://127.0.0.1:8765", "http://evil.example": ""} {
+		req, _ := http.NewRequest("GET", "http://"+st.HTTP+"/hosts?token="+st.Token, nil)
+		req.Header.Set("Origin", origin)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if got := resp.Header.Get("Access-Control-Allow-Origin"); got != want {
+			t.Errorf("Origin %s: ACAO = %q, want %q", origin, got, want)
+		}
 	}
 }

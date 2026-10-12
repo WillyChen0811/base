@@ -26,7 +26,20 @@
   私钥也可以只放在 ssh-agent 里。
 
 就绪后往 stdout 写一行 `{"http":"127.0.0.1:端口","token":"…","socks":{…}}`；stdin 关闭即退出。
-HTTP 接口都要带 `token` 参数：`GET /hosts`、`GET /status`、WebSocket `/term?host=&cols=&rows=`。
+HTTP 接口都要带 `token` 参数；每台主机共用一条 SSH 连接（第一次用到才拨，断了自动重拨）：
+- `GET /hosts`：主机清单，每项 `{"name","tunnel","connected","error"}`；
+  `connected` 是共用连接当前是否连着，`error` 是最近一次拨号/断开的原因（没有则空串）。
+- `GET /status`：隧道握手与流量统计。
+- `GET /sessions?host=`：列 tmux 会话 `{"sessions":[{"name","attached","windows","created","activity"}]}`
+  （时间是 Unix 秒；远端没有 tmux 服务时返回空数组）。
+- `POST /sessions/new?host=&name=`：新建会话，成功 `{"name":…}`；名字不合规 400、重名 409。
+- `POST /sessions/kill?host=&name=`：结束会话，成功 `{"ok":true}`；不存在 404。
+- `GET /capture?host=&name=&lines=`：抓会话内容 `{"text":…}`；lines 默认 200（1..5000）。
+- WebSocket `/term?host=&cols=&rows=[&session=名]`：网页终端；带 `session` 时 attach 该 tmux 会话，
+  否则执行主机配置的 `command`（空则登录 shell）。
+写操作走 POST 但不带请求体和自定义头，浏览器跨域时属于简单请求、不发预检。
+错误统一返回 `{"error":"原因"}`：参数不合规 400、主机/会话不存在 404、重名 409、方法不对 405、
+连不上主机或远端执行失败 502。
 
 ## 测试
     cd go && go test ./...

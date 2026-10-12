@@ -16,10 +16,12 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/WillyChen0811/base/go/sshterm"
+	"github.com/WillyChen0811/base/go/tmux"
 	"github.com/WillyChen0811/base/go/wgtunnel"
 	"github.com/WillyChen0811/base/go/wgtunnel/socks"
 	"golang.org/x/crypto/ssh"
@@ -157,42 +159,182 @@ func Run(ctx context.Context, dir string, stdin io.Reader, stdout io.Writer) (er
 	for _, h := range conf.Hosts {
 		hosts[h.Name] = h
 	}
-	open := func(r *http.Request, cols, rows int) (*sshterm.Session, error) {
-		h, ok := hosts[r.URL.Query().Get("host")]
-		if !ok {
-			return nil, errors.New("未知主机")
-		}
-		var d sshterm.Dialer = &net.Dialer{Timeout: 15 * time.Second}
+	// 每台主机共用一条 SSH 连接，第一次用到时才拨号
+	pool := newSSHPool(knownHostsCb)
+	closers = append(closers, pool)
+	for _, h := range conf.Hosts {
+		var d sshterm.Dialer = &net.Dialer{Timeout: dialTimeout}
 		if h.Tunnel != "" {
 			d = tunnels[h.Tunnel]
 		}
-		signers, agentConn, keyErrs := loadSigners(h.IdentityFiles)
-		if agentConn != nil {
-			defer agentConn.Close()
+		pool.add(h, d)
+	}
+
+	open := func(r *http.Request, cols, rows int) (*sshterm.Session, error) {
+		q := r.URL.Query()
+		name := q.Get("host")
+		if _, ok := hosts[name]; !ok {
+			return nil, errors.New("未知主机")
 		}
-		if len(signers) == 0 {
-			if len(keyErrs) > 0 {
-				return nil, fmt.Errorf("没有可用的私钥：%s", strings.Join(keyErrs, "；"))
+		// /term?session=名：在共用连接上附加 tmux 会话；
+		// 没有 session 时执行主机配置的 command（空则登录 shell），同样走共用连接
+		command := hosts[name].Command
+		if s := q.Get("session"); s != "" {
+			c, err := tmux.AttachCommand(s)
+			if err != nil { // ValidTarget 校验：控制字符等在这里拒绝
+				return nil, err
 			}
-			return nil, errors.New("没有可用的私钥（identity_files 为空，ssh-agent 也没有密钥）")
+			command = c
 		}
-		// ssh.Client 握手期间就会用完 signer，Open 返回后 agent 连接不再需要
-		return sshterm.Open(r.Context(), d,
-			sshterm.Target{Addr: h.Addr, User: h.User, Command: h.Command},
-			sshterm.Auth{Signers: signers, HostKeyCallback: knownHostsCb}, cols, rows)
+		return pool.session(r.Context(), name, command, cols, rows)
 	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/hosts", func(w http.ResponseWriter, r *http.Request) {
 		type item struct {
-			Name   string `json:"name"`
-			Tunnel string `json:"tunnel"`
+			Name      string `json:"name"`
+			Tunnel    string `json:"tunnel"`
+			Connected bool   `json:"connected"`
+			Error     string `json:"error"`
 		}
 		list := []item{}
 		for _, h := range conf.Hosts {
-			list = append(list, item{h.Name, h.Tunnel})
+			connected, lastErr := pool.info(h.Name)
+			list = append(list, item{h.Name, h.Tunnel, connected, lastErr})
 		}
 		writeJSON(w, list)
+	})
+
+	// tmux 会话管理。写操作用 POST 但不带请求体和自定义头，
+	// 这样浏览器跨域时属于"简单请求"，不会先发预检（OPTIONS）。
+	mux.HandleFunc("/sessions", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			errJSON(w, http.StatusMethodNotAllowed, "只支持 GET")
+			return
+		}
+		if _, ok := hostOf(w, r, hosts); !ok {
+			return
+		}
+		out, err := pool.run(r.Context(), r.URL.Query().Get("host"), tmux.ListCommand())
+		if err != nil {
+			var ee *sshterm.ExitError
+			if errors.As(err, &ee) && tmux.NoServer(ee.Stderr) {
+				writeJSON(w, map[string]any{"sessions": []any{}}) // 没有 tmux 服务：空列表
+				return
+			}
+			errJSON(w, http.StatusBadGateway, "列会话失败: "+err.Error())
+			return
+		}
+		list, err := tmux.ParseList(out)
+		if err != nil {
+			errJSON(w, http.StatusBadGateway, "解析会话列表失败: "+err.Error())
+			return
+		}
+		type item struct {
+			Name     string `json:"name"`
+			Attached int    `json:"attached"`
+			Windows  int    `json:"windows"`
+			Created  int64  `json:"created"`
+			Activity int64  `json:"activity"`
+		}
+		items := []item{}
+		for _, s := range list {
+			items = append(items, item{s.Name, s.Attached, s.Windows, s.Created.Unix(), s.Activity.Unix()})
+		}
+		writeJSON(w, map[string]any{"sessions": items})
+	})
+
+	mux.HandleFunc("/sessions/new", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			errJSON(w, http.StatusMethodNotAllowed, "请用 POST")
+			return
+		}
+		hname := r.URL.Query().Get("host")
+		if _, ok := hosts[hname]; !ok {
+			errJSON(w, http.StatusNotFound, "未知主机")
+			return
+		}
+		name := r.URL.Query().Get("name")
+		cmd, err := tmux.NewCommand(name) // 内含 ValidNewName
+		if err != nil {
+			errJSON(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if _, err := pool.run(r.Context(), hname, cmd); err != nil {
+			var ee *sshterm.ExitError
+			if errors.As(err, &ee) && tmux.Duplicate(ee.Stderr) {
+				errJSON(w, http.StatusConflict, "会话已存在: "+name)
+				return
+			}
+			errJSON(w, http.StatusBadGateway, "新建会话失败: "+err.Error())
+			return
+		}
+		writeJSON(w, map[string]any{"name": name})
+	})
+
+	mux.HandleFunc("/sessions/kill", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			errJSON(w, http.StatusMethodNotAllowed, "请用 POST")
+			return
+		}
+		hname := r.URL.Query().Get("host")
+		if _, ok := hosts[hname]; !ok {
+			errJSON(w, http.StatusNotFound, "未知主机")
+			return
+		}
+		cmd, err := tmux.KillCommand(r.URL.Query().Get("name")) // 内含 ValidTarget
+		if err != nil {
+			errJSON(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if _, err := pool.run(r.Context(), hname, cmd); err != nil {
+			var ee *sshterm.ExitError
+			if errors.As(err, &ee) && tmux.NotFound(ee.Stderr) {
+				errJSON(w, http.StatusNotFound, "会话不存在")
+				return
+			}
+			errJSON(w, http.StatusBadGateway, "结束会话失败: "+err.Error())
+			return
+		}
+		writeJSON(w, map[string]any{"ok": true})
+	})
+
+	// 抓取会话窗格内容（给以后任务中心读会话输出用）
+	mux.HandleFunc("/capture", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			errJSON(w, http.StatusMethodNotAllowed, "只支持 GET")
+			return
+		}
+		hname := r.URL.Query().Get("host")
+		if _, ok := hosts[hname]; !ok {
+			errJSON(w, http.StatusNotFound, "未知主机")
+			return
+		}
+		lines := 200
+		if v := r.URL.Query().Get("lines"); v != "" {
+			n, err := strconv.Atoi(v)
+			if err != nil {
+				errJSON(w, http.StatusBadRequest, "lines 要是整数")
+				return
+			}
+			lines = n
+		}
+		cmd, err := tmux.CaptureCommand(r.URL.Query().Get("name"), lines) // 内含 ValidTarget 与 1..5000
+		if err != nil {
+			errJSON(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		out, err := pool.run(r.Context(), hname, cmd)
+		if err != nil {
+			var ee *sshterm.ExitError
+			if errors.As(err, &ee) && tmux.NotFound(ee.Stderr) {
+				errJSON(w, http.StatusNotFound, "会话不存在")
+				return
+			}
+			errJSON(w, http.StatusBadGateway, "抓取会话失败: "+err.Error())
+			return
+		}
+		writeJSON(w, map[string]any{"text": string(out)})
 	})
 	mux.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
 		type peer struct {
@@ -270,6 +412,22 @@ func Run(ctx context.Context, dir string, stdin io.Reader, stdout io.Writer) (er
 func writeJSON(w http.ResponseWriter, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(v)
+}
+
+// errJSON 返回带中文原因的错误 JSON。
+func errJSON(w http.ResponseWriter, code int, msg string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	json.NewEncoder(w).Encode(map[string]string{"error": msg})
+}
+
+// hostOf 校验 host 参数；未知主机回 404。
+func hostOf(w http.ResponseWriter, r *http.Request, hosts map[string]hostConf) (hostConf, bool) {
+	h, ok := hosts[r.URL.Query().Get("host")]
+	if !ok {
+		errJSON(w, http.StatusNotFound, "未知主机")
+	}
+	return h, ok
 }
 
 // loadSigners 先读私钥文件，再追加 ssh-agent 里的密钥。读不了的文件跳过，

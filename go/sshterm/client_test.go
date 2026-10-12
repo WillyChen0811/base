@@ -332,6 +332,24 @@ func TestPeerGoneClosesDone(t *testing.T) {
 	}
 }
 
+// 服务器端掐断连接（不关监听、不动 keepalive）：Done 必须马上关，靠的是 Wait 监视而不是 keepalive。
+func TestServerCloseConnsClosesDone(t *testing.T) {
+	e := newCliEnv(t)
+	c := e.dial(t)
+	eventually(t, "服务器握手完成", func() bool { return e.srv.Conns() == 1 })
+
+	e.srv.CloseConns()
+
+	select {
+	case <-c.Done():
+	case <-time.After(2 * time.Second):
+		t.Fatal("服务器端 CloseConns 后 Done 应在 2 秒内关闭（keepalive 保持默认 15s，不该是它触发的）")
+	}
+	if c.Err() == nil {
+		t.Error("Err 应说明断开原因")
+	}
+}
+
 // 对端"装死"（TCP 通但不回话）：keepalive 超时后连接应被关掉。
 func TestKeepaliveTimeout(t *testing.T) {
 	oldInt, oldTo := keepAliveInterval, keepAliveTimeout

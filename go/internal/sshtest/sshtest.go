@@ -28,6 +28,7 @@ type Server struct {
 	mu      sync.Mutex
 	cmds    []string
 	conns   int
+	live    map[net.Conn]struct{}
 }
 
 func NewSigner() ssh.Signer {
@@ -55,7 +56,7 @@ func Serve(ln net.Listener, clientKey ssh.PublicKey) *Server {
 
 // ServeWith 同 Serve，但可配置 exec 行为。
 func ServeWith(ln net.Listener, clientKey ssh.PublicKey, opts Options) *Server {
-	s := &Server{HostKey: NewSigner(), opts: opts}
+	s := &Server{HostKey: NewSigner(), opts: opts, live: map[net.Conn]struct{}{}}
 	cfg := &ssh.ServerConfig{
 		PublicKeyCallback: func(_ ssh.ConnMetadata, k ssh.PublicKey) (*ssh.Permissions, error) {
 			if string(k.Marshal()) == string(clientKey.Marshal()) {
@@ -84,6 +85,19 @@ func (s *Server) Conns() int {
 	return s.conns
 }
 
+// CloseConns 从服务器端关掉当前所有已接受的连接（测试模拟断线用）。
+func (s *Server) CloseConns() {
+	s.mu.Lock()
+	conns := make([]net.Conn, 0, len(s.live))
+	for c := range s.live {
+		conns = append(conns, c)
+	}
+	s.mu.Unlock()
+	for _, c := range conns {
+		c.Close()
+	}
+}
+
 func (s *Server) Commands() []string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -99,7 +113,13 @@ func (s *Server) serve(c net.Conn, cfg *ssh.ServerConfig) {
 	defer sc.Close()
 	s.mu.Lock()
 	s.conns++
+	s.live[c] = struct{}{}
 	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		delete(s.live, c)
+		s.mu.Unlock()
+	}()
 	go ssh.DiscardRequests(reqs)
 	for nc := range chans {
 		if nc.ChannelType() != "session" {

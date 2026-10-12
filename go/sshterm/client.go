@@ -51,7 +51,17 @@ func Dial(ctx context.Context, d Dialer, t Target, a Auth) (*Client, error) {
 		return nil, err
 	}
 	c := &Client{client: cc, done: make(chan struct{})}
-	go c.keepAlive()
+	// 同步快照 keepalive 参数再传给 goroutine，避免 goroutine 里读全局变量与测试改值竞争
+	go c.keepAlive(keepAliveInterval, keepAliveTimeout)
+	// 底层传输一结束（对端关、传输出错、本地 Close）就标记断开并关掉 Done，
+	// 不用等 keepalive 的下一次探测；fail 幂等，与 Close/keepalive 共用同一次收尾。
+	go func() {
+		werr := cc.Wait()
+		if werr == nil {
+			werr = errors.New("连接已结束")
+		}
+		c.fail(werr)
+	}()
 	return c, nil
 }
 
@@ -215,8 +225,8 @@ func (c *Client) live() error {
 }
 
 // keepAlive 定期发全局请求，失败或超时说明隧道已经断了（TCP 可能还"连着"），关掉连接让上层察觉。
-func (c *Client) keepAlive() {
-	t := time.NewTicker(keepAliveInterval)
+func (c *Client) keepAlive(interval, timeout time.Duration) {
+	t := time.NewTicker(interval)
 	defer t.Stop()
 	for {
 		select {
@@ -234,7 +244,7 @@ func (c *Client) keepAlive() {
 					c.fail(fmt.Errorf("sshterm: keepalive 失败: %w", err))
 					return
 				}
-			case <-time.After(keepAliveTimeout):
+			case <-time.After(timeout):
 				c.fail(errors.New("sshterm: keepalive 无回应"))
 				return
 			}

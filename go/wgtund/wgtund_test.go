@@ -46,6 +46,12 @@ type fixture struct {
 
 func newFixture(t *testing.T, mutate func(cfg map[string]any)) *fixture {
 	t.Helper()
+	return newFixtureExec(t, mutate, nil)
+}
+
+// newFixtureExec 同 newFixture，但给隧道内的 SSH 服务器配 exec 行为（假 tmux 用）。
+func newFixtureExec(t *testing.T, mutate func(cfg map[string]any), exec func(string) (string, string, int)) *fixture {
+	t.Helper()
 	dir := t.TempDir()
 	aPriv, aPub := wgKey(t)
 	bPriv, bPub := wgKey(t)
@@ -70,7 +76,7 @@ func newFixture(t *testing.T, mutate func(cfg map[string]any)) *fixture {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { ln.Close() })
-	srv := sshtest.Serve(ln, clientKey.PublicKey())
+	srv := sshtest.ServeWith(ln, clientKey.PublicKey(), sshtest.Options{Exec: exec})
 
 	// 远端回显服务（在隧道 A 里监听 7000），给 SOCKS 测试用
 	eln, err := a.Listen("tcp", "10.99.0.1:7000")

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"sync"
 	"time"
 
@@ -188,6 +189,19 @@ func (c *Client) Run(ctx context.Context, command string) ([]byte, error) {
 		return nil, fmt.Errorf("sshterm: 远端命令失败: %w", werr)
 	}
 	return stdout, nil
+}
+
+// Listen 让远端在 addr（形如 "127.0.0.1:0"）上监听，连进来的连接经这条 SSH 连接转回本地。
+// 返回的 Listener.Addr() 是远端实际监听的地址。连接断开后 Accept 返回错误。连接已断时直接返回错误。
+func (c *Client) Listen(addr string) (net.Listener, error) {
+	if err := c.live(); err != nil {
+		return nil, err
+	}
+	ln, err := c.client.Listen("tcp", addr)
+	if err != nil {
+		return nil, fmt.Errorf("sshterm: 远端监听 %s 失败: %w", addr, err)
+	}
+	return ln, nil
 }
 
 // Done 在连接断开（对端关、keepalive 失败）或 Close 后关闭。

@@ -9,6 +9,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -20,6 +21,8 @@ type Options struct {
 	// Exec 不为 nil 时，没有申请 PTY 的 exec 请求交给它处理：返回标准输出、标准错误和退出码。
 	// 申请了 PTY 的 exec/shell 仍走回显（现有行为）。
 	Exec func(cmd string) (stdout, stderr string, code int)
+	// Forward 为 true 时支持远端端口转发（tcpip-forward）；默认拒绝。
+	Forward bool
 }
 
 type Server struct {
@@ -29,6 +32,7 @@ type Server struct {
 	cmds    []string
 	conns   int
 	live    map[net.Conn]struct{}
+	fwds    map[net.Listener]struct{} // 活着的转发监听
 }
 
 func NewSigner() ssh.Signer {
@@ -56,7 +60,7 @@ func Serve(ln net.Listener, clientKey ssh.PublicKey) *Server {
 
 // ServeWith 同 Serve，但可配置 exec 行为。
 func ServeWith(ln net.Listener, clientKey ssh.PublicKey, opts Options) *Server {
-	s := &Server{HostKey: NewSigner(), opts: opts, live: map[net.Conn]struct{}{}}
+	s := &Server{HostKey: NewSigner(), opts: opts, live: map[net.Conn]struct{}{}, fwds: map[net.Listener]struct{}{}}
 	cfg := &ssh.ServerConfig{
 		PublicKeyCallback: func(_ ssh.ConnMetadata, k ssh.PublicKey) (*ssh.Permissions, error) {
 			if string(k.Marshal()) == string(clientKey.Marshal()) {
@@ -104,6 +108,126 @@ func (s *Server) Commands() []string {
 	return append([]string(nil), s.cmds...)
 }
 
+// Forwards 返回当前活着的转发监听地址（"127.0.0.1:端口"）。
+func (s *Server) Forwards() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []string
+	for ln := range s.fwds {
+		out = append(out, ln.Addr().String())
+	}
+	return out
+}
+
+// forwardReq 是 tcpip-forward / cancel-tcpip-forward 的负载。
+type forwardReq struct {
+	Addr string
+	Port uint32
+}
+
+// forwardedPayload 是 forwarded-tcpip 通道的负载。
+type forwardedPayload struct {
+	Addr       string
+	Port       uint32
+	OriginAddr string
+	OriginPort uint32
+}
+
+// globalReqs 处理一条连接的全局请求；连接结束时关掉它开的全部转发监听。
+func (s *Server) globalReqs(sc *ssh.ServerConn, reqs <-chan *ssh.Request) {
+	lns := map[uint32]net.Listener{} // 按实际端口索引，只在本 goroutine 里访问
+	defer func() {
+		for _, ln := range lns {
+			s.closeFwd(ln)
+		}
+	}()
+	for req := range reqs {
+		ok := false
+		var reply []byte
+		switch {
+		case req.Type == "tcpip-forward" && s.opts.Forward:
+			var f forwardReq
+			if ssh.Unmarshal(req.Payload, &f) != nil || (f.Addr != "127.0.0.1" && f.Addr != "localhost") {
+				break
+			}
+			ln, err := net.Listen("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(int(f.Port))))
+			if err != nil {
+				break
+			}
+			port := uint32(ln.Addr().(*net.TCPAddr).Port)
+			lns[port] = ln
+			s.mu.Lock()
+			s.fwds[ln] = struct{}{}
+			s.mu.Unlock()
+			go s.acceptFwd(sc, ln, f.Addr, port)
+			ok, reply = true, ssh.Marshal(struct{ Port uint32 }{port})
+		case req.Type == "cancel-tcpip-forward" && s.opts.Forward:
+			var f forwardReq
+			if ssh.Unmarshal(req.Payload, &f) != nil {
+				break
+			}
+			if ln, found := lns[f.Port]; found {
+				delete(lns, f.Port)
+				s.closeFwd(ln)
+				ok = true
+			}
+		}
+		if req.WantReply {
+			req.Reply(ok, reply)
+		}
+	}
+}
+
+func (s *Server) closeFwd(ln net.Listener) {
+	ln.Close()
+	s.mu.Lock()
+	delete(s.fwds, ln)
+	s.mu.Unlock()
+}
+
+// acceptFwd 把进入监听的连接经 forwarded-tcpip 通道转给客户端。
+func (s *Server) acceptFwd(sc *ssh.ServerConn, ln net.Listener, addr string, port uint32) {
+	for {
+		c, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		go func() {
+			ra := c.RemoteAddr().(*net.TCPAddr)
+			ch, reqs, err := sc.OpenChannel("forwarded-tcpip", ssh.Marshal(forwardedPayload{
+				Addr: addr, Port: port, OriginAddr: ra.IP.String(), OriginPort: uint32(ra.Port),
+			}))
+			if err != nil {
+				c.Close()
+				return
+			}
+			go ssh.DiscardRequests(reqs)
+			pipe(c, ch)
+		}()
+	}
+}
+
+// pipe 双向拷贝，半关闭语义：每个方向读到 EOF 就对另一端 CloseWrite，
+// 两个方向都结束后才关两边，避免截断另一方向在途的数据。
+func pipe(a io.ReadWriteCloser, b io.ReadWriteCloser) {
+	done := make(chan struct{}, 2)
+	cp := func(dst, src io.ReadWriteCloser) {
+		io.Copy(dst, src)
+		if cw, ok := dst.(interface{ CloseWrite() error }); ok {
+			cw.CloseWrite()
+		} else {
+			dst.Close()
+		}
+		done <- struct{}{}
+	}
+	go cp(a, b)
+	go cp(b, a)
+	<-done
+	<-done
+	a.Close()
+	b.Close()
+}
+
 func (s *Server) serve(c net.Conn, cfg *ssh.ServerConfig) {
 	sc, chans, reqs, err := ssh.NewServerConn(c, cfg)
 	if err != nil {
@@ -120,7 +244,7 @@ func (s *Server) serve(c net.Conn, cfg *ssh.ServerConfig) {
 		delete(s.live, c)
 		s.mu.Unlock()
 	}()
-	go ssh.DiscardRequests(reqs)
+	go s.globalReqs(sc, reqs)
 	for nc := range chans {
 		if nc.ChannelType() != "session" {
 			nc.Reject(ssh.UnknownChannelType, "")

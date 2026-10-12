@@ -7,8 +7,8 @@ import (
 
 func TestValidNewName(t *testing.T) {
 	tests := []struct {
-		name  string
-		input string
+		name    string
+		input   string
 		wantErr bool
 	}{
 		{"空字符串", "", true},
@@ -57,8 +57,8 @@ func TestValidNewName(t *testing.T) {
 
 func TestValidTarget(t *testing.T) {
 	tests := []struct {
-		name  string
-		input string
+		name    string
+		input   string
 		wantErr bool
 	}{
 		{"空字符串", "", true},
@@ -122,7 +122,7 @@ func TestQuote(t *testing.T) {
 
 func TestListCommand(t *testing.T) {
 	got := ListCommand()
-	want := "tmux list-sessions -F '#{session_attached}\t#{session_windows}\t#{session_created}\t#{session_activity}\t#{session_name}'"
+	want := "tmux -u list-sessions -F '#{session_attached} #{session_windows} #{session_created} #{session_activity} #{session_name}'"
 	if got != want {
 		t.Errorf("ListCommand() =\n%q\n期望\n%q", got, want)
 	}
@@ -135,8 +135,8 @@ func TestNewCommand(t *testing.T) {
 		want  string
 		err   bool
 	}{
-		{"普通", "ab", "tmux new-session -d -s 'ab'", false},
-		{"含中文", "中文名", "tmux new-session -d -s '中文名'", false},
+		{"普通", "ab", "tmux -u new-session -d -s 'ab'", false},
+		{"含中文", "中文名", "tmux -u new-session -d -s '中文名'", false},
 		{"空", "", "", true},
 		{"以-开头", "-a", "", true},
 	}
@@ -161,10 +161,10 @@ func TestAttachCommand(t *testing.T) {
 		want  string
 		err   bool
 	}{
-		{"普通", "ab", "tmux attach-session -t '=ab'", false},
-		{"含单引号", "a'b", "tmux attach-session -t '=a" + "'\\''" + "b'", false},
-		{"含空格", "my session", "tmux attach-session -t '=my session'", false},
-		{"含中文", "中文名", "tmux attach-session -t '=中文名'", false},
+		{"普通", "ab", "tmux -u attach-session -t '=ab'", false},
+		{"含单引号", "a'b", "tmux -u attach-session -t '=a" + "'\\''" + "b'", false},
+		{"含空格", "my session", "tmux -u attach-session -t '=my session'", false},
+		{"含中文", "中文名", "tmux -u attach-session -t '=中文名'", false},
 		{"空", "", "", true},
 	}
 	for _, tt := range tests {
@@ -188,9 +188,9 @@ func TestKillCommand(t *testing.T) {
 		want  string
 		err   bool
 	}{
-		{"普通", "ab", "tmux kill-session -t '=ab'", false},
-		{"含单引号", "a'b", "tmux kill-session -t '=a" + "'\\''" + "b'", false},
-		{"含中文", "中文名", "tmux kill-session -t '=中文名'", false},
+		{"普通", "ab", "tmux -u kill-session -t '=ab'", false},
+		{"含单引号", "a'b", "tmux -u kill-session -t '=a" + "'\\''" + "b'", false},
+		{"含中文", "中文名", "tmux -u kill-session -t '=中文名'", false},
 		{"空", "", "", true},
 	}
 	for _, tt := range tests {
@@ -209,15 +209,15 @@ func TestKillCommand(t *testing.T) {
 
 func TestCaptureCommand(t *testing.T) {
 	tests := []struct {
-		name   string
-		input  string
-		lines  int
-		want   string
-		err    bool
+		name  string
+		input string
+		lines int
+		want  string
+		err   bool
 	}{
-		{"普通 10行", "ab", 10, "tmux capture-pane -p -J -t '=ab:' -S -10", false},
-		{"含单引号 100行", "a'b", 100, "tmux capture-pane -p -J -t '=a" + "'\\''" + "b:' -S -100", false},
-		{"中文 5000行", "中文名", 5000, "tmux capture-pane -p -J -t '=中文名:' -S -5000", false},
+		{"普通 10行", "ab", 10, "tmux -u capture-pane -p -J -t '=ab:' -S -10", false},
+		{"含单引号 100行", "a'b", 100, "tmux -u capture-pane -p -J -t '=a" + "'\\''" + "b:' -S -100", false},
+		{"中文 5000行", "中文名", 5000, "tmux -u capture-pane -p -J -t '=中文名:' -S -5000", false},
 		{"行数为0", "ab", 0, "", true},
 		{"行数5001", "ab", 5001, "", true},
 		{"空会话名", "", 10, "", true},
@@ -238,7 +238,7 @@ func TestCaptureCommand(t *testing.T) {
 
 func TestParseList(t *testing.T) {
 	// 真实 tmux 输出样例（字段间是制表符）
-	base := "0\t1\t1791761526\t1791761526\tab c\n"
+	base := "0 1 1791761526 1791761526 ab c\n"
 
 	tests := []struct {
 		name  string
@@ -251,18 +251,18 @@ func TestParseList(t *testing.T) {
 			input: base,
 			want: []Session{
 				{Name: "ab c", Attached: 0, Windows: 1,
-					Created:  time.Unix(1791761526, 0), Activity: time.Unix(1791761526, 0)},
+					Created: time.Unix(1791761526, 0), Activity: time.Unix(1791761526, 0)},
 			},
 			err: false,
 		},
 		{
 			name:  "正常多行",
-			input: "1\t3\t1791761526\t1791761526\tmain\n0\t1\t1791761530\t1791761530\tab c\n",
+			input: "1 3 1791761526 1791761526 main\n0 1 1791761530 1791761530 ab c\n",
 			want: []Session{
 				{Name: "main", Attached: 1, Windows: 3,
-					Created:  time.Unix(1791761526, 0), Activity: time.Unix(1791761526, 0)},
+					Created: time.Unix(1791761526, 0), Activity: time.Unix(1791761526, 0)},
 				{Name: "ab c", Attached: 0, Windows: 1,
-					Created:  time.Unix(1791761530, 0), Activity: time.Unix(1791761530, 0)},
+					Created: time.Unix(1791761530, 0), Activity: time.Unix(1791761530, 0)},
 			},
 			err: false,
 		},
@@ -274,61 +274,61 @@ func TestParseList(t *testing.T) {
 		},
 		{
 			name:  "\r\n 换行",
-			input: "0\t1\t1791761526\t1791761526\tab c\r\n",
+			input: "0 1 1791761526 1791761526 ab c\r\n",
 			want: []Session{
 				{Name: "ab c", Attached: 0, Windows: 1,
-					Created:  time.Unix(1791761526, 0), Activity: time.Unix(1791761526, 0)},
+					Created: time.Unix(1791761526, 0), Activity: time.Unix(1791761526, 0)},
 			},
 			err: false,
 		},
 		{
 			name:  "名字含空格",
-			input: "0\t1\t1791761526\t1791761526\tmy session name\n",
+			input: "0 1 1791761526 1791761526 my session name\n",
 			want: []Session{
 				{Name: "my session name", Attached: 0, Windows: 1,
-					Created:  time.Unix(1791761526, 0), Activity: time.Unix(1791761526, 0)},
+					Created: time.Unix(1791761526, 0), Activity: time.Unix(1791761526, 0)},
 			},
 			err: false,
 		},
 		{
 			name:  "名字含制表符",
-			input: "0\t1\t1791761526\t1791761526\tnames\twith\ttabs\n",
+			input: "0 1 1791761526 1791761526 names\twith\ttabs\n",
 			want: []Session{
 				{Name: "names\twith\ttabs", Attached: 0, Windows: 1,
-					Created:  time.Unix(1791761526, 0), Activity: time.Unix(1791761526, 0)},
+					Created: time.Unix(1791761526, 0), Activity: time.Unix(1791761526, 0)},
 			},
 			err: false,
 		},
 		{
 			name:  "名字首尾空格保留",
-			input: "0\t1\t1791761526\t1791761526\t ab \n",
+			input: "0 1 1791761526 1791761526  ab \n",
 			want: []Session{
 				{Name: " ab ", Attached: 0, Windows: 1,
-					Created:  time.Unix(1791761526, 0), Activity: time.Unix(1791761526, 0)},
+					Created: time.Unix(1791761526, 0), Activity: time.Unix(1791761526, 0)},
 			},
 			err: false,
 		},
 		{
 			name:  "字段数不够（仅4段，缺会话名）",
-			input: "0\t1\t1791761526\tabc",
+			input: "0 1 1791761526 abc",
 			want:  nil,
 			err:   true,
 		},
 		{
 			name:  "字段数不够（仅3个字段）",
-			input: "0\t1\t1791761526\n",
+			input: "0 1 1791761526\n",
 			want:  nil,
 			err:   true,
 		},
 		{
 			name:  "attached 不是整数",
-			input: "x\t1\t1791761526\t1791761526\tab\n",
+			input: "x 1 1791761526 1791761526 ab\n",
 			want:  nil,
 			err:   true,
 		},
 		{
 			name:  "created 不是整数",
-			input: "0\t1\tx\t1791761526\tab\n",
+			input: "0 1 x 1791761526 ab\n",
 			want:  nil,
 			err:   true,
 		},
@@ -359,7 +359,7 @@ func TestParseList(t *testing.T) {
 
 func TestParseList_空白行(t *testing.T) {
 	// 多行输出末尾有换行，Split 会产生空行
-	input := "0\t1\t1791761526\t1791761526\tab\n\n"
+	input := "0 1 1791761526 1791761526 ab\n\n"
 	got, err := ParseList([]byte(input))
 	if err != nil {
 		t.Errorf("ParseList 应跳过空白行，但报错: %v", err)

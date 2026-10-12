@@ -14,7 +14,7 @@ import (
 // Session 是 tmux list-sessions 输出的一行。
 type Session struct {
 	Name     string
-	Attached int       // 当前连接的客户端数
+	Attached int // 当前连接的客户端数
 	Windows  int
 	Created  time.Time // 秒级 Unix 时间
 	Activity time.Time
@@ -66,18 +66,19 @@ func ValidTarget(name string) error {
 
 // Quote 把任意字符串做成单引号包住的 shell 参数。
 // 原理：' 不能直接被转义，改为断言末尾单引号 → 插入转义单引号 → 续上剩余部分。
-// 例: a'b → 'a'\''b'
+// 例: a'b → 'a'\”b'
 func Quote(s string) string {
-	q := "'"+strings.ReplaceAll(s, "'", "'\\''")+"'"
+	q := "'" + strings.ReplaceAll(s, "'", "'\\''") + "'"
 	return q
 }
 
 // ── 命令构造 ──────────────────────────────────────────
+// 所有命令都带 -u：经 SSH 执行时远端往往没有 LANG，tmux 会把中文等非 ASCII 字符显示成 _（会话名和终端内容都会坏）。
 
 // ListCommand 返回列会话的完整命令字符串。
-// 字段间用制表符分隔，会话名放在最后，避免名字里有特殊字符干扰解析。
+// 字段间用空格分隔（tmux 3.4 会把 -F 输出里的制表符等控制字符换成 _），会话名放在最后，名字里有空格也能正确切出。
 func ListCommand() string {
-	return "tmux list-sessions -F '#{session_attached}\t#{session_windows}\t#{session_created}\t#{session_activity}\t#{session_name}'"
+	return "tmux -u list-sessions -F '#{session_attached} #{session_windows} #{session_created} #{session_activity} #{session_name}'"
 }
 
 // NewCommand 返回创建新会话的命令：tmux new-session -d -s '名'
@@ -85,7 +86,7 @@ func NewCommand(name string) (string, error) {
 	if err := ValidNewName(name); err != nil {
 		return "", err
 	}
-	return "tmux new-session -d -s " + Quote(name), nil
+	return "tmux -u new-session -d -s " + Quote(name), nil
 }
 
 // AttachCommand 返回附加会话的命令：tmux attach-session -t '=名'
@@ -94,7 +95,7 @@ func AttachCommand(name string) (string, error) {
 	if err := ValidTarget(name); err != nil {
 		return "", err
 	}
-	return "tmux attach-session -t " + Quote("=" + name), nil
+	return "tmux -u attach-session -t " + Quote("="+name), nil
 }
 
 // KillCommand 返回终止会话的命令：tmux kill-session -t '=名'
@@ -102,7 +103,7 @@ func KillCommand(name string) (string, error) {
 	if err := ValidTarget(name); err != nil {
 		return "", err
 	}
-	return "tmux kill-session -t " + Quote("=" + name), nil
+	return "tmux -u kill-session -t " + Quote("="+name), nil
 }
 
 // CaptureCommand 返回抓取窗格内容的命令。
@@ -114,7 +115,7 @@ func CaptureCommand(name string, lines int) (string, error) {
 	if lines < 1 || lines > 5000 {
 		return "", fmt.Errorf("行数必须在 1..5000 之间，当前 %d", lines)
 	}
-	return fmt.Sprintf("tmux capture-pane -p -J -t %s -S -%d", Quote("="+name+":"), lines), nil
+	return fmt.Sprintf("tmux -u capture-pane -p -J -t %s -S -%d", Quote("="+name+":"), lines), nil
 }
 
 // ── 输出解析 ──────────────────────────────────────────
@@ -140,9 +141,9 @@ func ParseList(out []byte) ([]Session, error) {
 			continue // 跳过空白行
 		}
 
-		parts := strings.SplitN(line, "\t", 5) // 名字里可能有制表符
+		parts := strings.SplitN(line, " ", 5) // 前 4 个是数字，名字放最后，名字里有空格也不怕
 		if len(parts) < 5 {
-			return nil, fmt.Errorf("第 %d 行字段数不足（期望 4 个制表符分隔，实际 %d）", i+1, len(parts)-1)
+			return nil, fmt.Errorf("第 %d 行字段数不足（期望 5 个空格分隔的字段，实际 %d）", i+1, len(parts)-1)
 		}
 
 		s := new(Session)

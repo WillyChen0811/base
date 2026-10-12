@@ -73,35 +73,35 @@ func (f *fakeTmux) exec(cmd string) (stdout, stderr string, code int) {
 		var b strings.Builder
 		for _, n := range names {
 			s := f.sessions[n]
-			fmt.Fprintf(&b, "0\t%d\t%d\t%d\t%s\n", s.windows, s.created, s.activity, n)
+			fmt.Fprintf(&b, "0 %d %d %d %s\n", s.windows, s.created, s.activity, n)
 		}
 		return b.String(), "", 0
 
-	case strings.HasPrefix(cmd, "tmux new-session -d -s "):
+	case strings.HasPrefix(cmd, "tmux -u new-session -d -s "):
 		name, ok := argAfter(cmd, "-s")
 		if !ok {
 			return "", "fake tmux: 命令解析失败", 1
 		}
 		if _, dup := f.sessions[name]; dup {
-			return "", "duplicate session: "+name, 1
+			return "", "duplicate session: " + name, 1
 		}
 		f.nextTS++
 		f.sessions[name] = &fakeSess{created: f.nextTS, activity: f.nextTS, windows: 1, content: "pane:" + name + "\n"}
 		return "", "", 0
 
-	case strings.HasPrefix(cmd, "tmux kill-session -t "):
+	case strings.HasPrefix(cmd, "tmux -u kill-session -t "):
 		target, ok := argAfter(cmd, "-t")
 		if !ok {
 			return "", "fake tmux: 命令解析失败", 1
 		}
 		name := strings.TrimPrefix(target, "=")
 		if _, ok := f.sessions[name]; !ok {
-			return "", "can't find session: "+name, 1
+			return "", "can't find session: " + name, 1
 		}
 		delete(f.sessions, name)
 		return "", "", 0 // 会话清空后 list 会报"无服务"，与真 tmux 一致
 
-	case strings.HasPrefix(cmd, "tmux capture-pane "):
+	case strings.HasPrefix(cmd, "tmux -u capture-pane "):
 		target, ok := argAfter(cmd, "-t")
 		if !ok {
 			return "", "fake tmux: 命令解析失败", 1
@@ -109,7 +109,7 @@ func (f *fakeTmux) exec(cmd string) (stdout, stderr string, code int) {
 		name := strings.TrimSuffix(strings.TrimPrefix(target, "="), ":")
 		s, ok := f.sessions[name]
 		if !ok {
-			return "", "can't find session: "+name, 1
+			return "", "can't find session: " + name, 1
 		}
 		return s.content, "", 0
 
@@ -478,4 +478,3 @@ func TestTermAttachBadSession(t *testing.T) {
 		t.Errorf("非法会话名应回 error: %v", m)
 	}
 }
-

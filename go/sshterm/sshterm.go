@@ -38,10 +38,10 @@ type Auth struct {
 
 // Session 是一个远端终端会话：读到的是终端输出（stdout+stderr），写入的是键盘输入。
 type Session struct {
-	conn   *Client    // 专用连接（Open 建的）；Client.OpenSession 的会话为 nil，Close 不关连接
-	sess   *ssh.Session
-	in     io.WriteCloser // StdinPipe，必须在启动前取
-	out    io.Reader      // StdoutPipe；PTY 下 stderr 也走这里
+	conn *Client // 专用连接（Open 建的）；Client.OpenSession 的会话为 nil，Close 不关连接
+	sess *ssh.Session
+	in   io.WriteCloser // StdinPipe，必须在启动前取
+	out  io.Reader      // StdoutPipe；PTY 下 stderr 也走这里
 
 	mu     sync.Mutex
 	closed bool

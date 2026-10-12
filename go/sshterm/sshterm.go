@@ -38,7 +38,7 @@ type Auth struct {
 
 // Session 是一个远端终端会话：读到的是终端输出（stdout+stderr），写入的是键盘输入。
 type Session struct {
-	client *ssh.Client
+	conn   *Client    // 专用连接（Open 建的）；Client.OpenSession 的会话为 nil，Close 不关连接
 	sess   *ssh.Session
 	in     io.WriteCloser // StdinPipe，必须在启动前取
 	out    io.Reader      // StdoutPipe；PTY 下 stderr 也走这里
@@ -47,9 +47,8 @@ type Session struct {
 	closed bool
 }
 
-// Open 经 d 建 TCP 连接并完成 SSH 握手，然后开 PTY 会话。
-// 握手期间 ctx 到期会关掉连接并返回 ctx 的错误。
-func Open(ctx context.Context, d Dialer, t Target, a Auth, cols, rows int) (*Session, error) {
+// dialConn 经 d 建 TCP 连接并完成 SSH 握手。握手期间 ctx 到期会关掉连接并返回 ctx 的错误。
+func dialConn(ctx context.Context, d Dialer, t Target, a Auth) (*ssh.Client, error) {
 	if a.HostKeyCallback == nil {
 		return nil, errors.New("sshterm: 必须提供 HostKeyCallback，不能默认放行主机密钥")
 	}
@@ -89,46 +88,24 @@ func Open(ctx context.Context, d Dialer, t Target, a Auth, cols, rows int) (*Ses
 		conn.Close()
 		return nil, fmt.Errorf("sshterm: SSH 握手失败: %w", hs.err)
 	}
-	client := ssh.NewClient(hs.cc, hs.chans, hs.reqs)
-	// 开会话、申请 PTY、启动程序这几步对端也可能不回话：ctx 到期就关连接
-	stop := context.AfterFunc(ctx, func() { client.Close() })
-	defer stop()
+	return ssh.NewClient(hs.cc, hs.chans, hs.reqs), nil
+}
 
-	sess, err := client.NewSession()
+// Open 经 d 建 TCP 连接并完成 SSH 握手，然后开 PTY 会话。
+// 握手期间 ctx 到期会关掉连接并返回 ctx 的错误。
+// 返回的 Session 是专用会话：Close 时连带关掉底层连接。
+func Open(ctx context.Context, d Dialer, t Target, a Auth, cols, rows int) (*Session, error) {
+	c, err := Dial(ctx, d, t, a)
 	if err != nil {
-		client.Close()
-		return nil, fmt.Errorf("sshterm: 开会话失败: %w", err)
+		return nil, err
 	}
-	modes := ssh.TerminalModes{
-		ssh.ECHO:          1,
-		ssh.TTY_OP_ISPEED: 115200,
-		ssh.TTY_OP_OSPEED: 115200,
-	}
-	if err := sess.RequestPty("xterm-256color", rows, cols, modes); err != nil {
-		client.Close()
-		return nil, fmt.Errorf("sshterm: 申请 PTY 失败: %w", err)
-	}
-	// StdinPipe/StdoutPipe 必须在 Start/Shell 之前取。
-	in, err := sess.StdinPipe()
+	s, err := c.OpenSession(ctx, t.Command, cols, rows)
 	if err != nil {
-		client.Close()
-		return nil, fmt.Errorf("sshterm: 取 stdin 失败: %w", err)
+		c.Close()
+		return nil, err
 	}
-	out, err := sess.StdoutPipe()
-	if err != nil {
-		client.Close()
-		return nil, fmt.Errorf("sshterm: 取 stdout 失败: %w", err)
-	}
-	if t.Command != "" {
-		err = sess.Start(t.Command)
-	} else {
-		err = sess.Shell()
-	}
-	if err != nil {
-		client.Close()
-		return nil, fmt.Errorf("sshterm: 启动远端程序失败: %w", err)
-	}
-	return &Session{client: client, sess: sess, in: in, out: out}, nil
+	s.conn = c
+	return s, nil
 }
 
 // Read 读远端终端输出。
@@ -177,7 +154,7 @@ func (s *Session) Wait() (int, error) {
 	return 0, err
 }
 
-// Close 关掉 SSH 连接；可重复调用，之后 Write 报错。
+// Close 关掉会话；专用会话（Open 建的）连带关掉底层连接。可重复调用，之后 Write 报错。
 func (s *Session) Close() error {
 	s.mu.Lock()
 	if s.closed {
@@ -185,9 +162,13 @@ func (s *Session) Close() error {
 		return nil
 	}
 	s.closed = true
+	conn := s.conn
 	s.mu.Unlock()
 	s.sess.Close()
-	return s.client.Close()
+	if conn != nil {
+		return conn.Close()
+	}
+	return nil
 }
 
 // BridgeOptions 是 WebSocket 桥的可选配置。

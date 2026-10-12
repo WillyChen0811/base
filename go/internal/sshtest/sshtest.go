@@ -15,10 +15,19 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
+// Options 是服务器可选行为。
+type Options struct {
+	// Exec 不为 nil 时，没有申请 PTY 的 exec 请求交给它处理：返回标准输出、标准错误和退出码。
+	// 申请了 PTY 的 exec/shell 仍走回显（现有行为）。
+	Exec func(cmd string) (stdout, stderr string, code int)
+}
+
 type Server struct {
 	HostKey ssh.Signer
+	opts    Options
 	mu      sync.Mutex
 	cmds    []string
+	conns   int
 }
 
 func NewSigner() ssh.Signer {
@@ -41,7 +50,12 @@ func NewKey() (ssh.Signer, ed25519.PrivateKey) {
 
 // Serve 在 ln 上接受连接直到 ln 关闭
 func Serve(ln net.Listener, clientKey ssh.PublicKey) *Server {
-	s := &Server{HostKey: NewSigner()}
+	return ServeWith(ln, clientKey, Options{})
+}
+
+// ServeWith 同 Serve，但可配置 exec 行为。
+func ServeWith(ln net.Listener, clientKey ssh.PublicKey, opts Options) *Server {
+	s := &Server{HostKey: NewSigner(), opts: opts}
 	cfg := &ssh.ServerConfig{
 		PublicKeyCallback: func(_ ssh.ConnMetadata, k ssh.PublicKey) (*ssh.Permissions, error) {
 			if string(k.Marshal()) == string(clientKey.Marshal()) {
@@ -63,6 +77,13 @@ func Serve(ln net.Listener, clientKey ssh.PublicKey) *Server {
 	return s
 }
 
+// Conns 返回累计接受成功（握手完成）的 SSH 连接数，用来验证连接复用。
+func (s *Server) Conns() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.conns
+}
+
 func (s *Server) Commands() []string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -76,6 +97,9 @@ func (s *Server) serve(c net.Conn, cfg *ssh.ServerConfig) {
 		return
 	}
 	defer sc.Close()
+	s.mu.Lock()
+	s.conns++
+	s.mu.Unlock()
 	go ssh.DiscardRequests(reqs)
 	for nc := range chans {
 		if nc.ChannelType() != "session" {
@@ -88,9 +112,15 @@ func (s *Server) serve(c net.Conn, cfg *ssh.ServerConfig) {
 		}
 		go func() {
 			started := false
+			pty := false
 			for req := range creqs {
 				switch req.Type {
-				case "pty-req", "window-change":
+				case "pty-req":
+					pty = true
+					if req.WantReply {
+						req.Reply(true, nil)
+					}
+				case "window-change":
 					if req.WantReply {
 						req.Reply(true, nil)
 					}
@@ -103,8 +133,13 @@ func (s *Server) serve(c net.Conn, cfg *ssh.ServerConfig) {
 					s.cmds = append(s.cmds, req.Type+":"+e.Command)
 					s.mu.Unlock()
 					req.Reply(true, nil)
-					if !started {
-						started = true
+					if started {
+						continue
+					}
+					started = true
+					if req.Type == "exec" && !pty && s.opts.Exec != nil {
+						go exec(ch, s.opts.Exec, e.Command)
+					} else {
 						go echo(ch)
 					}
 				default:
@@ -115,6 +150,19 @@ func (s *Server) serve(c net.Conn, cfg *ssh.ServerConfig) {
 			}
 		}()
 	}
+}
+
+// exec 处理无 PTY 的 exec：标准输出/标准错误分开写回，发 exit-status 后关通道。
+func exec(ch ssh.Channel, fn func(string) (string, string, int), cmd string) {
+	stdout, stderr, code := fn(cmd)
+	if stdout != "" {
+		io.WriteString(ch, stdout)
+	}
+	if stderr != "" {
+		io.WriteString(ch.Stderr(), stderr)
+	}
+	ch.SendRequest("exit-status", false, ssh.Marshal(struct{ C uint32 }{uint32(code)}))
+	ch.Close()
 }
 
 func echo(ch ssh.Channel) {

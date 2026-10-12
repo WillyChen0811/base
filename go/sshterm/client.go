@@ -23,6 +23,9 @@ const (
 	maxRunStderr = 4 << 10 // 报错时带出的标准错误前 4KB
 )
 
+// ErrOutputTooLarge 表示 Run 的标准输出超过 1MB 上限。
+var ErrOutputTooLarge = errors.New("sshterm: 标准输出超过 1MB")
+
 // ExitError 是 Run 遇到的非零退出码。
 type ExitError struct {
 	Code   int
@@ -166,10 +169,12 @@ func (c *Client) Run(ctx context.Context, command string) ([]byte, error) {
 		return nil, fmt.Errorf("sshterm: 读远端输出失败: %w", err)
 	}
 	if len(stdout) > maxRunStdout {
-		sess.Close()
-		return nil, errors.New("sshterm: 标准输出超过 1MB")
+		sess.Close() // 关会话即丢弃剩余输出，不会阻塞；连接不受影响
+		return nil, ErrOutputTooLarge
 	}
 	stderr, _ := io.ReadAll(io.LimitReader(errPipe, maxRunStderr))
+	// 剩下的 stderr 必须读完丢弃：远端 stderr 很大时不读完，远端写满管道会阻塞、进程不退出，Wait 挂到超时。
+	io.Copy(io.Discard, errPipe)
 
 	werr := sess.Wait()
 	if ctxErr := ctx.Err(); ctxErr != nil {

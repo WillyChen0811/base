@@ -65,6 +65,8 @@ func TestValidTarget(t *testing.T) {
 		{"普通名字", "session1", false},
 		{"含空格", "my session", false},
 		{"中文", "中文会话", false},
+		{"含冒号", "a:x", true},
+		{"含点", "a.b", true},
 		{"含换行", "session\nname", true},
 		{"含制表符", "session\tname", true},
 		{"含DEL", string([]byte{'s', 'e', 's', 's', 'i', 'o', 'n', 0x7f, 'n', 'a', 'm', 'e'}), true},

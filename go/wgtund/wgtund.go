@@ -331,6 +331,10 @@ func Run(ctx context.Context, dir string, stdin io.Reader, stdout io.Writer) (er
 				errJSON(w, http.StatusNotFound, "会话不存在")
 				return
 			}
+			if errors.Is(err, sshterm.ErrOutputTooLarge) {
+				errJSON(w, http.StatusBadGateway, "输出过大")
+				return
+			}
 			errJSON(w, http.StatusBadGateway, "抓取会话失败: "+err.Error())
 			return
 		}

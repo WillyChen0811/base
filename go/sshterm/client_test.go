@@ -96,6 +96,8 @@ func newCliEnv(t *testing.T) *cliEnv {
 				return "hello\n", "", 0
 			case "fail":
 				return "", "boom\n", 3
+			case "bigerr":
+				return "", strings.Repeat("e", 1<<20), 2
 			case "big":
 				return strings.Repeat("x", maxRunStdout+16), "", 0
 			case "hang":
@@ -213,8 +215,8 @@ func TestRunExitCode(t *testing.T) {
 func TestRunStdoutLimit(t *testing.T) {
 	e := newCliEnv(t)
 	c := e.dial(t)
-	if _, err := c.Run(context.Background(), "big"); err == nil {
-		t.Fatal("超过 1MB 应报错")
+	if _, err := c.Run(context.Background(), "big"); !errors.Is(err, ErrOutputTooLarge) {
+		t.Fatalf("超过 1MB 应返回 ErrOutputTooLarge，得到 %v", err)
 	}
 	// 超限后连接还能用
 	out, err := c.Run(context.Background(), "ok")
@@ -223,6 +225,26 @@ func TestRunStdoutLimit(t *testing.T) {
 	}
 	if string(out) != "hello\n" {
 		t.Errorf("got %q", out)
+	}
+}
+
+// 远端 stderr 很大时 Run 也要读完丢弃，很快返回退出码，Stderr 只带前 4KB。
+func TestRunHugeStderr(t *testing.T) {
+	e := newCliEnv(t)
+	c := e.dial(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	start := time.Now()
+	_, err := c.Run(ctx, "bigerr")
+	var ee *ExitError
+	if !errors.As(err, &ee) || ee.Code != 2 {
+		t.Fatalf("应返回退出码 2 的 *ExitError，得到 %v", err)
+	}
+	if len(ee.Stderr) > maxRunStderr {
+		t.Errorf("Stderr 长度 %d，应 <= %d", len(ee.Stderr), maxRunStderr)
+	}
+	if d := time.Since(start); d > 5*time.Second {
+		t.Errorf("耗时 %v，应很快返回", d)
 	}
 }
 

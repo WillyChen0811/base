@@ -93,8 +93,29 @@ func (p *sshPool) conn(host string) (*sshterm.Client, error) {
 	}
 }
 
-// session 在共用连接上开终端会话；开失败时丢掉旧连接重拨一次再试
-// （调用方 ctx 已取消的不算，直接返回原错误）。
+// brokenGrace 是操作出错后等连接被标记断开的宽限：底层传输刚断时，
+// 操作的错误可能比 Done 关闭早几毫秒到达。
+const brokenGrace = 500 * time.Millisecond
+
+// connBroken 判断出错后连接是否真断了（Done 已关闭，或宽限内关闭）。
+func connBroken(c *sshterm.Client) bool {
+	select {
+	case <-c.Done():
+		return true
+	default:
+	}
+	t := time.NewTimer(brokenGrace)
+	defer t.Stop()
+	select {
+	case <-c.Done():
+		return true
+	case <-t.C:
+		return false
+	}
+}
+
+// session 在共用连接上开终端会话；只有连接真断了（Done 已关闭）才丢掉重拨一次再试，
+// 连接健康时开失败原样返回（比如远端没装 tmux，重拨多少次都一样）。
 func (p *sshPool) session(ctx context.Context, host, command string, cols, rows int) (*sshterm.Session, error) {
 	c, err := p.conn(host)
 	if err != nil {
@@ -104,8 +125,8 @@ func (p *sshPool) session(ctx context.Context, host, command string, cols, rows 
 	if err == nil {
 		return s, nil
 	}
-	if ctx.Err() != nil {
-		return nil, err
+	if !connBroken(c) {
+		return nil, err // 连接健康（含 ctx 取消）：不重试，原样返回
 	}
 	p.drop(host, c)
 	c2, err := p.conn(host)
@@ -116,8 +137,8 @@ func (p *sshPool) session(ctx context.Context, host, command string, cols, rows 
 }
 
 // run 在共用连接上执行短命令（超时 runTimeout）。
-// Run 返回非 ExitError 的错误时丢掉旧连接重拨一次再试
-// （ExitError 说明命令真跑了、只是退出码非零，不是连接问题）。
+// 只有连接真断了（Done 已关闭）才丢掉重拨一次再试；
+// 连接健康时的错误（ExitError、超时、输出超限等）原样返回，不重拨。
 func (p *sshPool) run(ctx context.Context, host, command string) ([]byte, error) {
 	c, err := p.conn(host)
 	if err != nil {
@@ -129,9 +150,10 @@ func (p *sshPool) run(ctx context.Context, host, command string) ([]byte, error)
 	if err == nil {
 		return out, nil
 	}
+	// 远端命令跑完了只是退出码非零（会话已存在/不存在等）、或输出超限：连接肯定是好的，不必等宽限
 	var ee *sshterm.ExitError
-	if errors.As(err, &ee) || ctx.Err() != nil {
-		return nil, err
+	if errors.As(err, &ee) || errors.Is(err, sshterm.ErrOutputTooLarge) || !connBroken(c) {
+		return nil, err // 连接健康：不重试，原样返回
 	}
 	p.drop(host, c)
 	c2, err := p.conn(host)
@@ -253,14 +275,20 @@ func (e *hostConn) recordDeadLocked(c *sshterm.Client) {
 }
 
 // drop 丢掉 c 指向的连接（c 为 nil 时丢掉当前缓存的任意一条）。
+// 只有缓存里还是 c（或没指向别的）才把它从缓存摘掉；
+// 若缓存已经换成别人刚重拨的新连接，绝不能关那条新连接，只关 c 自己（幂等）。
 func (e *hostConn) drop(c *sshterm.Client) {
 	e.mu.Lock()
 	cur := e.client
-	if c == nil || cur == c {
+	match := c == nil || cur == c
+	if match {
 		e.client = nil
 	}
 	e.mu.Unlock()
-	if cur != nil {
+	if match && cur != nil {
 		cur.Close()
+	}
+	if c != nil && !match {
+		c.Close() // 旧连接自己也关（幂等）
 	}
 }

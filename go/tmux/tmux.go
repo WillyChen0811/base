@@ -43,7 +43,8 @@ func ValidNewName(name string) error {
 }
 
 // ValidTarget 校验"操作已有会话"的名字：
-// 非空、≤256 字节、合法 UTF-8、不含控制字符（< 0x20 和 0x7f）。
+// 非空、≤256 字节、合法 UTF-8、不含控制字符（< 0x20 和 0x7f）、不含 ':' 和 '.'
+// （tmux 建会话时会把它们换成 _，真实会话名不含；而 "=a:x" 会被解析成会话 a 的窗口 x）。
 func ValidTarget(name string) error {
 	if name == "" {
 		return fmt.Errorf("目标会话名不能为空")
@@ -52,6 +53,9 @@ func ValidTarget(name string) error {
 		return fmt.Errorf("目标会话名不能超过 256 字节（当前 %d）", len([]byte(name)))
 	}
 	for i, r := range name {
+		if r == ':' || r == '.' {
+			return fmt.Errorf("目标会话名不能包含 %q（在第 %d 位）", r, i+1)
+		}
 		if r < 0x20 || r == 0x7f {
 			return fmt.Errorf("目标会话名包含控制字符 U+%04X 在第 %d 位", r, i+1)
 		}

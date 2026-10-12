@@ -478,3 +478,113 @@ func TestTermAttachBadSession(t *testing.T) {
 		t.Errorf("非法会话名应回 error: %v", m)
 	}
 }
+
+// 连接被服务器掐断后，8 个并发请求共用一次重拨：全部成功，累计连接数 ≤ 2。
+func TestConcurrentAfterServerClose(t *testing.T) {
+	f := newFakeTmux()
+	fx := newFixtureExec(t, nil, f.exec)
+	st, _, _ := run(t, fx.dir)
+	listSessions(t, st) // 先建立连接
+	fx.ssh.CloseConns()
+
+	var wg sync.WaitGroup
+	codes := make([]int, 8)
+	for i := range codes {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			resp, _ := call(t, st, "GET", "/sessions?host=ubuntu")
+			codes[i] = resp.StatusCode
+		}()
+	}
+	wg.Wait()
+	for i, c := range codes {
+		if c != 200 {
+			t.Errorf("并发请求 %d 应 200，得到 %d", i, c)
+		}
+	}
+	if n := fx.ssh.Conns(); n > 2 {
+		t.Errorf("Conns() 应 <= 2，得到 %d", n)
+	}
+}
+
+// 首次并发请求共用同一次拨号。
+func TestConcurrentFirstDialOnce(t *testing.T) {
+	f := newFakeTmux()
+	fx := newFixtureExec(t, nil, f.exec)
+	st, _, _ := run(t, fx.dir)
+
+	var wg sync.WaitGroup
+	codes := make([]int, 8)
+	for i := range codes {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			resp, _ := call(t, st, "GET", "/sessions?host=ubuntu")
+			codes[i] = resp.StatusCode
+		}()
+	}
+	wg.Wait()
+	for i, c := range codes {
+		if c != 200 {
+			t.Errorf("并发请求 %d 应 200，得到 %d", i, c)
+		}
+	}
+	if n := fx.ssh.Conns(); n != 1 {
+		t.Errorf("首次并发应只拨一次，Conns()=%d", n)
+	}
+}
+
+// 拨号失败时并发请求都拿到 502。
+func TestConcurrentDialFailure(t *testing.T) {
+	f := newFakeTmux()
+	fx := newFixtureExec(t, func(cfg map[string]any) {
+		hosts := cfg["hosts"].([]map[string]any)
+		cfg["hosts"] = append(hosts, map[string]any{
+			"name": "dead", "addr": "127.0.0.1:1", "user": "x",
+			"identity_files": hosts[0]["identity_files"],
+		})
+	}, f.exec)
+	st, _, _ := run(t, fx.dir)
+
+	var wg sync.WaitGroup
+	codes := make([]int, 8)
+	for i := range codes {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			resp, _ := call(t, st, "GET", "/sessions?host=dead")
+			codes[i] = resp.StatusCode
+		}()
+	}
+	wg.Wait()
+	for i, c := range codes {
+		if c != http.StatusBadGateway {
+			t.Errorf("并发请求 %d 应 502，得到 %d", i, c)
+		}
+	}
+}
+
+// capture 输出超 1MB：返回 502 "输出过大"，共用连接不被丢弃。
+func TestCaptureTooLarge(t *testing.T) {
+	f := newFakeTmux()
+	fx := newFixtureExec(t, nil, f.exec)
+	st, _, _ := run(t, fx.dir)
+	if resp := newSession(t, st, "big"); resp.StatusCode != 200 {
+		t.Fatalf("新建失败 %d", resp.StatusCode)
+	}
+	f.mu.Lock()
+	f.sessions["big"].content = strings.Repeat("x", 1<<20+16)
+	f.mu.Unlock()
+
+	resp, b := call(t, st, "GET", "/capture?host=ubuntu&name=big")
+	if resp.StatusCode != http.StatusBadGateway || !strings.Contains(string(b), "输出过大") {
+		t.Fatalf("应 502 输出过大，得到 %d: %.100s", resp.StatusCode, b)
+	}
+	if n := len(listSessions(t, st)); n != 1 {
+		t.Errorf("之后列会话应成功，得到 %d 个", n)
+	}
+	if n := fx.ssh.Conns(); n != 1 {
+		t.Errorf("共用连接不该被丢，Conns()=%d", n)
+	}
+}

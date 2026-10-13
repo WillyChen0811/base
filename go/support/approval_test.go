@@ -380,3 +380,32 @@ func TestAskCanceledContextReturnsImmediately(t *testing.T) {
 		t.Fatalf("Pending 应为空，实际 %d 条", len(got))
 	}
 }
+
+func TestAskWithNotifyReportsID(t *testing.T) {
+	q := NewQueue()
+	got := make(chan Request, 1)
+	res := make(chan askResult, 1)
+	go func() {
+		d, err := q.AskWithNotify(context.Background(), "Bash", json.RawMessage(`{"command":"ls"}`), func(r Request) {
+			// 回调在锁外：这里可以安全地再访问队列
+			_ = q.Pending()
+			got <- r
+		})
+		res <- askResult{d, err}
+	}()
+	var r Request
+	select {
+	case r = <-got:
+	case <-time.After(5 * time.Second):
+		t.Fatal("没收到通知")
+	}
+	if p := waitForPending(t, q, 1); p[0].ID != r.ID || r.Tool != "Bash" || r.Summary != "ls" {
+		t.Fatalf("通知的请求与待批不一致: %+v vs %+v", r, p)
+	}
+	if err := q.Decide(r.ID, Decision{Allow: true}); err != nil {
+		t.Fatal(err)
+	}
+	if a := recv(t, res); a.err != nil || !a.d.Allow {
+		t.Fatalf("结果 = %+v", a)
+	}
+}

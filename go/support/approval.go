@@ -64,6 +64,12 @@ func newID() string {
 // Decide 若在 ctx 到期后、Ask 处理前抢先成功，Ask 返回该决定且无错误
 // （保证 Decide 返回 nil 即调用方一定拿到这个决定）。
 func (q *Queue) Ask(ctx context.Context, tool string, input json.RawMessage) (Decision, error) {
+	return q.AskWithNotify(ctx, tool, input, nil)
+}
+
+// AskWithNotify 同 Ask；加入待批之后、阻塞之前，在锁外调用 added（可为 nil），
+// 让调用方拿到这条请求的 ID（例如写日志）。
+func (q *Queue) AskWithNotify(ctx context.Context, tool string, input json.RawMessage, added func(Request)) (Decision, error) {
 	input = cloneRaw(input)
 	w := &waiter{
 		req: Request{
@@ -83,7 +89,13 @@ func (q *Queue) Ask(ctx context.Context, tool string, input json.RawMessage) (De
 	}
 	q.waiters[w.req.ID] = w
 	q.order = append(q.order, w.req.ID)
+	req := w.req
+	req.Input = cloneRaw(req.Input)
 	q.mu.Unlock()
+
+	if added != nil {
+		added(req)
+	}
 
 	select {
 	case d := <-w.done:

@@ -39,6 +39,9 @@ type Config struct {
 	// Prepare 在每次从未开启到开启时、开远端入口之前调用（可为 nil），例如重新读 Claude 设置；
 	// 返回错误则不开启。
 	Prepare func() error
+	// MsgSync / MsgDeliver 透传给消息 Hub：nil 时 Hub 的同步/送达报"未配置"。
+	MsgSync    func(ctx context.Context, m Message) error
+	MsgDeliver func(ctx context.Context, m Message) error
 }
 
 // Status 是协助服务的状态快照。
@@ -66,6 +69,8 @@ var (
 	minuteUnit = time.Minute
 	// maxPending 是待批请求的上限，超出的钩子请求直接拒绝；测试可调小。
 	maxPending = 50
+	// msgPumpInterval 是会话内消息推进循环的间隔；测试可调小。
+	msgPumpInterval = 2 * time.Second
 )
 
 const (
@@ -96,7 +101,9 @@ type Service struct {
 	remote    Remote
 	queue     *Queue
 	runner    *Runner
-	hookToken string // NewService 时随机生成，不变
+	hub       *Hub          // 消息中转队列（纯内存）
+	msgKick   chan struct{} // 容量 1 的"踢一下"：Send/Decide/SetState/SetAuto 后叫醒 Pump
+	hookToken string        // NewService 时随机生成，不变
 	repos     []string
 	syncLocks map[string]*sync.Mutex // 每个仓库一把，同仓库的同步串行
 
@@ -126,7 +133,7 @@ func NewService(cfg Config, remote Remote) *Service {
 		locks[name] = &sync.Mutex{}
 	}
 	sort.Strings(names)
-	return &Service{
+	s := &Service{
 		cfg:       cfg,
 		remote:    remote,
 		queue:     NewQueue(),
@@ -134,6 +141,41 @@ func NewService(cfg Config, remote Remote) *Service {
 		hookToken: randHex32(),
 		repos:     names,
 		syncLocks: locks,
+		msgKick:   make(chan struct{}, 1),
+	}
+	// hub 依赖 s.logEvent，必须等 s 建好再接上
+	s.hub = NewHub(HubConfig{Sync: cfg.MsgSync, Deliver: cfg.MsgDeliver, Log: s.logEvent})
+	return s
+}
+
+// Hub 返回消息中转队列（协助没开时也能入库和决定，只是不推进）。
+func (s *Service) Hub() *Hub { return s.hub }
+
+// kickMsgPump 踢一下消息推进：chan 满（已经有一次待处理）就忽略。
+func (s *Service) kickMsgPump() {
+	select {
+	case s.msgKick <- struct{}{}:
+	default:
+	}
+}
+
+// msgPumpLoop 是会话内的消息推进循环：每 msgPumpInterval 或被踢一次调 hub.Pump，
+// 会话 ctx 结束就退出。占会话 wg 的一个名额。
+func (s *Service) msgPumpLoop(sess *session) {
+	defer sess.wg.Done()
+	ticker := time.NewTicker(msgPumpInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-sess.ctx.Done():
+			return
+		case <-ticker.C:
+		case <-s.msgKick:
+		}
+		if sess.ctx.Err() != nil {
+			return
+		}
+		s.hub.Pump(sess.ctx)
 	}
 }
 
@@ -253,10 +295,11 @@ func (s *Service) Start(minutes int) error {
 	s.srv = srv
 	s.ln = ln
 	s.timer = time.AfterFunc(time.Until(s.until), func() { s.stop("到时自动结束", sess) })
-	sess.wg.Add(1) // 在 opMu 内、Stop 不可能同时进行，Add 安全
+	sess.wg.Add(2) // serveLoop + msgPumpLoop；在 opMu 内、Stop 不可能同时进行，Add 安全
 	s.mu.Unlock()
 
 	go s.serveLoop(sess, ln, srv)
+	go s.msgPumpLoop(sess)
 	s.logEvent("start", map[string]string{"minutes": strconv.Itoa(minutes), "addr": addr})
 	return nil
 }
@@ -459,6 +502,7 @@ func (s *Service) remoteMux(sess *session) http.Handler {
 	mux.HandleFunc("/sync", only(http.MethodPost, s.remoteSync))
 	mux.HandleFunc("/stop-claude", only(http.MethodPost, s.remoteStopClaude))
 	mux.HandleFunc("/projsync", only(http.MethodPost, s.remoteProjSync))
+	s.mountMsgRemote(mux)
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, http.StatusNotFound, "没有这个路径")
 	})
@@ -802,6 +846,7 @@ func (s *Service) LocalHandler() http.Handler {
 		}
 		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 	}))
+	s.mountMsgLocal(mux)
 	return mux
 }
 

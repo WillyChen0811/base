@@ -31,8 +31,9 @@ type supportConf struct {
 }
 
 type supportRepo struct {
-	Dir    string `json:"dir"`
-	Remote string `json:"remote"`
+	Dir       string `json:"dir"`
+	Remote    string `json:"remote"`
+	RemoteDir string `json:"remote_dir"` // Ubuntu 上的仓库目录；不写时从 remote 推导（见 remoteDirOf）
 }
 
 // supportPrep 是校验通过后的 support 配置。
@@ -295,8 +296,20 @@ func startSupport(p *supportPrep, dir, knownHosts, httpAddr string, socksAddrs m
 		bin = "claude"
 	}
 	repos := map[string]support.Repo{}
+	remoteDirs := map[string]string{}
 	for n, r := range sc.Repos {
 		repos[n] = support.Repo{Dir: expand(r.Dir), Remote: r.Remote}
+		if r.RemoteDir != "" {
+			remoteDirs[n] = r.RemoteDir
+			continue
+		}
+		d, err := remoteDirOf(r.Remote)
+		if err != nil {
+			// 推导不出 Ubuntu 目录不让 wgtund 起不来：只跳过该仓库的 Mac→Ubuntu（Sync 时报错）
+			fmt.Fprintf(os.Stderr, "wgtund: support 仓库 %q：%v，Mac→Ubuntu 代码同步不可用\n", n, err)
+		} else {
+			remoteDirs[n] = d
+		}
 	}
 	var gitEnv []string
 	var fwd net.Listener
@@ -319,11 +332,20 @@ func startSupport(p *supportPrep, dir, knownHosts, httpAddr string, socksAddrs m
 		closeFwd()
 		return nil, nil, fmt.Errorf("support: 找不到 wgtund 自身路径: %w", err)
 	}
+	bridge := &msgBridge{
+		repos:     repos,
+		remoteDir: remoteDirs,
+		gitEnv:    gitEnv,
+		run:       msgRemoteRunner(pool, sc.Host),
+		write:     msgSFTPWriter(pool, sc.Host),
+	}
 	cfg := support.Config{
-		Runner:  support.RunnerConfig{Bin: bin, Dir: p.workdir, Args: claudeArgs(sc, merged)},
-		Repos:   repos,
-		GitEnv:  gitEnv,
-		LogPath: filepath.Join(dir, "support-log.jsonl"),
+		Runner:     support.RunnerConfig{Bin: bin, Dir: p.workdir, Args: claudeArgs(sc, merged)},
+		Repos:      repos,
+		GitEnv:     gitEnv,
+		LogPath:    filepath.Join(dir, "support-log.jsonl"),
+		MsgSync:    bridge.Sync,
+		MsgDeliver: bridge.Deliver,
 	}
 	if proj != nil {
 		cfg.ProjSyncNames = proj.Names() // 配置顺序的项目名，远端只能发起这些

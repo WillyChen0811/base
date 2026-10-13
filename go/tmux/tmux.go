@@ -4,6 +4,7 @@ package tmux
 
 import (
 	"fmt"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -108,6 +109,36 @@ func KillCommand(name string) (string, error) {
 		return "", err
 	}
 	return "tmux -u kill-session -t " + Quote("="+name), nil
+}
+
+// bufName 校验临时缓冲区名：只允许 ASCII 字母数字、'_'、'-'，1..64 字节。
+func bufName(name string) error {
+	if len(name) == 0 || len(name) > 64 {
+		return fmt.Errorf("缓冲区名长度必须 1..64 字节，当前 %d", len(name))
+	}
+	if m := bufIllegal.FindString(name); m != "" {
+		return fmt.Errorf("缓冲区名包含非法字符 %q，只允许字母、数字、'-' 和 '_'", m)
+	}
+	return nil
+}
+
+var bufIllegal = regexp.MustCompile(`[^A-Za-z0-9_-]`)
+
+// PasteCommand 返回把标准输入里的文字以括号粘贴方式注入会话、再按回车的 shell 命令。
+// 文字本身不进命令行，由调用方经 SSH 的 stdin 喂入。buf 是临时缓冲区名（调用方给，如 "xxyi-<消息id>"）。
+// -p 走括号粘贴（文字不被逐字符当成按键，多行/带特殊字符都安全），-d 粘贴完删掉缓冲区。
+func PasteCommand(session, buf string) (string, error) {
+	if err := ValidTarget(session); err != nil {
+		return "", err
+	}
+	if err := bufName(buf); err != nil {
+		return "", err
+	}
+	qBuf := Quote(buf)
+	qTarget := Quote("=" + session + ":")
+	return "tmux -u load-buffer -b " + qBuf + " -" +
+		" && tmux -u paste-buffer -p -d -b " + qBuf + " -t " + qTarget +
+		" && tmux -u send-keys -t " + qTarget + " Enter", nil
 }
 
 // CaptureCommand 返回抓取窗格内容的命令。

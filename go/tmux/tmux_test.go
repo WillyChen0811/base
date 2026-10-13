@@ -1,6 +1,9 @@
 package tmux
 
 import (
+	"os"
+	"os/exec"
+	"strings"
 	"testing"
 	"time"
 )
@@ -236,6 +239,123 @@ func TestCaptureCommand(t *testing.T) {
 			t.Errorf("CaptureCommand(%q, %d) =\n%q\n期望\n%q", tt.input, tt.lines, got, tt.want)
 		}
 	}
+}
+
+func TestPasteCommand(t *testing.T) {
+	tests := []struct {
+		name string
+		sess string
+		buf  string
+		want string
+		err  bool
+	}{
+		{"普通", "ab", "xxyi-1",
+			"tmux -u load-buffer -b 'xxyi-1' - && tmux -u paste-buffer -p -d -b 'xxyi-1' -t '=ab:' && tmux -u send-keys -t '=ab:' Enter", false},
+		{"含空格会话", "my session", "buf_2",
+			"tmux -u load-buffer -b 'buf_2' - && tmux -u paste-buffer -p -d -b 'buf_2' -t '=my session:' && tmux -u send-keys -t '=my session:' Enter", false},
+		{"含单引号会话（单引号(buf)非法见下）", "a'b", "buf", "", false},
+		{"含中文会话", "中文名", "xxyi-msg-9",
+			"tmux -u load-buffer -b 'xxyi-msg-9' - && tmux -u paste-buffer -p -d -b 'xxyi-msg-9' -t '=中文名:' && tmux -u send-keys -t '=中文名:' Enter", false},
+		{"空会话", "", "buf", "", true},
+		{"会话含冒号", "a:b", "buf", "", true},
+		{"空buf", "ab", "", "", true},
+		{"buf含点", "ab", "a.b", "", true},
+		{"buf含空格", "ab", "a b", "", true},
+		{"buf含斜杠", "ab", "a/b", "", true},
+		{"buf64字节", "ab", strings.Repeat("a", 64), "", false},
+		{"buf65字节", "ab", strings.Repeat("a", 65), "", true},
+	}
+	for _, tt := range tests {
+		got, err := PasteCommand(tt.sess, tt.buf)
+		if tt.err && err == nil {
+			t.Errorf("PasteCommand(%q, %q) 期望报错但没有", tt.sess, tt.buf)
+		}
+		if !tt.err && err != nil {
+			t.Errorf("PasteCommand(%q, %q) 期望通过但报错: %v", tt.sess, tt.buf, err)
+		}
+		if !tt.err && tt.want != "" && got != tt.want {
+			t.Errorf("PasteCommand(%q, %q) =\n%q\n期望\n%q", tt.sess, tt.buf, got, tt.want)
+		}
+	}
+
+	// 单引号出现在 buf：非法
+	if _, err := PasteCommand("ab", "b'1"); err == nil {
+		t.Error("buf 含单引号应该报错")
+	}
+	// 单引号出现在会话名：合法，Quote 后命令行正确断接
+	got, err := PasteCommand("a'b", "buf")
+	if err != nil {
+		t.Fatalf("会话名含单引号应合法: %v", err)
+	}
+	want := "tmux -u load-buffer -b 'buf' - && tmux -u paste-buffer -p -d -b 'buf' -t '=a'\\''b:' && tmux -u send-keys -t '=a'\\''b:' Enter"
+	if got != want {
+		t.Errorf("含单引号会话 =\n%q\n期望\n%q", got, want)
+	}
+}
+
+// 真跑：去掉 $TMUX、用独立 TMUX_TMPDIR 起服务器（不碰用户的 tmux），
+// 建 detached 会话跑 cat，PasteCommand 经 stdin 喂两行中文，capture-pane 检查都在。
+func TestPasteCommand_real(t *testing.T) {
+	tmuxPath, err := exec.LookPath("tmux")
+	if err != nil {
+		t.Skip("本机没有 tmux")
+	}
+	// 必须去掉 TMUX/TMUX_PANE：在 tmux 里跑测试时 tmux 优先用 $TMUX 指的 socket，
+	// kill-server 会关掉用户自己的 tmux 服务器（连带里面的一切）。
+	sockDir, err := os.MkdirTemp("/tmp", "xxyi-tmuxtest-") // socket 路径不能太长
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(sockDir) })
+	var env []string
+	for _, kv := range os.Environ() {
+		if !strings.HasPrefix(kv, "TMUX=") && !strings.HasPrefix(kv, "TMUX_PANE=") && !strings.HasPrefix(kv, "TMUX_TMPDIR=") {
+			env = append(env, kv)
+		}
+	}
+	env = append(env, "TMUX_TMPDIR="+sockDir)
+
+	run := func(args ...string) (string, error) {
+		cmd := exec.Command(tmuxPath, args...)
+		cmd.Env = env
+		out, err := cmd.CombinedOutput()
+		return string(out), err
+	}
+	t.Cleanup(func() { run("-u", "kill-server") })
+
+	session := "粘贴测试会话"
+	if out, err := run("-u", "new-session", "-d", "-s", session, "cat"); err != nil {
+		t.Fatalf("new-session: %v\n%s", err, out)
+	}
+	// 等 cat 挂上 pty
+	time.Sleep(300 * time.Millisecond)
+
+	cmdStr, err := PasteCommand(session, "xxyi-test-1")
+	if err != nil {
+		t.Fatalf("PasteCommand: %v", err)
+	}
+	const line1, line2 = "你好，世界", "second 第二行"
+	sh := exec.Command("sh", "-c", cmdStr)
+	sh.Env = env
+	sh.Stdin = strings.NewReader(line1 + "\n" + line2 + "\n")
+	if out, err := sh.CombinedOutput(); err != nil {
+		t.Fatalf("执行 PasteCommand: %v\n%s", err, out)
+	}
+
+	target := "=" + session + ":"
+	var pane string
+	for i := 0; i < 50; i++ {
+		out, err := run("-u", "capture-pane", "-p", "-t", target)
+		if err != nil {
+			t.Fatalf("capture-pane: %v\n%s", err, out)
+		}
+		pane = out
+		if strings.Contains(pane, line1) && strings.Contains(pane, line2) {
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	t.Fatalf("窗格里没找到两行文字，最后内容:\n%s", pane)
 }
 
 func TestParseList(t *testing.T) {

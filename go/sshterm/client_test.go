@@ -5,6 +5,8 @@ import (
 	"errors"
 	"io"
 	"net"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -456,4 +458,52 @@ func TestOpenSessionCloseClosesConn(t *testing.T) {
 		t.Fatal(err)
 	}
 	eventually(t, "Open 的会话关闭后服务器端连接结束", func() bool { return e.tln.allEOF() })
+}
+
+// ---------- SFTP ----------
+
+func TestClientSFTP(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "hi.txt"), []byte("hello sftp"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ck := newSigner(t)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	srv := sshtest.ServeWith(ln, ck.PublicKey(), sshtest.Options{SFTPRoot: root})
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	c, err := Dial(ctx, netDialer{}, Target{Addr: ln.Addr().String(), User: "chenwy"},
+		Auth{Signers: []ssh.Signer{ck}, HostKeyCallback: ssh.FixedHostKey(srv.HostKey.PublicKey())})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	sc, err := c.SFTP()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sc.Close()
+	infos, err := sc.ReadDir(root)
+	if err != nil || len(infos) != 1 || infos[0].Name() != "hi.txt" {
+		t.Fatalf("ReadDir = %v, %v", infos, err)
+	}
+	f, err := sc.Open(root + "/hi.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := io.ReadAll(f)
+	f.Close()
+	if err != nil || string(b) != "hello sftp" {
+		t.Fatalf("read = %q, %v", b, err)
+	}
+
+	c.Close()
+	if _, err := c.SFTP(); err == nil {
+		t.Error("连接关闭后 SFTP 应报错")
+	}
 }

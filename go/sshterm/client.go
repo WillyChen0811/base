@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/pkg/sftp"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -241,6 +242,14 @@ func (c *Client) live() error {
 		return fmt.Errorf("sshterm: %w", c.err)
 	}
 	return nil
+}
+
+// SFTP 在这条连接上开一个 SFTP 会话；用完调用方负责 Close。连接已断时报错。
+func (c *Client) SFTP() (*sftp.Client, error) {
+	if err := c.live(); err != nil {
+		return nil, err
+	}
+	return sftp.NewClient(c.client)
 }
 
 // keepAlive 定期发全局请求，失败或超时说明隧道已经断了（TCP 可能还"连着"），关掉连接让上层察觉。

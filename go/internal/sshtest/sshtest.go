@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/pkg/sftp"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -23,6 +24,9 @@ type Options struct {
 	Exec func(cmd string) (stdout, stderr string, code int)
 	// Forward 为 true 时支持远端端口转发（tcpip-forward）；默认拒绝。
 	Forward bool
+	// SFTPRoot 非空时，session 通道上的 "subsystem" 请求且名字是 "sftp" 时回 true，
+	// 并用 sftp.NewServer 服务（Serve 结束后关通道）。为空时 subsystem 请求照旧回 false。
+	SFTPRoot string
 }
 
 type Server struct {
@@ -285,6 +289,21 @@ func (s *Server) serve(c net.Conn, cfg *ssh.ServerConfig) {
 						go exec(ch, s.opts.Exec, e.Command)
 					} else {
 						go echo(ch)
+					}
+				case "subsystem":
+					var e struct{ Name string }
+					ssh.Unmarshal(req.Payload, &e)
+					if e.Name == "sftp" && s.opts.SFTPRoot != "" {
+						req.Reply(true, nil)
+						go func() {
+							srv, err := sftp.NewServer(ch, sftp.WithServerWorkingDirectory(s.opts.SFTPRoot))
+							if err == nil {
+								srv.Serve()
+							}
+							ch.Close()
+						}()
+					} else if req.WantReply {
+						req.Reply(false, nil)
 					}
 				default:
 					if req.WantReply {

@@ -29,11 +29,13 @@ type Remote interface {
 
 // Config 是协助服务的配置；零值不自带任何项目默认值。
 type Config struct {
-	Runner   RunnerConfig
-	Repos    map[string]Repo // 允许同步的仓库
-	GitEnv   []string        // 同步时追加给 git 的环境变量
-	LogPath  string          // 审计日志（jsonl，追加写，文件权限 0600）；空则不写文件
-	HookWait time.Duration   // 钩子最多等用户多久，<=0 用 9 分钟
+	Runner        RunnerConfig
+	Repos         map[string]Repo                                     // 允许同步的仓库
+	GitEnv        []string                                            // 同步时追加给 git 的环境变量
+	LogPath       string                                              // 审计日志（jsonl，追加写，文件权限 0600）；空则不写文件
+	HookWait      time.Duration                                       // 钩子最多等用户多久，<=0 用 9 分钟
+	ProjSyncNames []string                                            // 可同步的项目名；空则不提供项目同步
+	ProjSync      func(ctx context.Context, name string) (any, error) // 执行一次同步，返回可 JSON 编码的结果
 }
 
 // Status 是协助服务的状态快照。
@@ -42,8 +44,9 @@ type Status struct {
 	Until      int64       `json:"until"`       // Unix 秒，未开为 0
 	RemoteAddr string      `json:"remote_addr"` // 远端监听地址，未开或暂时断开为空
 	Claude     RunnerState `json:"claude"`
-	Pending    []Request   `json:"pending"` // 永远不是 null
-	Repos      []string    `json:"repos"`   // 排序后的名字，永远不是 null
+	Pending    []Request   `json:"pending"`  // 永远不是 null
+	Repos      []string    `json:"repos"`    // 排序后的名字，永远不是 null
+	Projects   []string    `json:"projects"` // 可同步项目名列表，排序后永远不是 null
 }
 
 // LogEntry 是一条审计日志。
@@ -337,6 +340,7 @@ func (s *Service) Status() Status {
 		Claude:     claude,
 		Pending:    s.queue.Pending(),
 		Repos:      append([]string{}, s.repos...),
+		Projects:   sortedStrings(s.cfg.ProjSyncNames),
 	}
 	if active {
 		st.Until = until.Unix()
@@ -434,7 +438,7 @@ func (s *Service) reconnectLoop(sess *session) (net.Listener, *http.Server) {
 // ---------- 远端接口 ----------
 
 // remoteMux 是某个会话的远端接口；只有 GET /status、POST /task、GET /events、POST /sync、
-// POST /stop-claude，绝不含开始/停止协助或批准请求。
+// POST /stop-claude、POST /projsync，绝不含开始/停止协助或批准请求。
 func (s *Service) remoteMux(sess *session) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/status", only(http.MethodGet, s.remoteStatus))
@@ -442,6 +446,7 @@ func (s *Service) remoteMux(sess *session) http.Handler {
 	mux.HandleFunc("/events", only(http.MethodGet, s.remoteEvents))
 	mux.HandleFunc("/sync", only(http.MethodPost, s.remoteSync))
 	mux.HandleFunc("/stop-claude", only(http.MethodPost, s.remoteStopClaude))
+	mux.HandleFunc("/projsync", only(http.MethodPost, s.remoteProjSync))
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, http.StatusNotFound, "没有这个路径")
 	})
@@ -613,6 +618,110 @@ func (s *Service) remoteStopClaude(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+func (s *Service) remoteProjSync(w http.ResponseWriter, r *http.Request) {
+	name := r.URL.Query().Get("name")
+	detail := map[string]string{"project": truncRunes(name, 100)}
+
+	// ProjSync 未配置或名字不在白名单 → 404
+	if s.cfg.ProjSync == nil {
+		detail["result"] = "未配置"
+		s.logEvent("projsync", detail)
+		errJSON(w, http.StatusNotFound, "未知项目")
+		return
+	}
+	ok := false
+	for _, n := range s.cfg.ProjSyncNames {
+		if n == name {
+			ok = true
+			break
+		}
+	}
+	if !ok {
+		detail["result"] = "未知项目"
+		s.logEvent("projsync", detail)
+		errJSON(w, http.StatusNotFound, "未知项目")
+		return
+	}
+
+	body, err := json.Marshal(map[string]string{"project": name})
+	if err != nil {
+		errJSON(w, http.StatusInternalServerError, "内部错误")
+		return
+	}
+
+	s.logEvent("projsync", map[string]string{"project": name, "result": "requested"})
+
+	// 待批数已达上限 → 直接拒绝
+	if len(s.queue.Pending()) >= maxPending {
+		detail["result"] = "待批太多"
+		s.logEvent("projsync", detail)
+		errJSON(w, http.StatusServiceUnavailable, "待批请求太多")
+		return
+	}
+
+	// 等用户决定：用 HookWait 的上限（<=0 用默认值）。r.Context() 已由 guard 绑定会话，Stop 会取消它
+	wait := s.cfg.HookWait
+	if wait <= 0 {
+		wait = defaultHookWait
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), wait)
+	defer cancel()
+
+	decision, err := s.queue.AskWithNotify(ctx, "ProjectSync", json.RawMessage(body), func(req Request) {
+		s.logEvent("ask", map[string]string{
+			"id":      req.ID,
+			"tool":    "ProjectSync",
+			"summary": req.Summary,
+		})
+	})
+	if err != nil {
+		// Ask 返回错误 = ctx 先到期（超时或取消），decision 是零值 Allow=false
+		switch {
+		case r.Context().Err() != nil:
+			detail["result"] = "cancelled"
+			s.logEvent("projsync", detail)
+			errJSON(w, http.StatusServiceUnavailable, "请求已取消")
+		default:
+			// ctx.Err() != nil 但 r.Context() 没断：超时（HookWait）
+			detail["result"] = "timeout"
+			s.logEvent("projsync", detail)
+			errJSON(w, http.StatusGatewayTimeout, "等待授权超时")
+		}
+		return
+	}
+
+	// Ask 返回 nil err：用户明确决定
+	if !decision.Allow {
+		detail["result"] = "denied"
+		if decision.Message != "" {
+			detail["message"] = decision.Message
+		}
+		s.logEvent("projsync", detail)
+		msg := "用户拒绝了同步"
+		if decision.Message != "" {
+			msg += "：" + decision.Message
+		}
+		errJSON(w, http.StatusForbidden, msg)
+		return
+	}
+
+	// 用户允许：调 ProjSync（30 分钟上限）
+	ctx2, cancel2 := context.WithTimeout(r.Context(), 30*time.Minute)
+	defer cancel2()
+	result, err := s.cfg.ProjSync(ctx2, name)
+	detail = map[string]string{"project": name}
+	if err != nil {
+		detail["result"] = "failed"
+		detail["error"] = truncRunes(err.Error(), 300)
+		s.logEvent("projsync", detail)
+		errJSON(w, http.StatusBadGateway, "同步失败："+err.Error())
+		return
+	}
+	detail["result"] = "ok"
+	s.logEvent("projsync", detail)
+	writeJSON(w, http.StatusOK, map[string]any{"result": result})
 }
 
 // ---------- 本机接口 ----------
@@ -840,6 +949,13 @@ func (s *Service) logSnapshot(n int) []LogEntry {
 }
 
 // ---------- HTTP 小工具 ----------
+
+// sortedStrings 返回排序后的字符串切片副本。
+func sortedStrings(s []string) []string {
+	out := append([]string{}, s...)
+	sort.Strings(out)
+	return out
+}
 
 // only 校验请求方法，不对就 405。
 func only(method string, h http.HandlerFunc) http.HandlerFunc {

@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -13,6 +14,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -1220,5 +1222,283 @@ func TestRemoteSyncWhileBusy(t *testing.T) {
 	code, body := remoteDo(t, http.MethodPost, base+"/sync?repo=app&branch=master", token, nil)
 	if code != 409 || !strings.Contains(string(body), "Mac 上的 Claude 正在工作，稍后再同步") {
 		t.Fatalf("忙碌时同步应 409: %d %s", code, body)
+	}
+}
+
+// ---------- ProjectSync 测试 ----------
+
+func TestProjsyncNotConfigured(t *testing.T) {
+	s, fr := newTestService(t, Config{})
+	if err := s.Start(30); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	addr := s.Status().RemoteAddr
+	token := fr.publishRec(0).token
+	// ProjSync 未配置 → 404
+	code, body := remoteDo(t, http.MethodPost, "http://"+addr+"/projsync?name=ai-browser", token, nil)
+	if code != 404 || !strings.Contains(string(body), "未知项目") {
+		t.Fatalf("未配置应 404: %d %s", code, body)
+	}
+}
+
+func TestProjsyncUnknownName(t *testing.T) {
+	// ProjSync 配置了但名字不在白名单
+	s, fr := newTestService(t, Config{
+		ProjSyncNames: []string{"ai-browser"},
+	})
+	// 用一个假的 ProjSync 让它不 panic
+	called := false
+	s.cfg.ProjSync = func(ctx context.Context, name string) (any, error) {
+		called = true
+		return map[string]string{"name": name}, nil
+	}
+	if err := s.Start(30); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	code, body := remoteDo(t, http.MethodPost, "http://"+s.Status().RemoteAddr+"/projsync?name=unknown", fr.publishRec(0).token, nil)
+	if code != 404 {
+		t.Fatalf("未知项目应 404: %d %s", code, body)
+	}
+	if called {
+		t.Fatal("未知项目不应调用 ProjSync")
+	}
+}
+
+func TestProjsyncApproved(t *testing.T) {
+	s, fr := newTestService(t, Config{
+		ProjSyncNames: []string{"ai-browser"},
+		ProjSync: func(ctx context.Context, name string) (any, error) {
+			return map[string]any{"name": name, "ok": true}, nil
+		},
+	})
+	if err := s.Start(30); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	addr := s.Status().RemoteAddr
+	token := fr.publishRec(0).token
+	base := "http://" + addr
+
+	// 发 projsync 请求
+	ch := make(chan struct {
+		code int
+		body []byte
+	}, 1)
+	go func() {
+		code, body := remoteDo(t, http.MethodPost, base+"/projsync?name=ai-browser", token, nil)
+		ch <- struct {
+			code int
+			body []byte
+		}{code, body}
+	}()
+	p := waitPending(t, s, 1)
+	if p[0].Tool != "ProjectSync" || !strings.Contains(p[0].Summary, "同步项目") || !strings.Contains(p[0].Summary, "ai-browser") {
+		t.Fatalf("待批内容不对: %+v", p[0])
+	}
+
+	// 本机允许
+	lsrv := newServer(t, s.LocalHandler())
+	code, body := remoteDo(t, http.MethodPost, lsrv.URL+"/support/decide?id="+p[0].ID+"&allow=1", "", nil)
+	if code != 200 {
+		t.Fatalf("decide: %d %s", code, body)
+	}
+
+	// 等响应回来
+	select {
+	case r := <-ch:
+		if r.code != 200 {
+			t.Fatalf("应 200: %d %s", r.code, r.body)
+		}
+		var got struct {
+			Result map[string]any `json:"result"`
+		}
+		if err := json.Unmarshal(r.body, &got); err != nil || got.Result["name"] != "ai-browser" {
+			t.Fatalf("result 不对: %s", r.body)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("等 projsync 响应超时")
+	}
+}
+
+func TestProjsyncDenied(t *testing.T) {
+	s, fr := newTestService(t, Config{
+		ProjSyncNames: []string{"ai-browser"},
+		ProjSync: func(ctx context.Context, name string) (any, error) {
+			return nil, nil
+		},
+	})
+	if err := s.Start(30); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	addr := s.Status().RemoteAddr
+	token := fr.publishRec(0).token
+	base := "http://" + addr
+
+	// 发 projsync 请求
+	ch := make(chan struct {
+		code int
+		body []byte
+	}, 1)
+	go func() {
+		code, body := remoteDo(t, http.MethodPost, base+"/projsync?name=ai-browser", token, nil)
+		ch <- struct {
+			code int
+			body []byte
+		}{code, body}
+	}()
+	p := waitPending(t, s, 1)
+
+	// 拒绝（带附言）
+	lsrv := newServer(t, s.LocalHandler())
+	q := url.Values{"id": {p[0].ID}, "allow": {"0"}, "message": {"我现在没空"}}
+	code, body := remoteDo(t, http.MethodPost, lsrv.URL+"/support/decide?"+q.Encode(), "", nil)
+	if code != 200 {
+		t.Fatalf("decide deny: %d %s", code, body)
+	}
+
+	// 等远端请求返回
+	select {
+	case r := <-ch:
+		if r.code != 403 {
+			t.Fatalf("拒绝应 403: %d %s", r.code, r.body)
+		}
+		if !strings.Contains(string(r.body), "用户拒绝了同步") || !strings.Contains(string(r.body), "我现在没空") {
+			t.Fatalf("403 正文应含附言: %s", r.body)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("远端请求没返回")
+	}
+}
+
+func TestProjsyncExecError(t *testing.T) {
+	s, fr := newTestService(t, Config{
+		ProjSyncNames: []string{"ai-browser"},
+		ProjSync: func(ctx context.Context, name string) (any, error) {
+			return nil, errors.New("同步失败：仓库不存在")
+		},
+	})
+	if err := s.Start(30); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	addr := s.Status().RemoteAddr
+	token := fr.publishRec(0).token
+	base := "http://" + addr
+
+	ch := make(chan struct {
+		code int
+		body []byte
+	}, 1)
+	go func() {
+		code, body := remoteDo(t, http.MethodPost, base+"/projsync?name=ai-browser", token, nil)
+		ch <- struct {
+			code int
+			body []byte
+		}{code, body}
+	}()
+	p := waitPending(t, s, 1)
+
+	// 允许
+	lsrv := newServer(t, s.LocalHandler())
+	code, body := remoteDo(t, http.MethodPost, lsrv.URL+"/support/decide?id="+p[0].ID+"&allow=1", "", nil)
+	if code != 200 {
+		t.Fatalf("decide: %d %s", code, body)
+	}
+
+	select {
+	case r := <-ch:
+		if r.code != 502 {
+			t.Fatalf("执行失败应 502: %d %s", r.code, r.body)
+		}
+		if !strings.Contains(string(r.body), "同步失败") {
+			t.Fatalf("502 正文应含错误: %s", r.body)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("远端请求没返回")
+	}
+}
+
+func TestProjsyncStopCancelled(t *testing.T) {
+	var called atomic.Int32
+	s, fr := newTestService(t, Config{
+		ProjSyncNames: []string{"ai-browser"},
+		ProjSync: func(ctx context.Context, name string) (any, error) {
+			called.Add(1)
+			return nil, nil
+		},
+	})
+	if err := s.Start(30); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	addr := s.Status().RemoteAddr
+	token := fr.publishRec(0).token
+	base := "http://" + addr
+
+	type res struct {
+		code int
+		err  error
+	}
+	ch := make(chan res, 1)
+	go func() {
+		req, _ := http.NewRequest(http.MethodPost, base+"/projsync?name=ai-browser", nil)
+		req.Header.Set("Authorization", "Bearer "+token)
+		resp, err := httpClient.Do(req)
+		if err != nil {
+			ch <- res{err: err}
+			return
+		}
+		resp.Body.Close()
+		ch <- res{code: resp.StatusCode}
+	}()
+	waitPending(t, s, 1)
+
+	// 停止协助：Stop 会关掉远端连接，请求要么出错（连接被关）要么 503
+	s.Stop("测试结束")
+
+	select {
+	case r := <-ch:
+		if r.err == nil && r.code != 503 {
+			t.Fatalf("Stop 后应出错或 503: %d", r.code)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("远端请求没返回")
+	}
+	if called.Load() != 0 {
+		t.Fatal("Stop 后不应调用 ProjSync")
+	}
+}
+
+func TestProjsyncStatusAndLog(t *testing.T) {
+	s, fr := newTestService(t, Config{
+		ProjSyncNames: []string{"b", "a", "c"},
+	})
+	// ProjSync 未设置但 Status 应该包含项目名称
+	st := s.Status()
+	if st.Projects == nil {
+		t.Fatal("Projects 不应为 null")
+	}
+	want := []string{"a", "b", "c"}
+	if fmt.Sprint(st.Projects) != fmt.Sprint(want) {
+		t.Fatalf("Projects 应排序: got %v want %v", st.Projects, want)
+	}
+	if st.Active {
+		t.Fatal("未开启时不应显示 Active")
+	}
+
+	if err := s.Start(30); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	addr := s.Status().RemoteAddr
+	token := fr.publishRec(0).token
+	code, _ := remoteDo(t, http.MethodPost, "http://"+addr+"/projsync?name=a", token, nil)
+	if code != 404 {
+		t.Fatalf("未配置 ProjSync 应 404: %d", code)
+	}
+	code, _ = remoteDo(t, http.MethodPost, "http://"+addr+"/projsync?name=zzz", token, nil)
+	if code != 404 {
+		t.Fatalf("未知项目应 404: %d", code)
+	}
+	if !hasLog(s, "projsync", func(d map[string]string) bool {
+		return d["project"] == "zzz"
+	}) {
+		t.Fatal("应有 projsync zzz 日志")
 	}
 }

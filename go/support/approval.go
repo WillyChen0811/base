@@ -178,7 +178,7 @@ func (q *Queue) removeLocked(id string) {
 }
 
 // Summarize 生成一行摘要：Bash 取 command；Edit/Write/Read/NotebookEdit 取
-// file_path（缺失则 notebook_path）；WebFetch 取 url；其他工具取 input 原文。
+// file_path（缺失则 notebook_path）；WebFetch 取 url；ProjectSync 取 project；其他工具取 input 原文。
 // 取字段时先解成字符串（不能带 JSON 的引号和转义）；取不到就退回 input 原文。
 // 换行换成空格；超过 200 个字符（按 rune）截断加 "…"。input 非法 JSON 不 panic。
 func Summarize(tool string, input json.RawMessage) string {
@@ -192,6 +192,8 @@ func Summarize(tool string, input json.RawMessage) string {
 		}
 	case "WebFetch":
 		s = jsonString(input, "url")
+	case "ProjectSync":
+		s = "同步项目 " + jsonString(input, "project")
 	}
 	if s == "" {
 		s = string(input)

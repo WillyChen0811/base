@@ -19,9 +19,10 @@ import (
 
 // 轮询参数，测试里可调小。
 var (
-	eventsWait  = 5 // GET /events 的 wait 秒数；短一些，待批请求能及时提示
-	httpTimeout = 60 * time.Second
-	retryDelay  = 2 * time.Second // ask 轮询失败后的重试间隔
+	eventsWait      = 5 // GET /events 的 wait 秒数；短一些，待批请求能及时提示
+	httpTimeout     = 60 * time.Second
+	retryDelay      = 2 * time.Second  // ask 轮询失败后的重试间隔
+	projsyncTimeout = 40 * time.Minute // projsync 请求超时，单独设
 )
 
 // 退出码。
@@ -112,7 +113,7 @@ func defaultEndpoint() string {
 	return filepath.Join(home, ".xxyi-support", "endpoint.json")
 }
 
-const usage = "用法：macsup [-endpoint 路径] [-timeout 时长] status | sync <仓库> <分支> | ask <任务文字|-> | events [-after N] | stop-claude"
+const usage = "用法：macsup [-endpoint 路径] [-timeout 时长] status | sync <仓库> <分支> | ask <任务文字|-> | events [-after N] | stop-claude | projsync <项目名>"
 
 // run 是程序主体，返回退出码。
 func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
@@ -130,7 +131,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	}
 
 	switch rest[0] {
-	case "status", "sync", "ask", "events", "stop-claude":
+	case "status", "sync", "ask", "events", "stop-claude", "projsync":
 	default:
 		fmt.Fprintf(stderr, "未知命令 %q\n%s\n", rest[0], usage)
 		return exitErr
@@ -171,6 +172,8 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		if _, err = c.do(http.MethodPost, "/stop-claude", nil, ""); err == nil {
 			fmt.Fprintln(stdout, "已请求停止 Mac 上的 Claude")
 		}
+	case "projsync":
+		code, err = cmdProjsync(c, cargs, stdout, projsyncTimeout)
 	default:
 		fmt.Fprintf(stderr, "未知命令 %q\n%s\n", cmd, usage)
 		return exitErr
@@ -263,6 +266,52 @@ func printEvent(out io.Writer, data json.RawMessage) {
 	for _, l := range formatEvent(data) {
 		fmt.Fprintln(out, l)
 	}
+}
+
+func cmdProjsync(c *client, args []string, out io.Writer, timeout time.Duration) (int, error) {
+	if len(args) != 1 {
+		return 0, errors.New("用法：macsup projsync <项目名>")
+	}
+	name := args[0]
+	// 发出前先打印提示信息
+	fmt.Fprintf(out, "已请求同步 %s，请在 Mac 的 xxyi 协助页点允许…\n", name)
+
+	// 用单独的超时
+	hc := &http.Client{Timeout: timeout}
+	req, err := http.NewRequest(http.MethodPost, c.base+"/projsync?name="+url.QueryEscape(name), nil)
+	if err != nil {
+		return 0, err
+	}
+	req.Header.Set("Authorization", "Bearer "+c.token)
+	resp, err := hc.Do(req)
+	if err != nil {
+		return 0, fmt.Errorf("连不上 Mac：%w", err)
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		var e struct {
+			Error string `json:"error"`
+		}
+		if json.Unmarshal(b, &e) == nil && e.Error != "" {
+			return 0, fmt.Errorf("%s（HTTP %d）", e.Error, resp.StatusCode)
+		}
+		return 0, fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+
+	// 成功：打印 result 的 JSON
+	var r struct {
+		Result any `json:"result"`
+	}
+	if err := json.Unmarshal(b, &r); err != nil {
+		return 0, err
+	}
+	enc, err := json.MarshalIndent(r.Result, "", "  ")
+	if err != nil {
+		return 0, err
+	}
+	fmt.Fprintln(out, string(enc))
+	return exitOK, nil
 }
 
 func cmdAsk(c *client, args []string, stdin io.Reader, out io.Writer, timeout time.Duration, epPath string) (int, error) {

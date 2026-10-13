@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -19,17 +20,19 @@ const testToken = "tok123"
 
 // fakeMac 模拟远端接口。
 type fakeMac struct {
-	mu      sync.Mutex
-	batches [][]string // 每批事件的 data JSON；按 /events 请求依次释放
-	next    int
-	seq     int64
-	status  string
-	task    string
-	statusN int
-	syncErr bool
-	afters  []int64 // 非探测的 /events 请求的 after
-	failN   int     // 前 N 次轮询（非探测）的 /events 返回 500
-	onFail  func()  // 非 nil 时每次注入失败前调用
+	mu             sync.Mutex
+	batches        [][]string // 每批事件的 data JSON；按 /events 请求依次释放
+	next           int
+	seq            int64
+	status         string
+	task           string
+	statusN        int
+	syncErr        bool
+	afters         []int64 // 非探测的 /events 请求的 after
+	failN          int     // 前 N 次轮询（非探测）的 /events 返回 500
+	onFail         func()  // 非 nil 时每次注入失败前调用
+	projsyncCode   int
+	projsyncResult string
 }
 
 func (f *fakeMac) handler() http.Handler {
@@ -96,6 +99,14 @@ func (f *fakeMac) handler() http.Handler {
 		fmt.Fprintf(w, `{"head":"abc123-%s-%s"}`, r.URL.Query().Get("repo"), r.URL.Query().Get("branch"))
 	})
 	mux.HandleFunc("/stop-claude", func(w http.ResponseWriter, r *http.Request) { fmt.Fprint(w, `{"ok":true}`) })
+	mux.HandleFunc("/projsync", func(w http.ResponseWriter, r *http.Request) {
+		if f.projsyncResult != "" {
+			w.WriteHeader(f.projsyncCode)
+			fmt.Fprint(w, f.projsyncResult)
+			return
+		}
+		http.NotFound(w, r)
+	})
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") != "Bearer "+testToken {
 			w.WriteHeader(http.StatusUnauthorized)
@@ -391,5 +402,66 @@ func TestAskStoppedWhenEndpointRemoved(t *testing.T) {
 	code, _, errs := runCmd([]string{"-endpoint", ep, "ask", "x"}, "")
 	if code != 2 || !strings.Contains(errs, "Mac 上已停止协助") {
 		t.Fatalf("code=%d err=%s", code, errs)
+	}
+}
+
+// projsync 成功：打印 JSON 退出 0
+func TestProjsyncOK(t *testing.T) {
+	f := &fakeMac{
+		projsyncCode:   200,
+		projsyncResult: `{"result":{"name":"test","head":"abc123"}}`,
+	}
+	ep := setup(t, f, testToken)
+	code, out, errs := runCmd([]string{"-endpoint", ep, "projsync", "test"}, "")
+	if code != 0 || errs != "" {
+		t.Fatalf("code=%d err=%s", code, errs)
+	}
+	if !strings.Contains(out, "已请求同步 test") {
+		t.Fatalf("缺少提示: %s", out)
+	}
+	if !strings.Contains(out, `"name": "test"`) {
+		t.Fatalf("缺少 result JSON: %s", out)
+	}
+}
+
+// projsync 403：退出 exitErr，打印中文错误
+func TestProjsyncForbidden(t *testing.T) {
+	f := &fakeMac{
+		projsyncCode:   403,
+		projsyncResult: `{"error":"用户拒绝了同步：我现在没空"}`,
+	}
+	ep := setup(t, f, testToken)
+	code, _, errs := runCmd([]string{"-endpoint", ep, "projsync", "test"}, "")
+	if code != exitErr || !strings.Contains(errs, "用户拒绝了同步") {
+		t.Fatalf("code=%d err=%s", code, errs)
+	}
+}
+
+// 项目名包含 URL 特殊字符时应被编码
+func TestProjsyncURLCodec(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/projsync" {
+			http.NotFound(w, r)
+			return
+		}
+		if r.URL.Query().Get("name") == "test&x=1" {
+			fmt.Fprint(w, `{"result":true}`)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+
+	// 用客户端验证 URL 编码
+	hc := &http.Client{Timeout: 10 * time.Second}
+	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/projsync?name="+url.QueryEscape("test&x=1"), nil)
+	req.Header.Set("Authorization", "Bearer t")
+	resp, err := hc.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("应返回 200: %d", resp.StatusCode)
 	}
 }

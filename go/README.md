@@ -126,6 +126,7 @@ HTTP 接口都要带 `token` 参数；每台主机共用一条 SSH 连接（第�
 钩子子命令：`wgtund support-hook [http://127.0.0.1:端口/support/hook?token=…]`
 （地址缺省取环境变量 `XXYI_HOOK_URL`；只接受本机地址）。从标准输入读钩子 JSON（最多 1MB）转给本机服务，
 原样输出其回答；任何失败都输出「拒绝」并以退出码 0 结束，让 Claude Code 按拒绝处理。
+`macsup projsync <项目名>`：向远端请求同步一个项目，等待用户批准后执行，成功后以 JSON 打印结果。
 
 ## 测试
     cd go && go test ./...

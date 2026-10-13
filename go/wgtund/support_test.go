@@ -381,7 +381,7 @@ func TestClaudeArgs(t *testing.T) {
 		Repos:      map[string]supportRepo{"b": {Dir: "/r/b"}, "a": {Dir: "/r/a"}},
 	}
 	got := strings.Join(claudeArgs(sc, "/m.json"), " ")
-	want := "--permission-prompts none --settings /m.json --add-dir /r/a --add-dir /r/b --model sonnet --foo=bar positional"
+	want := "--permission-mode auto --permission-prompts none --settings /m.json --add-dir /r/a --add-dir /r/b --model sonnet --foo=bar positional"
 	if got != want {
 		t.Errorf("得到 %s\n期望 %s", got, want)
 	}
@@ -423,7 +423,7 @@ func TestSupportRunnerReceivesArgs(t *testing.T) {
 	}
 	got := string(b)
 	merged := filepath.Join(f.dir, "support-claude.merged.json")
-	for _, w := range []string{"--permission-prompts\nnone\n", "--settings\n" + merged + "\n", "--add-dir\n", "--model\nsonnet\n"} {
+	for _, w := range []string{"--permission-mode\nauto\n", "--permission-prompts\nnone\n", "--settings\n" + merged + "\n", "--add-dir\n", "--model\nsonnet\n"} {
 		if !strings.Contains(got, w) {
 			t.Errorf("参数里缺 %q: %q", w, got)
 		}

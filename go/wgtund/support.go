@@ -239,10 +239,11 @@ func routeForwarder(pool *sshPool, host string) (net.Listener, error) {
 	return ln, nil
 }
 
-// claudeArgs 生成 Claude 的启动参数：权限提示全交给钩子（--permission-prompts none）、
+// claudeArgs 生成 Claude 的启动参数：自动模式（用户信任它在后台干活，只有分类器拿不准的才经钩子问用户）、
+// 权限提示全交给钩子（--permission-prompts none）、
 // 用协助合并设置文件、各仓库目录加入可访问目录，最后原样追加调用方的 claude_args（不校验）。
 func claudeArgs(sc *supportConf, merged string) []string {
-	args := []string{"--permission-prompts", "none", "--settings", merged}
+	args := []string{"--permission-mode", "auto", "--permission-prompts", "none", "--settings", merged}
 	names := make([]string, 0, len(sc.Repos))
 	for n := range sc.Repos {
 		names = append(names, n)

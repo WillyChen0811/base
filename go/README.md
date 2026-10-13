@@ -83,8 +83,8 @@ HTTP 接口都要带 `token` 参数；每台主机共用一条 SSH 连接（第�
 安全模型（只保留一道）：`PermissionRequest` 钩子。
 - 协助的 Claude 就是普通的 Claude Code，用它自己的设置；所有授权请求都经钩子交给你批准，钩子失败即拒绝。
 - `claude_settings` 可选：不写则合并设置里只有钩子；写了则必须是 JSON 对象，内容（沙盒、权限、`defaultMode` 等）不做校验，照你写的用。
-- 启动参数固定为 `--permission-prompts none --settings <合并文件>`，并为每个仓库加 `--add-dir <dir>`（按仓库名排序），
-  再原样接 `claude_args`（不校验、无白名单）。`--permission-prompts none` 下授权请求仍会触发 `PermissionRequest` 钩子。
+- 启动参数固定为 `--permission-mode auto --permission-prompts none --settings <合并文件>`，并为每个仓库加 `--add-dir <dir>`（按仓库名排序），
+  再原样接 `claude_args`（不校验、无白名单）。自动模式下普通操作直接放行，分类器拿不准的授权请求仍会触发 `PermissionRequest` 钩子交给用户；要换模式可在 `claude_args` 里再写一次 `--permission-mode`（后写的生效）。
 - 每个仓库的 `dir` 必须存在且是 git 仓库顶层，两个仓库名不能指向同一目录。
 - Claude 子进程只继承白名单环境变量（`PATH HOME USER LOGNAME SHELL TMPDIR LANG TERM TZ`、`LC_*`、`ANTHROPIC_*`、
   `CLAUDE_*`、各种 `*_proxy`），其余不传。

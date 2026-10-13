@@ -407,7 +407,7 @@ func mergedSettings(base map[string]any, hookCmd string, denyRead []string) map[
 func startSupport(p *supportPrep, dir, knownHosts, httpAddr string, socksAddrs map[string]string, pool *sshPool) (*support.Service, error) {
 	sc := p.conf
 	merged := filepath.Join(dir, "support-claude.merged.json")
-	bin := sc.ClaudeBin
+	bin := expand(sc.ClaudeBin) // 由 xxyi 拉起时 PATH 可能不含 ~/.local/bin，允许写 ~/ 开头的路径
 	if bin == "" {
 		bin = "claude"
 	}

@@ -30,12 +30,41 @@ import (
 )
 
 type hostConf struct {
-	Name          string   `json:"name"`
-	Tunnel        string   `json:"tunnel"`
-	Addr          string   `json:"addr"`
-	User          string   `json:"user"`
-	Command       string   `json:"command"`
-	IdentityFiles []string `json:"identity_files"`
+	Name          string      `json:"name"`
+	Tunnel        string      `json:"tunnel"`
+	Addr          string      `json:"addr"`
+	Routes        []routeConf `json:"routes"`
+	User          string      `json:"user"`
+	Command       string      `json:"command"`
+	IdentityFiles []string    `json:"identity_files"`
+}
+
+// routeConf 是主机的一条线路：经哪条隧道（空为直连）到主机的哪个地址。
+type routeConf struct {
+	Label  string `json:"label"`
+	Tunnel string `json:"tunnel"`
+	Addr   string `json:"addr"`
+}
+
+// hostRoutes 返回主机规范化后的线路列表：写了 routes 就用它，否则把 tunnel/addr 当作唯一一条线路。
+// label 为空时补全：先用隧道名，隧道名也空则用「直连」。
+func hostRoutes(h hostConf) []routeConf {
+	rs := h.Routes
+	if len(rs) == 0 {
+		rs = []routeConf{{Tunnel: h.Tunnel, Addr: h.Addr}}
+	}
+	out := make([]routeConf, len(rs))
+	for i, r := range rs {
+		if r.Label == "" {
+			if r.Tunnel != "" {
+				r.Label = r.Tunnel
+			} else {
+				r.Label = "直连"
+			}
+		}
+		out[i] = r
+	}
+	return out
 }
 
 type fileConf struct {
@@ -108,6 +137,20 @@ func Run(ctx context.Context, dir string, stdin io.Reader, stdout io.Writer) (er
 			return fmt.Errorf("hosts.json: 主机名 %q 为空或重复", h.Name)
 		}
 		seen[h.Name] = true
+		if len(h.Routes) > 0 {
+			if h.Tunnel != "" || h.Addr != "" {
+				return fmt.Errorf("hosts.json: 主机 %q 的 routes 与 tunnel/addr 只能写一种", h.Name)
+			}
+			for i, r := range h.Routes {
+				if _, _, err := net.SplitHostPort(r.Addr); err != nil {
+					return fmt.Errorf("hosts.json: 主机 %q 第 %d 条线路的地址 %q 要写成 主机:端口", h.Name, i+1, r.Addr)
+				}
+				if r.Tunnel != "" && cfgs[r.Tunnel] == nil {
+					return fmt.Errorf("hosts.json: 主机 %q 第 %d 条线路引用了不存在的隧道 %q", h.Name, i+1, r.Tunnel)
+				}
+			}
+			continue
+		}
 		if _, _, err := net.SplitHostPort(h.Addr); err != nil {
 			return fmt.Errorf("hosts.json: 主机 %q 的地址 %q 要写成 主机:端口", h.Name, h.Addr)
 		}
@@ -168,11 +211,15 @@ func Run(ctx context.Context, dir string, stdin io.Reader, stdout io.Writer) (er
 	pool := newSSHPool(knownHostsCb)
 	closers = append(closers, pool)
 	for _, h := range conf.Hosts {
-		var d sshterm.Dialer = &net.Dialer{Timeout: dialTimeout}
-		if h.Tunnel != "" {
-			d = tunnels[h.Tunnel]
+		var ds []sshterm.Dialer
+		for _, r := range hostRoutes(h) {
+			var d sshterm.Dialer = &net.Dialer{Timeout: dialTimeout}
+			if r.Tunnel != "" {
+				d = tunnels[r.Tunnel]
+			}
+			ds = append(ds, d)
 		}
-		pool.add(h, d)
+		pool.add(h, ds)
 	}
 
 	open := func(r *http.Request, cols, rows int) (*sshterm.Session, error) {
@@ -203,11 +250,14 @@ func Run(ctx context.Context, dir string, stdin io.Reader, stdout io.Writer) (er
 	// 协助服务（可选）：本机 HTTP 地址和钩子令牌都要在写合并设置文件前拿到
 	var supportLocal, supportHook http.Handler
 	if prep != nil {
-		svc, err := startSupport(prep, dir, expand(conf.KnownHosts), ln.Addr().String(), socksAddrs, pool)
+		svc, fwd, err := startSupport(prep, dir, expand(conf.KnownHosts), ln.Addr().String(), socksAddrs, pool)
 		if err != nil {
 			return err
 		}
 		closers = append(closers, closerFunc(svc.Close))
+		if fwd != nil {
+			closers = append(closers, fwd)
+		}
 		supportLocal, supportHook = svc.LocalHandler(), svc.HookHandler()
 	}
 
@@ -231,19 +281,58 @@ func Run(ctx context.Context, dir string, stdin io.Reader, stdout io.Writer) (er
 	}
 	mux.HandleFunc("/support", supportRoute)
 	mux.HandleFunc("/support/", supportRoute)
-	mux.HandleFunc("/hosts", func(w http.ResponseWriter, r *http.Request) {
-		type item struct {
-			Name      string `json:"name"`
-			Tunnel    string `json:"tunnel"`
-			Connected bool   `json:"connected"`
-			Error     string `json:"error"`
+	type hostItem struct {
+		Name      string `json:"name"`
+		Tunnel    string `json:"tunnel"`
+		Connected bool   `json:"connected"`
+		Error     string `json:"error"`
+		routeState
+	}
+	itemOf := func(h hostConf) hostItem {
+		connected, lastErr := pool.info(h.Name)
+		rs := pool.routeInfo(h.Name)
+		tunnel := h.Tunnel
+		if rs.Active >= 0 && rs.Active < len(rs.Routes) {
+			tunnel = rs.Routes[rs.Active].Tunnel // 当前线路的隧道
 		}
-		list := []item{}
+		return hostItem{h.Name, tunnel, connected, lastErr, rs}
+	}
+	mux.HandleFunc("/hosts", func(w http.ResponseWriter, r *http.Request) {
+		list := []hostItem{}
 		for _, h := range conf.Hosts {
-			connected, lastErr := pool.info(h.Name)
-			list = append(list, item{h.Name, h.Tunnel, connected, lastErr})
+			list = append(list, itemOf(h))
 		}
 		writeJSON(w, list)
+	})
+	// 切换线路：用户在页面上同意后才切；和协助的开始/停止一样，只许从 xxyi 页面发起
+	mux.HandleFunc("/hosts/route", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			errJSON(w, http.StatusMethodNotAllowed, "请用 POST")
+			return
+		}
+		if o := r.Header.Get("Origin"); o == "" || !originAllowed(o, conf.AllowedOrigins) {
+			errJSON(w, http.StatusForbidden, "需要从 xxyi 页面操作")
+			return
+		}
+		h, ok := hostOf(w, r, hosts)
+		if !ok {
+			return
+		}
+		idx, err := strconv.Atoi(r.URL.Query().Get("route"))
+		if err != nil {
+			errJSON(w, http.StatusBadRequest, "route 要是整数")
+			return
+		}
+		if err := pool.switchRoute(h.Name, idx); err != nil {
+			var re *routeError
+			if errors.As(err, &re) && re.notFound {
+				errJSON(w, http.StatusNotFound, "未知主机")
+			} else {
+				errJSON(w, http.StatusBadRequest, err.Error())
+			}
+			return
+		}
+		writeJSON(w, itemOf(h))
 	})
 
 	// tmux 会话管理。写操作用 POST 但不带请求体和自定义头，

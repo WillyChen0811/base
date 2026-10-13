@@ -24,11 +24,27 @@
   ```
   `tunnel` 为空表示直连不走隧道；`allowed_origins` 是允许连终端的网页来源（主机:端口）；
   私钥也可以只放在 ssh-agent 里。
+- 多线路（可选）：同一台主机有多条路能到时，用 `routes` 代替 `tunnel`/`addr`（两种写法只能选一种，否则启动失败）：
+  ```json
+  {"name": "ubuntu", "user": "chenwy", "identity_files": ["~/.ssh/id_ed25519"],
+   "routes": [{"label": "德国", "tunnel": "de",   "addr": "192.168.150.3:22"},
+              {"label": "家里", "tunnel": "home", "addr": "192.168.65.2:22"}]}
+  ```
+  列表第一条是首选，其余是备用；wgtund 每次启动都从首选开始（不记忆上次用哪条）。`label` 可省略（缺省用隧道名，
+  隧道名也空则显示「直连」）；每条线路的 `addr` 要写成 主机:端口，`tunnel` 非空时必须是存在的隧道。
+  首选连不上（拨号 15 秒超时仍失败）时**不会自动切换**，只在状态里标出 `preferred_down`，由用户在页面上同意后才切到备用；
+  走备用期间，wgtund 每 30 秒在后台探测一次首选的 TCP 端口，通了只标出 `preferred_back`，是否切回同样由用户决定。
+  不写 `routes` 的旧配置等于只有一条线路，行为不变。
 
 就绪后往 stdout 写一行 `{"http":"127.0.0.1:端口","token":"…","socks":{…}}`；stdin 关闭即退出。
 HTTP 接口都要带 `token` 参数；每台主机共用一条 SSH 连接（第一次用到才拨，断了自动重拨）：
-- `GET /hosts`：主机清单，每项 `{"name","tunnel","connected","error"}`；
-  `connected` 是共用连接当前是否连着，`error` 是最近一次拨号/断开的原因（没有则空串）。
+- `GET /hosts`：主机清单，每项 `{"name","tunnel","connected","error","routes","active","preferred_down","preferred_back"}`；
+  `tunnel` 是当前线路的隧道名，`connected` 是共用连接当前是否连着，`error` 是最近一次拨号/断开的原因（没有则空串）；
+  `routes` 是线路列表 `[{"label","tunnel","addr"}]`，`active` 是当前线路下标，`preferred_down` 表示首选线路连不上，
+  `preferred_back` 表示走备用期间探测到首选已恢复（没写 `routes` 的主机只有一条线路，两个标记恒为 false）。
+- `POST /hosts/route?host=&route=下标`：切换线路，成功返回该主机在 `/hosts` 里的那一项（切换后的状态）。
+  会关掉旧连接（终端会话随之结束），下次使用时经新线路重连。除主令牌外，还要求请求头 `Origin` 存在且在
+  `allowed_origins` 里，否则 403「需要从 xxyi 页面操作」；`route` 不是整数或越界 400、主机不存在 404、非 POST 405。
 - `GET /status`：隧道握手与流量统计。
 - `GET /sessions?host=`：列 tmux 会话 `{"sessions":[{"name","attached","windows","created","activity"}]}`
   （时间是 Unix 秒；远端没有 tmux 服务时返回空数组）。
@@ -61,6 +77,8 @@ HTTP 接口都要带 `token` 参数；每台主机共用一条 SSH 连接（第�
   `repos`（每项 `dir`、`remote` 都不能空）；`claude_bin` 默认 `claude`；`claude_args` 追加给 Claude 的参数。
 - `git_tunnel`：可选，git 同步经这条隧道的 SOCKS 口走 SSH（须在 `socks` 里有同名条目；
   用 `support.host` 第一个私钥，严格校验 known_hosts）。
+- 主机有多条线路（`routes` 多于一条）时不用写 `git_tunnel`（写了启动失败）：wgtund 会在本机 127.0.0.1 开一个转发口，
+  git 经它自动走主机的当前线路；此时 `support.host` 必须有 `identity_files`（用第一个私钥，同样严格校验 known_hosts）。
 - `claude_tools`：可选，协助 Claude 可用的工具（逗号分隔，仅字母），默认 `Bash,Read,Edit,Write,Glob,Grep`。
 - 不合规时 wgtund 启动失败，错误以 `hosts.json: support…` 开头。
 

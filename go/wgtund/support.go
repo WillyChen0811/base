@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/exec"
@@ -77,7 +78,8 @@ type supportPrep struct {
 	conf     *supportConf
 	workdir  string
 	settings map[string]any // claude_settings 的内容
-	identity string         // support.host 的第一个私钥（仅 git_tunnel 用）
+	identity string         // support.host 的第一个私钥（git_tunnel 或多线路时用）
+	viaRoute bool           // support.host 有多条线路：git 经线路转发口走当前线路
 	denyRead []string       // 要追加进 sandbox.filesystem.denyRead 的路径
 }
 
@@ -318,7 +320,16 @@ func prepareSupport(c *fileConf, dir string) (*supportPrep, error) {
 	}
 
 	p := &supportPrep{conf: sc, workdir: workdir, settings: settings, denyRead: denyRead}
-	if sc.GitTunnel != "" {
+	if len(hostRoutes(*host)) > 1 {
+		if sc.GitTunnel != "" {
+			return nil, bad("的 git_tunnel 不用写：主机 %q 有多条线路，git 会自动走当前线路", host.Name)
+		}
+		if len(host.IdentityFiles) == 0 {
+			return nil, bad("的主机 %q 有多条线路，git 要用它的私钥，但没有 identity_files", host.Name)
+		}
+		p.viaRoute = true
+		p.identity = expand(host.IdentityFiles[0])
+	} else if sc.GitTunnel != "" {
 		if _, ok := c.Socks[sc.GitTunnel]; !ok {
 			return nil, bad("的 git_tunnel %q 在 socks 里没有对应条目", sc.GitTunnel)
 		}
@@ -335,6 +346,55 @@ func gitSSHCommand(socksAddr, knownHosts, identity string) string {
 	return fmt.Sprintf(
 		"GIT_SSH_COMMAND=ssh -o ProxyCommand='nc -X 5 -x %s %%h %%p' -o UserKnownHostsFile=%s -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes -i %s",
 		socksAddr, tmux.Quote(knownHosts), tmux.Quote(identity))
+}
+
+// gitSSHCommandVia 生成 GIT_SSH_COMMAND：git 经本机线路转发口（forwardAddr，形如 127.0.0.1:端口）走 SSH，
+// 转发口会接到主机的当前线路；主机密钥仍按仓库 remote 里写的主机名严格校验，只用指定私钥。
+func gitSSHCommandVia(forwardAddr, knownHosts, identity string) string {
+	host, port, err := net.SplitHostPort(forwardAddr)
+	if err != nil {
+		host, port = forwardAddr, "0"
+	}
+	return fmt.Sprintf(
+		"GIT_SSH_COMMAND=ssh -o ProxyCommand='nc %s %s' -o UserKnownHostsFile=%s -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes -i %s",
+		host, port, tmux.Quote(knownHosts), tmux.Quote(identity))
+}
+
+// routeForwarder 在 127.0.0.1 上开一个转发口：每个进来的连接都拨到主机的当前线路，再双向拷贝。
+func routeForwarder(pool *sshPool, host string) (net.Listener, error) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return nil, err
+	}
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return // 转发口已关闭
+			}
+			go func() {
+				ctx, cancel := context.WithCancel(pool.ctx)
+				defer cancel()
+				up, err := pool.dialActive(ctx, host)
+				if err != nil {
+					c.Close()
+					return
+				}
+				done := make(chan struct{}, 2)
+				cp := func(dst, src net.Conn) {
+					io.Copy(dst, src)
+					done <- struct{}{}
+				}
+				go cp(up, c)
+				go cp(c, up)
+				<-done // 任一方向结束就两边都关
+				c.Close()
+				up.Close()
+				<-done
+			}()
+		}
+	}()
+	return ln, nil
 }
 
 // claudeArgs 生成 Claude 的启动参数：受限模式（忽略用户/项目/本地设置，只认协助设置文件）、
@@ -403,8 +463,9 @@ func mergedSettings(base map[string]any, hookCmd string, denyRead []string) map[
 }
 
 // startSupport 建协助服务。httpAddr 是本机 HTTP 监听地址；socksAddrs 是各 SOCKS 口的实际地址。
+// 主机有多条线路时还会起线路转发口，作为第二个返回值交给调用方在退出时关闭（否则为 nil）。
 // 合并设置文件在 NewService 之后（拿到钩子令牌）才写，Claude 要等用户点开始才会启动。
-func startSupport(p *supportPrep, dir, knownHosts, httpAddr string, socksAddrs map[string]string, pool *sshPool) (*support.Service, error) {
+func startSupport(p *supportPrep, dir, knownHosts, httpAddr string, socksAddrs map[string]string, pool *sshPool) (*support.Service, io.Closer, error) {
 	sc := p.conf
 	merged := filepath.Join(dir, "support-claude.merged.json")
 	bin := expand(sc.ClaudeBin) // 由 xxyi 拉起时 PATH 可能不含 ~/.local/bin，允许写 ~/ 开头的路径
@@ -416,12 +477,25 @@ func startSupport(p *supportPrep, dir, knownHosts, httpAddr string, socksAddrs m
 		repos[n] = support.Repo{Dir: expand(r.Dir), Remote: r.Remote}
 	}
 	var gitEnv []string
-	if sc.GitTunnel != "" {
+	var fwd net.Listener
+	if p.viaRoute {
+		var err error
+		if fwd, err = routeForwarder(pool, sc.Host); err != nil {
+			return nil, nil, fmt.Errorf("support: 开线路转发口失败: %w", err)
+		}
+		gitEnv = []string{gitSSHCommandVia(fwd.Addr().String(), knownHosts, p.identity)}
+	} else if sc.GitTunnel != "" {
 		gitEnv = []string{gitSSHCommand(socksAddrs[sc.GitTunnel], knownHosts, p.identity)}
+	}
+	closeFwd := func() {
+		if fwd != nil {
+			fwd.Close()
+		}
 	}
 	self, err := os.Executable()
 	if err != nil {
-		return nil, fmt.Errorf("support: 找不到 wgtund 自身路径: %w", err)
+		closeFwd()
+		return nil, nil, fmt.Errorf("support: 找不到 wgtund 自身路径: %w", err)
 	}
 	svc := support.NewService(support.Config{
 		Runner:  support.RunnerConfig{Bin: bin, Dir: p.workdir, Args: claudeArgs(sc, merged)},
@@ -441,9 +515,13 @@ func startSupport(p *supportPrep, dir, knownHosts, httpAddr string, socksAddrs m
 	}
 	if err != nil {
 		svc.Close()
-		return nil, fmt.Errorf("support: 写合并设置文件失败: %w", err)
+		closeFwd()
+		return nil, nil, fmt.Errorf("support: 写合并设置文件失败: %w", err)
 	}
-	return svc, nil
+	if fwd == nil {
+		return svc, nil, nil
+	}
+	return svc, fwd, nil
 }
 
 const endpointFile = "~/.xxyi-support/endpoint.json"

@@ -19,7 +19,7 @@ import (
 
 // 轮询参数，测试里可调小。
 var (
-	eventsWait  = 25 // GET /events 的 wait 秒数
+	eventsWait  = 5 // GET /events 的 wait 秒数；短一些，待批请求能及时提示
 	httpTimeout = 60 * time.Second
 	retryDelay  = 2 * time.Second // ask 轮询失败后的重试间隔
 )

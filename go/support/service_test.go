@@ -622,6 +622,9 @@ func TestStopKillsEverything(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("Stop 后挂着的钩子没被叫醒")
 	}
+	if !hasLog(s, "cancelled", func(d map[string]string) bool { return d["reason"] == "协助已结束" && d["id"] != "" }) {
+		t.Fatal("Stop 时挂着的请求应记 cancelled 日志")
+	}
 
 	if fr.unpublishCount() != 1 {
 		t.Fatalf("Unpublish 调用 %d 次，要 1", fr.unpublishCount())

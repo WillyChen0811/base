@@ -266,6 +266,10 @@ func (s *Service) stop(reason string, expired *session) {
 	if timer != nil {
 		timer.Stop()
 	}
+	// CancelAll 让 Ask 正常返回拒绝（不带错误），钩子那边不会记日志，所以在这里逐条记
+	for _, p := range s.queue.Pending() {
+		s.logEvent("cancelled", map[string]string{"id": p.ID, "tool": p.Tool, "reason": "协助已结束"})
+	}
 	s.queue.CancelAll("协助已结束")
 	if srv != nil {
 		_ = srv.Close() // 顺带关掉 listener 上的活动连接

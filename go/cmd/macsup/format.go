@@ -138,7 +138,8 @@ func formatEvent(data json.RawMessage) []string {
 		dur, _ := e["duration_ms"].(float64)
 		cost, _ := e["total_cost_usd"].(float64)
 		out = append(out, fmt.Sprintf("== 本轮结束：%s，%v 秒，$%.4f", str(e["subtype"]), dur/1000, cost))
-		if r := str(e["result"]); r != "" {
+		// 成功时 result 就是最后一段助手文字，前面已经打印过；只在出错时补上
+		if r := str(e["result"]); r != "" && e["is_error"] == true {
 			out = append(out, r)
 		}
 	case "exited":

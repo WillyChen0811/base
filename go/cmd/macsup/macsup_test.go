@@ -211,7 +211,7 @@ func TestAskFlow(t *testing.T) {
 	if n := strings.Count(out, "⏸ 等 Mac 上的用户授权：Bash rm -rf x"); n != 1 {
 		t.Errorf("待批提示出现 %d 次：\n%s", n, out)
 	}
-	for _, w := range []string{"== 会话 S，模型 opus", "开始", "== 本轮结束：success，2.5 秒，$0.1235", "完成"} {
+	for _, w := range []string{"== 会话 S，模型 opus", "开始", "== 本轮结束：success，2.5 秒，$0.1235"} {
 		if !strings.Contains(out, w) {
 			t.Errorf("缺少 %q：\n%s", w, out)
 		}
@@ -322,7 +322,8 @@ func TestFormatEvent(t *testing.T) {
 		{"结果数组", `{"type":"user","message":{"content":[{"type":"tool_result","content":[{"type":"text","text":"ab"},{"type":"text","text":"c"}]}]}}`, []string{"  ✓ (3 字)"}},
 		{"错误首行", `{"type":"user","message":{"content":[{"type":"tool_result","is_error":true,"content":"第一行\n第二行"}]}}`, []string{"  ✗ 第一行"}},
 		{"错误截断", `{"type":"user","message":{"content":[{"type":"tool_result","is_error":true,"content":"` + long + `"}]}}`, []string{"  ✗ " + strings.Repeat("长", 200)}},
-		{"result", `{"type":"result","subtype":"success","duration_ms":1500,"total_cost_usd":0.5,"result":"ok"}`, []string{"== 本轮结束：success，1.5 秒，$0.5000", "ok"}},
+		{"result", `{"type":"result","subtype":"success","duration_ms":1500,"total_cost_usd":0.5,"result":"ok"}`, []string{"== 本轮结束：success，1.5 秒，$0.5000"}},
+		{"result出错带文字", `{"type":"result","subtype":"error","is_error":true,"duration_ms":0,"total_cost_usd":0,"result":"坏了"}`, []string{"== 本轮结束：error，0 秒，$0.0000", "坏了"}},
 		{"result无文字", `{"type":"result","subtype":"s","duration_ms":0,"total_cost_usd":0}`, []string{"== 本轮结束：s，0 秒，$0.0000"}},
 		{"exited", `{"type":"exited","code":2,"stderr":"x\ny\n"}`, []string{"== Mac 上的 Claude 已退出：code=2 y"}},
 		{"raw", `{"type":"raw","text":"原文"}`, []string{"原文"}},

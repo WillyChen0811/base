@@ -54,11 +54,60 @@ var ErrMsgNotFound = errors.New("support: 没有这条消息")
 const (
 	maxMsgTextLen  = 64 * 1024   // Text 上限 64KB
 	maxMsgFileLen  = 1024 * 1024 // 附件上限 1MB
-	maxMsgKeep     = 200         // 内存保留的消息条数
+	maxMsgKeep     = 200         // 内存保留的消息条数（只淘汰已结束的）
+	maxMsgOpen     = 50          // 未结束（pending/queued/sync_failed）消息上限，超了拒收新消息
+	maxNameLen     = 100         // 附件名净化后按字节截断的长度
 	maxAutoMinutes = 600         // 自动模式最长分钟数
+
+	unackedTakeTimeout = 60 * time.Second // 出站消息被取走后多久没确认送达就重新排队
+	backoffBase        = 2 * time.Second  // Deliver 失败退避基数
+	backoffMax         = 60 * time.Second // Deliver 失败退避上限
 )
 
+// unackedReason 是取走后超时未确认写进 Reason 的提示语。
+const unackedReason = "取走后 60 秒未确认送达，重新排队"
+
+// deliveredWhileRejectedReason 是送达成功但消息已被拒绝时写进日志的提示语（不改状态）。
+const deliveredWhileRejectedReason = "拒绝时已经送达"
+
 var addrNameIllegal = regexp.MustCompile(`[^A-Za-z0-9._-]`)
+
+// sanitizeText 把 \r\n 统一成 \n 后，去掉除 \n、\t 外的所有 C0 控制字符（0x00–0x1F）、
+// 0x7F 和 C1（U+0080–U+009F），防止终端转义序列混进正文。
+func sanitizeText(text string) string {
+	text = strings.ReplaceAll(text, "\r\n", "\n")
+	return strings.Map(func(r rune) rune {
+		if r == '\n' || r == '\t' {
+			return r
+		}
+		if r < 0x20 || r == 0x7f || (r >= 0x80 && r <= 0x9f) {
+			return -1
+		}
+		return r
+	}, text)
+}
+
+// sanitizeFileName 把不在 [A-Za-z0-9._-] 里的字符换成 '_'，按字节截到 maxNameLen；
+// 结果为空或全是点则报错。先净化再截断，截断点一定落在 ASCII 上，不会切坏多字节字符。
+func sanitizeFileName(name string) (string, error) {
+	var b strings.Builder
+	for _, r := range name {
+		if r >= 'A' && r <= 'Z' || r >= 'a' && r <= 'z' || r >= '0' && r <= '9' ||
+			r == '.' || r == '_' || r == '-' {
+			b.WriteRune(r)
+		} else {
+			b.WriteByte('_')
+		}
+	}
+	out := b.String()
+	if len(out) > maxNameLen {
+		out = out[:maxNameLen]
+	}
+	if out == "" || strings.Trim(out, ".") == "" {
+		return "", fmt.Errorf("support: 附件 FileName %q 净化后为空或全是点", name)
+	}
+	return out, nil
+}
 
 // ValidAddr 校验中转地址：必须是 "mac:<名>" 或 "ubuntu:<名>"，
 // 名字 1..64 字节，只允许 ASCII 字母数字和 . _ -。
@@ -91,10 +140,13 @@ type HubConfig struct {
 type Hub struct {
 	mu        sync.Mutex
 	cfg       HubConfig
-	msgs      []Message       // 按加入顺序（即创建时间先后），File 一直留在msgs 里，取用时给完整内容
-	outbox    []string        // 等 mac: 接收方取的消息 ID，按放入顺序；内容以 h.msgs 当前值为准
-	outPlaced map[string]bool // 已放进过 outbox 的消息 ID（同一条只放一次，取走也不再加）
-	inflight  map[string]bool // 正在 pumpOne 处理（Sync/Deliver）的消息 ID，防并发双发；整个 pumpOne 结束才释放
+	msgs      []Message            // 按加入顺序（即创建时间先后），File 一直留在msgs 里，取用时给完整内容
+	outbox    []string             // 等 mac: 接收方取的消息 ID，按放入顺序；内容以 h.msgs 当前值为准
+	outPlaced map[string]bool      // 已放进过 outbox 的消息 ID（同一条只放一次；取走后超时未确认才允许重放）
+	inflight  map[string]bool      // 正在 pumpOne 处理（Sync/Deliver）的消息 ID，防并发双发；整个 pumpOne 结束才释放
+	takenAt   map[string]time.Time // 出站消息被 TakeOutbox 取走的时间；超时未确认由 pumpOne 重新排队
+	nextTry   map[string]time.Time // Deliver 失败后的下次可重试时间（指数退避）
+	fails     map[string]int       // Deliver 连续失败次数，退避用
 	peers     map[string]PeerState
 	autoUntil time.Time     // 零值表示自动模式关闭
 	wakeup    chan struct{} // outbox 有变化或 SetState 时翻转，唤醒长轮询的 TakeOutbox
@@ -107,6 +159,9 @@ func NewHub(cfg HubConfig) *Hub {
 		outbox:    nil,
 		outPlaced: make(map[string]bool),
 		inflight:  make(map[string]bool),
+		takenAt:   make(map[string]time.Time),
+		nextTry:   make(map[string]time.Time),
+		fails:     make(map[string]int),
 		peers:     make(map[string]PeerState),
 		wakeup:    make(chan struct{}),
 	}
@@ -164,23 +219,30 @@ func (h *Hub) removeFromOutboxLocked(id string) bool {
 	return false
 }
 
-// trimLocked 把消息数裁到 maxMsgKeep：优先删最早的已结束消息（delivered/rejected），
-// 都没结束就删最早的。若清理动过 outbox，返回要 close 的 wakeup（锁外 close）。
+// trimLocked 把消息数裁到 maxMsgKeep：只删最早已结束（delivered/rejected）的消息，
+// 一条已结束的都找不到就不删（允许暂时超过 maxMsgKeep，未结束消息另有 Send 的 maxMsgOpen 上限兜底）。
+// 若清理动过 outbox，返回要 close 的 wakeup（锁外 close）。
 // 调用方须持锁。
 func (h *Hub) trimLocked() (wake chan struct{}) {
 	touched := false
 	for len(h.msgs) > maxMsgKeep {
-		idx := 0
+		idx := -1
 		for i, m := range h.msgs {
 			if m.State == MsgDelivered || m.State == MsgRejected {
 				idx = i
 				break
 			}
 		}
+		if idx < 0 {
+			break // 全是未结束的消息：不删，让超限暂时存在
+		}
 		gone := h.msgs[idx]
 		h.msgs = append(h.msgs[:idx], h.msgs[idx+1:]...)
 		delete(h.outPlaced, gone.ID)
 		delete(h.inflight, gone.ID)
+		delete(h.takenAt, gone.ID)
+		delete(h.nextTry, gone.ID)
+		delete(h.fails, gone.ID)
 		if h.removeFromOutboxLocked(gone.ID) {
 			touched = true
 		}
@@ -203,6 +265,12 @@ func (h *Hub) Send(m Message) (string, error) {
 	if m.From == m.To {
 		return "", fmt.Errorf("support: From 与 To 不能相同（%q）", m.From)
 	}
+	// 地址已校验过，前缀相同即同一侧；同侧消息不经中转同步代码，带上只会引起误解
+	if strings.HasPrefix(m.From, "mac:") == strings.HasPrefix(m.To, "mac:") &&
+		(m.Repo != "" || m.Branch != "") {
+		return "", fmt.Errorf("support: 同一台机器上的消息不需要同步代码，去掉 --repo/--branch")
+	}
+	m.Text = sanitizeText(m.Text)
 	if strings.TrimSpace(m.Text) == "" {
 		return "", fmt.Errorf("support: 消息内容不能为空")
 	}
@@ -217,9 +285,11 @@ func (h *Hub) Send(m Message) (string, error) {
 			return "", fmt.Errorf("support: 有附件必须给 FileName")
 		}
 		m.FileName = path.Base(m.FileName)
-		if m.FileName == "" || m.FileName == "." || m.FileName == "/" {
-			return "", fmt.Errorf("support: 附件 FileName %q 无效", m.FileName)
+		cleaned, err := sanitizeFileName(m.FileName)
+		if err != nil {
+			return "", err
 		}
+		m.FileName = cleaned
 	}
 	if (m.Repo == "") != (m.Branch == "") {
 		return "", fmt.Errorf("support: Repo 与 Branch 必须同时给出或同时为空")
@@ -237,6 +307,17 @@ func (h *Hub) Send(m Message) (string, error) {
 	m.Synced = false
 
 	h.mu.Lock()
+	open := 0
+	for i := range h.msgs {
+		switch h.msgs[i].State {
+		case MsgPending, MsgQueued, MsgSyncFailed:
+			open++
+		}
+	}
+	if open >= maxMsgOpen {
+		h.mu.Unlock()
+		return "", fmt.Errorf("support: 未处理的消息太多（%d 条），先处理再发", maxMsgOpen)
+	}
 	for {
 		m.ID = newID()
 		if h.findLocked(m.ID) < 0 {
@@ -353,6 +434,11 @@ func (h *Hub) Decide(id, action string) error {
 		if h.removeFromOutboxLocked(id) {
 			wake = h.flipWakeupLocked()
 		}
+		// 已结束：清退避/取走跟踪，附件不再占内存
+		delete(h.takenAt, id)
+		delete(h.nextTry, id)
+		delete(h.fails, id)
+		cur.File = nil
 	}
 	out := *cur
 	h.mu.Unlock()
@@ -406,12 +492,16 @@ func (h *Hub) TakeOutbox(ctx context.Context, to string) (Message, bool) {
 				k-- // 元素前移，原位重查
 				continue
 			}
+			if h.msgs[i].To != to {
+				continue // outbox 是全局队列，只取发给本收件人的
+			}
 			if busy && !h.msgs[i].Now {
 				continue // 对方还忙，非 now 的按住
 			}
 			out := h.msgs[i]
 			h.outbox = append(h.outbox[:k], h.outbox[k+1:]...)
-			h.peers[to] = PeerBusy // 取走即算送出，置忙避免连发
+			h.takenAt[id] = h.now() // 记取走时间，超时未确认由 pumpOne 重新排队
+			h.peers[to] = PeerBusy  // 取走即算送出，置忙避免连发
 			h.mu.Unlock()
 			return out, true
 		}
@@ -439,6 +529,10 @@ func (h *Hub) MarkDelivered(id string) error {
 		return fmt.Errorf("support: 消息 %s 当前状态 %s，不能确认送达", id, cur.State)
 	}
 	cur.State = MsgDelivered
+	delete(h.takenAt, id)
+	delete(h.nextTry, id)
+	delete(h.fails, id)
+	cur.File = nil // 已结束，附件不再占内存
 	out := *cur
 	h.mu.Unlock()
 
@@ -475,8 +569,9 @@ func (h *Hub) Pump(ctx context.Context) {
 // pumpOne 推进一条 queued 消息。锁内只做检查和落状态，Sync/Deliver 在锁外调用。
 // inflight 一路持有到本函数末尾才释放：同步成功后到送达/进 outbox 之间
 // 若有另一个 Pump 进来，会因 inflight 被挡住，避免双发。
-// 同步回调期间消息可能被 reject/淘汰，每个落状态的点都必须在同一把锁内
+// 同步/送达回调期间消息可能被 reject/淘汰，每个落状态的点都必须在同一把锁内
 // 重查当前状态仍是 queued，否则就地收尾，不再往下送。
+// ctx 已取消时回调结果一概不写状态（取消不等于失败），只释放 inflight。
 func (h *Hub) pumpOne(ctx context.Context, id string) {
 	h.mu.Lock()
 	i := h.findLocked(id)
@@ -485,18 +580,44 @@ func (h *Hub) pumpOne(ctx context.Context, id string) {
 		return
 	}
 	m := h.msgs[i]
+	var reclaimed *Message
+	// 取走后超时未确认：收回取走标记，让它重新进 outbox
+	if taken, ok := h.takenAt[id]; ok && h.now().Sub(taken) > unackedTakeTimeout {
+		delete(h.outPlaced, id)
+		delete(h.takenAt, id)
+		h.msgs[i].Reason = unackedReason
+		cp := h.msgs[i]
+		reclaimed = &cp
+		m = cp
+	}
 	if !m.Now && h.peers[m.To] == PeerBusy {
 		h.mu.Unlock()
+		if reclaimed != nil {
+			h.logMsg(*reclaimed)
+		}
+		return
+	}
+	if next, ok := h.nextTry[id]; ok && h.now().Before(next) {
+		h.mu.Unlock() // 送达失败退避中，Now 也要遵守
+		if reclaimed != nil {
+			h.logMsg(*reclaimed)
+		}
 		return
 	}
 	needSync := m.Repo != "" && !m.Synced
 	macDest := strings.HasPrefix(m.To, "mac:")
 	if h.inflight[id] {
 		h.mu.Unlock()
+		if reclaimed != nil {
+			h.logMsg(*reclaimed)
+		}
 		return
 	}
 	h.inflight[id] = true
 	h.mu.Unlock()
+	if reclaimed != nil {
+		h.logMsg(*reclaimed)
+	}
 
 	if needSync {
 		var err error
@@ -508,10 +629,15 @@ func (h *Hub) pumpOne(ctx context.Context, id string) {
 		h.mu.Lock()
 		continueSend := false
 		var out *Message
-		if j := h.findLocked(id); j >= 0 && h.msgs[j].State == MsgQueued {
+		if ctx.Err() != nil {
+			// 取消不是失败：状态、Reason、Synced 都不动
+			delete(h.inflight, id)
+		} else if j := h.findLocked(id); j >= 0 && h.msgs[j].State == MsgQueued {
 			if err != nil {
 				h.msgs[j].State = MsgSyncFailed
 				h.msgs[j].Reason = err.Error()
+				delete(h.nextTry, id) // 离开 queued，退避作废
+				delete(h.fails, id)
 				cp := h.msgs[j]
 				out = &cp
 			} else {
@@ -527,7 +653,7 @@ func (h *Hub) pumpOne(ctx context.Context, id string) {
 			h.logMsg(*out)
 		}
 		if !continueSend {
-			return // 同步失败，或同步期间被 reject/淘汰
+			return // 同步失败、被取消，或同步期间被 reject/淘汰
 		}
 	}
 
@@ -558,15 +684,33 @@ func (h *Hub) pumpOne(ctx context.Context, id string) {
 	}
 	h.mu.Lock()
 	var out *Message
-	if j := h.findLocked(id); j >= 0 && h.msgs[j].State == MsgQueued {
-		if err != nil {
-			// 保持 queued，只记 Reason；不置忙，下次 Pump 再试。
-			h.msgs[j].Reason = err.Error()
-		} else {
-			h.msgs[j].State = MsgDelivered
-			h.msgs[j].Reason = ""
-			h.peers[m.To] = PeerBusy
+	if ctx.Err() != nil {
+		// 取消不是失败：状态、Reason 都不动
+	} else if j := h.findLocked(id); j >= 0 {
+		if h.msgs[j].State == MsgQueued {
+			if err != nil {
+				// 保持 queued，只记 Reason；指数退避，下次 Pump 到点才再试。
+				h.msgs[j].Reason = err.Error()
+				h.fails[id]++
+				delay := backoffBase << uint(h.fails[id]-1)
+				if delay > backoffMax || delay <= 0 { // 溢出视为封顶
+					delay = backoffMax
+				}
+				h.nextTry[id] = h.now().Add(delay)
+			} else {
+				h.msgs[j].State = MsgDelivered
+				h.msgs[j].Reason = ""
+				h.msgs[j].File = nil // 已结束，附件不再占内存
+				h.peers[m.To] = PeerBusy
+				delete(h.nextTry, id)
+				delete(h.fails, id)
+				cp := h.msgs[j]
+				out = &cp
+			}
+		} else if err == nil {
+			// 送达成功但这期间已被 reject/淘汰：状态不动，只写一条日志提示
 			cp := h.msgs[j]
+			cp.Reason = deliveredWhileRejectedReason
 			out = &cp
 		}
 	}

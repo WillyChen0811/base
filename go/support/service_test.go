@@ -19,7 +19,10 @@ import (
 
 // ---------- 假 Remote 与测试辅助 ----------
 
-type pubRec struct{ addr, token string }
+type pubRec struct {
+	addr, token string
+	until       int64
+}
 
 // fakeRemote 在本机 127.0.0.1:0 起监听；可注入 Open/Publish 失败，
 // 可强行关掉当前 listener 模拟断线。
@@ -50,7 +53,7 @@ func (f *fakeRemote) Open(ctx context.Context) (net.Listener, error) {
 	return ln, nil
 }
 
-func (f *fakeRemote) Publish(ctx context.Context, addr, token string) error {
+func (f *fakeRemote) Publish(ctx context.Context, addr, token string, until int64) error {
 	f.mu.Lock()
 	g, ent := f.gate, f.entered
 	f.mu.Unlock()
@@ -66,7 +69,7 @@ func (f *fakeRemote) Publish(ctx context.Context, addr, token string) error {
 	if f.publishErr != nil {
 		return f.publishErr
 	}
-	f.publishes = append(f.publishes, pubRec{addr, token})
+	f.publishes = append(f.publishes, pubRec{addr, token, until})
 	return nil
 }
 
@@ -290,18 +293,39 @@ func TestStartValidationAndPublish(t *testing.T) {
 		t.Fatalf("远端 Status 正文不对: %s", body)
 	}
 
-	// 延长时长：令牌不变、不再 Publish、Until 顺延
+	// 延长时长：令牌、地址不变，重新 Publish 一次新的截止时间
 	if err := s.Start(60); err != nil {
 		t.Fatalf("延长 Start: %v", err)
 	}
-	if fr.publishCount() != 1 {
-		t.Fatalf("延长不该再 Publish，count=%d", fr.publishCount())
+	if fr.publishCount() != 2 {
+		t.Fatalf("延长应重新 Publish 一次，count=%d", fr.publishCount())
 	}
-	if fr.publishRec(0).token != rec.token {
-		t.Fatal("延长应保持原令牌")
+	rec2 := fr.publishRec(1)
+	if rec2.token != rec.token || rec2.addr != rec.addr {
+		t.Fatalf("延长应保持原令牌和地址: %+v vs %+v", rec2, rec)
+	}
+	if rec.until < now+29*60 || rec.until > now+31*60 {
+		t.Fatalf("首次发布的 until = %d，要在现在±30分钟附近", rec.until)
+	}
+	if rec2.until < time.Now().Unix()+59*60 {
+		t.Fatalf("延长后发布的 until = %d，要到 60 分钟后", rec2.until)
 	}
 	if st2 := s.Status(); st2.Until < time.Now().Unix()+59*60 {
 		t.Fatalf("延长后 Until = %d，要到 60 分钟后", st2.Until)
+	}
+
+	// 延长时发布失败：只记日志，不报错
+	fr.setPublishErr(errors.New("写不进远端"))
+	if err := s.Start(90); err != nil {
+		t.Fatalf("延长时发布失败不该报错: %v", err)
+	}
+	fr.setPublishErr(nil)
+	found := false
+	for _, e := range s.Log() {
+		found = found || (e.Kind == "remote" && e.Detail["event"] == "republish_failed")
+	}
+	if !found {
+		t.Fatal("延长时发布失败应记 republish_failed 日志")
 	}
 }
 
@@ -1132,4 +1156,69 @@ func newServer(t *testing.T, h http.Handler) *httptest.Server {
 	srv := httptest.NewServer(h)
 	t.Cleanup(srv.Close)
 	return srv
+}
+
+// 待批达到上限后，新的钩子请求直接拒绝并记 ask_rejected。
+func TestHookPendingLimit(t *testing.T) {
+	old := maxPending
+	maxPending = 2
+	t.Cleanup(func() { maxPending = old })
+
+	s, _ := newTestService(t, Config{HookWait: 10 * time.Second})
+	hsrv := newServer(t, s.HookHandler())
+	if err := s.Start(30); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	hookURL := hsrv.URL + "/support/hook"
+	var wg sync.WaitGroup
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func() { defer wg.Done(); hookPost(t, hookURL, s.HookToken(), hookBody) }()
+	}
+	defer wg.Wait()
+	defer s.Stop("测试结束") // 放掉挂着的两条钩子
+	waitFor(t, 5*time.Second, "两条待批出现", func() bool { return len(s.Status().Pending) == 2 })
+
+	code, body := hookPost(t, hookURL, s.HookToken(), hookBody)
+	if code != 200 {
+		t.Fatalf("超限应返回 200 + 拒绝: %d %s", code, body)
+	}
+	if b, m := hookDecisionOf(t, body); b != "deny" || m != "待批请求太多" {
+		t.Fatalf("超限应拒绝「待批请求太多」: %s %s", b, m)
+	}
+	if n := len(s.Status().Pending); n != 2 {
+		t.Fatalf("被拒的请求不该进待批，Pending=%d", n)
+	}
+	found := false
+	for _, e := range s.Log() {
+		found = found || e.Kind == "ask_rejected"
+	}
+	if !found {
+		t.Fatal("应记 ask_rejected 日志")
+	}
+}
+
+// Claude 正在工作时拒绝同步。
+func TestRemoteSyncWhileBusy(t *testing.T) {
+	old := stopGrace
+	stopGrace = 200 * time.Millisecond
+	t.Cleanup(func() { stopGrace = old })
+
+	local, remote := setupTestRepos(t)
+	makeCommit(t, local, "file1")
+	pushDefault(t, local, remote)
+	s, fr := newTestService(t, Config{Repos: map[string]Repo{"app": {Dir: local, Remote: remote}}})
+	if err := s.Start(30); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	base := "http://" + s.Status().RemoteAddr
+	token := fr.publishRec(0).token
+	if code, b := remoteDo(t, http.MethodPost, base+"/task", token, []byte("hang")); code != 200 {
+		t.Fatalf("发任务: %d %s", code, b)
+	}
+	waitFor(t, 5*time.Second, "Claude 忙碌", func() bool { return s.Status().Claude.Busy })
+	code, body := remoteDo(t, http.MethodPost, base+"/sync?repo=app&branch=master", token, nil)
+	if code != 409 || !strings.Contains(string(body), "Mac 上的 Claude 正在工作，稍后再同步") {
+		t.Fatalf("忙碌时同步应 409: %d %s", code, body)
+	}
 }

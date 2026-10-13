@@ -29,6 +29,7 @@ type fakeMac struct {
 	syncErr bool
 	afters  []int64 // 非探测的 /events 请求的 after
 	failN   int     // 前 N 次轮询（非探测）的 /events 返回 500
+	onFail  func()  // 非 nil 时每次注入失败前调用
 }
 
 func (f *fakeMac) handler() http.Handler {
@@ -70,6 +71,9 @@ func (f *fakeMac) handler() http.Handler {
 		f.afters = append(f.afters, after)
 		if f.failN > 0 {
 			f.failN--
+			if f.onFail != nil {
+				f.onFail()
+			}
 			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
@@ -347,5 +351,44 @@ func TestFormatEvent(t *testing.T) {
 				t.Errorf("got %q want %q", got, c.want)
 			}
 		})
+	}
+}
+
+// 端点文件里的 until 已过期：不发请求，直接报到期。
+func TestExpiredEndpoint(t *testing.T) {
+	f := &fakeMac{}
+	ep := setup(t, f, testToken)
+	b, _ := json.Marshal(endpoint{Addr: "127.0.0.1:1", Token: testToken, Until: time.Now().Add(-time.Minute).Unix()})
+	if err := os.WriteFile(ep, b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	code, _, errs := runCmd([]string{"-endpoint", ep, "status"}, "")
+	if code != 2 || !strings.Contains(errs, "Mac 上的协助已到期（端点文件过期）") {
+		t.Fatalf("code=%d err=%s", code, errs)
+	}
+	f.mu.Lock()
+	n := f.statusN
+	f.mu.Unlock()
+	if n != 0 {
+		t.Errorf("过期时不该发请求，status 被调用 %d 次", n)
+	}
+	// until 在未来则正常
+	srv := httptest.NewServer(f.handler())
+	t.Cleanup(srv.Close)
+	b, _ = json.Marshal(endpoint{Addr: strings.TrimPrefix(srv.URL, "http://"), Token: testToken, Until: time.Now().Add(time.Hour).Unix()})
+	os.WriteFile(ep, b, 0o600)
+	if code, _, errs := runCmd([]string{"-endpoint", ep, "status"}, ""); code != 0 {
+		t.Fatalf("未过期应正常: code=%d err=%s", code, errs)
+	}
+}
+
+// 连续失败 3 次且端点文件已被删：报「Mac 上已停止协助」。
+func TestAskStoppedWhenEndpointRemoved(t *testing.T) {
+	f := &fakeMac{failN: 3}
+	ep := setup(t, f, testToken)
+	f.onFail = func() { os.Remove(ep) }
+	code, _, errs := runCmd([]string{"-endpoint", ep, "ask", "x"}, "")
+	if code != 2 || !strings.Contains(errs, "Mac 上已停止协助") {
+		t.Fatalf("code=%d err=%s", code, errs)
 	}
 }

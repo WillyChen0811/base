@@ -238,7 +238,7 @@ func (r *Runner) startLocked() error {
 
 	cmd := exec.Command(r.cfg.Bin, args...)
 	cmd.Dir = r.cfg.Dir
-	cmd.Env = append(os.Environ(), r.cfg.Env...)
+	cmd.Env = append(claudeEnv(os.Environ()), r.cfg.Env...)
 	setupProc(cmd)
 
 	stdin, err := cmd.StdinPipe()
@@ -273,6 +273,24 @@ func (r *Runner) startLocked() error {
 		r.finish(cmd, stderr)
 	}()
 	return nil
+}
+
+// claudeEnv 从环境里挑出该传给 Claude 的变量（白名单），其余（如各种密钥）不继承。
+func claudeEnv(environ []string) []string {
+	keep := map[string]bool{
+		"PATH": true, "HOME": true, "USER": true, "LOGNAME": true, "SHELL": true,
+		"TMPDIR": true, "LANG": true, "TERM": true, "TZ": true,
+		"http_proxy": true, "https_proxy": true, "no_proxy": true, "all_proxy": true,
+		"HTTP_PROXY": true, "HTTPS_PROXY": true, "NO_PROXY": true, "ALL_PROXY": true,
+	}
+	var out []string
+	for _, kv := range environ {
+		k, _, _ := strings.Cut(kv, "=")
+		if keep[k] || strings.HasPrefix(k, "LC_") || strings.HasPrefix(k, "ANTHROPIC_") || strings.HasPrefix(k, "CLAUDE_") {
+			out = append(out, kv)
+		}
+	}
+	return out
 }
 
 // finish 在进程退出后落 exited 事件、更新状态、关掉 procDone。

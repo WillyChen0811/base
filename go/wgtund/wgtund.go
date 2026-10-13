@@ -125,7 +125,7 @@ func Run(ctx context.Context, dir string, stdin io.Reader, stdout io.Writer) (er
 			return fmt.Errorf("hosts.json: socks 地址 %q 必须是回环地址", addr)
 		}
 	}
-	prep, err := prepareSupport(conf)
+	prep, err := prepareSupport(conf, dir)
 	if err != nil {
 		return err
 	}
@@ -216,6 +216,16 @@ func Run(ctx context.Context, dir string, stdin io.Reader, stdout io.Writer) (er
 		if supportLocal == nil {
 			errJSON(w, http.StatusNotFound, "没有配置协助")
 			return
+		}
+		// 开始/停止/批准只许从 xxyi 页面发起：要求带白名单内的 Origin（curl 等没有 Origin 的调用拿主令牌也不行）
+		if r.Method == http.MethodPost {
+			switch r.URL.Path {
+			case "/support/start", "/support/stop", "/support/decide":
+				if o := r.Header.Get("Origin"); o == "" || !originAllowed(o, conf.AllowedOrigins) {
+					errJSON(w, http.StatusForbidden, "需要从 xxyi 页面操作")
+					return
+				}
+			}
 		}
 		supportLocal.ServeHTTP(w, r)
 	}

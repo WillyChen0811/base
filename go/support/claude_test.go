@@ -698,3 +698,39 @@ func TestConcurrentStopSend(t *testing.T) {
 		t.Fatalf("最终 Stop 后不应在跑: %+v", st)
 	}
 }
+
+// Claude 子进程只继承白名单环境变量，不继承其他（如密钥）。
+func TestClaudeEnvWhitelist(t *testing.T) {
+	t.Setenv("FOO_SECRET", "s3cret")
+	t.Setenv("CLAUDE_TEST_KEEP", "yes")
+	t.Setenv("LC_ALL", "C")
+	t.Setenv("https_proxy", "http://p:1")
+	var keys []string
+	for _, kv := range claudeEnv(os.Environ()) {
+		k, _, _ := strings.Cut(kv, "=")
+		keys = append(keys, k)
+	}
+	has := func(k string) bool {
+		for _, x := range keys {
+			if x == k {
+				return true
+			}
+		}
+		return false
+	}
+	if has("FOO_SECRET") {
+		t.Error("FOO_SECRET 不该传给 claude")
+	}
+	for _, k := range []string{"PATH", "CLAUDE_TEST_KEEP", "LC_ALL", "https_proxy"} {
+		if !has(k) {
+			t.Errorf("%s 应传给 claude", k)
+		}
+	}
+
+	// 真实启动：额外的 cfg.Env 仍会追加
+	r, _ := newTestRunner(t, RunnerConfig{Env: []string{"EXTRA_OK=1"}})
+	if err := r.Send("hi"); err != nil {
+		t.Fatal(err)
+	}
+	waitEvents(t, r, func(ev []Event) bool { return len(ev) >= 3 })
+}

@@ -34,6 +34,7 @@ const (
 type endpoint struct {
 	Addr  string `json:"addr"`
 	Token string `json:"token"`
+	Until int64  `json:"until"` // 协助截止时间（Unix 秒）；0 或缺省表示未知
 }
 
 type client struct {
@@ -149,6 +150,10 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "端点文件格式不对：%s\n", *epPath)
 		return exitErr
 	}
+	if ep.Until > 0 && ep.Until < time.Now().Unix() {
+		fmt.Fprintln(stderr, "Mac 上的协助已到期（端点文件过期）")
+		return exitErr
+	}
 	c := &client{base: "http://" + ep.Addr, token: ep.Token, hc: &http.Client{Timeout: httpTimeout}}
 
 	var code int
@@ -159,7 +164,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	case "sync":
 		code, err = cmdSync(c, cargs, stdout)
 	case "ask":
-		code, err = cmdAsk(c, cargs, stdin, stdout, *timeout)
+		code, err = cmdAsk(c, cargs, stdin, stdout, *timeout, *epPath)
 	case "events":
 		code, err = cmdEvents(c, cargs, stdout)
 	case "stop-claude":
@@ -260,7 +265,7 @@ func printEvent(out io.Writer, data json.RawMessage) {
 	}
 }
 
-func cmdAsk(c *client, args []string, stdin io.Reader, out io.Writer, timeout time.Duration) (int, error) {
+func cmdAsk(c *client, args []string, stdin io.Reader, out io.Writer, timeout time.Duration, epPath string) (int, error) {
 	if len(args) != 1 {
 		return 0, errors.New("用法：macsup ask <任务文字|->")
 	}
@@ -294,9 +299,13 @@ func cmdAsk(c *client, args []string, stdin io.Reader, out io.Writer, timeout ti
 	seen := map[string]bool{}
 	fails := 0
 	// fail 记一次连续失败；达到 3 次返回错误，否则等一会儿再试。
+	// 此时端点文件若已被删（Mac 停止协助时会撤销），说明是对方主动停了，不是网络问题。
 	fail := func(err error) error {
 		fails++
 		if fails >= 3 {
+			if _, serr := os.Stat(epPath); errors.Is(serr, fs.ErrNotExist) {
+				return errors.New("Mac 上已停止协助")
+			}
 			return err
 		}
 		time.Sleep(retryDelay)

@@ -67,22 +67,42 @@ HTTP 接口都要带 `token` 参数；每台主机共用一条 SSH 连接（第�
 安全要求（启动时检查）：
 - `claude_settings` 必须是 JSON 对象，且 `sandbox.enabled` 为 `true`、`sandbox.allowUnsandboxedCommands` 为 `false`、
   `sandbox.failIfUnavailable` 为 `true`；`permissions.defaultMode` 若有，只能是 `default` 或 `manual`。
-- `claude_args` 不许出现 `--dangerously-skip-permissions`、`--allow-dangerously-skip-permissions`、`--permission-mode`、
-  `--permission-prompts`、`--settings`、`--permission-prompt-tool`，以及由 wgtund 固定给出的
-  `--restricted`、`--safe-mode`、`--setting-sources`、`--tools`、`--allowedTools`/`--allowed-tools`、
-  `--disallowedTools`/`--disallowed-tools`、`--mcp-config`、`--strict-mcp-config`、`--add-dir`、`--plugin-dir`、`--agents`
-  （含 `--xxx=值` 写法）：协助要求权限由用户批准。
-- 协助的 Claude 运行在受限模式：启动参数固定为 `--restricted --strict-mcp-config --tools <claude_tools>
-  --settings <合并文件>`，并为每个仓库加 `--add-dir <dir>`（按仓库名排序），再接 `claude_args`。
+- `sandbox.autoAllowBashIfSandboxed` 必须显式写出（布尔值），两种选择的含义：
+  `true` = 沙盒内的命令不经你批准直接运行（只能写工作目录和仓库、网络受限），不会触发授权钩子；
+  `false` = 每条命令都弹给你批准。
+- 禁止削弱沙盒、让沙盒内连回本机服务（否则 Claude 可能拿到主令牌自己批准）：
+  `sandbox.network.allowLocalBinding`、`sandbox.network.allowAllUnixSockets`、`sandbox.enableWeakerNetworkIsolation`、
+  `sandbox.enableWeakerNestedSandbox`、`sandbox.filesystem.disabled` 不许为 `true`；
+  `sandbox.network.allowUnixSockets` 必须为空；`sandbox.network.allowedDomains` 里不许有
+  `localhost`、`*.localhost`、`127.*`、`::1`、`0.0.0.0`（去掉端口、不分大小写）。
+  另外 `disableAllHooks`、`allowManagedHooksOnly` 不许为 `true`（合并设置时也会强制 `disableAllHooks=false`、删掉 `allowManagedHooksOnly`）。
+- 自动追加 `sandbox.filesystem.denyRead`（系统级禁读，保留你原有的条目、去重）：`~/.ssh`、wgtund 配置目录、
+  `claude_settings` 所在目录、wgtund 可执行文件所在目录。
+- 目录隔离：配置目录、`claude_settings` 所在目录、wgtund 所在目录，都必须与 `workdir` 以及每个仓库 `dir`
+  互不包含（符号链接解开后按路径分段比较）。原因：Claude 能写工作目录和仓库，若它们包含配置就能改掉钩子。
+  每个仓库的 `dir` 必须存在且是 git 仓库顶层，两个仓库名不能指向同一目录。
+- `claude_args` 是白名单：只允许 `--model`、`--fallback-model`、`--effort`、`--max-budget-usd`、`--max-turns`、
+  `--append-system-prompt`，每个都必须带值（`--x 值` 或 `--x=值`，值不能以 `-` 开头）；出现任何别的参数
+  （包括不认识的和位置参数）都启动失败。权限、工具、目录等由 wgtund 固定给出。
+- 协助的 Claude 运行在受限模式：启动参数固定为 `--restricted --permission-prompts none --strict-mcp-config
+  --tools <claude_tools> --settings <合并文件>`，并为每个仓库加 `--add-dir <dir>`（按仓库名排序），再接 `claude_args`。
   因此只读协助设置文件，不受用户全局/项目/本地设置（allow 规则、MCP 服务器等）影响；
-  文件工具只能访问 `workdir` 和各仓库目录；只有 `claude_tools` 点名的工具可用。
+  文件工具只能访问 `workdir` 和各仓库目录；只有 `claude_tools` 点名的工具可用；
+  `--permission-prompts none` 下授权请求仍会触发 `PermissionRequest` 钩子，由钩子交给你批准。
+  Claude 子进程只继承白名单环境变量（`PATH HOME USER LOGNAME SHELL TMPDIR LANG TERM TZ`、`LC_*`、`ANTHROPIC_*`、
+  `CLAUDE_*`、各种 `*_proxy`），其余不传。
 - 每次启动，wgtund 把 `claude_settings` 复制一份、覆盖其中的 `hooks.PermissionRequest`（指向下面的钩子子命令，
   失败即拒绝），写到配置目录的 `support-claude.merged.json`（权限 600），Claude 用 `--settings` 读它；其余设置保留。
   审计日志在配置目录的 `support-log.jsonl`。
+- 远端 sshd 的 `GatewayPorts` 必须是 `no` 或 `clientspecified`：开监听后 wgtund 会检查实际地址是回环，否则报错并不启动协助。
+- 远端 `endpoint.json` 内容为 `{"addr","token","until"}`，`until` 是截止时间（Unix 秒，延长时会重写）；
+  `macsup` 发现已过期会直接报「Mac 上的协助已到期」，不发请求。
+- 待批请求最多 50 条，超出的钩子请求直接拒绝；Claude 正在工作时 `/sync` 返回 409。
 
 本机接口（同样要主令牌和 CORS 规则）：
 - `GET /support`：状态与最近日志。
-- `POST /support/start?minutes=N`（1..240）、`POST /support/stop`、`POST /support/decide?id=&allow=1|0[&message=]`。
+- `POST /support/start?minutes=N`（1..240）、`POST /support/stop`、`POST /support/decide?id=&allow=1|0[&message=]`：
+  除主令牌外，还要求请求头 `Origin` 存在且在 `allowed_origins` 里，否则 403「需要从 xxyi 页面操作」（`GET /support` 不要求）。
 - `POST /support/hook?token=<钩子令牌>`：不走主令牌，由协助服务自己校验钩子令牌；只供下面的子命令使用。
 
 钩子子命令：`wgtund support-hook [http://127.0.0.1:端口/support/hook?token=…]`

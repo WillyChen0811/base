@@ -22,9 +22,9 @@ import (
 
 // Remote 由调用方（wgtund）实现：在远端主机上开监听、发布/撤销入口信息。
 type Remote interface {
-	Open(ctx context.Context) (net.Listener, error)        // 在远端开监听；Accept 到的连接由本服务处理
-	Publish(ctx context.Context, addr, token string) error // 把入口地址和远端令牌写到远端
-	Unpublish(ctx context.Context) error                   // 删掉远端的入口信息
+	Open(ctx context.Context) (net.Listener, error)                     // 在远端开监听；Accept 到的连接由本服务处理
+	Publish(ctx context.Context, addr, token string, until int64) error // 把入口地址、远端令牌和截止时间（Unix 秒）写到远端
+	Unpublish(ctx context.Context) error                                // 删掉远端的入口信息
 }
 
 // Config 是协助服务的配置；零值不自带任何项目默认值。
@@ -49,7 +49,7 @@ type Status struct {
 // LogEntry 是一条审计日志。
 type LogEntry struct {
 	Time   time.Time         `json:"time"`
-	Kind   string            `json:"kind"` // start / stop / task / ask / decide / timeout / cancelled / sync / remote
+	Kind   string            `json:"kind"` // start / stop / task / ask / ask_rejected / decide / timeout / cancelled / sync / remote
 	Detail map[string]string `json:"detail"`
 }
 
@@ -58,6 +58,8 @@ var (
 	reconnectDelay = 5 * time.Second
 	// minuteUnit 是 Start 里一分钟的实际长度；测试可调小。
 	minuteUnit = time.Minute
+	// maxPending 是待批请求的上限，超出的钩子请求直接拒绝；测试可调小。
+	maxPending = 50
 )
 
 const (
@@ -68,7 +70,7 @@ const (
 	maxDecideMessage = 500             // 本机批准/拒绝附言的上限（按 rune）
 	maxLogEntries    = 200             // 内存里保留的日志条数
 	syncTimeout      = 3 * time.Minute // 单次同步上限
-	remoteOpWait     = 30 * time.Second
+	remoteOpWait     = 10 * time.Second
 	stopDrainWait    = 10 * time.Second // Stop 等在途 handler 退出多久后改为先停 Claude
 	unpublishWait    = 5 * time.Second
 )
@@ -186,9 +188,18 @@ func (s *Service) Start(minutes int) error {
 		if s.timer != nil {
 			s.timer.Reset(time.Until(s.until))
 		}
-		addr := s.remoteAddr
+		addr, sess, until := s.remoteAddr, s.sess, s.until
 		s.mu.Unlock()
 		s.logEvent("start", map[string]string{"minutes": strconv.Itoa(minutes), "reason": "延长时长", "addr": addr})
+		// 把新的截止时间写到远端；失败只记日志（远端文件里的旧时间只会让 macsup 更早提示过期）
+		if addr != "" && sess != nil {
+			ctx, cancel := sess.opCtx(remoteOpWait)
+			err := s.remote.Publish(ctx, addr, sess.token, until.Unix())
+			cancel()
+			if err != nil {
+				s.logEvent("remote", map[string]string{"event": "republish_failed", "error": err.Error()})
+			}
+		}
 		return nil
 	}
 	s.mu.Unlock()
@@ -204,8 +215,9 @@ func (s *Service) Start(minutes int) error {
 		return fmt.Errorf("support: 开远端监听失败: %w", err)
 	}
 	addr := ln.Addr().String()
+	until := time.Now().Add(dur)
 	ctx2, cancel2 := sess.opCtx(remoteOpWait)
-	err = s.remote.Publish(ctx2, addr, sess.token)
+	err = s.remote.Publish(ctx2, addr, sess.token, until.Unix())
 	cancel2()
 	if err != nil {
 		_ = ln.Close()
@@ -220,7 +232,7 @@ func (s *Service) Start(minutes int) error {
 	srv := newRemoteServer(s.remoteMux(sess))
 	s.mu.Lock()
 	s.active = true
-	s.until = time.Now().Add(dur)
+	s.until = until
 	s.sess = sess
 	s.remoteAddr = addr
 	s.srv = srv
@@ -263,6 +275,7 @@ func (s *Service) stop(reason string, expired *session) {
 	sess.cancel()
 	s.mu.Unlock()
 
+	go s.runner.Stop() // 让 Claude 尽快停；下面还有同步的 Stop 兜底（Runner.Stop 可并发、幂等）
 	if timer != nil {
 		timer.Stop()
 	}
@@ -389,8 +402,11 @@ func (s *Service) reconnectLoop(sess *session) (net.Listener, *http.Server) {
 			continue
 		}
 		addr := ln.Addr().String()
+		s.mu.Lock()
+		until := s.until
+		s.mu.Unlock()
 		ctx2, cancel2 := sess.opCtx(remoteOpWait)
-		err = s.remote.Publish(ctx2, addr, sess.token)
+		err = s.remote.Publish(ctx2, addr, sess.token, until.Unix())
 		cancel2()
 		if err != nil {
 			_ = ln.Close()
@@ -552,6 +568,12 @@ func (s *Service) remoteSync(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	detail := map[string]string{"repo": name, "branch": branch}
+	if s.runner.State().Busy {
+		detail["result"] = "Claude 正在工作"
+		s.logEvent("sync", detail)
+		errJSON(w, http.StatusConflict, "Mac 上的 Claude 正在工作，稍后再同步")
+		return
+	}
 	lock := s.syncLocks[name]
 	lock.Lock() // 同一仓库的同步串行
 	defer lock.Unlock()
@@ -719,6 +741,12 @@ func (s *Service) HookHandler() http.Handler {
 		defer sess.wg.Done()
 		if sess.ctx.Err() != nil {
 			deny(http.StatusOK, "协助已结束")
+			return
+		}
+
+		if len(s.queue.Pending()) >= maxPending {
+			s.logEvent("ask_rejected", map[string]string{"tool": h.Tool, "summary": Summarize(h.Tool, h.Input), "reason": "待批请求太多"})
+			deny(http.StatusOK, "待批请求太多")
 			return
 		}
 

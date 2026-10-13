@@ -67,50 +67,29 @@ HTTP 接口都要带 `token` 参数；每台主机共用一条 SSH 连接（第�
     "claude_bin": "claude",
     "workdir": "~/xxyi-work",
     "claude_settings": "~/.xxyi/support-claude.json",
-    "claude_tools": "Bash,Read,Edit,Write,Glob,Grep",
     "claude_args": ["--model", "sonnet", "--max-budget-usd", "5"],
     "repos": {"xxyi": {"dir": "~/Documents/codes/xxyi", "remote": "ssh://chenwy@10.0.0.2/home/chenwy/xxyi"}},
     "git_tunnel": "home"
   }
   ```
-- `host`（必填，须在 hosts 里）、`workdir`（必填，须是已存在的目录）、`claude_settings`（必填）、
-  `repos`（每项 `dir`、`remote` 都不能空）；`claude_bin` 默认 `claude`；`claude_args` 追加给 Claude 的参数。
+- `host`（必填，须在 hosts 里）、`workdir`（必填，须是已存在的目录）、`claude_settings`（可选，Claude Code 设置文件）、
+  `repos`（每项 `dir`、`remote` 都不能空）；`claude_bin` 默认 `claude`；`claude_args` 原样追加给 Claude 的参数（不校验）。旧配置里的 `claude_tools` 已废弃，写了也被忽略。
 - `git_tunnel`：可选，git 同步经这条隧道的 SOCKS 口走 SSH（须在 `socks` 里有同名条目；
   用 `support.host` 第一个私钥，严格校验 known_hosts）。
 - 主机有多条线路（`routes` 多于一条）时不用写 `git_tunnel`（写了启动失败）：wgtund 会在本机 127.0.0.1 开一个转发口，
   git 经它自动走主机的当前线路；此时 `support.host` 必须有 `identity_files`（用第一个私钥，同样严格校验 known_hosts）。
-- `claude_tools`：可选，协助 Claude 可用的工具（逗号分隔，仅字母），默认 `Bash,Read,Edit,Write,Glob,Grep`。
 - 不合规时 wgtund 启动失败，错误以 `hosts.json: support…` 开头。
 
-安全要求（启动时检查）：
-- `claude_settings` 必须是 JSON 对象，且 `sandbox.enabled` 为 `true`、`sandbox.allowUnsandboxedCommands` 为 `false`、
-  `sandbox.failIfUnavailable` 为 `true`；`permissions.defaultMode` 若有，只能是 `default` 或 `manual`。
-- `sandbox.autoAllowBashIfSandboxed` 必须显式写出（布尔值），两种选择的含义：
-  `true` = 沙盒内的命令不经你批准直接运行（只能写工作目录和仓库、网络受限），不会触发授权钩子；
-  `false` = 每条命令都弹给你批准。
-- 禁止削弱沙盒、让沙盒内连回本机服务（否则 Claude 可能拿到主令牌自己批准）：
-  `sandbox.network.allowLocalBinding`、`sandbox.network.allowAllUnixSockets`、`sandbox.enableWeakerNetworkIsolation`、
-  `sandbox.enableWeakerNestedSandbox`、`sandbox.filesystem.disabled` 不许为 `true`；
-  `sandbox.network.allowUnixSockets` 必须为空；`sandbox.network.allowedDomains` 里不许有
-  `localhost`、`*.localhost`、`127.*`、`::1`、`0.0.0.0`（去掉端口、不分大小写）。
-  另外 `disableAllHooks`、`allowManagedHooksOnly` 不许为 `true`（合并设置时也会强制 `disableAllHooks=false`、删掉 `allowManagedHooksOnly`）。
-- 自动追加 `sandbox.filesystem.denyRead`（系统级禁读，保留你原有的条目、去重）：`~/.ssh`、wgtund 配置目录、
-  `claude_settings` 所在目录、wgtund 可执行文件所在目录。
-- 目录隔离：配置目录、`claude_settings` 所在目录、wgtund 所在目录，都必须与 `workdir` 以及每个仓库 `dir`
-  互不包含（符号链接解开后按路径分段比较）。原因：Claude 能写工作目录和仓库，若它们包含配置就能改掉钩子。
-  每个仓库的 `dir` 必须存在且是 git 仓库顶层，两个仓库名不能指向同一目录。
-- `claude_args` 是白名单：只允许 `--model`、`--fallback-model`、`--effort`、`--max-budget-usd`、`--max-turns`、
-  `--append-system-prompt`，每个都必须带值（`--x 值` 或 `--x=值`，值不能以 `-` 开头）；出现任何别的参数
-  （包括不认识的和位置参数）都启动失败。权限、工具、目录等由 wgtund 固定给出。
-- 协助的 Claude 运行在受限模式：启动参数固定为 `--restricted --permission-prompts none --strict-mcp-config
-  --tools <claude_tools> --settings <合并文件>`，并为每个仓库加 `--add-dir <dir>`（按仓库名排序），再接 `claude_args`。
-  因此只读协助设置文件，不受用户全局/项目/本地设置（allow 规则、MCP 服务器等）影响；
-  文件工具只能访问 `workdir` 和各仓库目录；只有 `claude_tools` 点名的工具可用；
-  `--permission-prompts none` 下授权请求仍会触发 `PermissionRequest` 钩子，由钩子交给你批准。
-  Claude 子进程只继承白名单环境变量（`PATH HOME USER LOGNAME SHELL TMPDIR LANG TERM TZ`、`LC_*`、`ANTHROPIC_*`、
+安全模型（只保留一道）：`PermissionRequest` 钩子。
+- 协助的 Claude 就是普通的 Claude Code，用它自己的设置；所有授权请求都经钩子交给你批准，钩子失败即拒绝。
+- `claude_settings` 可选：不写则合并设置里只有钩子；写了则必须是 JSON 对象，内容（沙盒、权限、`defaultMode` 等）不做校验，照你写的用。
+- 启动参数固定为 `--permission-prompts none --settings <合并文件>`，并为每个仓库加 `--add-dir <dir>`（按仓库名排序），
+  再原样接 `claude_args`（不校验、无白名单）。`--permission-prompts none` 下授权请求仍会触发 `PermissionRequest` 钩子。
+- 每个仓库的 `dir` 必须存在且是 git 仓库顶层，两个仓库名不能指向同一目录。
+- Claude 子进程只继承白名单环境变量（`PATH HOME USER LOGNAME SHELL TMPDIR LANG TERM TZ`、`LC_*`、`ANTHROPIC_*`、
   `CLAUDE_*`、各种 `*_proxy`），其余不传。
-- 每次启动，wgtund 把 `claude_settings` 复制一份、覆盖其中的 `hooks.PermissionRequest`（指向下面的钩子子命令，
-  失败即拒绝），写到配置目录的 `support-claude.merged.json`（权限 600），Claude 用 `--settings` 读它；其余设置保留。
+- 每次开启协助，wgtund 重新读 `claude_settings`（改设置不用重启；文件不是 JSON 对象则开启失败）、复制一份、覆盖其中的 `hooks.PermissionRequest`（指向下面的钩子子命令，
+  失败即拒绝），并强制 `disableAllHooks=false`、删掉 `allowManagedHooksOnly`，写到配置目录的 `support-claude.merged.json`（权限 600），Claude 用 `--settings` 读它；其余设置保留。
   审计日志在配置目录的 `support-log.jsonl`。
 - 远端 sshd 的 `GatewayPorts` 必须是 `no` 或 `clientspecified`：开监听后 wgtund 会检查实际地址是回环，否则报错并不启动协助。
 - 远端 `endpoint.json` 内容为 `{"addr","token","until"}`，`until` 是截止时间（Unix 秒，延长时会重写）；
@@ -119,7 +98,7 @@ HTTP 接口都要带 `token` 参数；每台主机共用一条 SSH 连接（第�
 
 本机接口（同样要主令牌和 CORS 规则）：
 - `GET /support`：状态与最近日志。
-- `POST /support/start?minutes=N`（1..240）、`POST /support/stop`、`POST /support/decide?id=&allow=1|0[&message=]`：
+- `POST /support/start?minutes=N`（1..600）、`POST /support/stop`、`POST /support/decide?id=&allow=1|0[&message=]`：
   除主令牌外，还要求请求头 `Origin` 存在且在 `allowed_origins` 里，否则 403「需要从 xxyi 页面操作」（`GET /support` 不要求）。
 - `POST /support/hook?token=<钩子令牌>`：不走主令牌，由协助服务自己校验钩子令牌；只供下面的子命令使用。
 

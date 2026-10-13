@@ -23,7 +23,7 @@ Ubuntu 上的 Claude 通过这个入口：
 ## 接口约定
 本机（wgtund 主令牌，和现有接口同一套 CORS 规则）：
 - `GET /support` → 状态：`{active, until, host, claude:{running,busy,session_id,error}, pending:[{id,tool,summary,created}]}`
-- `POST /support/start?minutes=N`（1..240）、`POST /support/stop`、`POST /support/decide?id=&allow=1|0`
+- `POST /support/start?minutes=N`（1..600）、`POST /support/stop`、`POST /support/decide?id=&allow=1|0`
 钩子（单独的钩子令牌，只能提交并等待，不能批）：
 - `POST /support/hook`（正文=钩子收到的 JSON）→ 阻塞到用户决定或超时 → 返回钩子输出 JSON。协助没开时立刻拒绝。
 远端（单独的远端令牌，只在反向监听上提供；不含 start/stop/decide）：

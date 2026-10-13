@@ -10,7 +10,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -26,7 +25,6 @@ type supportConf struct {
 	ClaudeBin      string                 `json:"claude_bin"`
 	Workdir        string                 `json:"workdir"`
 	ClaudeSettings string                 `json:"claude_settings"`
-	ClaudeTools    string                 `json:"claude_tools"`
 	ClaudeArgs     []string               `json:"claude_args"`
 	Repos          map[string]supportRepo `json:"repos"`
 	GitTunnel      string                 `json:"git_tunnel"`
@@ -37,50 +35,14 @@ type supportRepo struct {
 	Remote string `json:"remote"`
 }
 
-// claude_args 白名单：只有这些带值的参数可由配置追加。
-// 其余（权限、工具、目录、插件、worktree、位置参数等）一律不许：权限与工具由 wgtund 固定给出。
-var allowedClaudeArgs = []string{
-	"--model", "--fallback-model", "--effort", "--max-budget-usd", "--max-turns", "--append-system-prompt",
-}
-
-// checkClaudeArgs 校验 claude_args：每个参数必须是白名单里的，且带值（"--x 值" 或 "--x=值"，值不能以 - 开头）。
-func checkClaudeArgs(args []string) error {
-	list := strings.Join(allowedClaudeArgs, "、")
-	for i := 0; i < len(args); i++ {
-		name, val, hasEq := strings.Cut(args[i], "=")
-		ok := false
-		for _, w := range allowedClaudeArgs {
-			ok = ok || name == w
-		}
-		if !ok {
-			return fmt.Errorf("的 claude_args 只允许 %s（且必须带值），出现了 %q：协助要求权限由用户在 xxyi 里批准，权限、工具、目录等由 wgtund 固定给出", list, args[i])
-		}
-		if !hasEq {
-			if i+1 >= len(args) {
-				return fmt.Errorf("的 claude_args 只允许 %s（且必须带值），%s 缺值", list, name)
-			}
-			i++
-			val = args[i]
-		}
-		if val == "" || strings.HasPrefix(val, "-") {
-			return fmt.Errorf("的 claude_args 只允许 %s（且必须带值），%s 的值 %q 不合规（不能为空或以 - 开头）", list, name, val)
-		}
-	}
-	return nil
-}
-
-const defaultClaudeTools = "Bash,Read,Edit,Write,Glob,Grep"
-
-var toolsRe = regexp.MustCompile(`^[A-Za-z]+(,[A-Za-z]+)*$`)
-
 // supportPrep 是校验通过后的 support 配置。
 type supportPrep struct {
-	conf     *supportConf
-	workdir  string
-	settings map[string]any // claude_settings 的内容
-	identity string         // support.host 的第一个私钥（git_tunnel 或多线路时用）
-	viaRoute bool           // support.host 有多条线路：git 经线路转发口走当前线路
-	denyRead []string       // 要追加进 sandbox.filesystem.denyRead 的路径
+	conf         *supportConf
+	workdir      string
+	settings     map[string]any // claude_settings 的内容（启动时读的那份）
+	settingsPath string         // claude_settings 的路径（每次开启协助重新读）
+	identity     string         // support.host 的第一个私钥（git_tunnel 或多线路时用）
+	viaRoute     bool           // support.host 有多条线路：git 经线路转发口走当前线路
 }
 
 // jsonPath 在嵌套对象里取值。
@@ -107,18 +69,6 @@ func canonPath(p string) (string, error) {
 	return filepath.EvalSymlinks(abs)
 }
 
-// pathWithin 判断 child 是否等于 parent 或在 parent 之下（按路径分段比较，不是字符串前缀）。
-func pathWithin(parent, child string) bool {
-	rel, err := filepath.Rel(parent, child)
-	if err != nil {
-		return false
-	}
-	return rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)))
-}
-
-// overlaps 任一方等于或包含另一方。
-func overlaps(a, b string) bool { return pathWithin(a, b) || pathWithin(b, a) }
-
 // gitToplevel 返回 dir 所在 git 仓库顶层目录（已解开符号链接）。
 func gitToplevel(dir string) (string, error) {
 	out, err := exec.Command("git", "-C", dir, "rev-parse", "--show-toplevel").Output()
@@ -128,72 +78,24 @@ func gitToplevel(dir string) (string, error) {
 	return filepath.EvalSymlinks(strings.TrimSpace(string(out)))
 }
 
-// localhostDomain 判断 allowedDomains 的条目（去端口、转小写后）是否指向本机。
-func localhostDomain(d string) bool {
-	d = strings.ToLower(strings.TrimSpace(d))
-	if h, _, err := net.SplitHostPort(d); err == nil {
-		d = h
+// loadClaudeSettings 读 claude_settings；path 为空（没配）时返回空设置。
+// 只要求文件是 JSON 对象，不校验内容：沙盒、权限等一律照用户写的用。
+func loadClaudeSettings(path string, bad func(string, ...any) error) (map[string]any, error) {
+	if path == "" {
+		return map[string]any{}, nil
 	}
-	d = strings.Trim(d, "[]")
-	return d == "localhost" || strings.HasSuffix(d, ".localhost") || strings.HasPrefix(d, "127.") ||
-		d == "::1" || d == "0.0.0.0"
-}
-
-// checkSandboxSettings 校验 claude_settings 里的沙盒与钩子相关项。
-func checkSandboxSettings(settings map[string]any, bad func(string, ...any) error) error {
-	for _, rule := range []struct {
-		key  string
-		want bool
-	}{{"enabled", true}, {"allowUnsandboxedCommands", false}, {"failIfUnavailable", true}} {
-		if v, ok := jsonPath(settings, "sandbox", rule.key); !ok || v != rule.want {
-			return bad("的 claude_settings 必须设置 sandbox.%s 为 %v", rule.key, rule.want)
-		}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, bad("的 claude_settings 读不了: %v", err)
 	}
-	if v, ok := jsonPath(settings, "sandbox", "autoAllowBashIfSandboxed"); !ok {
-		return bad("的 claude_settings 必须显式写出 sandbox.autoAllowBashIfSandboxed（true 或 false）：" +
-			"true = 沙盒内的命令不经你批准直接运行（只能写工作目录和仓库、网络受限）；false = 每条命令都弹给你批准")
-	} else if _, isBool := v.(bool); !isBool {
-		return bad("的 claude_settings 里 sandbox.autoAllowBashIfSandboxed 必须是 true 或 false（布尔值），实际 %#v", v)
+	var settings map[string]any
+	if err := json.Unmarshal(raw, &settings); err != nil || settings == nil {
+		return nil, bad("的 claude_settings 必须是 JSON 对象")
 	}
-	if v, ok := jsonPath(settings, "permissions", "defaultMode"); ok && v != "default" && v != "manual" {
-		return bad("的 claude_settings 里 permissions.defaultMode 只能是 \"default\" 或 \"manual\"，实际 %v", v)
-	}
-	// 沙盒内不许连回本机服务：否则 Claude 可能拿到主令牌自己批准
-	for _, k := range [][]string{
-		{"sandbox", "network", "allowLocalBinding"},
-		{"sandbox", "network", "allowAllUnixSockets"},
-		{"sandbox", "enableWeakerNetworkIsolation"},
-		{"sandbox", "enableWeakerNestedSandbox"},
-		{"sandbox", "filesystem", "disabled"},
-	} {
-		if v, ok := jsonPath(settings, k...); ok && v == true {
-			return bad("的 claude_settings 里 %s 不许为 true：沙盒内不许连回本机服务（否则 Claude 可能拿到主令牌自己批准）或削弱沙盒", strings.Join(k, "."))
-		}
-	}
-	if v, ok := jsonPath(settings, "sandbox", "network", "allowUnixSockets"); ok && v != nil {
-		if l, isList := v.([]any); !isList || len(l) > 0 {
-			return bad("的 claude_settings 里 sandbox.network.allowUnixSockets 必须为空：沙盒内不许连回本机服务（否则 Claude 可能拿到主令牌自己批准）")
-		}
-	}
-	if v, ok := jsonPath(settings, "sandbox", "network", "allowedDomains"); ok {
-		if l, isList := v.([]any); isList {
-			for _, e := range l {
-				if d, isStr := e.(string); isStr && localhostDomain(d) {
-					return bad("的 claude_settings 里 sandbox.network.allowedDomains 不许含本机地址 %q：沙盒内不许连回本机服务（否则 Claude 可能拿到主令牌自己批准）", d)
-				}
-			}
-		}
-	}
-	for _, k := range []string{"disableAllHooks", "allowManagedHooksOnly"} {
-		if settings[k] == true {
-			return bad("的 claude_settings 里 %s 不许为 true：协助靠 PermissionRequest 钩子把授权请求交给你", k)
-		}
-	}
-	return nil
+	return settings, nil
 }
 
 // prepareSupport 校验 support 段；不合规返回带「hosts.json: support」前缀的错误。
-// dir 是 wgtund 的配置目录（Claude 不许碰）。
 func prepareSupport(c *fileConf, dir string) (*supportPrep, error) {
 	sc := c.Support
 	if sc == nil {
@@ -223,66 +125,16 @@ func prepareSupport(c *fileConf, dir string) (*supportPrep, error) {
 			return nil, bad("的仓库 %q 要同时写 dir 和 remote", name)
 		}
 	}
-	if err := checkClaudeArgs(sc.ClaudeArgs); err != nil {
-		return nil, bad("%v", err)
+	settingsPath := ""
+	if sc.ClaudeSettings != "" { // 可选：没配就只有协助钩子
+		settingsPath = expand(sc.ClaudeSettings)
 	}
-	if sc.ClaudeTools != "" && !toolsRe.MatchString(sc.ClaudeTools) {
-		return nil, bad("的 claude_tools %q 不合规：只能是逗号分隔的工具名（字母），如 %q", sc.ClaudeTools, defaultClaudeTools)
-	}
-	if sc.ClaudeSettings == "" {
-		return nil, bad("缺少 claude_settings（Claude Code 设置文件）")
-	}
-	settingsPath := expand(sc.ClaudeSettings)
-	raw, err := os.ReadFile(settingsPath)
+	settings, err := loadClaudeSettings(settingsPath, bad)
 	if err != nil {
-		return nil, bad("的 claude_settings 读不了: %v", err)
-	}
-	var settings map[string]any
-	if err := json.Unmarshal(raw, &settings); err != nil || settings == nil {
-		return nil, bad("的 claude_settings 必须是 JSON 对象")
-	}
-	if err := checkSandboxSettings(settings, bad); err != nil {
 		return nil, err
 	}
 
-	// 目录隔离：Claude 能写工作目录和各仓库，这些目录若包含配置，它就能改钩子
-	canonWork, err := canonPath(workdir)
-	if err != nil {
-		return nil, bad("的 workdir %q 无法解析: %v", sc.Workdir, err)
-	}
-	self, err := os.Executable()
-	if err != nil {
-		return nil, bad("找不到 wgtund 自身路径: %v", err)
-	}
-	protected := []struct{ what, raw string }{
-		{"配置目录", dir},
-		{"claude_settings 所在目录", filepath.Dir(settingsPath)},
-		{"wgtund 所在目录", filepath.Dir(self)},
-	}
-	canonProt := make([]string, len(protected))
-	var denyRead []string
-	addDeny := func(paths ...string) {
-		for _, p := range paths {
-			dup := false
-			for _, d := range denyRead {
-				dup = dup || d == p
-			}
-			if !dup {
-				denyRead = append(denyRead, p)
-			}
-		}
-	}
-	addDeny("~/.ssh")
-	for i, pr := range protected {
-		cp, err := canonPath(pr.raw)
-		if err != nil {
-			return nil, bad("的%s %q 无法解析: %v", pr.what, pr.raw, err)
-		}
-		canonProt[i] = cp
-		abs, _ := filepath.Abs(pr.raw)
-		addDeny(abs, cp)
-	}
-	writable := []struct{ what, path string }{{"workdir", canonWork}}
+	// 仓库：目录存在、是 git 顶层、互不重复
 	canonRepos := map[string]string{}
 	names := make([]string, 0, len(sc.Repos))
 	for n := range sc.Repos {
@@ -308,18 +160,8 @@ func prepareSupport(c *fileConf, dir string) (*supportPrep, error) {
 			}
 		}
 		canonRepos[n] = cd
-		writable = append(writable, struct{ what, path string }{"仓库 " + n + " 的 dir", cd})
 	}
-	for i, pr := range protected {
-		for _, w := range writable {
-			if overlaps(canonProt[i], w.path) {
-				return nil, bad("的%s（%s）与 %s（%s）互相包含：Claude 能写工作目录和仓库，若包含配置就能改掉钩子，必须互不包含",
-					pr.what, canonProt[i], w.what, w.path)
-			}
-		}
-	}
-
-	p := &supportPrep{conf: sc, workdir: workdir, settings: settings, denyRead: denyRead}
+	p := &supportPrep{conf: sc, workdir: workdir, settings: settings, settingsPath: settingsPath}
 	if len(hostRoutes(*host)) > 1 {
 		if sc.GitTunnel != "" {
 			return nil, bad("的 git_tunnel 不用写：主机 %q 有多条线路，git 会自动走当前线路", host.Name)
@@ -397,14 +239,10 @@ func routeForwarder(pool *sshPool, host string) (net.Listener, error) {
 	return ln, nil
 }
 
-// claudeArgs 生成 Claude 的启动参数：受限模式（忽略用户/项目/本地设置，只认协助设置文件）、
-// 只用指定工具和 MCP 配置、文件访问限制在工作目录与各仓库目录内，最后才是调用方的追加参数。
+// claudeArgs 生成 Claude 的启动参数：权限提示全交给钩子（--permission-prompts none）、
+// 用协助合并设置文件、各仓库目录加入可访问目录，最后原样追加调用方的 claude_args（不校验）。
 func claudeArgs(sc *supportConf, merged string) []string {
-	tools := sc.ClaudeTools
-	if tools == "" {
-		tools = defaultClaudeTools
-	}
-	args := []string{"--restricted", "--permission-prompts", "none", "--strict-mcp-config", "--tools", tools, "--settings", merged}
+	args := []string{"--permission-prompts", "none", "--settings", merged}
 	names := make([]string, 0, len(sc.Repos))
 	for n := range sc.Repos {
 		names = append(names, n)
@@ -426,10 +264,9 @@ func copyMap(m any) map[string]any {
 	return out
 }
 
-// mergedSettings 复制设置并覆盖 hooks.PermissionRequest、强制钩子不被关掉，
-// 在 sandbox.filesystem.denyRead 里追加 denyRead（去重，保留原有条目），其余内容保留。
-// 只拷贝、不改 base（含 sandbox/filesystem 两层 map）。
-func mergedSettings(base map[string]any, hookCmd string, denyRead []string) map[string]any {
+// mergedSettings 复制设置并覆盖 hooks.PermissionRequest（失败即拒绝）、强制钩子不被关掉，
+// 其余内容（含 sandbox、permissions）原样保留。只拷贝、不改 base。
+func mergedSettings(base map[string]any, hookCmd string) map[string]any {
 	out := copyMap(base)
 	hooks := copyMap(base["hooks"])
 	hooks["PermissionRequest"] = []any{map[string]any{
@@ -441,24 +278,6 @@ func mergedSettings(base map[string]any, hookCmd string, denyRead []string) map[
 	out["hooks"] = hooks
 	out["disableAllHooks"] = false
 	delete(out, "allowManagedHooksOnly")
-
-	sandbox := copyMap(base["sandbox"])
-	fsm := copyMap(sandbox["filesystem"])
-	deny, _ := fsm["denyRead"].([]any)
-	merged := append([]any{}, deny...)
-	for _, d := range denyRead {
-		dup := false
-		for _, e := range merged {
-			es, _ := e.(string)
-			dup = dup || es == d
-		}
-		if !dup {
-			merged = append(merged, d)
-		}
-	}
-	fsm["denyRead"] = merged
-	sandbox["filesystem"] = fsm
-	out["sandbox"] = sandbox
 	return out
 }
 
@@ -511,18 +330,35 @@ func startSupport(p *supportPrep, dir, knownHosts, httpAddr string, socksAddrs m
 			return proj.Run(ctx, name) // 用户已允许：同步执行并把结果原样交回远端
 		}
 	}
+	// 合并设置文件：启动时写一次；之后每次开启协助重新读 claude_settings 再写，改设置不用重启
+	var hookCmd string // NewService 之后才有钩子令牌
+	writeMerged := func(settings map[string]any) error {
+		b, err := json.MarshalIndent(mergedSettings(settings, hookCmd), "", "  ")
+		if err == nil {
+			err = os.WriteFile(merged, b, 0o600)
+		}
+		if err == nil {
+			err = os.Chmod(merged, 0o600) // 文件已存在时 WriteFile 不改权限
+		}
+		return err
+	}
+	cfg.Prepare = func() error {
+		settings, err := loadClaudeSettings(p.settingsPath, func(format string, a ...any) error {
+			return fmt.Errorf("hosts.json: support "+format, a...)
+		})
+		if err != nil {
+			return err
+		}
+		if err := writeMerged(settings); err != nil {
+			return fmt.Errorf("写合并设置文件失败: %w", err)
+		}
+		return nil
+	}
 	svc := support.NewService(cfg, &supportRemote{pool: pool, host: sc.Host})
 
 	hookURL := "http://" + httpAddr + "/support/hook?token=" + svc.HookToken()
-	cmd := tmux.Quote(self) + " support-hook " + tmux.Quote(hookURL)
-	b, err := json.MarshalIndent(mergedSettings(p.settings, cmd, p.denyRead), "", "  ")
-	if err == nil {
-		err = os.WriteFile(merged, b, 0o600)
-	}
-	if err == nil {
-		err = os.Chmod(merged, 0o600) // 文件已存在时 WriteFile 不改权限
-	}
-	if err != nil {
+	hookCmd = tmux.Quote(self) + " support-hook " + tmux.Quote(hookURL)
+	if err := writeMerged(p.settings); err != nil {
 		svc.Close()
 		closeFwd()
 		return nil, nil, fmt.Errorf("support: 写合并设置文件失败: %w", err)

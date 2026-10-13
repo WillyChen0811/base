@@ -148,14 +148,6 @@ func runErr(t *testing.T, dir string) error {
 	}
 }
 
-func setDomains(st map[string]any, ds ...string) {
-	l := []any{}
-	for _, d := range ds {
-		l = append(l, d)
-	}
-	st["sandbox"].(map[string]any)["network"] = map[string]any{"allowedDomains": l}
-}
-
 func TestSupportConfigValidation(t *testing.T) {
 	cases := []struct {
 		name  string
@@ -165,62 +157,6 @@ func TestSupportConfigValidation(t *testing.T) {
 		{"workdir 不存在", func(s, _ map[string]any) { s["workdir"] = "/nonexistent-xxyi-dir" }},
 		{"host 不存在", func(s, _ map[string]any) { s["host"] = "nope" }},
 		{"repo 缺 remote", func(s, _ map[string]any) { s["repos"] = map[string]any{"a": map[string]any{"dir": "/x"}} }},
-		{"禁用参数 skip", func(s, _ map[string]any) { s["claude_args"] = []string{"--dangerously-skip-permissions"} }},
-		{"禁用参数 permission-mode=", func(s, _ map[string]any) { s["claude_args"] = []string{"--permission-mode=plan"} }},
-		{"禁用参数 allowedTools", func(s, _ map[string]any) { s["claude_args"] = []string{"--allowedTools", "Bash"} }},
-		{"禁用参数 tools=", func(s, _ map[string]any) { s["claude_args"] = []string{"--tools=Bash"} }},
-		{"禁用参数 add-dir", func(s, _ map[string]any) { s["claude_args"] = []string{"--add-dir", "/"} }},
-		{"禁用参数 mcp-config", func(s, _ map[string]any) { s["claude_args"] = []string{"--mcp-config", "x"} }},
-		{"claude_tools 非法", func(s, _ map[string]any) { s["claude_tools"] = "Bash;rm" }},
-		{"禁用参数 settings", func(s, _ map[string]any) { s["claude_args"] = []string{"--settings", "x"} }},
-		{"沙盒没开", func(_, st map[string]any) { st["sandbox"].(map[string]any)["enabled"] = false }},
-		{"沙盒缺失", func(_, st map[string]any) { delete(st, "sandbox") }},
-		{"allowUnsandboxedCommands 不是 false", func(_, st map[string]any) {
-			st["sandbox"].(map[string]any)["allowUnsandboxedCommands"] = true
-		}},
-		{"failIfUnavailable 不是 true", func(_, st map[string]any) {
-			st["sandbox"].(map[string]any)["failIfUnavailable"] = false
-		}},
-		{"defaultMode=bypassPermissions", func(_, st map[string]any) {
-			st["permissions"] = map[string]any{"defaultMode": "bypassPermissions"}
-		}},
-		{"claude_args 不认识的参数", func(s, _ map[string]any) { s["claude_args"] = []string{"--foo", "bar"} }},
-		{"claude_args --plugin-url", func(s, _ map[string]any) { s["claude_args"] = []string{"--plugin-url", "http://x"} }},
-		{"claude_args --worktree", func(s, _ map[string]any) { s["claude_args"] = []string{"--worktree"} }},
-		{"claude_args 位置参数", func(s, _ map[string]any) { s["claude_args"] = []string{"--model", "sonnet", "do-something"} }},
-		{"claude_args --model 缺值", func(s, _ map[string]any) { s["claude_args"] = []string{"--model"} }},
-		{"claude_args 值以 - 开头", func(s, _ map[string]any) { s["claude_args"] = []string{"--model", "--effort"} }},
-		{"claude_args --model= 空值", func(s, _ map[string]any) { s["claude_args"] = []string{"--model="} }},
-		{"autoAllowBashIfSandboxed 缺省", func(_, st map[string]any) { delete(st["sandbox"].(map[string]any), "autoAllowBashIfSandboxed") }},
-		{"autoAllowBashIfSandboxed 不是 bool", func(_, st map[string]any) {
-			st["sandbox"].(map[string]any)["autoAllowBashIfSandboxed"] = "true"
-		}},
-		{"allowLocalBinding", func(_, st map[string]any) {
-			st["sandbox"].(map[string]any)["network"] = map[string]any{"allowLocalBinding": true}
-		}},
-		{"allowUnixSockets 非空", func(_, st map[string]any) {
-			st["sandbox"].(map[string]any)["network"] = map[string]any{"allowUnixSockets": []any{"/var/run/x.sock"}}
-		}},
-		{"allowAllUnixSockets", func(_, st map[string]any) {
-			st["sandbox"].(map[string]any)["network"] = map[string]any{"allowAllUnixSockets": true}
-		}},
-		{"enableWeakerNetworkIsolation", func(_, st map[string]any) {
-			st["sandbox"].(map[string]any)["enableWeakerNetworkIsolation"] = true
-		}},
-		{"enableWeakerNestedSandbox", func(_, st map[string]any) {
-			st["sandbox"].(map[string]any)["enableWeakerNestedSandbox"] = true
-		}},
-		{"filesystem.disabled", func(_, st map[string]any) {
-			st["sandbox"].(map[string]any)["filesystem"] = map[string]any{"disabled": true}
-		}},
-		{"allowedDomains localhost:端口", func(_, st map[string]any) { setDomains(st, "example.com", "LocalHost:8080") }},
-		{"allowedDomains *.localhost", func(_, st map[string]any) { setDomains(st, "*.localhost") }},
-		{"allowedDomains 127.0.0.1", func(_, st map[string]any) { setDomains(st, "127.0.0.1:3000") }},
-		{"allowedDomains [::1]", func(_, st map[string]any) { setDomains(st, "[::1]:80") }},
-		{"allowedDomains ::1", func(_, st map[string]any) { setDomains(st, "::1") }},
-		{"allowedDomains 0.0.0.0", func(_, st map[string]any) { setDomains(st, "0.0.0.0") }},
-		{"disableAllHooks", func(_, st map[string]any) { st["disableAllHooks"] = true }},
-		{"allowManagedHooksOnly", func(_, st map[string]any) { st["allowManagedHooksOnly"] = true }},
 		{"repo.dir 不存在", func(s, _ map[string]any) {
 			s["repos"] = map[string]any{"a": map[string]any{"dir": "/nonexistent-xxyi-repo", "remote": "r"}}
 		}},
@@ -240,6 +176,11 @@ func TestSupportConfigValidation(t *testing.T) {
 		}},
 		{"git_tunnel 不在 socks", func(s, _ map[string]any) { s["git_tunnel"] = "other" }},
 		{"设置文件不存在", func(s, _ map[string]any) { s["claude_settings"] = "/nonexistent-xxyi.json" }},
+		{"设置文件不是 JSON 对象", func(s, _ map[string]any) {
+			p := filepath.Join(t.TempDir(), "bad.json")
+			os.WriteFile(p, []byte("[1,2]"), 0o600)
+			s["claude_settings"] = p
+		}},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -257,7 +198,6 @@ func TestSupportMergedSettings(t *testing.T) {
 		st["permissions"] = map[string]any{"defaultMode": "default"}
 		st["allowManagedHooksOnly"] = false
 		st["disableAllHooks"] = false
-		st["sandbox"].(map[string]any)["filesystem"] = map[string]any{"denyRead": []any{"~/.aws", "~/.ssh"}}
 	})
 	st, _, _ := run(t, f.dir)
 	p := filepath.Join(f.dir, "support-claude.merged.json")
@@ -284,28 +224,6 @@ func TestSupportMergedSettings(t *testing.T) {
 	}
 	if _, ok := m["allowManagedHooksOnly"]; ok {
 		t.Errorf("allowManagedHooksOnly 应被删除: %v", m)
-	}
-	deny, _ := jsonPath(m, "sandbox", "filesystem", "denyRead")
-	var denyList []string
-	for _, d := range deny.([]any) {
-		denyList = append(denyList, d.(string))
-	}
-	exe, _ := os.Executable()
-	cfgDir, _ := canonPath(f.dir)
-	exeDir, _ := canonPath(filepath.Dir(exe))
-	for _, w := range []string{"~/.aws", "~/.ssh", cfgDir, exeDir} {
-		n := 0
-		for _, d := range denyList {
-			if d == w {
-				n++
-			}
-		}
-		if n != 1 {
-			t.Errorf("denyRead 里 %q 应恰好出现一次，实际 %d：%v", w, n, denyList)
-		}
-	}
-	if len(denyList) < 5 || denyList[0] != "~/.aws" || denyList[1] != "~/.ssh" {
-		t.Errorf("denyRead 应保留原有条目在前并追加: %v", denyList)
 	}
 	hooks := m["hooks"].(map[string]any)
 	if _, ok := hooks["PreToolUse"]; !ok {
@@ -457,23 +375,24 @@ func TestGitSSHCommand(t *testing.T) {
 	}
 }
 
-func TestClaudeArgsRestricted(t *testing.T) {
+func TestClaudeArgs(t *testing.T) {
 	sc := &supportConf{
-		ClaudeArgs: []string{"--model", "sonnet"},
+		ClaudeArgs: []string{"--model", "sonnet", "--foo=bar", "positional"},
 		Repos:      map[string]supportRepo{"b": {Dir: "/r/b"}, "a": {Dir: "/r/a"}},
 	}
 	got := strings.Join(claudeArgs(sc, "/m.json"), " ")
-	want := "--restricted --permission-prompts none --strict-mcp-config --tools Bash,Read,Edit,Write,Glob,Grep --settings /m.json --add-dir /r/a --add-dir /r/b --model sonnet"
+	want := "--permission-prompts none --settings /m.json --add-dir /r/a --add-dir /r/b --model sonnet --foo=bar positional"
 	if got != want {
 		t.Errorf("得到 %s\n期望 %s", got, want)
 	}
-	sc.ClaudeTools = "Read,Grep"
-	if g := strings.Join(claudeArgs(sc, "/m.json"), " "); !strings.Contains(g, "--tools Read,Grep ") {
-		t.Errorf("claude_tools 未生效: %s", g)
+	for _, no := range []string{"--restricted", "--tools", "--strict-mcp-config"} {
+		if strings.Contains(got, no) {
+			t.Errorf("参数里不应有 %s: %s", no, got)
+		}
 	}
 }
 
-// 端到端：Runner 真正启动假 claude 时收到受限模式参数。
+// 端到端：Runner 真正启动假 claude 时收到固定参数和 claude_args。
 func TestSupportRunnerReceivesArgs(t *testing.T) {
 	argsOut := filepath.Join(t.TempDir(), "args.txt")
 	t.Setenv("CLAUDE_ARGS_OUT", argsOut) // CLAUDE_ 前缀的环境变量会传给 claude
@@ -504,9 +423,14 @@ func TestSupportRunnerReceivesArgs(t *testing.T) {
 	}
 	got := string(b)
 	merged := filepath.Join(f.dir, "support-claude.merged.json")
-	for _, w := range []string{"--restricted\n", "--strict-mcp-config\n", "--tools\nBash,Read,Edit,Write,Glob,Grep\n", "--settings\n" + merged + "\n", "--add-dir\n", "--model\nsonnet\n"} {
+	for _, w := range []string{"--permission-prompts\nnone\n", "--settings\n" + merged + "\n", "--add-dir\n", "--model\nsonnet\n"} {
 		if !strings.Contains(got, w) {
 			t.Errorf("参数里缺 %q: %q", w, got)
+		}
+	}
+	for _, no := range []string{"--restricted", "--strict-mcp-config", "--tools"} {
+		if strings.Contains(got, no) {
+			t.Errorf("参数里不应有 %s: %q", no, got)
 		}
 	}
 }
@@ -563,123 +487,146 @@ func TestSupportMutatingRoutesNeedOrigin(t *testing.T) {
 	}
 }
 
-func TestCheckClaudeArgs(t *testing.T) {
-	ok := [][]string{
-		nil,
-		{"--model", "sonnet"},
-		{"--max-budget-usd=5"},
-		{"--model", "sonnet", "--effort=high", "--max-turns", "20", "--fallback-model", "haiku", "--append-system-prompt", "hi"},
-	}
-	for _, a := range ok {
-		if err := checkClaudeArgs(a); err != nil {
-			t.Errorf("%v 应通过: %v", a, err)
-		}
-	}
-	bad := [][]string{
-		{"--plugin-url", "http://x"},
-		{"--worktree"},
-		{"positional"},
-		{"--model"},
-		{"--model", "--effort"},
-		{"--model="},
-		{"--permission-prompts", "none"},
-		{"--dangerously-skip-permissions"},
-		{"--model", "sonnet", "extra"},
-	}
-	for _, a := range bad {
-		err := checkClaudeArgs(a)
-		if err == nil || !strings.Contains(err.Error(), "claude_args 只允许") {
-			t.Errorf("%v 应报「claude_args 只允许」错误，得到 %v", a, err)
-		}
-	}
-}
-
 func TestMergedSettingsDoesNotMutateBase(t *testing.T) {
 	base := goodSettings()
-	base["sandbox"].(map[string]any)["filesystem"] = map[string]any{"denyRead": []any{"~/x"}, "allowWrite": []any{"/w"}}
+	base["sandbox"] = map[string]any{"enabled": false, "allowUnsandboxedCommands": true}
+	base["permissions"] = map[string]any{"allow": []any{"Bash(ls)"}, "defaultMode": "acceptEdits"}
+	base["allowManagedHooksOnly"] = true
+	base["disableAllHooks"] = true
 	before, _ := json.Marshal(base)
-	out := mergedSettings(base, "cmd", []string{"~/.ssh", "~/x", "/cfg"})
+	out := mergedSettings(base, "cmd")
 	after, _ := json.Marshal(base)
 	if string(before) != string(after) {
 		t.Errorf("mergedSettings 改动了入参:\n%s\n%s", before, after)
 	}
-	fsm := out["sandbox"].(map[string]any)["filesystem"].(map[string]any)
-	if got, _ := json.Marshal(fsm["denyRead"]); string(got) != `["~/x","~/.ssh","/cfg"]` {
-		t.Errorf("denyRead 合并结果不对: %s", got)
+	// 沙盒、权限原样保留
+	if got, _ := json.Marshal(out["sandbox"]); string(got) != `{"allowUnsandboxedCommands":true,"enabled":false}` {
+		t.Errorf("sandbox 应原样保留: %s", got)
 	}
-	if fsm["allowWrite"] == nil {
-		t.Errorf("filesystem 其他键丢失: %v", fsm)
+	if got, _ := json.Marshal(out["permissions"]); string(got) != `{"allow":["Bash(ls)"],"defaultMode":"acceptEdits"}` {
+		t.Errorf("permissions 应原样保留: %s", got)
 	}
-	// 没有 filesystem 时也能建出来
-	out2 := mergedSettings(goodSettings(), "cmd", []string{"/cfg"})
-	if v, ok := jsonPath(out2, "sandbox", "filesystem", "denyRead"); !ok || len(v.([]any)) != 1 {
-		t.Errorf("无 filesystem 时应新建 denyRead: %v", out2["sandbox"])
+	if out["disableAllHooks"] != false {
+		t.Errorf("disableAllHooks 应为 false: %v", out["disableAllHooks"])
+	}
+	if _, ok := out["allowManagedHooksOnly"]; ok {
+		t.Errorf("allowManagedHooksOnly 应被删除")
+	}
+	// 空 base：只有钩子
+	empty := mergedSettings(map[string]any{}, "cmd")
+	if _, ok := empty["hooks"].(map[string]any)["PermissionRequest"]; !ok || len(empty["hooks"].(map[string]any)) != 1 {
+		t.Errorf("空设置应只含 PermissionRequest 钩子: %v", empty)
 	}
 }
 
-// 目录隔离：配置目录/设置文件目录/wgtund 目录不能与工作目录或仓库互相包含。
-func TestSupportDirIsolation(t *testing.T) {
-	t.Run("workdir 就是配置目录", func(t *testing.T) {
-		f, _, _ := supportFixture(t, nil)
-		patchSupport(t, f.dir, func(sup map[string]any) {
-			sup["workdir"] = f.dir
-			sup["repos"] = map[string]any{}
-		})
-		err := runErr(t, f.dir)
-		if err == nil || !strings.HasPrefix(err.Error(), "hosts.json: support") || !strings.Contains(err.Error(), "互相包含") {
-			t.Fatalf("应报互相包含: %v", err)
-		}
+// 设置文件内容不做校验：沙盒关掉、任意权限都照用。
+func TestSupportSettingsNotValidated(t *testing.T) {
+	f, _, _ := supportFixture(t, func(_, st map[string]any) {
+		st["sandbox"] = map[string]any{"enabled": false}
+		st["permissions"] = map[string]any{"defaultMode": "bypassPermissions"}
+		st["disableAllHooks"] = true
 	})
-	t.Run("workdir 在配置目录之内", func(t *testing.T) {
-		f, _, _ := supportFixture(t, nil)
-		sub := filepath.Join(f.dir, "work")
-		os.MkdirAll(sub, 0o755)
-		patchSupport(t, f.dir, func(sup map[string]any) {
-			sup["workdir"] = sub
-			sup["repos"] = map[string]any{}
-		})
-		if err := runErr(t, f.dir); err == nil || !strings.Contains(err.Error(), "互相包含") {
-			t.Fatalf("应报互相包含: %v", err)
-		}
-	})
-	t.Run("repo.dir 包含配置目录", func(t *testing.T) {
-		f, _, _ := supportFixture(t, nil)
-		parent := filepath.Dir(f.dir)
-		gitInit(t, parent)
-		patchSupport(t, f.dir, func(sup map[string]any) {
-			sup["repos"] = map[string]any{"r": map[string]any{"dir": parent, "remote": "x"}}
-		})
-		err := runErr(t, f.dir)
-		if err == nil || !strings.HasPrefix(err.Error(), "hosts.json: support") || !strings.Contains(err.Error(), "互相包含") {
-			t.Fatalf("应报互相包含: %v", err)
-		}
-	})
-	t.Run("设置文件目录包含工作目录", func(t *testing.T) {
-		f, _, tmp := supportFixture(t, nil)
-		// 把设置文件挪到 tmp（工作目录 tmp/work 的上一级）
-		sp := filepath.Join(tmp, "settings.json")
-		b, _ := json.Marshal(goodSettings())
-		os.WriteFile(sp, b, 0o600)
-		patchSupport(t, f.dir, func(sup map[string]any) { sup["claude_settings"] = sp })
-		if err := runErr(t, f.dir); err == nil || !strings.Contains(err.Error(), "互相包含") {
-			t.Fatalf("应报互相包含: %v", err)
-		}
-	})
-	t.Run("路径按分段比较而非字符串前缀", func(t *testing.T) {
-		if overlaps("/a/work", "/a/workdir") || !overlaps("/a/work", "/a/work/x") || !overlaps("/a/work/x", "/a/work") {
-			t.Fatal("overlaps 判断不对")
-		}
-	})
+	st, _, _ := run(t, f.dir)
+	if resp, b := supportPost(t, st, "/support/start?minutes=5", testOrigin); resp.StatusCode != 200 {
+		t.Fatalf("应能启动: %d %s", resp.StatusCode, b)
+	}
+	mb, _ := os.ReadFile(filepath.Join(f.dir, "support-claude.merged.json"))
+	var m map[string]any
+	if err := json.Unmarshal(mb, &m); err != nil {
+		t.Fatal(err)
+	}
+	if v, _ := jsonPath(m, "sandbox", "enabled"); v != false {
+		t.Errorf("sandbox.enabled 应保持用户写的 false: %v", m["sandbox"])
+	}
+	if v, _ := jsonPath(m, "permissions", "defaultMode"); v != "bypassPermissions" {
+		t.Errorf("permissions 应原样: %v", m["permissions"])
+	}
+	if m["disableAllHooks"] != false {
+		t.Errorf("disableAllHooks 仍应被强制为 false")
+	}
 }
 
-// autoAllowBashIfSandboxed 写 false 同样合规；合法的 claude_args 能启动。
-func TestSupportAutoAllowFalseAndArgsAccepted(t *testing.T) {
-	f, _, _ := supportFixture(t, func(s, st map[string]any) {
-		st["sandbox"].(map[string]any)["autoAllowBashIfSandboxed"] = false
-		s["claude_args"] = []string{"--model", "sonnet", "--max-budget-usd=5"}
+// claude_settings 可以不写：合并文件只含钩子；旧的 claude_tools 键被忽略。
+func TestSupportMissingSettingsAccepted(t *testing.T) {
+	f, _, _ := supportFixture(t, nil)
+	patchSupport(t, f.dir, func(sup map[string]any) {
+		delete(sup, "claude_settings")
+		sup["claude_tools"] = "Read,Grep" // 已废弃，忽略
+	})
+	st, _, _ := run(t, f.dir)
+	if resp, b := supportPost(t, st, "/support/start?minutes=5", testOrigin); resp.StatusCode != 200 {
+		t.Fatalf("应能启动: %d %s", resp.StatusCode, b)
+	}
+	mb, _ := os.ReadFile(filepath.Join(f.dir, "support-claude.merged.json"))
+	var m map[string]any
+	if err := json.Unmarshal(mb, &m); err != nil {
+		t.Fatal(err)
+	}
+	if len(m) != 2 || m["disableAllHooks"] != false {
+		t.Errorf("合并文件应只含 hooks 和 disableAllHooks: %s", mb)
+	}
+	if _, ok := jsonPath(m, "hooks", "PermissionRequest"); !ok {
+		t.Errorf("合并文件应含钩子: %s", mb)
+	}
+}
+
+// claude_args 原样透传，不做白名单校验。
+func TestSupportArbitraryClaudeArgsAccepted(t *testing.T) {
+	f, _, _ := supportFixture(t, func(s, _ map[string]any) {
+		s["claude_args"] = []string{"--dangerously-skip-permissions", "--foo", "positional"}
 	})
 	st, _, _ := run(t, f.dir)
 	if resp, b := get(t, st, "/support", true); resp.StatusCode != 200 {
 		t.Fatalf("应能启动: %d %s", resp.StatusCode, b)
+	}
+}
+
+// 每次开启协助都重新读 claude_settings：改了设置不用重启；改坏了则开启失败、合并文件不变。
+func TestSupportReloadsSettingsOnStart(t *testing.T) {
+	f, _, _ := supportFixture(t, nil)
+	st, _, _ := run(t, f.dir)
+
+	raw, err := os.ReadFile(filepath.Join(f.dir, "hosts.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var conf struct {
+		Support struct {
+			ClaudeSettings string `json:"claude_settings"`
+		} `json:"support"`
+	}
+	if err := json.Unmarshal(raw, &conf); err != nil || conf.Support.ClaudeSettings == "" {
+		t.Fatalf("读不到 claude_settings 路径: %v", err)
+	}
+	sp := conf.Support.ClaudeSettings
+	merged := filepath.Join(f.dir, "support-claude.merged.json")
+
+	settings := goodSettings()
+	settings["sandbox"].(map[string]any)["network"] = map[string]any{"allowedDomains": []any{"github.com"}}
+	b, _ := json.Marshal(settings)
+	if err := os.WriteFile(sp, b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if resp, body := supportPost(t, st, "/support/start?minutes=5", testOrigin); resp.StatusCode != 200 {
+		t.Fatalf("start 应 200，得到 %d: %s", resp.StatusCode, body)
+	}
+	mb, _ := os.ReadFile(merged)
+	if !strings.Contains(string(mb), "github.com") {
+		t.Fatalf("开启协助后合并文件应带上新设置: %s", mb)
+	}
+	if resp, body := supportPost(t, st, "/support/stop", testOrigin); resp.StatusCode != 200 {
+		t.Fatalf("stop 应 200，得到 %d: %s", resp.StatusCode, body)
+	}
+
+	os.WriteFile(sp, []byte("{not json"), 0o600)
+	resp, body := supportPost(t, st, "/support/start?minutes=5", testOrigin)
+	if resp.StatusCode == 200 || !strings.Contains(string(body), "JSON 对象") {
+		t.Fatalf("设置改坏后 start 应失败并说明原因，得到 %d: %s", resp.StatusCode, body)
+	}
+	if mb2, _ := os.ReadFile(merged); string(mb2) != string(mb) {
+		t.Errorf("开启失败时合并文件不应改动")
+	}
+	if resp, body := supportPost(t, st, "/support/start?minutes=600", testOrigin); resp.StatusCode == 200 {
+		t.Fatalf("设置仍坏时不应开启: %s", body)
 	}
 }

@@ -36,6 +36,9 @@ type Config struct {
 	HookWait      time.Duration                                       // 钩子最多等用户多久，<=0 用 9 分钟
 	ProjSyncNames []string                                            // 可同步的项目名；空则不提供项目同步
 	ProjSync      func(ctx context.Context, name string) (any, error) // 执行一次同步，返回可 JSON 编码的结果
+	// Prepare 在每次从未开启到开启时、开远端入口之前调用（可为 nil），例如重新读 Claude 设置；
+	// 返回错误则不开启。
+	Prepare func() error
 }
 
 // Status 是协助服务的状态快照。
@@ -175,11 +178,14 @@ func bindSession(parent context.Context, sess *session) (context.Context, contex
 	return ctx, func() { stop(); cancel() }
 }
 
-// Start 开启协助。minutes 限 1..240；已在协助中则把截止时间改成「现在+minutes」，
+// MaxMinutes 是一次协助的最长时长（分钟）。
+const MaxMinutes = 600
+
+// Start 开启协助。minutes 限 1..MaxMinutes；已在协助中则把截止时间改成「现在+minutes」，
 // 保持原远端令牌。Open 或 Publish 失败时关掉已开的东西并保持未开启。
 func (s *Service) Start(minutes int) error {
-	if minutes < 1 || minutes > 240 {
-		return fmt.Errorf("support: 时长必须 1..240 分钟，实际 %d", minutes)
+	if minutes < 1 || minutes > MaxMinutes {
+		return fmt.Errorf("support: 时长必须 1..%d 分钟，实际 %d", MaxMinutes, minutes)
 	}
 	s.opMu.Lock()
 	defer s.opMu.Unlock()
@@ -206,6 +212,12 @@ func (s *Service) Start(minutes int) error {
 		return nil
 	}
 	s.mu.Unlock()
+
+	if s.cfg.Prepare != nil {
+		if err := s.cfg.Prepare(); err != nil {
+			return fmt.Errorf("support: 开启前准备失败: %w", err)
+		}
+	}
 
 	sctx, scancel := context.WithCancel(context.Background())
 	sess := &session{ctx: sctx, cancel: scancel, token: randHex32()}
@@ -740,8 +752,8 @@ func (s *Service) LocalHandler() http.Handler {
 	}))
 	mux.HandleFunc("/support/start", only(http.MethodPost, func(w http.ResponseWriter, r *http.Request) {
 		minutes, err := strconv.Atoi(r.URL.Query().Get("minutes"))
-		if err != nil || minutes < 1 || minutes > 240 {
-			errJSON(w, http.StatusBadRequest, "minutes 必须是 1..240 的整数")
+		if err != nil || minutes < 1 || minutes > MaxMinutes {
+			errJSON(w, http.StatusBadRequest, fmt.Sprintf("minutes 必须是 1..%d 的整数", MaxMinutes))
 			return
 		}
 		if err := s.Start(minutes); err != nil {

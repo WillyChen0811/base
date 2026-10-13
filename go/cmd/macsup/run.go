@@ -120,7 +120,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	flags := flag.NewFlagSet("macsup", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	epPath := flags.String("endpoint", defaultEndpoint(), "端点文件路径")
-	timeout := flags.Duration("timeout", 60*time.Minute, "ask 的总时长上限")
+	timeout := flags.Duration("timeout", 10*time.Hour, "ask 的总时长上限（默认 10 小时）")
 	if err := flags.Parse(args); err != nil {
 		return exitErr
 	}

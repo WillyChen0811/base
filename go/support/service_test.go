@@ -219,7 +219,7 @@ const hookBody = `{"session_id":"sess-9","hook_event_name":"PermissionRequest","
 func TestStartValidationAndPublish(t *testing.T) {
 	s, fr := newTestService(t, Config{})
 
-	for _, bad := range []int{0, 241, -1} {
+	for _, bad := range []int{0, MaxMinutes + 1, -1} {
 		if err := s.Start(bad); err == nil {
 			t.Fatalf("Start(%d) 应报错", bad)
 		}
@@ -1500,5 +1500,38 @@ func TestProjsyncStatusAndLog(t *testing.T) {
 		return d["project"] == "zzz"
 	}) {
 		t.Fatal("应有 projsync zzz 日志")
+	}
+}
+
+// Prepare：每次从未开启到开启时调用；延长时长不调用；失败则不开启、不发布。
+func TestStartPrepare(t *testing.T) {
+	calls := 0
+	var fail error
+	s, fr := newTestService(t, Config{Prepare: func() error { calls++; return fail }})
+
+	fail = errors.New("设置不合规")
+	if err := s.Start(5); err == nil || !strings.Contains(err.Error(), "设置不合规") {
+		t.Fatalf("Prepare 失败时 Start 应报错并带原因，得到 %v", err)
+	}
+	if st := s.Status(); st.Active || fr.publishCount() != 0 {
+		t.Fatalf("Prepare 失败后不应开启或发布: %+v，发布 %d 次", st, fr.publishCount())
+	}
+
+	fail = nil
+	if err := s.Start(5); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Start(MaxMinutes); err != nil { // 延长：不再 Prepare
+		t.Fatal(err)
+	}
+	if calls != 2 {
+		t.Fatalf("Prepare 应只在开启时调用（共 2 次），实际 %d 次", calls)
+	}
+	s.Stop("测试")
+	if err := s.Start(5); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 3 {
+		t.Fatalf("停止后再开启应再调用 Prepare，实际 %d 次", calls)
 	}
 }

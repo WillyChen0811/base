@@ -73,6 +73,7 @@ type fileConf struct {
 	Socks          map[string]string `json:"socks"`
 	Hosts          []hostConf        `json:"hosts"`
 	Support        *supportConf      `json:"support"`
+	Projsync       *projsyncConf     `json:"projsync"`
 }
 
 func expand(p string) string {
@@ -172,6 +173,10 @@ func Run(ctx context.Context, dir string, stdin io.Reader, stdout io.Writer) (er
 	if err != nil {
 		return err
 	}
+	pjPrep, err := prepareProjsync(conf)
+	if err != nil {
+		return err
+	}
 	knownHostsCb, err := knownhosts.New(expand(conf.KnownHosts))
 	if err != nil {
 		return fmt.Errorf("known_hosts: %w", err)
@@ -222,6 +227,18 @@ func Run(ctx context.Context, dir string, stdin io.Reader, stdout io.Writer) (er
 		pool.add(h, ds)
 	}
 
+	// 项目同步（可选）：给目标主机开一条本机线路转发口（git 走它、跟随当前线路），
+	// 启动时开一次，退出时一起关（照协助多线路对 fwd 的处理）
+	var projSvc *projsyncSvc
+	if pjPrep != nil {
+		pjFwd, err := routeForwarder(pool, pjPrep.host)
+		if err != nil {
+			return fmt.Errorf("projsync: 开线路转发口失败: %w", err)
+		}
+		closers = append(closers, pjFwd)
+		projSvc = newProjsyncSvc(pjPrep, pool, pjFwd.Addr().String())
+	}
+
 	open := func(r *http.Request, cols, rows int) (*sshterm.Session, error) {
 		q := r.URL.Query()
 		name := q.Get("host")
@@ -248,9 +265,10 @@ func Run(ctx context.Context, dir string, stdin io.Reader, stdout io.Writer) (er
 	closers = append(closers, ln)
 
 	// 协助服务（可选）：本机 HTTP 地址和钩子令牌都要在写合并设置文件前拿到
+	// （projSvc 必须在这之前建好：协助的 ProjSync 要直接用它）
 	var supportLocal, supportHook http.Handler
 	if prep != nil {
-		svc, fwd, err := startSupport(prep, dir, expand(conf.KnownHosts), ln.Addr().String(), socksAddrs, pool)
+		svc, fwd, err := startSupport(prep, dir, expand(conf.KnownHosts), ln.Addr().String(), socksAddrs, pool, projSvc)
 		if err != nil {
 			return err
 		}
@@ -334,6 +352,19 @@ func Run(ctx context.Context, dir string, stdin io.Reader, stdout io.Writer) (er
 		}
 		writeJSON(w, itemOf(h))
 	})
+
+	// 项目同步（可选）：GET 列状态、POST /projsync/run 发起；没配置一律 404
+	if projSvc != nil {
+		h := projSvc.localHandler(ctx, conf.AllowedOrigins)
+		mux.Handle("/projsync", h)
+		mux.Handle("/projsync/run", h)
+	} else {
+		noProj := func(w http.ResponseWriter, r *http.Request) {
+			errJSON(w, http.StatusNotFound, "没有配置项目同步")
+		}
+		mux.HandleFunc("/projsync", noProj)
+		mux.HandleFunc("/projsync/run", noProj)
+	}
 
 	// tmux 会话管理。写操作用 POST 但不带请求体和自定义头，
 	// 这样浏览器跨域时属于"简单请求"，不会先发预检（OPTIONS）。

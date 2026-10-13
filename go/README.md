@@ -128,5 +128,36 @@ HTTP 接口都要带 `token` 参数；每台主机共用一条 SSH 连接（第�
 原样输出其回答；任何失败都输出「拒绝」并以退出码 0 结束，让 Claude Code 按拒绝处理。
 `macsup projsync <项目名>`：向远端请求同步一个项目，等待用户批准后执行，成功后以 JSON 打印结果。
 
+### 项目同步（可选）
+
+`hosts.json` 的可选段 `projsync`：在本机和某台主机之间交换同一个项目的已提交代码，并双向补齐两边的 Claude Code 对话目录。
+
+    "projsync": {
+      "host": "ubuntu",
+      "local_name": "mac",
+      "remote_name": "ubuntu",
+      "projects": [
+        {"name": "ai-browser", "local": "~/Documents/codes/ai-browser",
+         "remote": "/home/chenwy/Documents/codes/ai-browser"}
+      ]
+    }
+
+- `host` 必须是 `hosts` 里的主机且有 `identity_files`（git 只用第一个私钥）。`local_name` 缺省 `mac`，`remote_name` 缺省主机名，
+  只许 `[a-z0-9-]`（1..32）。项目名 `[A-Za-z0-9._-]`、1..64、不能重复。
+- `local` 可写 `~/`，必须存在且是 git 仓库顶层；`remote` 是远端仓库绝对路径，只许 `[A-Za-z0-9._/-]`，不含 `..`。
+  `local_claude` 缺省 `~/.claude/projects/<本机仓库绝对路径转成的目录名>`；`remote_claude` 缺省 `.claude/projects/<远端路径转成的目录名>`（相对远端登录目录）。
+  配置有误时启动失败，错误以「hosts.json: projsync」开头。
+- 代码：git 经主机当前线路的转发口走 ssh（严格校验主机密钥、只用指定私钥）。同步后，对方仓库里有 `refs/remotes/mac/*`
+  （本机各分支），本机仓库里有 `refs/remotes/<主机名>/*`（对方各分支）。不改任何一边的 HEAD、`refs/heads/*` 和工作区。
+- 对话：两边目录互相补齐缺的文件；同名文件一边是另一边的前缀（会话在增长）就用长的覆盖短的；内容分叉的算冲突，两边都不动；永不删除。
+- 同一项目同一时刻只能同步一次，单次最长 30 分钟。
+
+本机接口（要主令牌；没配置 `projsync` 时都返回 404「没有配置项目同步」）：
+- `GET /projsync`：`{"projects":[{"name","running","last"}]}`，按配置顺序；`last` 是上次结果（代码与对话各有各的错误字段）或 null。
+- `POST /projsync/run?name=`：要求 `Origin` 存在且在 `allowed_origins` 里，否则 403；未知项目 404；正在同步 409「正在同步」；
+  否则在后台开始并立即返回 202 `{"started":true}`，之后用 `GET /projsync` 看进度。
+
+远端 Claude 也可以用 `macsup projsync <项目名>` 发起：进入待批队列，用户在 xxyi 点允许后才同步，同步完成后打印结果 JSON。
+
 ## 测试
     cd go && go test ./...

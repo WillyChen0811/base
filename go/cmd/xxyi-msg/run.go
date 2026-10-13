@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -43,10 +44,15 @@ var (
 )
 
 // tmuxSession 取当前 tmux 会话名；测试里替换，绝不真执行 tmux。
+// 在 tmux 里时指定 $TMUX_PANE：同一服务器上有别的客户端/会话也不取错。
 var tmuxSession = func() (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), tmuxTimeout)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, "tmux", "display-message", "-p", "#S").Output()
+	args := []string{"display-message", "-p", "#S"}
+	if pane := os.Getenv("TMUX_PANE"); pane != "" {
+		args = append(args, "-t", pane)
+	}
+	out, err := exec.CommandContext(ctx, "tmux", args...).Output()
 	if err != nil {
 		return "", err
 	}
@@ -208,7 +214,11 @@ func xxyiPort() (string, error) {
 	return port, nil
 }
 
+// addrNameIllegal 与服务端 support.ValidAddr 同一套字符集：名字只许 ASCII 字母数字和 . _ -。
+var addrNameIllegal = regexp.MustCompile(`[^A-Za-z0-9._-]`)
+
 // selfAddr 定自己的地址：XXYI_ADDR 优先，其次 tmux 会话名（ubuntu: 一侧）。
+// 会话名先按服务端规则校验：不合法现在就说清，别让 send 到服务端才碰一脑袋 400。
 func selfAddr() (string, error) {
 	if a := strings.TrimSpace(os.Getenv("XXYI_ADDR")); a != "" {
 		return a, nil
@@ -220,6 +230,9 @@ func selfAddr() (string, error) {
 		}
 		if name == "" {
 			return "", errors.New("tmux 会话名为空")
+		}
+		if len(name) > 64 || addrNameIllegal.FindString(name) != "" {
+			return "", fmt.Errorf("tmux 会话名 %q 含不支持的字符，只允许字母数字 . _ -，请改名（tmux rename-session）或设 XXYI_ADDR", name)
 		}
 		return "ubuntu:" + name, nil
 	}
@@ -234,10 +247,15 @@ type sendOpts struct {
 }
 
 // parseSendArgs 允许选项写在位置参数前后；text 为空串表示要从标准输入读。
+// 单独的 "--" 终止选项解析：之后的都以 "--" 开头的文字（如 "--help me"）按位置参数收。
 func parseSendArgs(args []string) (to, text string, o sendOpts, err error) {
 	var pos []string
 	for i := 0; i < len(args); i++ {
 		a := args[i]
+		if a == "--" {
+			pos = append(pos, args[i+1:]...)
+			break
+		}
 		if strings.HasPrefix(a, "--") {
 			var dst *string
 			switch a {

@@ -386,6 +386,53 @@ func TestStateNeverRespondsReturnsZeroFast(t *testing.T) {
 	}
 }
 
+// "--" 之后的文字即使本身以 "--" 开头也照原文发出。
+func TestSendDoubleDashLiteralText(t *testing.T) {
+	var cap captured
+	srv := httptest.NewServer(cap.handler())
+	defer srv.Close()
+	useEndpoint(t, srv.URL)
+	t.Setenv("XXYI_ADDR", "ubuntu:a")
+
+	out := &bytes.Buffer{}
+	if code := run([]string{"send", "mac:x", "--", "--help me"}, strings.NewReader(""), out, io.Discard); code != exitOK {
+		t.Fatalf("退出码 %d，stdout %q", code, out.String())
+	}
+	if got := cap.last(t); got.body.Text != "--help me" {
+		t.Errorf("text = %q，want %q", got.body.Text, "--help me")
+	}
+}
+
+// tmux 会话名带中文/空格：send 当场退出 2 并提示改名，state 照旧静默 0、不发请求。
+func TestSelfAddrIllegalSessionName(t *testing.T) {
+	var cap captured
+	srv := httptest.NewServer(cap.handler())
+	defer srv.Close()
+	useEndpoint(t, srv.URL)
+	t.Setenv("XXYI_ADDR", "")
+	t.Setenv("TMUX", "1")
+	oldTmux := tmuxSession
+	t.Cleanup(func() { tmuxSession = oldTmux })
+	tmuxSession = func() (string, error) { return "中文 会话", nil }
+
+	errOut := &bytes.Buffer{}
+	if code := run([]string{"send", "mac:boss", "hi"}, strings.NewReader(""), io.Discard, errOut); code != exitErr {
+		t.Fatalf("会话名不合法时 send 退出码 %d，stderr %q", code, errOut.String())
+	}
+	if !strings.Contains(errOut.String(), "tmux rename-session") {
+		t.Errorf("stderr 要提示 tmux rename-session：%q", errOut.String())
+	}
+	if n := cap.count(); n != 0 {
+		t.Errorf("地址不合法时不该发请求，已发 %d", n)
+	}
+	if code := run([]string{"state", "busy"}, nil, io.Discard, io.Discard); code != exitOK {
+		t.Fatalf("state 应静默退出 0，得到 %d", code)
+	}
+	if n := cap.count(); n != 0 {
+		t.Errorf("地址不合法时 state 不该发请求，已发 %d", n)
+	}
+}
+
 func TestSendArgValidation(t *testing.T) {
 	var cap captured
 	srv := httptest.NewServer(cap.handler())

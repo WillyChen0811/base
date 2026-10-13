@@ -297,6 +297,7 @@ func startSupport(p *supportPrep, dir, knownHosts, httpAddr string, socksAddrs m
 	}
 	repos := map[string]support.Repo{}
 	remoteDirs := map[string]string{}
+	remoteDirErrs := map[string]string{}
 	for n, r := range sc.Repos {
 		repos[n] = support.Repo{Dir: expand(r.Dir), Remote: r.Remote}
 		if r.RemoteDir != "" {
@@ -305,8 +306,9 @@ func startSupport(p *supportPrep, dir, knownHosts, httpAddr string, socksAddrs m
 		}
 		d, err := remoteDirOf(r.Remote)
 		if err != nil {
-			// 推导不出 Ubuntu 目录不让 wgtund 起不来：只跳过该仓库的 Mac→Ubuntu（Sync 时报错）
+			// 推导不出 Ubuntu 目录不让 wgtund 起不来：只跳过该仓库的 Mac→Ubuntu（Sync 时报错，原因留给报错用）
 			fmt.Fprintf(os.Stderr, "wgtund: support 仓库 %q：%v，Mac→Ubuntu 代码同步不可用\n", n, err)
+			remoteDirErrs[n] = err.Error()
 		} else {
 			remoteDirs[n] = d
 		}
@@ -333,11 +335,12 @@ func startSupport(p *supportPrep, dir, knownHosts, httpAddr string, socksAddrs m
 		return nil, nil, fmt.Errorf("support: 找不到 wgtund 自身路径: %w", err)
 	}
 	bridge := &msgBridge{
-		repos:     repos,
-		remoteDir: remoteDirs,
-		gitEnv:    gitEnv,
-		run:       msgRemoteRunner(pool, sc.Host),
-		write:     msgSFTPWriter(pool, sc.Host),
+		repos:        repos,
+		remoteDir:    remoteDirs,
+		remoteDirErr: remoteDirErrs,
+		gitEnv:       gitEnv,
+		run:          msgRemoteRunner(pool, sc.Host),
+		write:        msgSFTPWriter(pool, sc.Host),
 	}
 	cfg := support.Config{
 		Runner:     support.RunnerConfig{Bin: bin, Dir: p.workdir, Args: claudeArgs(sc, merged)},
@@ -378,6 +381,8 @@ func startSupport(p *supportPrep, dir, knownHosts, httpAddr string, socksAddrs m
 		return nil
 	}
 	svc := support.NewService(cfg, &supportRemote{pool: pool, host: sc.Host})
+	// 消息桥的代码同步和页面手动同步共用 Service 的同仓库锁（bridge 建在 NewService 之前，这里补上）
+	bridge.lock = svc.RepoLock
 
 	hookURL := "http://" + httpAddr + "/support/hook?token=" + svc.HookToken()
 	hookCmd = tmux.Quote(self) + " support-hook " + tmux.Quote(hookURL)

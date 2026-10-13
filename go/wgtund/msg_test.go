@@ -7,7 +7,9 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/WillyChen0811/base/go/support"
 	"github.com/WillyChen0811/base/go/tmux"
@@ -65,7 +67,7 @@ func TestMsgBridgeDeliver(t *testing.T) {
 			rec.cmds = append(rec.cmds, cmd)
 			return rec.out, rec.code, nil
 		},
-		write: func(p string, data []byte) error {
+		write: func(_ context.Context, p string, data []byte) error {
 			rec.writes[p] = data
 			rec.order = append(rec.order, p)
 			return nil
@@ -107,7 +109,7 @@ func TestMsgBridgeDeliver(t *testing.T) {
 			rec2.cmds = append(rec2.cmds, cmd)
 			return nil, 0, nil
 		},
-		write: func(p string, data []byte) error {
+		write: func(_ context.Context, p string, data []byte) error {
 			rec2.writes[p] = data
 			rec2.order = append(rec2.order, p)
 			return nil
@@ -129,7 +131,7 @@ func TestMsgBridgeDeliver(t *testing.T) {
 	rec3 := &deliverRecorder{writes: map[string][]byte{}, out: []byte("can't find session: claude"), code: 1}
 	b3 := &msgBridge{
 		run: func(ctx context.Context, cmd string) ([]byte, int, error) { return rec3.out, rec3.code, nil },
-		write: func(p string, data []byte) error {
+		write: func(_ context.Context, p string, data []byte) error {
 			rec3.writes[p] = data
 			return nil
 		},
@@ -197,7 +199,7 @@ func TestMsgBridgeSyncMacToUbuntu(t *testing.T) {
 		repos:     map[string]support.Repo{"xxyi": {Dir: mac, Remote: ubuntu}},
 		remoteDir: map[string]string{"xxyi": ubuntu},
 		run:       localShRun,
-		write:     func(string, []byte) error { t.Fatal("Sync 不该写文件"); return nil },
+		write:     func(context.Context, string, []byte) error { t.Fatal("Sync 不该写文件"); return nil },
 	}
 	m := support.Message{ID: "1", From: "mac:frank", To: "ubuntu:claude", Text: "x", Repo: "xxyi", Branch: "main"}
 	if err := b.Sync(context.Background(), m); err != nil {
@@ -255,7 +257,7 @@ func TestMsgBridgeSyncBusyAndNoRepo(t *testing.T) {
 		repos:     map[string]support.Repo{"xxyi": {Dir: mac, Remote: ubuntu}},
 		remoteDir: map[string]string{"xxyi": ubuntu},
 		run:       localShRun,
-		write:     func(string, []byte) error { t.Fatal("Sync 不该写文件"); return nil },
+		write:     func(context.Context, string, []byte) error { t.Fatal("Sync 不该写文件"); return nil },
 	}
 	m := support.Message{ID: "5", From: "mac:frank", To: "ubuntu:claude", Text: "x", Repo: "xxyi", Branch: "main"}
 	gitCommit(t, mac, "c2")
@@ -269,7 +271,7 @@ func TestMsgBridgeSyncBusyAndNoRepo(t *testing.T) {
 		repos:     map[string]support.Repo{"xxyi": {Dir: mac, Remote: ubuntu}},
 		remoteDir: map[string]string{"xxyi": filepath.Join(t.TempDir(), "nothing")},
 		run:       localShRun,
-		write:     func(string, []byte) error { t.Fatal("Sync 不该写文件"); return nil },
+		write:     func(context.Context, string, []byte) error { t.Fatal("Sync 不该写文件"); return nil },
 	}
 	if err := b2.Sync(context.Background(), m); err == nil ||
 		!strings.Contains(err.Error(), "不是 git 仓库") || !strings.Contains(err.Error(), "remote_dir") {
@@ -284,7 +286,7 @@ func TestMsgBridgeSyncUbuntuToMac(t *testing.T) {
 		repos:     map[string]support.Repo{"xxyi": {Dir: mac, Remote: ubuntu}},
 		remoteDir: map[string]string{"xxyi": ubuntu},
 		run:       localShRun,
-		write:     func(string, []byte) error { t.Fatal("Sync 不该写文件"); return nil },
+		write:     func(context.Context, string, []byte) error { t.Fatal("Sync 不该写文件"); return nil },
 	}
 	m := support.Message{ID: "2", From: "ubuntu:claude", To: "mac:frank", Text: "x", Repo: "xxyi", Branch: "main"}
 	if err := b.Sync(context.Background(), m); err != nil {
@@ -346,6 +348,87 @@ func TestMsgRoutesWired(t *testing.T) {
 	st2, _, _ := run(t, f2.dir)
 	if resp, b := get(t, st2, "/msg", true); resp.StatusCode != 404 || !strings.Contains(string(b), "没有配置协助") {
 		t.Errorf("没配协助的 GET /msg 应 404: %d %s", resp.StatusCode, b)
+	}
+}
+
+// Sync 跟别的同仓库同步串行：锁被别人拿着就等到 ctx 超时，解锁后才干活。
+func TestMsgBridgeSyncWaitsRepoLock(t *testing.T) {
+	mac, ubuntu := newRepoPair(t)
+	gitCommit(t, ubuntu, "c2") // ubuntu→mac 方向有东西可同步
+	mu := &sync.Mutex{}
+	mu.Lock()
+	b := &msgBridge{
+		repos:     map[string]support.Repo{"xxyi": {Dir: mac, Remote: ubuntu}},
+		remoteDir: map[string]string{"xxyi": ubuntu},
+		lock:      func(string) *sync.Mutex { return mu },
+		run:       localShRun,
+		write:     func(context.Context, string, []byte) error { t.Fatal("Sync 不该写文件"); return nil },
+	}
+	m := support.Message{ID: "lk1", From: "ubuntu:x", To: "mac:y", Text: "x", Repo: "xxyi", Branch: "main"}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	if err := b.Sync(ctx, m); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("锁被占时应等到 ctx 超时，得到 %v", err)
+	}
+	mu.Unlock()
+	// 解锁后（新 ctx）再调：不该再因锁报 ctx 错误（别的原因失败由别的测试管，这里不断言成败）
+	if err := b.Sync(context.Background(), m); errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		t.Fatalf("解锁后再调不该因锁报 ctx 错误，得到 %v", err)
+	}
+}
+
+// Deliver 写文件阻塞时必须按 msgRunTimeout 返回，不能挂死（协助 Stop 等在这里）。
+func TestMsgBridgeDeliverWriteBlocksUntilTimeout(t *testing.T) {
+	old := msgRunTimeout
+	t.Cleanup(func() { msgRunTimeout = old })
+	msgRunTimeout = 200 * time.Millisecond
+
+	b := &msgBridge{
+		run: func(context.Context, string) ([]byte, int, error) {
+			t.Fatal("写正文都没写完，不该走到执行命令")
+			return nil, 0, nil
+		},
+		write: func(ctx context.Context, _ string, _ []byte) error {
+			<-ctx.Done()
+			return ctx.Err()
+		},
+	}
+	start := time.Now()
+	err := b.Deliver(context.Background(), support.Message{
+		ID: "to1", From: "mac:frank", To: "ubuntu:claude", Text: "hi",
+	})
+	if err == nil {
+		t.Fatal("写文件阻塞时 Deliver 应按超时返回错误")
+	}
+	if d := time.Since(start); d > time.Second {
+		t.Fatalf("耗时 %v，应在 1 秒内按超时返回", d)
+	}
+	if !strings.Contains(err.Error(), "写到 Ubuntu 失败") {
+		t.Errorf("错误应说清卡在写文件：%v", err)
+	}
+}
+
+// remoteDir 配不出来但记了原因（remoteDirErr）：报错要把原因带上，让人知道去哪儿修。
+func TestMsgBridgeSyncRemoteDirErr(t *testing.T) {
+	mac, ubuntu := newRepoPair(t)
+	b := &msgBridge{
+		repos:        map[string]support.Repo{"xxyi": {Dir: mac, Remote: ubuntu}},
+		remoteDirErr: map[string]string{"xxyi": "xyz"},
+		run: func(context.Context, string) ([]byte, int, error) {
+			t.Fatal("推不出 Ubuntu 目录就不该执行远端命令")
+			return nil, 0, nil
+		},
+		write: func(context.Context, string, []byte) error {
+			t.Fatal("推不出 Ubuntu 目录就不该写文件")
+			return nil
+		},
+	}
+	err := b.Sync(context.Background(), support.Message{
+		ID: "rd1", From: "mac:x", To: "ubuntu:y", Text: "x", Repo: "xxyi", Branch: "main",
+	})
+	if err == nil || !strings.Contains(err.Error(), "xyz") || !strings.Contains(err.Error(), "没有 Ubuntu 目录") {
+		t.Fatalf("报错要带上 remoteDirErr 里的原因，得到 %v", err)
 	}
 }
 

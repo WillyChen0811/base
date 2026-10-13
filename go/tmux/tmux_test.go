@@ -250,12 +250,12 @@ func TestPasteCommand(t *testing.T) {
 		err  bool
 	}{
 		{"普通", "ab", "xxyi-1",
-			"tmux -u load-buffer -b 'xxyi-1' - && tmux -u paste-buffer -p -d -b 'xxyi-1' -t '=ab:' && tmux -u send-keys -t '=ab:' Enter", false},
+			"tmux -u load-buffer -b 'xxyi-1' - && tmux -u paste-buffer -p -d -b 'xxyi-1' -t '=ab:' && sleep 0.3 && tmux -u send-keys -t '=ab:' Enter", false},
 		{"含空格会话", "my session", "buf_2",
-			"tmux -u load-buffer -b 'buf_2' - && tmux -u paste-buffer -p -d -b 'buf_2' -t '=my session:' && tmux -u send-keys -t '=my session:' Enter", false},
+			"tmux -u load-buffer -b 'buf_2' - && tmux -u paste-buffer -p -d -b 'buf_2' -t '=my session:' && sleep 0.3 && tmux -u send-keys -t '=my session:' Enter", false},
 		{"含单引号会话（单引号(buf)非法见下）", "a'b", "buf", "", false},
 		{"含中文会话", "中文名", "xxyi-msg-9",
-			"tmux -u load-buffer -b 'xxyi-msg-9' - && tmux -u paste-buffer -p -d -b 'xxyi-msg-9' -t '=中文名:' && tmux -u send-keys -t '=中文名:' Enter", false},
+			"tmux -u load-buffer -b 'xxyi-msg-9' - && tmux -u paste-buffer -p -d -b 'xxyi-msg-9' -t '=中文名:' && sleep 0.3 && tmux -u send-keys -t '=中文名:' Enter", false},
 		{"空会话", "", "buf", "", true},
 		{"会话含冒号", "a:b", "buf", "", true},
 		{"空buf", "ab", "", "", true},
@@ -287,7 +287,7 @@ func TestPasteCommand(t *testing.T) {
 	if err != nil {
 		t.Fatalf("会话名含单引号应合法: %v", err)
 	}
-	want := "tmux -u load-buffer -b 'buf' - && tmux -u paste-buffer -p -d -b 'buf' -t '=a'\\''b:' && tmux -u send-keys -t '=a'\\''b:' Enter"
+	want := "tmux -u load-buffer -b 'buf' - && tmux -u paste-buffer -p -d -b 'buf' -t '=a'\\''b:' && sleep 0.3 && tmux -u send-keys -t '=a'\\''b:' Enter"
 	if got != want {
 		t.Errorf("含单引号会话 =\n%q\n期望\n%q", got, want)
 	}

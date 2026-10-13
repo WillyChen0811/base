@@ -151,6 +151,10 @@ func NewService(cfg Config, remote Remote) *Service {
 // Hub 返回消息中转队列（协助没开时也能入库和决定，只是不推进）。
 func (s *Service) Hub() *Hub { return s.hub }
 
+// RepoLock 返回某仓库的同步锁（没有这个仓库返回 nil）。
+// 页面手动同步和消息桥的代码同步共用同一把锁，同仓库串行，互不踩工作区。
+func (s *Service) RepoLock(name string) *sync.Mutex { return s.syncLocks[name] }
+
 // kickMsgPump 踢一下消息推进：chan 满（已经有一次待处理）就忽略。
 func (s *Service) kickMsgPump() {
 	select {

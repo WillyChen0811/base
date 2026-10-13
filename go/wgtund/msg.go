@@ -8,25 +8,30 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/WillyChen0811/base/go/sshterm"
 	"github.com/WillyChen0811/base/go/support"
 	"github.com/WillyChen0811/base/go/tmux"
+	"github.com/pkg/sftp"
 )
 
-const (
-	msgSyncTimeout = 2 * time.Minute  // 单次代码同步上限（经隧道 fetch/push 可能较慢）
-	msgRunTimeout  = 30 * time.Second // 单次远端短命令上限（tmux 注入等）
-)
+// msgSyncTimeout 单次代码同步上限（经隧道 fetch/push 可能较慢）。
+const msgSyncTimeout = 2 * time.Minute
+
+// msgRunTimeout 单次远端短命令/写文件上限（tmux 注入、SFTP 等）；测试里调小。
+var msgRunTimeout = 30 * time.Second
 
 // msgBridge 把 Hub 的 Sync/Deliver 落到 SSH 和 git 上；字段都可在测试里换成假的。
 type msgBridge struct {
-	repos     map[string]support.Repo // Mac 本地仓库（Dir）+ 远端地址（Remote）
-	remoteDir map[string]string       // 仓库名 → Ubuntu 上的仓库目录
-	gitEnv    []string
-	run       func(ctx context.Context, cmd string) ([]byte, int, error) // 在 Ubuntu 执行，返回输出和退出码
-	write     func(path string, data []byte) error                       // 在 Ubuntu 写文件（相对家目录，自动建父目录，权限 0600）
+	repos        map[string]support.Repo // Mac 本地仓库（Dir）+ 远端地址（Remote）
+	remoteDir    map[string]string       // 仓库名 → Ubuntu 上的仓库目录
+	remoteDirErr map[string]string       // 仓库名 → 推导 Ubuntu 目录失败的原因（报错时直接说清）
+	gitEnv       []string
+	lock         func(name string) *sync.Mutex                              // support.Service 的同仓库锁；服务没建好时为 nil
+	run          func(ctx context.Context, cmd string) ([]byte, int, error) // 在 Ubuntu 执行，返回输出和退出码
+	write        func(ctx context.Context, path string, data []byte) error  // 在 Ubuntu 写文件（相对家目录，自动建父目录，权限 0600）
 }
 
 // msgSyncErr 把 git 同步错误翻译成消息窗口里给人看的一句话；
@@ -55,6 +60,20 @@ func (b *msgBridge) Sync(ctx context.Context, m support.Message) error {
 	}
 	ctx, cancel := context.WithTimeout(ctx, msgSyncTimeout)
 	defer cancel()
+	// 同仓库的同步（页面手动同步、别条消息触发的同步）串行；拿不到锁就等，超时放弃
+	if b.lock != nil {
+		if mu := b.lock(m.Repo); mu != nil {
+			locked := make(chan struct{})
+			go func() { mu.Lock(); close(locked) }()
+			select {
+			case <-locked:
+				defer mu.Unlock()
+			case <-ctx.Done():
+				go func() { mu.Lock(); mu.Unlock() }() // 真等到了也立刻放回，不把锁白白占着
+				return ctx.Err()
+			}
+		}
+	}
 	switch {
 	case strings.HasPrefix(m.From, "ubuntu:"):
 		if _, err := support.Sync(ctx, repo, m.Branch, b.gitEnv); err != nil {
@@ -64,6 +83,9 @@ func (b *msgBridge) Sync(ctx context.Context, m support.Message) error {
 	case strings.HasPrefix(m.From, "mac:"):
 		dir, ok := b.remoteDir[m.Repo]
 		if !ok {
+			if why := b.remoteDirErr[m.Repo]; why != "" {
+				return fmt.Errorf("仓库 %s 没有 Ubuntu 目录：%s", m.Repo, why)
+			}
 			return fmt.Errorf("仓库 %s 没有 Ubuntu 目录", m.Repo)
 		}
 		want, err := support.PushRef(ctx, repo, m.Branch, b.gitEnv)
@@ -98,17 +120,20 @@ func (b *msgBridge) Sync(ctx context.Context, m support.Message) error {
 // Deliver 把发往 ubuntu:<会话> 的消息注入 tmux：附件放收件箱，正文写成临时文件，
 // 经括号粘贴喂进会话后立即删掉临时文件。会话不存在时 tmux 的报错原样带上。
 func (b *msgBridge) Deliver(ctx context.Context, m support.Message) error {
+	// 开头就套超时：写文件和执行命令共用，协助 Stop / Hub 取消时不会卡在 SFTP 上
+	ctx, cancel := context.WithTimeout(ctx, msgRunTimeout)
+	defer cancel()
 	session := strings.TrimPrefix(m.To, "ubuntu:")
 	text := "[来自 " + m.From + "] " + m.Text
 	if len(m.File) > 0 {
 		inbox := "xxyi-work/inbox/" + m.ID + "-" + m.FileName
-		if err := b.write(inbox, m.File); err != nil {
+		if err := b.write(ctx, inbox, m.File); err != nil {
 			return fmt.Errorf("附件写到 Ubuntu 失败: %v", err)
 		}
 		text += "（附件：~/" + inbox + "）"
 	}
 	msgPath := ".xxyi-support/msg/" + m.ID + ".txt"
-	if err := b.write(msgPath, []byte(text)); err != nil {
+	if err := b.write(ctx, msgPath, []byte(text)); err != nil {
 		return fmt.Errorf("消息正文写到 Ubuntu 失败: %v", err)
 	}
 	paste, err := tmux.PasteCommand(session, "xxyi-"+m.ID)
@@ -117,8 +142,6 @@ func (b *msgBridge) Deliver(ctx context.Context, m support.Message) error {
 	}
 	cmd := "(" + paste + ") < " + tmux.Quote(msgPath) +
 		"; rc=$?; rm -f " + tmux.Quote(msgPath) + "; exit $rc"
-	ctx, cancel := context.WithTimeout(ctx, msgRunTimeout)
-	defer cancel()
 	out, code, err := b.run(ctx, cmd)
 	if err != nil {
 		return fmt.Errorf("连不上 Ubuntu: %v", err)
@@ -211,34 +234,72 @@ func msgRemoteRunner(pool *sshPool, host string) func(ctx context.Context, cmd s
 
 // msgSFTPWriter 经共用连接的 SFTP 在 Ubuntu 写文件（path 相对远端家目录）：
 // 自动建父目录，权限 0600（文件已存在时 OpenFile 的 mode 不生效，写完再 Chmod 一次），SFTP 会话用完即关。
-func msgSFTPWriter(pool *sshPool, host string) func(path string, data []byte) error {
-	return func(p string, data []byte) error {
-		c, err := pool.conn(host)
-		if err != nil {
-			return err
-		}
-		sc, err := c.SFTP()
-		if err != nil {
-			return err
-		}
-		defer sc.Close()
-		if i := strings.LastIndex(p, "/"); i > 0 {
-			if err := sc.MkdirAll(p[:i]); err != nil {
-				return err
+// 全部 SFTP 操作放进 goroutine：ctx 先到就关掉会话打断在途调用、返回 ctx.Err()，goroutine 自己退出，
+// 否则隧道半死时 SFTP 调用会一直阻塞，协助 Stop 永远挂住。
+func msgSFTPWriter(pool *sshPool, host string) func(ctx context.Context, path string, data []byte) error {
+	return func(ctx context.Context, p string, data []byte) error {
+		done := make(chan error, 1)
+		var mu sync.Mutex
+		var sc *sftp.Client // goroutine 拿到会话后放进来，ctx 分支要关它
+		var abandoned bool  // ctx 先结束时会话还没建好，由 goroutine 拿到后自己关
+		go func() {
+			c, err := pool.conn(host)
+			if err != nil {
+				done <- err
+				return
 			}
-		}
-		f, err := sc.OpenFile(p, os.O_WRONLY|os.O_CREATE|os.O_TRUNC)
-		if err != nil {
+			s, err := c.SFTP()
+			if err != nil {
+				done <- err
+				return
+			}
+			mu.Lock()
+			if abandoned {
+				mu.Unlock()
+				s.Close()
+				return
+			}
+			sc = s
+			mu.Unlock()
+			defer s.Close()
+			done <- sftpWriteFile(s, p, data)
+		}()
+		select {
+		case err := <-done:
 			return err
+		case <-ctx.Done():
+			mu.Lock()
+			s := sc
+			if s == nil {
+				abandoned = true // 会话稍后才建好，标记后由 goroutine 自己关
+			}
+			mu.Unlock()
+			if s != nil {
+				s.Close() // 打断 goroutine 里的在途调用
+			}
+			return ctx.Err()
 		}
-		if _, err := f.Write(data); err != nil {
-			f.Close()
-			return err
-		}
-		if err := f.Close(); err != nil {
-			return err
-		}
-		// 文件已存在时 OpenFile 不带 mode、服务端 umask 也不受控，写完显式 chmod 0600
-		return sc.Chmod(p, 0o600)
 	}
+}
+
+// sftpWriteFile 在已建好的 SFTP 会话里写一个文件（建父目录、写完 chmod 0600）。
+func sftpWriteFile(sc *sftp.Client, p string, data []byte) error {
+	if i := strings.LastIndex(p, "/"); i > 0 {
+		if err := sc.MkdirAll(p[:i]); err != nil {
+			return err
+		}
+	}
+	f, err := sc.OpenFile(p, os.O_WRONLY|os.O_CREATE|os.O_TRUNC)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	// 文件已存在时 OpenFile 不带 mode、服务端 umask 也不受控，写完显式 chmod 0600
+	return sc.Chmod(p, 0o600)
 }

@@ -127,6 +127,7 @@ var bufIllegal = regexp.MustCompile(`[^A-Za-z0-9_-]`)
 // PasteCommand 返回把标准输入里的文字以括号粘贴方式注入会话、再按回车的 shell 命令。
 // 文字本身不进命令行，由调用方经 SSH 的 stdin 喂入。buf 是临时缓冲区名（调用方给，如 "xxyi-<消息id>"）。
 // -p 走括号粘贴（文字不被逐字符当成按键，多行/带特殊字符都安全），-d 粘贴完删掉缓冲区。
+// 粘贴和回车之间 sleep 0.3：粘贴内容落到 shell 输入行需要时间，立刻回车可能没提交。
 func PasteCommand(session, buf string) (string, error) {
 	if err := ValidTarget(session); err != nil {
 		return "", err
@@ -138,7 +139,7 @@ func PasteCommand(session, buf string) (string, error) {
 	qTarget := Quote("=" + session + ":")
 	return "tmux -u load-buffer -b " + qBuf + " -" +
 		" && tmux -u paste-buffer -p -d -b " + qBuf + " -t " + qTarget +
-		" && tmux -u send-keys -t " + qTarget + " Enter", nil
+		" && sleep 0.3 && tmux -u send-keys -t " + qTarget + " Enter", nil
 }
 
 // CaptureCommand 返回抓取窗格内容的命令。

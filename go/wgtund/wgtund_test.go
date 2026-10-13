@@ -52,6 +52,12 @@ func newFixture(t *testing.T, mutate func(cfg map[string]any)) *fixture {
 // newFixtureExec 同 newFixture，但给隧道内的 SSH 服务器配 exec 行为（假 tmux 用）。
 func newFixtureExec(t *testing.T, mutate func(cfg map[string]any), exec func(string) (string, string, int)) *fixture {
 	t.Helper()
+	return newFixtureOpts(t, mutate, sshtest.Options{Exec: exec})
+}
+
+// newFixtureOpts 同 newFixtureExec，但可完整指定 SSH 服务器选项（如 Forward）。
+func newFixtureOpts(t *testing.T, mutate func(cfg map[string]any), opts sshtest.Options) *fixture {
+	t.Helper()
 	dir := t.TempDir()
 	aPriv, aPub := wgKey(t)
 	bPriv, bPub := wgKey(t)
@@ -76,7 +82,7 @@ func newFixtureExec(t *testing.T, mutate func(cfg map[string]any), exec func(str
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { ln.Close() })
-	srv := sshtest.ServeWith(ln, clientKey.PublicKey(), sshtest.Options{Exec: exec})
+	srv := sshtest.ServeWith(ln, clientKey.PublicKey(), opts)
 
 	// 远端回显服务（在隧道 A 里监听 7000），给 SOCKS 测试用
 	eln, err := a.Listen("tcp", "10.99.0.1:7000")

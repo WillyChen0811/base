@@ -41,5 +41,53 @@ HTTP 接口都要带 `token` 参数；每台主机共用一条 SSH 连接（第�
 错误统一返回 `{"error":"原因"}`：参数不合规 400、主机/会话不存在 404、重名 409、方法不对 405、
 连不上主机或远端执行失败 502。
 
+### 协助服务（可选）
+`hosts.json` 里加 `support` 段才启用；没有这段，下面的接口全部返回 404 `{"error":"没有配置协助"}`。
+让远端主机上的 Claude 借本机做测试：本机主动经共用 SSH 连接在远端开只绑 127.0.0.1 的入口，
+入口地址和令牌写到远端 `~/.xxyi-support/endpoint.json`（权限 600）。
+  ```json
+  "support": {
+    "host": "ubuntu",
+    "claude_bin": "claude",
+    "workdir": "~/xxyi-work",
+    "claude_settings": "~/.xxyi/support-claude.json",
+    "claude_tools": "Bash,Read,Edit,Write,Glob,Grep",
+    "claude_args": ["--model", "sonnet", "--max-budget-usd", "5"],
+    "repos": {"xxyi": {"dir": "~/Documents/codes/xxyi", "remote": "ssh://chenwy@10.0.0.2/home/chenwy/xxyi"}},
+    "git_tunnel": "home"
+  }
+  ```
+- `host`（必填，须在 hosts 里）、`workdir`（必填，须是已存在的目录）、`claude_settings`（必填）、
+  `repos`（每项 `dir`、`remote` 都不能空）；`claude_bin` 默认 `claude`；`claude_args` 追加给 Claude 的参数。
+- `git_tunnel`：可选，git 同步经这条隧道的 SOCKS 口走 SSH（须在 `socks` 里有同名条目；
+  用 `support.host` 第一个私钥，严格校验 known_hosts）。
+- `claude_tools`：可选，协助 Claude 可用的工具（逗号分隔，仅字母），默认 `Bash,Read,Edit,Write,Glob,Grep`。
+- 不合规时 wgtund 启动失败，错误以 `hosts.json: support…` 开头。
+
+安全要求（启动时检查）：
+- `claude_settings` 必须是 JSON 对象，且 `sandbox.enabled` 为 `true`、`sandbox.allowUnsandboxedCommands` 为 `false`、
+  `sandbox.failIfUnavailable` 为 `true`；`permissions.defaultMode` 若有，只能是 `default` 或 `manual`。
+- `claude_args` 不许出现 `--dangerously-skip-permissions`、`--allow-dangerously-skip-permissions`、`--permission-mode`、
+  `--permission-prompts`、`--settings`、`--permission-prompt-tool`，以及由 wgtund 固定给出的
+  `--restricted`、`--safe-mode`、`--setting-sources`、`--tools`、`--allowedTools`/`--allowed-tools`、
+  `--disallowedTools`/`--disallowed-tools`、`--mcp-config`、`--strict-mcp-config`、`--add-dir`、`--plugin-dir`、`--agents`
+  （含 `--xxx=值` 写法）：协助要求权限由用户批准。
+- 协助的 Claude 运行在受限模式：启动参数固定为 `--restricted --strict-mcp-config --tools <claude_tools>
+  --settings <合并文件>`，并为每个仓库加 `--add-dir <dir>`（按仓库名排序），再接 `claude_args`。
+  因此只读协助设置文件，不受用户全局/项目/本地设置（allow 规则、MCP 服务器等）影响；
+  文件工具只能访问 `workdir` 和各仓库目录；只有 `claude_tools` 点名的工具可用。
+- 每次启动，wgtund 把 `claude_settings` 复制一份、覆盖其中的 `hooks.PermissionRequest`（指向下面的钩子子命令，
+  失败即拒绝），写到配置目录的 `support-claude.merged.json`（权限 600），Claude 用 `--settings` 读它；其余设置保留。
+  审计日志在配置目录的 `support-log.jsonl`。
+
+本机接口（同样要主令牌和 CORS 规则）：
+- `GET /support`：状态与最近日志。
+- `POST /support/start?minutes=N`（1..240）、`POST /support/stop`、`POST /support/decide?id=&allow=1|0[&message=]`。
+- `POST /support/hook?token=<钩子令牌>`：不走主令牌，由协助服务自己校验钩子令牌；只供下面的子命令使用。
+
+钩子子命令：`wgtund support-hook [http://127.0.0.1:端口/support/hook?token=…]`
+（地址缺省取环境变量 `XXYI_HOOK_URL`；只接受本机地址）。从标准输入读钩子 JSON（最多 1MB）转给本机服务，
+原样输出其回答；任何失败都输出「拒绝」并以退出码 0 结束，让 Claude Code 按拒绝处理。
+
 ## 测试
     cd go && go test ./...

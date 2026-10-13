@@ -43,6 +43,7 @@ type fileConf struct {
 	AllowedOrigins []string          `json:"allowed_origins"`
 	Socks          map[string]string `json:"socks"`
 	Hosts          []hostConf        `json:"hosts"`
+	Support        *supportConf      `json:"support"`
 }
 
 func expand(p string) string {
@@ -124,6 +125,10 @@ func Run(ctx context.Context, dir string, stdin io.Reader, stdout io.Writer) (er
 			return fmt.Errorf("hosts.json: socks 地址 %q 必须是回环地址", addr)
 		}
 	}
+	prep, err := prepareSupport(conf)
+	if err != nil {
+		return err
+	}
 	knownHostsCb, err := knownhosts.New(expand(conf.KnownHosts))
 	if err != nil {
 		return fmt.Errorf("known_hosts: %w", err)
@@ -189,7 +194,33 @@ func Run(ctx context.Context, dir string, stdin io.Reader, stdout io.Writer) (er
 		return pool.session(r.Context(), name, command, cols, rows)
 	}
 
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return err
+	}
+	closers = append(closers, ln)
+
+	// 协助服务（可选）：本机 HTTP 地址和钩子令牌都要在写合并设置文件前拿到
+	var supportLocal, supportHook http.Handler
+	if prep != nil {
+		svc, err := startSupport(prep, dir, expand(conf.KnownHosts), ln.Addr().String(), socksAddrs, pool)
+		if err != nil {
+			return err
+		}
+		closers = append(closers, closerFunc(svc.Close))
+		supportLocal, supportHook = svc.LocalHandler(), svc.HookHandler()
+	}
+
 	mux := http.NewServeMux()
+	supportRoute := func(w http.ResponseWriter, r *http.Request) {
+		if supportLocal == nil {
+			errJSON(w, http.StatusNotFound, "没有配置协助")
+			return
+		}
+		supportLocal.ServeHTTP(w, r)
+	}
+	mux.HandleFunc("/support", supportRoute)
+	mux.HandleFunc("/support/", supportRoute)
 	mux.HandleFunc("/hosts", func(w http.ResponseWriter, r *http.Request) {
 		type item struct {
 			Name      string `json:"name"`
@@ -368,6 +399,11 @@ func Run(ctx context.Context, dir string, stdin io.Reader, stdout io.Writer) (er
 	mux.Handle("/term", sshterm.Handler(open, sshterm.BridgeOptions{OriginPatterns: conf.AllowedOrigins}))
 
 	guarded := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// 钩子入口由 support 自己校验钩子令牌，不走主令牌；只放行这一个精确路径
+		if supportHook != nil && r.URL.Path == "/support/hook" {
+			supportHook.ServeHTTP(w, r)
+			return
+		}
 		// 页面（如 xxyi 的 127.0.0.1:8765）和本服务端口不同，fetch /hosts、/status 属于跨域：
 		// 只对 allowed_origins 里的来源放行；WebSocket 不受 CORS 管，由 sshterm 自己校验 Origin
 		if o := r.Header.Get("Origin"); o != "" && originAllowed(o, conf.AllowedOrigins) {
@@ -380,10 +416,6 @@ func Run(ctx context.Context, dir string, stdin io.Reader, stdout io.Writer) (er
 		}
 		mux.ServeHTTP(w, r)
 	})
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		return err
-	}
 	srv := &http.Server{Handler: guarded}
 	served := make(chan error, 1)
 	go func() { served <- srv.Serve(ln) }()
@@ -412,6 +444,11 @@ func Run(ctx context.Context, dir string, stdin io.Reader, stdout io.Writer) (er
 	}
 	return nil
 }
+
+// closerFunc 让普通函数当 io.Closer 用。
+type closerFunc func()
+
+func (f closerFunc) Close() error { f(); return nil }
 
 func writeJSON(w http.ResponseWriter, v any) {
 	w.Header().Set("Content-Type", "application/json")

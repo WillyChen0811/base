@@ -206,18 +206,74 @@ func TestMsgBridgeSyncMacToUbuntu(t *testing.T) {
 	if got := gitSh(t, ubuntu, "rev-parse", "refs/heads/main"); got != want {
 		t.Errorf("Ubuntu main 应快进到 %s，得到 %s", want, got)
 	}
+	// 同步成功后暂存引用应已被删掉（中转用完就该没了）
+	if out, err := exec.Command("git", "-C", ubuntu, "rev-parse", "--verify", "-q", "refs/xxyi/mac/main").CombinedOutput(); err == nil {
+		t.Errorf("成功后暂存引用还在: %s", out)
+	}
 
-	// Ubuntu 脏：FFScript 报 ERR dirty，Sync 要转成给人看的中文
-	if err := os.WriteFile(filepath.Join(ubuntu, "dirty.txt"), []byte("oops"), 0o644); err != nil {
+	// mac 写个文件再同步一次，把它带进 ubuntu 工作区（成为已跟踪文件）
+	if err := os.WriteFile(filepath.Join(mac, "f.txt"), []byte("v1"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	newWant := gitCommit(t, mac, "c3")
+	gitSh(t, mac, "add", "f.txt")
+	gitSh(t, mac, "commit", "-q", "-m", "add f")
+	gitSh(t, mac, "commit", "-q", "--allow-empty", "-m", "c3")
+	if err := b.Sync(context.Background(), m); err != nil {
+		t.Fatalf("干净时 Sync 不该报错: %v", err)
+	}
+	// 未跟踪文件不挡同步
+	if err := os.WriteFile(filepath.Join(ubuntu, "scratch.txt"), []byte("scratch"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	newWant := gitCommit(t, mac, "c4")
+	if err := b.Sync(context.Background(), m); err != nil {
+		t.Fatalf("只有未跟踪文件时不该挡同步: %v", err)
+	}
+
+	// Ubuntu 脏（改已跟踪文件）：FFScript 报 ERR dirty，Sync 要转成给人看的中文
+	if err := os.WriteFile(filepath.Join(ubuntu, "f.txt"), []byte("oops"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	newWant = gitCommit(t, mac, "c5")
 	err := b.Sync(context.Background(), m)
 	if err == nil || !strings.Contains(err.Error(), "Ubuntu") || !strings.Contains(err.Error(), "未提交") {
 		t.Fatalf("Ubuntu 脏应报中文错误，得到 %v", err)
 	}
 	if got := gitSh(t, ubuntu, "rev-parse", "refs/heads/main"); got == newWant {
 		t.Errorf("脏时不该快进")
+	}
+}
+
+func TestMsgBridgeSyncBusyAndNoRepo(t *testing.T) {
+	mac, ubuntu := newRepoPair(t)
+	// ubuntu 主工作区让出 main，改检出别的分支
+	gitSh(t, ubuntu, "checkout", "-q", "-b", "other")
+	wt := filepath.Join(t.TempDir(), "wt")
+	gitSh(t, ubuntu, "worktree", "add", "-q", wt, "main")
+
+	b := &msgBridge{
+		repos:     map[string]support.Repo{"xxyi": {Dir: mac, Remote: ubuntu}},
+		remoteDir: map[string]string{"xxyi": ubuntu},
+		run:       localShRun,
+		write:     func(string, []byte) error { t.Fatal("Sync 不该写文件"); return nil },
+	}
+	m := support.Message{ID: "5", From: "mac:frank", To: "ubuntu:claude", Text: "x", Repo: "xxyi", Branch: "main"}
+	gitCommit(t, mac, "c2")
+	err := b.Sync(context.Background(), m)
+	if err == nil || !strings.Contains(err.Error(), "main") || !strings.Contains(err.Error(), "工作区") {
+		t.Fatalf("main 被另一工作区检出应报占用，得到 %v", err)
+	}
+
+	// remote_dir 配错指向非仓库目录 → 报「不是 git 仓库」并提示查 remote_dir
+	b2 := &msgBridge{
+		repos:     map[string]support.Repo{"xxyi": {Dir: mac, Remote: ubuntu}},
+		remoteDir: map[string]string{"xxyi": filepath.Join(t.TempDir(), "nothing")},
+		run:       localShRun,
+		write:     func(string, []byte) error { t.Fatal("Sync 不该写文件"); return nil },
+	}
+	if err := b2.Sync(context.Background(), m); err == nil ||
+		!strings.Contains(err.Error(), "不是 git 仓库") || !strings.Contains(err.Error(), "remote_dir") {
+		t.Fatalf("非仓库目录应报查 remote_dir，得到 %v", err)
 	}
 }
 

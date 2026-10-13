@@ -222,6 +222,172 @@ func TestFFScript_currentBranchDirty(t *testing.T) {
 	}
 }
 
+func TestFFScript_untrackedDoesNotBlock(t *testing.T) {
+	mac, ubuntu := setupMacUbuntu(t)
+	gitOK(t, mac, "checkout", "-b", "feat/x")
+	makeCommit(t, mac, "x1")
+	c1 := stageAndWant(t, mac, ubuntu, "feat/x")
+	script, _ := FFScript(ubuntu, "feat/x", c1)
+	runSh(t, script)
+	gitOK(t, ubuntu, "checkout", "feat/x")
+
+	// 当前检出该分支，只有未跟踪文件：不挡快进
+	if err := os.WriteFile(filepath.Join(ubuntu, "scratch.txt"), []byte("scratch"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	makeCommit(t, mac, "x2")
+	c2 := stageAndWant(t, mac, ubuntu, "feat/x")
+	script, _ = FFScript(ubuntu, "feat/x", c2)
+	out, code := runSh(t, script)
+	got, err := ParseFFResult(out, code)
+	if err != nil {
+		t.Fatalf("只有未跟踪文件应能快进: %v (out=%q code=%d)", err, out, code)
+	}
+	if got != c2 {
+		t.Fatalf("OK 提交号 = %s，期望 %s", got, c2)
+	}
+}
+
+func TestFFScript_alreadyConsistent(t *testing.T) {
+	mac, ubuntu := setupMacUbuntu(t)
+	gitOK(t, mac, "checkout", "-b", "feat/x")
+	makeCommit(t, mac, "x1")
+	c1 := stageAndWant(t, mac, ubuntu, "feat/x")
+	script, _ := FFScript(ubuntu, "feat/x", c1)
+	out, code := runSh(t, script)
+	if _, err := ParseFFResult(out, code); err != nil {
+		t.Fatalf("首次 FF: %v (out=%q code=%d)", err, out, code)
+	}
+
+	// 工作区把已跟踪文件弄脏，再跑一次同样的 want：已一致 → 直接 OK，分支不动
+	if err := os.WriteFile(filepath.Join(ubuntu, "x1"), []byte("local"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	c1again := stageAndWant(t, mac, ubuntu, "feat/x") // mac 没动，重新摆好暂存引用
+	if c1again != c1 {
+		t.Fatalf("重推提交号变了: %s → %s", c1, c1again)
+	}
+	script, _ = FFScript(ubuntu, "feat/x", c1)
+	out, code = runSh(t, script)
+	got, err := ParseFFResult(out, code)
+	if err != nil {
+		t.Fatalf("已一致应报 OK: %v (out=%q code=%d)", err, out, code)
+	}
+	if got != c1 {
+		t.Fatalf("OK 提交号 = %s，期望 %s", got, c1)
+	}
+	if h := gitOK(t, ubuntu, "rev-parse", "refs/heads/feat/x"); h != c1 {
+		t.Fatalf("分支被动了: %s → %s", c1, h)
+	}
+	// 本地改动必须原样保留（没被 merge/reset 抹掉）
+	body, err := os.ReadFile(filepath.Join(ubuntu, "x1"))
+	if err != nil || string(body) != "local" {
+		t.Fatalf("本地改动被覆盖: %q %v", body, err)
+	}
+}
+
+func TestFFScript_noRepoDir(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "not-a-repo")
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	script, err := FFScript(dir, "feat/x", strings.Repeat("a", 40))
+	if err != nil {
+		t.Fatalf("FFScript: %v", err)
+	}
+	out, code := runSh(t, script)
+	if _, err := ParseFFResult(out, code); !errors.Is(err, ErrNoRepoDir) {
+		t.Fatalf("期望 ErrNoRepoDir，得到 %v (out=%q code=%d)", err, out, code)
+	}
+	if code != 6 {
+		t.Fatalf("退出码 = %d，期望 6", code)
+	}
+}
+
+func TestFFScript_busyWorktree(t *testing.T) {
+	mac, ubuntu := setupMacUbuntu(t)
+	gitOK(t, mac, "checkout", "-b", "feat/x")
+	makeCommit(t, mac, "x1")
+	c1 := stageAndWant(t, mac, ubuntu, "feat/x")
+	script, _ := FFScript(ubuntu, "feat/x", c1)
+	out, code := runSh(t, script)
+	if _, err := ParseFFResult(out, code); err != nil {
+		t.Fatalf("首次 FF: %v (out=%q code=%d)", err, out, code)
+	}
+
+	// 另一个工作区检出 feat/x：ubuntu 主工作区仍在 master，但分支被别人占了
+	wt := filepath.Join(t.TempDir(), "wt")
+	gitOK(t, ubuntu, "worktree", "add", wt, "feat/x")
+
+	makeCommit(t, mac, "x2")
+	c2 := stageAndWant(t, mac, ubuntu, "feat/x")
+	script, _ = FFScript(ubuntu, "feat/x", c2)
+	out, code = runSh(t, script)
+	if _, err := ParseFFResult(out, code); !errors.Is(err, ErrRepoBusy) {
+		t.Fatalf("期望 ErrRepoBusy，得到 %v (out=%q code=%d)", err, out, code)
+	}
+	if code != 7 {
+		t.Fatalf("退出码 = %d，期望 7", code)
+	}
+	if h := gitOK(t, ubuntu, "rev-parse", "refs/heads/feat/x"); h != c1 {
+		t.Fatalf("忙时分支被移动了: %s → %s", c1, h)
+	}
+}
+
+func TestFFScript_busyRebase(t *testing.T) {
+	mac, ubuntu := setupMacUbuntu(t)
+	// mac 的 feat/x 上有一个碰 conf 文件的提交
+	gitOK(t, mac, "checkout", "-b", "feat/x")
+	if err := os.WriteFile(filepath.Join(mac, "conf"), []byte("mac"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	gitOK(t, mac, "add", "conf")
+	gitOK(t, mac, "commit", "-m", "mac-conf")
+	c1 := stageAndWant(t, mac, ubuntu, "feat/x")
+	script, _ := FFScript(ubuntu, "feat/x", c1)
+	out, code := runSh(t, script)
+	if _, err := ParseFFResult(out, code); err != nil {
+		t.Fatalf("首次 FF: %v (out=%q code=%d)", err, out, code)
+	}
+	// ubuntu 的 master 上同名文件不同内容：rebase feat/x 必冲突，rebase 停在半途
+	if err := os.WriteFile(filepath.Join(ubuntu, "conf"), []byte("ubuntu"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	gitOK(t, ubuntu, "add", "conf")
+	gitOK(t, ubuntu, "commit", "-m", "ubuntu-conf")
+	gitOK(t, ubuntu, "checkout", "feat/x")
+	if out, err := exec.Command("git", "-C", ubuntu, "rebase", "master").CombinedOutput(); err == nil {
+		t.Fatalf("rebase 应冲突停下: %s", out)
+	}
+
+	makeCommit(t, mac, "x2")
+	c2 := stageAndWant(t, mac, ubuntu, "feat/x")
+	script, _ = FFScript(ubuntu, "feat/x", c2)
+	out, code = runSh(t, script)
+	if _, err := ParseFFResult(out, code); !errors.Is(err, ErrRepoBusy) {
+		t.Fatalf("期望 ErrRepoBusy，得到 %v (out=%q code=%d)", err, out, code)
+	}
+	if code != 7 {
+		t.Fatalf("退出码 = %d，期望 7", code)
+	}
+}
+
+func TestFFScript_stagingRefRemoved(t *testing.T) {
+	mac, ubuntu := setupMacUbuntu(t)
+	gitOK(t, mac, "checkout", "-b", "feat/x")
+	makeCommit(t, mac, "x1")
+	c1 := stageAndWant(t, mac, ubuntu, "feat/x")
+	script, _ := FFScript(ubuntu, "feat/x", c1)
+	out, code := runSh(t, script)
+	if _, err := ParseFFResult(out, code); err != nil {
+		t.Fatalf("首次 FF: %v (out=%q code=%d)", err, out, code)
+	}
+	// 成功快进后暂存引用应被删掉
+	if out, err := exec.Command("git", "-C", ubuntu, "rev-parse", "--verify", "-q", "refs/xxyi/mac/feat/x").CombinedOutput(); err == nil {
+		t.Fatalf("成功后暂存引用还在: %s", out)
+	}
+}
+
 func TestFFScript_notFastForward(t *testing.T) {
 	mac, ubuntu := setupMacUbuntu(t)
 	gitOK(t, mac, "checkout", "-b", "feat/x")
@@ -303,6 +469,13 @@ func TestParseFFResult_genericError(t *testing.T) {
 	// 退出码非 0 但输出是 OK → 不能当成功
 	if _, err := ParseFFResult([]byte("OK "+strings.Repeat("a", 40)), 1); err == nil {
 		t.Error("退出码非 0 不能当成功")
+	}
+	// ERR nodir / ERR busy → 对应哨兵错误
+	if _, err := ParseFFResult([]byte("ERR nodir"), 6); !errors.Is(err, ErrNoRepoDir) {
+		t.Errorf("ERR nodir 应得 ErrNoRepoDir，得到 %v", err)
+	}
+	if _, err := ParseFFResult([]byte("ERR busy"), 7); !errors.Is(err, ErrRepoBusy) {
+		t.Errorf("ERR busy 应得 ErrRepoBusy，得到 %v", err)
 	}
 	// OK 前混着 merge 的提示输出 → 取 OK 行的提交号
 	noisy := []byte("Updating eafc78b..5fbeb6e\nFast-forward\n x2 | 1 +\nOK " + strings.Repeat("b", 40) + "\n")

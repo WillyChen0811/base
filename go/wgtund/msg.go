@@ -39,6 +39,8 @@ func msgSyncErr(src, dst, branch string, err error) error {
 		return fmt.Errorf("%s 上 %s 有%s没有的提交，不能快进", src, branch, dst)
 	case errors.Is(err, support.ErrMismatch):
 		return errors.New("推送后暂存引用被改动")
+	case errors.Is(err, support.ErrRepoBusy):
+		return fmt.Errorf("Ubuntu 上 %s 正在另一个工作区或 rebase 中，不能动", branch)
 	default:
 		return err
 	}
@@ -78,6 +80,10 @@ func (b *msgBridge) Sync(ctx context.Context, m support.Message) error {
 		}
 		got, err := support.ParseFFResult(out, code)
 		if err != nil {
+			// 目录不对是配置问题，单独翻（msgSyncErr 拿不到 dir）
+			if errors.Is(err, support.ErrNoRepoDir) {
+				return fmt.Errorf("Ubuntu 上 %s 不是 git 仓库（检查 hosts.json 的 remote_dir）", dir)
+			}
 			return msgSyncErr("Ubuntu", "Mac", m.Branch, err)
 		}
 		if got != want {

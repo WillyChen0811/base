@@ -11,6 +11,12 @@ import (
 // ErrMismatch 接收方暂存引用的提交号与期望值不一致（推送后被别处覆盖过）。
 var ErrMismatch = errors.New("support: 暂存引用与期望提交号不一致")
 
+// ErrNoRepoDir 目标目录不是 git 仓库（hosts.json 的 remote_dir 配错了）。
+var ErrNoRepoDir = errors.New("support: 目标目录不是 git 仓库")
+
+// ErrRepoBusy 分支正被占用：另一个工作区检出了它，或仓库处于 rebase 中。
+var ErrRepoBusy = errors.New("support: 分支正被占用（其他工作区或 rebase 中）")
+
 var fullCommit = regexp.MustCompile(`^[0-9a-fA-F]{40}$`)
 
 // shQuote 把任意字符串做成单引号包住的 shell 参数。
@@ -56,7 +62,9 @@ func PushRef(ctx context.Context, r Repo, branch string, env []string) (string, 
 // FFScript 返回在接收方仓库 dir 里执行的 sh 脚本：把 refs/xxyi/mac/<branch> 快进到 refs/heads/<branch>。
 // want 是期望的提交号（40 位十六进制，否则报错）；dir 用 shQuote 引起来。
 // 输出约定：成功 "OK <提交号>" 退出 0；暂存引用不符 "ERR mismatch" 退出 3；
-// 不能快进 "ERR notff" 退出 4；当前分支工作区脏 "ERR dirty" 退出 5。
+// 不能快进 "ERR notff" 退出 4；当前分支工作区脏（未跟踪文件不算）"ERR dirty" 退出 5；
+// 目录不是 git 仓库 "ERR nodir" 退出 6；分支被其他工作区检出或 rebase 中 "ERR busy" 退出 7。
+// 成功（含已一致）后删除暂存引用——中转用完就该没了，失败路径不删（留给排查）。
 func FFScript(dir, branch, want string) (string, error) {
 	if err := ValidBranch(branch); err != nil {
 		return "", err
@@ -68,9 +76,13 @@ func FFScript(dir, branch, want string) (string, error) {
 	h := shQuote("refs/heads/" + branch)
 	s := shQuote(stagingRef(branch))
 	w := shQuote(want)
+	// worktree list --porcelain 里检出该分支的行恰好是 "branch refs/heads/<branch>"
+	wtLine := shQuote("branch refs/heads/" + branch)
 	return strings.Join([]string{
 		"set -e",
 		"D=" + d,
+		// 0. 目录必须是 git 仓库，否则后面每一步的报错都看不出真正原因
+		`git -C "$D" rev-parse --git-dir >/dev/null 2>&1 || { echo 'ERR nodir'; exit 6; }`,
 		// 1. 暂存引用必须是刚推上去的那个提交
 		`if [ "$(git -C "$D" rev-parse --verify -q ` + s + ` || true)" != ` + w + ` ]; then echo 'ERR mismatch'; exit 3; fi`,
 		`if ! git -C "$D" rev-parse --verify -q ` + h + ` >/dev/null 2>&1; then`,
@@ -79,21 +91,35 @@ func FFScript(dir, branch, want string) (string, error) {
 		`elif ! git -C "$D" merge-base --is-ancestor ` + h + ` ` + w + `; then`,
 		// 3. 本地有独有提交：不能快进
 		`  echo 'ERR notff'; exit 4`,
+		`elif [ "$(git -C "$D" rev-parse ` + h + `)" = ` + w + ` ]; then`,
+		// 4. 已一致：什么都不做——工作区脏不脏与此无关，不该拦同步
+		`  :`,
 		`elif [ "$(git -C "$D" symbolic-ref -q HEAD || true)" = ` + h + ` ]; then`,
-		// 4. 正检出该分支：工作区必须干净，再 merge 快进（带动工作区）
-		`  if [ -n "$(git -C "$D" status --porcelain)" ]; then echo 'ERR dirty'; exit 5; fi`,
+		// 5. 正检出该分支：已跟踪文件必须干净（未跟踪不挡，撞上了 merge --ff-only 自己会拒），再 merge 快进（带动工作区）
+		`  if [ -n "$(git -C "$D" status --porcelain --untracked-files=no)" ]; then echo 'ERR dirty'; exit 5; fi`,
 		`  git -C "$D" merge --ff-only ` + w,
 		`else`,
-		// 5. 没检出该分支：CAS 更新，旧值中途被人动过就会失败
+		// 6. 没检出该分支：先确认没被别的工作区检出、不在 rebase 中（rebase 时 HEAD 是 detached，走的就是这一支）
+		`  if git -C "$D" worktree list --porcelain | grep -qxF ` + wtLine + `; then echo 'ERR busy'; exit 7; fi`,
+		// rev-parse --git-path 可能返回相对路径，相对 "$D" 解析
+		`  rp=$(git -C "$D" rev-parse --git-path rebase-merge)`,
+		`  case $rp in /*) ;; *) rp="$D/$rp" ;; esac`,
+		`  if [ -d "$rp" ]; then echo 'ERR busy'; exit 7; fi`,
+		`  rp=$(git -C "$D" rev-parse --git-path rebase-apply)`,
+		`  case $rp in /*) ;; *) rp="$D/$rp" ;; esac`,
+		`  if [ -d "$rp" ]; then echo 'ERR busy'; exit 7; fi`,
+		// 7. CAS 更新，旧值中途被人动过就会失败
 		`  git -C "$D" update-ref ` + h + ` ` + w + ` "$(git -C "$D" rev-parse ` + h + `)"`,
 		`fi`,
-		// 6. 报告结果
+		// 8. 删除暂存引用（失败忽略），报告结果
+		`git -C "$D" update-ref -d ` + s + ` 2>/dev/null || true`,
 		`echo "OK $(git -C "$D" rev-parse ` + h + `)"`,
 	}, "\n"), nil
 }
 
 // ParseFFResult 解析 FFScript 的输出和退出码：OK → 返回提交号；
-// ERR dirty→ErrDirty，notff→ErrNotFastForward，mismatch→ErrMismatch；其他 → 带输出前 500 字节的错误。
+// ERR dirty→ErrDirty，notff→ErrNotFastForward，mismatch→ErrMismatch，
+// nodir→ErrNoRepoDir，busy→ErrRepoBusy；其他 → 带输出前 500 字节的错误。
 // 从最后一行往前找结果行：merge 等命令的提示性输出会混在 OK 行之前，不能假设 OK 在第一行。
 func ParseFFResult(out []byte, exitCode int) (string, error) {
 	lines := strings.Split(string(out), "\n")
@@ -117,6 +143,12 @@ func ParseFFResult(out []byte, exitCode int) (string, error) {
 		}
 		if strings.HasPrefix(l, "ERR mismatch") {
 			return "", ErrMismatch
+		}
+		if strings.HasPrefix(l, "ERR nodir") {
+			return "", ErrNoRepoDir
+		}
+		if strings.HasPrefix(l, "ERR busy") {
+			return "", ErrRepoBusy
 		}
 	}
 	msg := out

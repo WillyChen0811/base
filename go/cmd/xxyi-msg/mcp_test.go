@@ -124,7 +124,7 @@ func TestMCPToolsList(t *testing.T) {
 		t.Fatalf("回应条数 %d", len(resps))
 	}
 	tools := resps[0]["result"].(map[string]any)["tools"].([]any)
-	if len(tools) != 4 {
+	if len(tools) != 5 {
 		t.Fatalf("工具数 %d", len(tools))
 	}
 	names := make([]string, 0, len(tools))
@@ -149,9 +149,14 @@ func TestMCPToolsList(t *testing.T) {
 			t.Errorf("xxyi_peers 不该有必填参数：%v", req)
 		}
 	}
-	want := []string{"xxyi_send", "xxyi_reply", "xxyi_inbox", "xxyi_peers"}
+	want := []string{"xxyi_send", "xxyi_reply", "xxyi_inbox", "xxyi_verify", "xxyi_peers"}
 	if strings.Join(names, ",") != strings.Join(want, ",") {
 		t.Errorf("工具名 %v", names)
+	}
+	// verify 必填 id
+	vsch := tools[3].(map[string]any)["inputSchema"].(map[string]any)
+	if r := fmt.Sprint(vsch["required"]); !strings.Contains(r, "id") {
+		t.Errorf("xxyi_verify 必填 %v", r)
 	}
 	// send 的 kind 枚举不含 reply
 	send := tools[0].(map[string]any)["inputSchema"].(map[string]any)["properties"].(map[string]any)["kind"].(map[string]any)
@@ -278,6 +283,7 @@ func TestMCPToolErrors(t *testing.T) {
 		{"xxyi_send", map[string]any{"to": "mac:boss", "kind": "notice", "text": "   "}, "text 不能为空"},
 		{"xxyi_reply", map[string]any{"text": "好了"}, "缺少参数 id"},
 		{"xxyi_inbox", map[string]any{"n": 0}, "必须 1..100"},
+		{"xxyi_verify", map[string]any{}, "缺少参数 id"},
 		{"xxyi_nope", map[string]any{}, "没有这个工具"},
 	}
 	for _, c := range cases {

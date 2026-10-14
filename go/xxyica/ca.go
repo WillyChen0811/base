@@ -23,7 +23,15 @@ const (
 	tsWindowSeconds = 300
 	// nonceWindow 是 nonce 防重放的记忆窗口，必须大于 tsWindowSeconds，
 	// 否则窗口外的重放会先被时间戳检查拦下。
-	nonceWindow = 10 * time.Minute
+	nonceWindow = 11 * time.Minute
+)
+
+// 签名域前缀：证书、消息、请求三类签名原文各带各的固定前缀，
+// 签名跨域复用从第一个字节就对不上——拿消息签名冒充证书签名或请求签名一律验不过。
+const (
+	certSigningPrefix    = "xxyi-cert-v1\n"
+	msgSigningPrefix     = "xxyi-msg-v1\n"
+	requestSigningPrefix = "xxyi-req-v1\n"
 )
 
 // certNamePattern 限制客户端名只用小写字母、数字和连字符，方便进路径和展示。
@@ -40,8 +48,9 @@ type Cert struct {
 	Sig       []byte    `json:"sig"`    // CA 对除 Sig 外字段的规范 JSON 的签名
 }
 
-// certSigningBytes 返回 Cert 去掉 Sig 后的规范 JSON——签发和校验两边都用它，
+// certSigningBytes 返回固定前缀 + Cert 去掉 Sig 后的规范 JSON——签发和校验两边都用它，
 // 字段顺序由 certBody 的结构体定义固定，time/json.Marshal 都是确定性输出。
+// 前缀把证书签名域与消息/请求签名域隔开（见 certSigningPrefix）。
 // certBody 各字段序列化都不可能出错，故忽略 Marshal 的错误返回。
 func certSigningBytes(c Cert) []byte {
 	b, _ := json.Marshal(struct {
@@ -59,7 +68,7 @@ func certSigningBytes(c Cert) []byte {
 		NotAfter:  c.NotAfter,
 		Serial:    c.Serial,
 	})
-	return b
+	return append([]byte(certSigningPrefix), b...)
 }
 
 // CA 是证书签发方，持有 Ed25519 密钥对。
@@ -212,17 +221,19 @@ type MsgFields struct {
 	Repo       string    `json:"repo"`
 	Branch     string    `json:"branch"`
 	FileSHA256 string    `json:"file_sha256"`
+	AskUser    bool      `json:"ask_user"` // 发件人声明：涉及决定的部分要交给用户
 	Created    time.Time `json:"created"`
 }
 
-// MessageSigningBytes 拼出消息签名的原文：json.Marshal（字段顺序即结构体顺序，确定性输出）。
+// MessageSigningBytes 拼出消息签名的原文：固定前缀 + json.Marshal（字段顺序即结构体顺序，确定性输出）。
+// 前缀把消息签名域与证书/请求签名域隔开（见 msgSigningPrefix）。
 // Created 统一折成 UTC 再编——签名方存的是本地时区的 RFC3339，收件方解析回来的偏移可能不同，
 // 只要时刻相同折 UTC 后字节就一致，否则同一时刻不同时区会验不过。
 // 这几个字段的 Marshal 不可能出错，故忽略错误返回（同 certSigningBytes）。
 func MessageSigningBytes(f MsgFields) []byte {
 	f.Created = f.Created.UTC()
 	b, _ := json.Marshal(f)
-	return b
+	return append([]byte(msgSigningPrefix), b...)
 }
 
 // authPayload 是 X-XXYI-Auth 请求头解码后的内容。
@@ -233,10 +244,11 @@ type authPayload struct {
 	Sig   []byte `json:"sig"`
 }
 
-// requestSigningString 拼出请求签名的原文。ts 是 Unix 秒的十进制，nonce 是 16 字节随机 hex。
+// requestSigningString 拼出请求签名的原文：固定前缀（见 requestSigningPrefix）+ 五行原文。
+// ts 是 Unix 秒的十进制，nonce 是 16 字节随机 hex。
 func requestSigningString(method, path string, ts int64, nonce string, body []byte) string {
 	sum := sha256.Sum256(body)
-	return fmt.Sprintf("%s\n%s\n%d\n%s\n%s", method, path, ts, nonce, hex.EncodeToString(sum[:]))
+	return requestSigningPrefix + fmt.Sprintf("%s\n%s\n%d\n%s\n%s", method, path, ts, nonce, hex.EncodeToString(sum[:]))
 }
 
 // SignRequest 用客户端私钥给一次请求签名，返回 X-XXYI-Auth 头的值
@@ -268,7 +280,7 @@ func SignRequest(priv ed25519.PrivateKey, cert Cert, method, path string, body [
 }
 
 // Verifier 是服务端校验器：拿 CA 公钥验证书，再验请求签名的时间戳、
-// nonce 防重放（10 分钟窗口，每次校验顺手清旧条目）。
+// nonce 防重放（11 分钟窗口，每次校验顺手清旧条目）。
 type Verifier struct {
 	caPub   ed25519.PublicKey
 	revoked func(serial string) bool
@@ -313,7 +325,7 @@ func (v *Verifier) Verify(header, method, path string, body []byte, now time.Tim
 	return payload.Cert, nil
 }
 
-// useNonce 记录并使用一个 nonce；10 分钟内见过即判重放。顺手清掉窗口外的旧条目。
+// useNonce 记录并使用一个 nonce；窗口（nonceWindow，11 分钟）内见过即判重放。顺手清掉窗口外的旧条目。
 func (v *Verifier) useNonce(nonce string, now time.Time) bool {
 	v.mu.Lock()
 	defer v.mu.Unlock()

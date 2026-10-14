@@ -63,13 +63,38 @@ func prepareMsgCA() (*xxyica.CA, func(serial string) bool, error) {
 	return ca, rc.revoked, nil
 }
 
-// ensureClientBundle 客户端包已存在就原样保留（证书指纹不能因重启而变）；
-// 不存在才生成密钥对并向 CA 申领证书。
+// ensureClientBundle 保证客户端包可用：
+//   - 包已存在且证书用当前 CA 校验通过 → 原样保留（证书指纹不能因重启而变）；
+//   - 校验不过（签名域换过前缀、已过期等）→ 保留原客户端密钥对重新签发，只换证书，stderr 说明；
+//   - 包读不了/读不到 → 生成新密钥对签发（旧包烂在那儿只会让该侧请求永远验不过）。
+//
+// 这里只看"证书还是不是当前 CA 签的、还在不在有效期"；吊销由请求时校验器的 revoked 回调把关，
+// 不在此处消费（重签发会换新序列号，吊销旧序列号本来就该让旧证书请求 401，不该在这里触发重签复活）。
+// 本机侧（mac）重签后由 prepareMsgCA 的 copyIfChanged 把新包同步到 ~/.xxyi/client.json。
 func ensureClientBundle(path string, ca *xxyica.CA, side string) error {
-	if _, err := os.Stat(path); err == nil {
-		return nil
-	} else if !os.IsNotExist(err) {
-		return fmt.Errorf("读取 %s: %w", path, err)
+	_, statErr := os.Stat(path)
+	if statErr != nil && !os.IsNotExist(statErr) {
+		return fmt.Errorf("读取 %s: %w", path, statErr)
+	}
+	if statErr == nil {
+		cert, priv, _, lerr := xxyica.LoadClientBundle(path)
+		if lerr == nil {
+			if verr := xxyica.VerifyCert(ca.Public(), cert, time.Now(), nil); verr == nil {
+				return nil
+			} else {
+				fmt.Fprintf(os.Stderr, "wgtund: 客户端 %s 的证书用当前 CA 校验不通过（%v），保留原密钥重新签发 %s\n", side, verr, path)
+				cert2, err := ca.Issue(side, cert.PublicKey, xxyica.DefaultPerm(side), certValidFor, time.Now())
+				if err != nil {
+					return fmt.Errorf("重签 %s 证书失败: %w", side, err)
+				}
+				if err := xxyica.WriteClientBundle(path, cert2, priv, ca.Public()); err != nil {
+					return fmt.Errorf("写 %s: %w", path, err)
+				}
+				return nil
+			}
+		}
+		// 旧包读不了：救不出原密钥对，只能换新（报错文案让用户能对上现象）。
+		fmt.Fprintf(os.Stderr, "wgtund: 客户端包 %s 读不了（%v），换新密钥重新签发\n", path, lerr)
 	}
 	pub, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
@@ -110,47 +135,74 @@ func copyIfChanged(src, dst string) error {
 }
 
 // revokedTable 读 ~/.xxyi/ca/revoked.json（JSON 序列号数组）：
-// 按文件修改时间缓存，mtime 没变不重读；文件不存在等于空表；
-// 读失败/坏 JSON 沿用上一次的结果（吊销表写坏了不能让所有证书突然全放进来）。
+// 按文件修改时间缓存，mtime 没变不重读；文件不存在 = 空表（记为最近一次成功状态）；
+// Stat/读/解析失败（不存在除外）：沿用上次成功读到的表；从没成功读到过时 fail-closed
+// ——所有序列号都当已吊销，并 stderr 记录。吊销表读不成却"全放进来"的后果
+// 远大于暂时按住没吊销的证书：宁可误拦，不可误放。
 type revokedTable struct {
 	path    string
 	mu      sync.Mutex
 	mtime   time.Time
-	loaded  bool
-	serials map[string]bool
+	haveAll bool            // 是否成功确定过表内容（读到好 JSON，或确认不存在=空表）
+	serials map[string]bool // 上次成功读到的表
 }
 
 func (rt *revokedTable) revoked(serial string) bool {
 	st, err := os.Stat(rt.path)
 	if err != nil {
+		if os.IsNotExist(err) {
+			// 不存在 = 空表：这也是一次成功的确定，之后的读失败沿用空表。
+			rt.mu.Lock()
+			rt.serials = nil
+			rt.mtime = time.Time{}
+			rt.haveAll = true
+			rt.mu.Unlock()
+			return false
+		}
 		rt.mu.Lock()
-		rt.loaded = true
-		rt.serials = nil
-		rt.mtime = time.Time{}
-		rt.mu.Unlock()
-		return false
+		defer rt.mu.Unlock()
+		return rt.fallbackLocked("Stat", err, serial)
 	}
 	rt.mu.Lock()
-	defer rt.mu.Unlock()
-	if rt.loaded && rt.mtime.Equal(st.ModTime()) {
-		return rt.serials[serial]
+	if rt.haveAll && rt.mtime.Equal(st.ModTime()) {
+		v := rt.serials[serial]
+		rt.mu.Unlock()
+		return v
 	}
+	rt.mu.Unlock()
 	data, err := os.ReadFile(rt.path)
 	if err != nil {
-		return rt.serials[serial] // 读不到沿用缓存
+		rt.mu.Lock()
+		defer rt.mu.Unlock()
+		return rt.fallbackLocked("读取", err, serial)
 	}
 	var list []string
 	if err := json.Unmarshal(data, &list); err != nil {
-		return rt.serials[serial] // 坏 JSON 沿用缓存，不放大成"全部未吊销"
+		rt.mu.Lock()
+		defer rt.mu.Unlock()
+		return rt.fallbackLocked("解析", err, serial)
 	}
 	serials := make(map[string]bool, len(list))
 	for _, s := range list {
 		serials[s] = true
 	}
+	rt.mu.Lock()
 	rt.serials = serials
 	rt.mtime = st.ModTime()
-	rt.loaded = true
+	rt.haveAll = true
+	rt.mu.Unlock()
 	return serials[serial]
+}
+
+// fallbackLocked 读失败兜底（调用方须持锁）：有上次成功读到的表就沿用；
+// 从没成功读到过就 fail-closed（一律当已吊销）。两种都要 stderr 记录。
+func (rt *revokedTable) fallbackLocked(what string, err error, serial string) bool {
+	if rt.haveAll {
+		fmt.Fprintf(os.Stderr, "wgtund: 吊销表 %s %s失败（%v），沿用上次成功读到的表\n", rt.path, what, err)
+		return rt.serials[serial]
+	}
+	fmt.Fprintf(os.Stderr, "wgtund: 吊销表 %s %s失败（%v），此前从未成功读到，按全部吊销处理\n", rt.path, what, err)
+	return true
 }
 
 // denyAllVerifier 在 CA 准备失败时顶上的永远拒绝的校验器：

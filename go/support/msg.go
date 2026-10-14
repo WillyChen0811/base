@@ -121,6 +121,7 @@ func msgSignFields(m Message) xxyica.MsgFields {
 		Repo:       m.Repo,
 		Branch:     m.Branch,
 		FileSHA256: m.FileSHA256,
+		AskUser:    m.AskUser,
 		Created:    m.Created,
 	}
 }

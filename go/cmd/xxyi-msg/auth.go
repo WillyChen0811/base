@@ -85,6 +85,7 @@ func (b *clientBundle) verifyMessage(m inboxMessage) bool {
 		Repo:       m.Repo,
 		Branch:     m.Branch,
 		FileSHA256: m.FileSHA256,
+		AskUser:    m.AskUser,
 		Created:    m.Created,
 	}), m.Sig)
 }

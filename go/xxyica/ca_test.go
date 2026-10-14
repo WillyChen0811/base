@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/ed25519"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -473,6 +474,7 @@ func TestMessageSigningBytesRoundTrip(t *testing.T) {
 		func(f *MsgFields) { f.Repo = "other" },
 		func(f *MsgFields) { f.Branch = "dev" },
 		func(f *MsgFields) { f.FileSHA256 = "0000" },
+		func(f *MsgFields) { f.AskUser = !f.AskUser },
 		func(f *MsgFields) { f.Created = f.Created.Add(time.Second) },
 	} {
 		g := f
@@ -480,5 +482,91 @@ func TestMessageSigningBytesRoundTrip(t *testing.T) {
 		if VerifyMessage(ca.Public(), MessageSigningBytes(g), sig) {
 			t.Errorf("改过的字段不应验真: %+v", g)
 		}
+	}
+}
+
+// 三种签名原文各带固定前缀；拿一个域的签名冒充另一个域一律验不过。
+func TestSigningPrefixesSeparateDomains(t *testing.T) {
+	ca, _, cPriv, cert := newTestCerts(t)
+	now := time.Now()
+	f := MsgFields{ID: "x1", From: "mac:a", To: "ubuntu:b", Kind: "notice", Text: "hi", Created: now}
+
+	msgBytes := MessageSigningBytes(f)
+	certBytes := certSigningBytes(cert)
+	reqStr := requestSigningString("GET", "/x", now.Unix(), "nonce0", nil)
+	if !bytes.HasPrefix(msgBytes, []byte("xxyi-msg-v1\n")) {
+		t.Errorf("消息签名原文前缀不对: %q", msgBytes[:24])
+	}
+	if !bytes.HasPrefix(certBytes, []byte("xxyi-cert-v1\n")) {
+		t.Errorf("证书签名原文前缀不对: %q", certBytes[:24])
+	}
+	if !strings.HasPrefix(reqStr, "xxyi-req-v1\n") {
+		t.Errorf("请求签名原文前缀不对: %q", reqStr[:24])
+	}
+
+	// 消息签名冒充证书签名：VerifyCert 必须不过。
+	bad := cert
+	bad.Sig = ca.Sign(msgBytes)
+	if err := VerifyCert(ca.Public(), bad, now, nil); err == nil {
+		t.Error("拿消息签名当证书签名不应通过")
+	}
+	// 证书签名冒充消息签名：VerifyMessage 必须不过。
+	if VerifyMessage(ca.Public(), msgBytes, cert.Sig) {
+		t.Error("拿证书签名当消息签名不应通过")
+	}
+
+	// 证书签名冒充请求签名：Verifier 必须拒（新校验器，nonce 互不干扰）。
+	forgedHdr := func(sig []byte) string {
+		hdr, err := SignRequest(cPriv, cert, "POST", "/msg/send?y=2", []byte("body"), now)
+		if err != nil {
+			t.Fatalf("SignRequest: %v", err)
+		}
+		blob, err := base64.RawURLEncoding.DecodeString(hdr)
+		if err != nil {
+			t.Fatalf("解认证头: %v", err)
+		}
+		var p authPayload
+		if err := json.Unmarshal(blob, &p); err != nil {
+			t.Fatalf("认证头 JSON: %v", err)
+		}
+		p.Sig = sig
+		out, err := json.Marshal(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return base64.RawURLEncoding.EncodeToString(out)
+	}
+	v := NewVerifier(ca.Public(), nil)
+	if _, err := v.Verify(forgedHdr(cert.Sig), "POST", "/msg/send?y=2", []byte("body"), now); err == nil || !strings.Contains(err.Error(), "签名") {
+		t.Errorf("拿证书签名当请求签名应被拒，实际: %v", err)
+	}
+	// 反方向：消息签名（CA 签的）冒充请求签名也不该过——证书公钥验不了 CA 的签名，
+	// 再拿客户端密钥签一份消息域原文来冒充更不行。
+	if _, err := v.Verify(forgedHdr(ca.Sign(msgBytes)), "POST", "/msg/send?y=2", []byte("body"), now); err == nil {
+		t.Error("拿消息签名当请求签名不应通过")
+	}
+	// 对照组：真请求签名仍要过（防前缀改动把正常路径也弄挂）。
+	real, err := SignRequest(cPriv, cert, "POST", "/msg/send?y=2", []byte("body"), now)
+	if err != nil {
+		t.Fatalf("SignRequest: %v", err)
+	}
+	if _, err := NewVerifier(ca.Public(), nil).Verify(real, "POST", "/msg/send?y=2", []byte("body"), now); err != nil {
+		t.Errorf("真请求签名应通过: %v", err)
+	}
+}
+
+// nonce 窗口 11 分钟：窗口内重放仍拦，窗口外旧条目被清、放行。
+func TestNonceWindow11Minutes(t *testing.T) {
+	ca, _, _, _ := newTestCerts(t)
+	v := NewVerifier(ca.Public(), nil)
+	now := time.Now()
+	if !v.useNonce("n1", now) {
+		t.Fatal("首次使用应放行")
+	}
+	if v.useNonce("n1", now.Add(10*time.Minute+59*time.Second)) {
+		t.Error("10 分 59 秒仍在 11 分钟窗口内，重放不该放行")
+	}
+	if !v.useNonce("n1", now.Add(11*time.Minute+time.Second)) {
+		t.Error("超过 11 分钟窗口后旧条目应被清掉、放行")
 	}
 }

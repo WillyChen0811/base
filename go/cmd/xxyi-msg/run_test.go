@@ -946,7 +946,8 @@ func TestStateStartCompactSkips(t *testing.T) {
 	}
 }
 
-// 附件位置限制：只能是当前工作目录或 ~/xxyi-work 之下、必须普通文件；超限的报错文案不变。
+// 附件位置限制：必须写绝对路径（相对路径当场拒收），解开符号链接后只能是
+// 当前工作目录或 ~/xxyi-work 之下、必须普通文件；超限的报错文案不变。
 func TestAttachPathRestrictions(t *testing.T) {
 	var cap captured
 	srv := httptest.NewServer(cap.handler())
@@ -997,14 +998,27 @@ func TestAttachPathRestrictions(t *testing.T) {
 		t.Errorf("/dev/null stderr %q", errOut.String())
 	}
 
-	// 工作目录下的普通文件通过（相对路径也行）
+	// 相对路径：当场拒收并提示写绝对路径（相对跟着当时的当前目录走，不能猜）
 	t.Chdir(proj)
 	okFile := filepath.Join(proj, "ok.txt")
 	if err := os.WriteFile(okFile, []byte("好的"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	n2 := cap.count()
+	errOut.Reset()
+	if code := run([]string{"send", "mac:boss", "hi", "--file", "ok.txt"}, strings.NewReader(""), io.Discard, errOut); code != exitErr {
+		t.Fatalf("相对路径附件退出码 %d，stderr %q", code, errOut.String())
+	}
+	if !strings.Contains(errOut.String(), "附件路径要写绝对路径") {
+		t.Errorf("相对路径 stderr %q", errOut.String())
+	}
+	if cap.count() != n2 {
+		t.Errorf("相对路径被拦下不该发请求，已发 %d", cap.count()-n2)
+	}
+
+	// 工作目录下的普通文件（绝对路径）通过
 	out := &bytes.Buffer{}
-	if code := run([]string{"send", "mac:boss", "hi", "--file", "ok.txt"}, strings.NewReader(""), out, io.Discard); code != exitOK {
+	if code := run([]string{"send", "mac:boss", "hi", "--file", okFile}, strings.NewReader(""), out, io.Discard); code != exitOK {
 		t.Fatalf("正常附件退出码 %d，输出 %q", code, out.String())
 	}
 	got := cap.last(t)

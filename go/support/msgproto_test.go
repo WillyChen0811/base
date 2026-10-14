@@ -595,7 +595,8 @@ func TestMsgAPIStateCheckUnanswered(t *testing.T) {
 		t.Errorf("欠回复时不该变 idle，实际 %s", got)
 	}
 
-	// 补上回复：远端代发（回给 mac:frank，走 outbox）；必须经本机取走并确认送达才算回了
+	// 补上回复：远端代发（回给 mac:frank，走 outbox）；发出去就不再算欠回复，
+	// 取走并确认送达只是把这条回复自己走完投递流程
 	if code, body = remoteDo(t, http.MethodPost, a.base+"/msg/send", a.token, protoMsgBody(t, msgSendReq{
 		From: "ubuntu:bob", Text: "看完了", Kind: KindReply, ReplyTo: id,
 	})); code != 200 {
@@ -606,8 +607,8 @@ func TestMsgAPIStateCheckUnanswered(t *testing.T) {
 		t.Fatalf("回复响应应带 id: %s", body)
 	}
 	replyID := rr["id"]
-	if len(a.s.Hub().Unanswered("ubuntu:bob")) != 1 {
-		t.Fatalf("回复未送达时原请求应仍欠回复")
+	if len(a.s.Hub().Unanswered("ubuntu:bob")) != 0 {
+		t.Fatalf("回复已发出（哪怕还没送达）就不该再算欠回复")
 	}
 	if code, body = post(t, a.lURL+"/decide?id="+replyID+"&action=approve", nil); code != 200 {
 		t.Fatalf("approve 回复: %d %s", code, body)
@@ -848,6 +849,112 @@ func TestBusyStaleTreatedAsReady(t *testing.T) {
 	defer cancel2()
 	if _, ok := f.hub.TakeOutbox(shortCtx2, "mac:alice"); ok {
 		t.Fatalf("gone 再久也不该可送，实际取到了 %s", id3)
+	}
+}
+
+// 回复只要发出去了（pending/queued/delivered/sync_failed，只要没被拒绝）就算"已经回复过了"：
+// 原请求不再出现在 Unanswered（NagUnanswered 也就不催），重复回复当场拦下；
+// 上一条被拒绝后请求重新变回欠着，才允许再回复。
+func TestLiveReplyCountsAsAnswered(t *testing.T) {
+	f := newMsgFixture()
+	const bob = "ubuntu:bob"
+	r := protoDeliverTo(t, f, Message{From: "mac:sue", To: bob, Text: "第一件事", Kind: KindRequest})
+
+	replyID, err := f.hub.Send(Message{From: bob, Text: "做完了", Kind: KindReply, ReplyTo: r})
+	if err != nil {
+		t.Fatalf("回复应通过: %v", err)
+	}
+	if ids := idsOf(f.hub.Unanswered(bob)); len(ids) != 0 {
+		t.Fatalf("回复 pending（还没送达）就该算已回复，实际欠 %v", ids)
+	}
+	if nag := f.hub.NagUnanswered(bob); len(nag) != 0 {
+		t.Errorf("没有欠回复不该催，实际 %v", idsOf(nag))
+	}
+	// 重复回复：拦下，报错带上上一条回复的 ID
+	if _, err := f.hub.Send(Message{From: bob, Text: "再说一遍", Kind: KindReply, ReplyTo: r}); err == nil ||
+		!strings.Contains(err.Error(), "已经回复过了") || !strings.Contains(err.Error(), replyID) {
+		t.Fatalf("重复回复应报「已经回复过了」并带上 #%s，实际 %v", replyID, err)
+	}
+	// 上一条被拒绝：请求重新欠着，可以再回复
+	if err := f.hub.Decide(replyID, "reject"); err != nil {
+		t.Fatal(err)
+	}
+	if ids := idsOf(f.hub.Unanswered(bob)); len(ids) != 1 || ids[0] != r {
+		t.Fatalf("回复被拒后应重新欠回复，实际 %v", ids)
+	}
+	if _, err := f.hub.Send(Message{From: bob, Text: "重新做完了", Kind: KindReply, ReplyTo: r}); err != nil {
+		t.Fatalf("上一条被拒后应能再回复: %v", err)
+	}
+}
+
+// TakeOutbox 定时重查：对端 busy 之后再无任何事件（不再 SetState、不再 Pump），
+// 注入时钟推过 busyStale（busy 失联）后，等待中的 TakeOutbox 靠 outboxRecheck
+// 定时器自己醒来取走，不会干等到 ctx 结束。
+func TestTakeOutboxRechecksPeriodically(t *testing.T) {
+	old := outboxRecheck
+	t.Cleanup(func() { outboxRecheck = old })
+	outboxRecheck = 50 * time.Millisecond
+
+	f := newMsgFixture()
+	id, err := f.hub.Send(okMsg()) // → mac:alice
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.hub.Decide(id, "approve"); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.hub.SetState("mac:alice", PeerIdle); err != nil {
+		t.Fatal(err)
+	}
+	f.hub.Pump(context.Background()) // idle 时进 outbox
+	if err := f.hub.SetState("mac:alice", PeerBusy); err != nil {
+		t.Fatal(err)
+	}
+	// 之后 hub 不再有任何调用——取走只能靠 TakeOutbox 的定时重查
+	go func() {
+		time.Sleep(100 * time.Millisecond) // 让 TakeOutbox 先进入等待（此刻 busy 还没过期）
+		f.clock.Add(busyStale + time.Second)
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	got, ok := f.hub.TakeOutbox(ctx, "mac:alice")
+	if !ok || got.ID != id {
+		t.Fatalf("busy 失联后无任何事件也该按时钟重查取到，实际 ok=%v got=%+v", ok, got)
+	}
+}
+
+// ErrPeerNotClaude 与送达成功置 busy 同一条规矩：送达期间对端有新上报就不动状态。
+// 假 Deliver 里先上报 idle（版本号变了）再报不是 Claude——对端应停在 idle，
+// 不能被 gone 按住（否则刚报的空闲被吞，后续消息全卡住）。
+func TestPeerNotClaudeNotOverwriteIdleDuringDeliver(t *testing.T) {
+	f := newMsgFixture()
+	f.hub.cfg.Deliver = func(_ context.Context, m Message) error {
+		if err := f.hub.SetState(m.To, PeerIdle); err != nil {
+			t.Errorf("送达期间上报 idle: %v", err)
+		}
+		return ErrPeerNotClaude
+	}
+	m := okMsg()
+	m.To = "ubuntu:bob"
+	id, err := f.hub.Send(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.hub.Decide(id, "approve"); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.hub.SetState("ubuntu:bob", PeerIdle); err != nil {
+		t.Fatal(err)
+	}
+	f.hub.Pump(context.Background())
+	if st := stateOf(t, f.hub, id); st != MsgQueued {
+		t.Errorf("没送达应仍 queued，实际 %s", st)
+	}
+	if got := f.hub.Peers()["ubuntu:bob"]; got != PeerIdle {
+		t.Errorf("送达期间报的 idle 不该被 gone 覆盖，实际 %s", got)
+	}
+	if r := peekHubMsg(t, f.hub, id).Reason; !strings.Contains(r, "不是 Claude") {
+		t.Errorf("Reason 应含「不是 Claude」，实际 %q", r)
 	}
 }
 

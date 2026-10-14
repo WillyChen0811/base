@@ -189,7 +189,7 @@ func TestMsgBridgeDeliver(t *testing.T) {
 
 // 用真 sh 跑 deliverCmd，tmux 换成 t.TempDir() 里的假脚本（PATH 顶在前，并断言 LookPath 命中它，
 // 防止误调真 tmux）。覆盖：前台 claude/node/版本号→放行粘贴；bash→退 9 拦下且正文已删；
-// 查询失败→退 1 带 tmux 原话、不粘贴；Now→不查前台直接粘贴。
+// 查询失败→删正文后退 1 带 tmux 原话、不粘贴；Now→不查前台直接粘贴。
 func TestDeliverCmdRealScript(t *testing.T) {
 	dir := t.TempDir()
 	fake := filepath.Join(dir, "tmux")
@@ -291,7 +291,7 @@ exit 0
 		t.Error("拦下时正文文件应已删掉")
 	}
 
-	// 查询失败（会话不存在）：退 1 带 tmux 原话，不算"不是 Claude"、不粘贴
+	// 查询失败（会话不存在）：退 1 带 tmux 原话，不算"不是 Claude"、不粘贴、正文也要删掉
 	out, code = runDeliver(t, support.Message{ID: "ff", From: "mac:x", To: "ubuntu:claude", Text: "hi"}, "claude", true)
 	if code != 1 {
 		t.Fatalf("查询失败应退出 1，得到 %d：%s", code, out)
@@ -301,6 +301,9 @@ exit 0
 	}
 	if pasted() {
 		t.Errorf("查询失败不该粘贴，日志：%s", logText())
+	}
+	if _, err := os.Stat(filepath.Join(dir, "ff.txt")); err == nil {
+		t.Error("查询失败退 1 前正文文件也应删掉，不能留垃圾")
 	}
 
 	// Now：不查前台程序，直接粘贴

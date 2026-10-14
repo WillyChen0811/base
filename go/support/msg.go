@@ -84,10 +84,19 @@ const (
 	backoffBase        = 2 * time.Second  // Deliver 失败退避基数
 	backoffMax         = 60 * time.Second // Deliver 失败退避上限
 
-	busyStale = 15 * time.Minute // busy 这么久没再变化视为失联，非 Now 消息按可送处理
-	nagMax    = 2                // 单条欠回复请求经 NagUnanswered 提醒的次数上限
-	nagWindow = 24 * time.Hour   // 欠回复提醒窗口，创建超过窗口的不再提醒
+	// busyStale：busy 这么久没再变化视为失联，非 Now 消息按可送处理。
+	// 取 30 分钟的取舍：Claude Code 会把输入排到当前任务后面，
+	// 真跑超过 30 分钟的一轮可能在干活中途被注入新消息；
+	// 权衡下来接受这个代价——换来对端失联（进程挂了/忘了报）后最多卡 30 分钟就能恢复送达。
+	busyStale = 30 * time.Minute
+	nagMax    = 2              // 单条欠回复请求经 NagUnanswered 提醒的次数上限
+	nagWindow = 24 * time.Hour // 欠回复提醒窗口，创建超过窗口的不再提醒
 )
+
+// outboxRecheck 是 TakeOutbox 长轮询等不到事件时的定时重查间隔（测试里可调小）。
+// busy 变成失联（busyStale）是纯时间推移，没有任何事件会叫醒等待者；
+// 不定时重查，busy 过期后本可送出的消息会一直干等到 ctx 结束。
+var outboxRecheck = 30 * time.Second
 
 // unackedReason 是取走后超时未确认写进 Reason 的提示语。
 const unackedReason = "取走后 60 秒未确认送达，重新排队"
@@ -251,6 +260,18 @@ func (h *Hub) markAnsweredLocked(reply Message) {
 	}
 }
 
+// hasLiveReplyLocked 查有没有人（from）已对 reqID 发出过还没被拒绝的回复
+// （pending/queued/delivered/sync_failed 都算"已经回复过了"，只有 rejected 不算——
+// 被拒绝的回复等于没回，之后还可以再回复）。调用方须持锁。
+func (h *Hub) hasLiveReplyLocked(reqID, from string) (string, bool) {
+	for _, m := range h.msgs {
+		if m.Kind == KindReply && m.ReplyTo == reqID && m.From == from && m.State != MsgRejected {
+			return m.ID, true
+		}
+	}
+	return "", false
+}
+
 // findLocked 按 ID 找消息下标，找不到返回 -1。调用方须持锁。
 func (h *Hub) findLocked(id string) int {
 	for i := range h.msgs {
@@ -331,6 +352,7 @@ func (h *Hub) Send(m Message) (string, error) {
 	// reply 的收件人来自被回复的那条请求，所以要先查出原消息才能校验 To。
 	var orig Message
 	var haveOrig bool
+	var dupReplyID string // 同一发件人对同一请求已有的没被拒绝的回复
 	if m.Kind == KindReply {
 		if m.ReplyTo == "" {
 			return "", fmt.Errorf("support: 回复必须给 reply_to")
@@ -340,6 +362,7 @@ func (h *Hub) Send(m Message) (string, error) {
 		if i >= 0 {
 			orig, haveOrig = h.msgs[i], true
 		}
+		dupReplyID, _ = h.hasLiveReplyLocked(m.ReplyTo, m.From)
 		h.mu.Unlock()
 		if !haveOrig {
 			return "", fmt.Errorf("support: reply_to %q: %w", m.ReplyTo, ErrMsgNotFound)
@@ -358,6 +381,11 @@ func (h *Hub) Send(m Message) (string, error) {
 			m.To = orig.From
 		} else if m.To != orig.From {
 			return "", fmt.Errorf("support: 回复的收件人应是原请求的发件人 %s，不能填 %q", orig.From, m.To)
+		}
+		// 同一个人对同一条请求只能有一个没被拒绝的回复：重复回复拦下；
+		// 上一条被拒绝后 dupReplyID 为空，可以再回复。
+		if dupReplyID != "" {
+			return "", fmt.Errorf("support: #%s 已经回复过了（#%s）", m.ReplyTo, dupReplyID)
 		}
 	} else if m.ReplyTo != "" {
 		return "", fmt.Errorf("support: 只有回复才能带 reply_to")
@@ -539,12 +567,18 @@ func MacInboxPath(m Message) string {
 }
 
 // Unanswered 返回发给 addr、已送达但还没被回复的请求，按创建时间从旧到新。
+// "已回复"看两条：Answered（有回复已送达），或有一条 addr 发出、还没被拒绝的回复
+// （pending/queued/delivered/sync_failed 都算）——回复发出去了就不该再催，
+// 哪怕还没送到发件人手里；被拒绝的回复不算回复，照旧催。
 // 返回的是拷贝，不含 File。
 func (h *Hub) Unanswered(addr string) []Message {
 	h.mu.Lock()
 	var out []Message
 	for _, m := range h.msgs {
 		if m.To == addr && m.State == MsgDelivered && m.Kind == KindRequest && !m.Answered {
+			if _, live := h.hasLiveReplyLocked(m.ID, addr); live {
+				continue
+			}
 			out = append(out, m)
 		}
 	}
@@ -699,6 +733,7 @@ func (h *Hub) AutoUntil() time.Time {
 
 // TakeOutbox 长轮询取一条发往 to 的出站消息（含 File）。
 // 只返回"现在可送"的消息：接收方不忙，或消息被点了 now（都按 h.msgs 里的当前值判断）。
+// 等不到事件时每隔 outboxRecheck 自己重查一次（busy 熬过 busyStale 没有事件通知）。
 // 取走即从 outbox 移除且不会重复给；送达确认仍要靠 MarkDelivered。
 // ctx 结束仍没有可取的消息时返回 false。
 func (h *Hub) TakeOutbox(ctx context.Context, to string) (Message, bool) {
@@ -731,6 +766,9 @@ func (h *Hub) TakeOutbox(ctx context.Context, to string) (Message, bool) {
 		h.mu.Unlock()
 		select {
 		case <-wake:
+		case <-time.After(outboxRecheck):
+			// 定时重查：busy 熬过 busyStale 变成失联只是时间推移，
+			// 不会有 SetState 之类的事件叫醒这里，不重查就只能干等。
 		case <-ctx.Done():
 			return Message{}, false
 		}
@@ -912,7 +950,7 @@ func (h *Hub) pumpOne(ctx context.Context, id string) {
 	}
 
 	// 记下调用 Deliver 前的对端状态版本号：送达期间对端若有新上报（比如钩子报了 idle），
-	// 回来后不能拿 busy 把人覆盖掉。
+	// 回来后不能拿 busy/gone 把人覆盖掉。
 	h.mu.Lock()
 	seq0 := h.peerSeq[m.To]
 	h.mu.Unlock()
@@ -932,7 +970,11 @@ func (h *Hub) pumpOne(ctx context.Context, id string) {
 			if errors.Is(err, ErrPeerNotClaude) {
 				// 对面不是 Claude：记 gone 把后续消息整体按住。这不算投递失败——
 				// 不累计失败次数、不设退避，对方重新上报 idle 后下一轮 Pump 立刻重试。
-				h.setPeerLocked(m.To, PeerGone)
+				// 与送达成功置 busy 同一条规矩：送达期间对端有新上报（版本号变了）
+				// 就不动状态，钩子刚报的 idle 不能被 gone 覆盖。
+				if h.peerSeq[m.To] == seq0 {
+					h.setPeerLocked(m.To, PeerGone)
+				}
 				h.msgs[j].Reason = err.Error()
 			} else if err != nil {
 				// 保持 queued，只记 Reason；指数退避，下次 Pump 到点才再试。

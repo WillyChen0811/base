@@ -474,11 +474,23 @@ func attachAllowedRoots() ([]string, error) {
 }
 
 // loadAttach 读附件并限长，返回文件名和内容；path 为空表示没有附件。
+// 必须写绝对路径（~/ 开头的先展开成家目录）：相对路径看的是当时的当前目录，
+// Claude 换了目录就指到别的文件上，当场拒收比猜意图靠谱。
 // 位置限制：解开符号链接后必须落在当前工作目录或 ~/xxyi-work 之下（别把机器上任意路径的文件发出去）；
 // 必须是普通文件；超限用 io.LimitReader 兜底（读出来的长度说了算，不信 Stat）。
 func loadAttach(path string) (string, []byte, error) {
 	if path == "" {
 		return "", nil, nil
+	}
+	if path == "~" || strings.HasPrefix(path, "~/") {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", nil, fmt.Errorf("附件读不了：%w", err)
+		}
+		path = filepath.Join(home, strings.TrimPrefix(strings.TrimPrefix(path, "~"), "/"))
+	}
+	if !filepath.IsAbs(path) {
+		return "", nil, fmt.Errorf("附件路径要写绝对路径：%s", path)
 	}
 	abs, err := filepath.Abs(path)
 	if err == nil {

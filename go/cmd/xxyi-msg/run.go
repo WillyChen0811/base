@@ -301,7 +301,8 @@ func xxyiPort() (string, error) {
 // addrNameIllegal 与服务端 support.ValidAddr 同一套字符集：名字只许 ASCII 字母数字和 . _ -。
 var addrNameIllegal = regexp.MustCompile(`[^A-Za-z0-9._-]`)
 
-// selfAddr 定自己的地址：XXYI_ADDR 优先，其次 tmux 会话名（ubuntu: 一侧）。
+// selfAddr 定自己的地址：XXYI_ADDR 优先，其次 TMUX 里的会话名（ubuntu: 一侧）；
+// 两个都没有（Codex 跑钩子时环境变量全不带）再沿进程树往上找自己住在哪个 tmux 会话里（见 selfaddr.go）。
 // 会话名先按服务端规则校验：不合法现在就说清，别让 send 到服务端才碰一脑袋 400。
 func selfAddr() (string, error) {
 	if a := strings.TrimSpace(os.Getenv("XXYI_ADDR")); a != "" {
@@ -312,15 +313,23 @@ func selfAddr() (string, error) {
 		if err != nil {
 			return "", fmt.Errorf("取 tmux 会话名失败：%w", err)
 		}
-		if name == "" {
-			return "", errors.New("tmux 会话名为空")
-		}
-		if len(name) > 64 || addrNameIllegal.FindString(name) != "" {
-			return "", fmt.Errorf("tmux 会话名 %q 含不支持的字符，只允许字母数字 . _ -，请改名（tmux rename-session）或设 XXYI_ADDR", name)
+		if err := checkSessionName(name); err != nil {
+			return "", err
 		}
 		return "ubuntu:" + name, nil
 	}
-	return "", errNoSelfAddr
+	return selfAddrFromProcTree()
+}
+
+// checkSessionName 校验 tmux 会话名能不能当地址名用（与服务端 support.ValidAddr 同一套字符集）。
+func checkSessionName(name string) error {
+	if name == "" {
+		return errors.New("tmux 会话名为空")
+	}
+	if len(name) > 64 || addrNameIllegal.FindString(name) != "" {
+		return fmt.Errorf("tmux 会话名 %q 含不支持的字符，只允许字母数字 . _ -，请改名（tmux rename-session）或设 XXYI_ADDR", name)
+	}
+	return nil
 }
 
 // sendOpts 是 send 的可选参数；kind 为空按 notice 处理。
@@ -1074,6 +1083,8 @@ func blockJSON(un []inboxMessage) string {
 // "--start"（SessionStart 钩子用）也读标准输入取 source：compact 是压缩中途，
 // Claude 正在干活，什么都不做退出 0；其余（startup/resume/clear/读不到）照常上报；
 // 其余情况绝不碰标准输入，免得等 EOF 卡住钩子。
+// 每次运行都在 ~/.xxyi[-support]/msg-hook.log 追加一行（见 selfaddr.go 的 hookLog）：
+// Codex 跑钩子不带环境变量，出了问题没日志就只能干瞪眼；日志失败忽略，不影响退出码。
 func cmdState(args []string, stdin io.Reader, stdout io.Writer) int {
 	state := ""
 	check := false
@@ -1086,14 +1097,17 @@ func cmdState(args []string, stdin io.Reader, stdout io.Writer) int {
 			start = true
 		case stateBusy, stateIdle, stateGone:
 			if state != "" {
+				hookLog(args, "参数不合法：给了两个状态值")
 				return exitOK // 给了两个状态值：当参数不合法处理
 			}
 			state = a
 		default:
+			hookLog(args, "参数不合法："+a)
 			return exitOK
 		}
 	}
 	if state == "" {
+		hookLog(args, "参数里没有状态")
 		return exitOK
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), stateDeadline)
@@ -1101,10 +1115,12 @@ func cmdState(args []string, stdin io.Reader, stdout io.Writer) int {
 	// state 钩子不补发暂存：状态上报是送达确认的唯一依据，别让补发挤掉上报的预算
 	//（补发只在 send/reply/inbox/who 与 MCP 工具调用时做）。
 	if start && sessionStartSource(ctx, stdin) == sessionSourceCompact {
+		hookLog(args, "SessionStart 是 compact，不上报")
 		return exitOK // 压缩触发的 SessionStart：不上报状态，免得把干活中的 Claude 记成空闲
 	}
 	from, err := selfAddr()
 	if err != nil {
+		hookLog(args, "取地址失败："+err.Error())
 		return exitOK
 	}
 	q := url.Values{"addr": {from}, "state": {state}}
@@ -1115,19 +1131,24 @@ func cmdState(args []string, stdin io.Reader, stdout io.Writer) int {
 	}
 	c, err := connect(ctx, stateDeadline)
 	if err != nil {
+		hookLog(args, "addr="+from+" 连不上："+err.Error())
 		return exitOK
 	}
 	b, err := c.do(ctx, http.MethodPost, c.path("/msg/state", q), nil)
 	if err != nil {
+		hookLog(args, "addr="+from+" 上报失败："+err.Error())
 		return exitOK
 	}
 	if q.Get("check") != "1" {
+		hookLog(args, "addr="+from+" 已上报 "+state)
 		return exitOK // 没要求自查：服务端回什么都不拦 Claude 停下
 	}
 	var resp stateResp
 	if json.Unmarshal(b, &resp) != nil || len(resp.Unanswered) == 0 {
+		hookLog(args, "addr="+from+" 已上报 "+state+"，没有欠回复")
 		return exitOK
 	}
+	hookLog(args, fmt.Sprintf("addr=%s 已上报 %s，拦下 %d 条欠回复", from, state, len(resp.Unanswered)))
 	if line := blockJSON(resp.Unanswered); line != "" {
 		fmt.Fprintln(stdout, line)
 	}

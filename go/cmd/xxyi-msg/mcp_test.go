@@ -315,6 +315,11 @@ func TestMCPCallWithoutSelfAddr(t *testing.T) {
 	useEndpoint(t, srv.URL)
 	t.Setenv("XXYI_ADDR", "")
 	t.Setenv("TMUX", "")
+	// 第三步兜底只吃注入（绝不真执行 tmux）：链上没有 pane 命中 → 还是"不知道自己的地址"。
+	oldPP, oldLP := parentPID, listPanes
+	t.Cleanup(func() { parentPID, listPanes = oldPP, oldLP })
+	parentPID = func(int) (int, error) { return 1, nil }
+	listPanes = func() (string, error) { return "55 other", nil }
 
 	resps := mcpRound(t,
 		mcpCall(1, "tools/call", map[string]any{"name": "xxyi_send", "arguments": map[string]any{

@@ -501,8 +501,13 @@ func TestSelfAddr(t *testing.T) {
 	}
 
 	// 都没有：send 退出 2，state 静默 0
+	// 第三步兜底同样只吃注入（绝不真执行 tmux）：链上没有 pane 命中 → 还是"不知道自己的地址"。
 	t.Setenv("TMUX", "")
 	tmuxCalled = false
+	oldPP, oldLP := parentPID, listPanes
+	t.Cleanup(func() { parentPID, listPanes = oldPP, oldLP })
+	parentPID = func(int) (int, error) { return 1, nil } // 一路到 init，链上谁也不是 pane
+	listPanes = func() (string, error) { return "55 other", nil }
 	errOut := &bytes.Buffer{}
 	if code := run([]string{"send", "mac:boss", "hi"}, strings.NewReader(""), io.Discard, errOut); code != exitErr {
 		t.Fatalf("退出码 %d", code)

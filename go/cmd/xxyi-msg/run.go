@@ -211,7 +211,9 @@ func connect(ctx context.Context, timeout time.Duration) (*client, error) {
 	if errors.Is(err, fs.ErrNotExist) {
 		// 有 Ubuntu 侧证书却没有端点文件：这台就是 Ubuntu，只是协助没开，别去连 Mac 的本机接口。
 		// 仍按连不上处理（send 会暂存，协助打开后补发）。
-		if _, berr := os.Stat(clientBundlePathUbuntu); berr == nil {
+		_, berr := os.Stat(clientBundlePathUbuntu)
+		_, cerr := os.Stat(xxyiConfigPath) // 只有 Mac 上有 XXYI 配置
+		if berr == nil && errors.Is(cerr, fs.ErrNotExist) {
 			return nil, &connError{err: errors.New("Ubuntu 这边没有协助端点")}
 		}
 		return connectMac(ctx, timeout)

@@ -264,7 +264,7 @@ exit 0
 	}
 	pasted := func() bool { return strings.Contains(logText(), "paste-buffer") }
 
-	for _, prog := range []string{"claude", "node", "2.1.296"} {
+	for _, prog := range []string{"claude", "codex", "node", "2.1.296"} {
 		out, code := runDeliver(t, support.Message{
 			ID: "ok", From: "mac:x", To: "ubuntu:claude", Text: "hi",
 		}, prog, false)

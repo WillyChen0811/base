@@ -146,7 +146,7 @@ func deliverCmd(m support.Message, paste, pane, msgPath string) string {
 		return body
 	}
 	check := "c=$(" + pane + " 2>&1) || { rm -f " + q + "; printf '%s\\n' \"$c\"; exit 1; };" +
-		" case \"$c\" in claude|node|[0-9]*.[0-9]*.[0-9]*) ;; *) rm -f " + q +
+		" case \"$c\" in claude|codex|node|[0-9]*.[0-9]*.[0-9]*) ;; *) rm -f " + q +
 		"; printf '" + notClaudeMark + " %s\\n' \"$c\"; exit 9;; esac; "
 	return check + body
 }
@@ -163,7 +163,7 @@ func paneProgOfNotClaude(out []byte) (string, bool) {
 
 // Deliver 把发往 ubuntu:<会话> 的消息注入 tmux：附件放收件箱，正文（support.Display 统一格式）
 // 写成临时文件，经括号粘贴喂进会话后立即删掉临时文件。
-// 非立即送达时先确认窗格里跑的是 Claude（claude/node/版本号样的名字），不是就报 ErrPeerNotClaude；
+// 非立即送达时先确认窗格里跑的是 Claude（claude/codex/node/版本号样的名字），不是就报 ErrPeerNotClaude；
 // 前台程序查询本身失败（如会话不存在）按普通注入失败报错，tmux 的原话原样带上；
 // 两个拦下的分支都会删掉已写的正文文件。
 func (b *msgBridge) Deliver(ctx context.Context, m support.Message) error {

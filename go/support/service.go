@@ -114,6 +114,7 @@ type Service struct {
 	cfg       Config
 	remote    Remote
 	queue     *Queue
+	approvals *approvalBook // 任意会话的通用审批簿；与协助会话生命周期无关，Stop 不清
 	runner    *Runner
 	hub       *Hub          // 消息中转队列（配了 MsgStorePath 则落盘）
 	msgKick   chan struct{} // 容量 1 的"踢一下"：Send/Decide/SetState/SetAuto 后叫醒 Pump
@@ -151,6 +152,7 @@ func NewService(cfg Config, remote Remote) *Service {
 		cfg:       cfg,
 		remote:    remote,
 		queue:     NewQueue(),
+		approvals: newApprovalBook(),
 		runner:    NewRunner(cfg.Runner),
 		hookToken: randHex32(),
 		repos:     names,
@@ -547,6 +549,7 @@ func (s *Service) remoteMux(sess *session) http.Handler {
 	mux.HandleFunc("/stop-claude", only(http.MethodPost, s.remoteStopClaude))
 	mux.HandleFunc("/projsync", only(http.MethodPost, s.remoteProjSync))
 	s.mountMsgRemote(mux)
+	s.mountApprovalRemote(mux)
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, http.StatusNotFound, "没有这个路径")
 	})
@@ -902,6 +905,7 @@ func (s *Service) LocalHandler() http.Handler {
 		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 	}))
 	s.mountMsgLocal(mux)
+	s.mountApprovalLocal(mux)
 	return mux
 }
 

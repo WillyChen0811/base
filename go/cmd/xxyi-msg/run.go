@@ -417,6 +417,8 @@ func checkCodeRepoBranch(kind, repo, branch string) error {
 
 // sendBody 是 POST /msg/send 的正文（File 由 encoding/json 自动 base64）。
 // 回复的 To 留空，由服务端填成原请求的发件人。
+// ClientID 是每次发送现生成的随机去重 id：暂存原样保存、补发不变，服务端按发件人+client_id 去重，
+// 响应丢失后重发拿回的是同一个消息 id，不会入库两条。
 type sendBody struct {
 	From     string `json:"from"`
 	To       string `json:"to"`
@@ -428,6 +430,7 @@ type sendBody struct {
 	Kind     string `json:"kind,omitempty"`
 	ReplyTo  string `json:"reply_to,omitempty"`
 	AskUser  bool   `json:"ask_user,omitempty"`
+	ClientID string `json:"client_id,omitempty"`
 }
 
 // inboxMessage 是 /msg/inbox 里我们关心的那几个字段（服务端 Message 的字段远不止这些）。
@@ -601,13 +604,42 @@ func loadAttach(path string) (string, []byte, error) {
 	return filepath.Base(path), data, nil
 }
 
-// doSendSpool 发到 /msg/send：成功返回消息 id（spooled=0）；
-// 连不上（connError）时落盘暂存并返回条数（id 为空、err 为空——不是失败，是已暂存）；
-// 暂存满/超期/写不进磁盘、以及服务端明确拒绝等其它错误原样返回。命令行和 MCP 共用。
+// doSendSpool 发到 /msg/send：每次现生成随机 client_id 放进正文（服务端按发件人+client_id 去重）。
+// 成功返回消息 id（spooled=0）；连不上（connError）时把正文（含 client_id）落盘暂存并返回条数
+// （id 为空、err 为空——不是失败，是已暂存）。
+// 暂存非空时走另一条路：新消息先进暂存再补发——老消息自然先发，新消息可能顺带补出去
+// （id 从补发的 sent 映射里取；被拒则取 .reason 里的原因报错）。进不了暂存（满/超期）退回直发。
+// 服务端明确拒绝等其它错误原样返回。命令行和 MCP 共用。
 func doSendSpool(ctx context.Context, body sendBody) (id string, spooled int, err error) {
+	if body.ClientID == "" {
+		if body.ClientID, err = newClientID(); err != nil {
+			return "", 0, err
+		}
+	}
 	raw, err := json.Marshal(body)
 	if err != nil {
 		return "", 0, err
+	}
+	dir := spoolDirNow()
+	if len(spoolList(dir)) > 0 {
+		name, _, serr := spoolAdd(dir, http.MethodPost, "/msg/send", raw)
+		if serr == nil {
+			sent, _ := flushSpool(ctx)
+			if sid, ok := sent[name]; ok {
+				if sid == "" {
+					return "", 0, errors.New("服务端响应里没有消息 id")
+				}
+				return sid, 0, nil
+			}
+			if rj, ok := readRejection(dir, name); ok {
+				return "", 0, errors.New(rj.Reason)
+			}
+			n := len(spoolList(dir))
+			if n == 0 {
+				n = 1 // 自己这条还压着（刚被别的进程认领等）：别让"已暂存 0 条"骗人
+			}
+			return "", n, nil
+		}
 	}
 	c, err := connect(ctx, httpTimeout)
 	if err != nil {
@@ -617,7 +649,7 @@ func doSendSpool(ctx context.Context, body sendBody) (id string, spooled int, er
 	if err != nil {
 		var ce *connError
 		if errors.As(err, &ce) {
-			if n, serr := spoolAdd(spoolDirNow(), http.MethodPost, "/msg/send", raw); serr == nil {
+			if _, n, serr := spoolAdd(dir, http.MethodPost, "/msg/send", raw); serr == nil {
 				return "", n, nil
 			}
 		}
@@ -686,7 +718,8 @@ func doInbox(ctx context.Context, addr string, n int) (inboxResp, *clientBundle,
 }
 
 // inboxText 是收件箱的展示文本；命令行与 MCP 用同一份，保证两边看到的一样。
-// 顶部先提示本轮补发被拒的暂存（如果有），每条消息按 CA 核验结果带 ✓/✗ 前缀。
+// 顶部先列出还没看过的被拒暂存（正文第一行 + 原因，列过即标已读），
+// 每条消息按 CA 核验结果带 ✓/✗ 前缀。
 func inboxText(ctx context.Context, addr string, n int) (string, error) {
 	in, bundle, err := doInbox(ctx, addr, n)
 	if err != nil {
@@ -696,7 +729,7 @@ func inboxText(ctx context.Context, addr string, n int) (string, error) {
 	if text == "" {
 		text = "收件箱是空的"
 	}
-	if note := rejectedNote(); note != "" {
+	if note := rejectedNoteText(spoolDirNow()); note != "" {
 		text = note + "\n" + text
 	}
 	return text, nil
@@ -1006,9 +1039,8 @@ func cmdState(args []string, stdin io.Reader, stdout io.Writer) int {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), stateDeadline)
 	defer cancel()
-	// 钩子只有 stateDeadline 这一份预算：补发先走（连不上/超时就放下，留下的下次），
-	// 剩下的时间才轮到本次状态上报。
-	spoolRejections = flushSpool(ctx)
+	// state 钩子不补发暂存：状态上报是送达确认的唯一依据，别让补发挤掉上报的预算
+	//（补发只在 send/reply/inbox/who 与 MCP 工具调用时做）。
 	if start && sessionStartSource(ctx, stdin) == sessionSourceCompact {
 		return exitOK // 压缩触发的 SessionStart：不上报状态，免得把干活中的 Claude 记成空闲
 	}
@@ -1055,10 +1087,11 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	var err error
 	switch args[0] {
 	case "send", "reply", "inbox", "who":
-		// 任何子命令先尝试补发暂存；补发与正事共用 httpTimeout 这一份总预算。
+		// 这四个子命令先尝试补发暂存（state 钩子不补发）；补发与正事共用 httpTimeout 这一份总预算。
+		// send/reply 若暂存非空还会"先进暂存再补发"（见 doSendSpool），保证老消息先发。
 		ctx, cancel := context.WithTimeout(context.Background(), httpTimeout)
 		defer cancel()
-		spoolRejections = flushSpool(ctx)
+		flushSpool(ctx) // 被拒的落 rejected/ + .reason，收件箱从盘上列一次
 		switch args[0] {
 		case "send":
 			err = cmdSend(ctx, args[1:], stdin, stdout)

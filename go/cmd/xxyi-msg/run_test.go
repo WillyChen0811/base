@@ -173,7 +173,6 @@ func setPaths(t *testing.T, ep, cfg string) *xxyica.CA {
 		endpointPath, xxyiConfigPath = oldEP, oldCfg
 		clientBundlePathUbuntu, clientBundlePathMac = oldBU, oldBM
 		spoolDirUbuntu, spoolDirMac = oldSU, oldSM
-		spoolRejections = nil
 	})
 	endpointPath, xxyiConfigPath = ep, cfg
 	dir := filepath.Dir(ep)
@@ -330,6 +329,9 @@ func TestUbuntuSend(t *testing.T) {
 	}
 	if got.body.Repo != "base" || got.body.Branch != "feat" {
 		t.Errorf("repo/branch %+v", got.body)
+	}
+	if !clientIDPat.MatchString(got.body.ClientID) {
+		t.Errorf("client_id %q，该是 16 字节随机 hex", got.body.ClientID)
 	}
 }
 

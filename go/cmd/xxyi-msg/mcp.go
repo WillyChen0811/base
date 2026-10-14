@@ -185,11 +185,12 @@ func callTool(params json.RawMessage) (string, bool) {
 }
 
 // runTool 是四个工具的实现；每次调用自带 httpTimeout。
-// 每次工具调用前先尝试补发暂存（连不上/超时就放下，不挡这次的调用）。
+// 每次工具调用前先尝试补发暂存（连不上/超时就放下，不挡这次的调用；
+// 被拒的落 rejected/ + .reason，xxyi_inbox 从盘上列一次）。
 func runTool(ctx context.Context, name string, args map[string]any) (string, error) {
 	ctx, cancel := context.WithTimeout(ctx, httpTimeout)
 	defer cancel()
-	spoolRejections = flushSpool(ctx)
+	flushSpool(ctx)
 	switch name {
 	case "xxyi_send":
 		return toolSend(ctx, args)

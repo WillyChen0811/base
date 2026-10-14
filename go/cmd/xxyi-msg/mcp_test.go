@@ -198,6 +198,9 @@ func TestMCPCallSendReplyPeers(t *testing.T) {
 	if got.path != "/msg/send" || got.body.Kind != "request" || !got.body.AskUser || got.body.To != "mac:boss" || got.body.From != "ubuntu:cw" {
 		t.Errorf("send 正文 %+v", got.body)
 	}
+	if !clientIDPat.MatchString(got.body.ClientID) {
+		t.Errorf("send 的 client_id %q，该是 16 字节随机 hex", got.body.ClientID)
+	}
 	if got.auth != "Bearer tk" {
 		t.Errorf("Ubuntu 侧该带令牌头：%q", got.auth)
 	}
@@ -209,6 +212,9 @@ func TestMCPCallSendReplyPeers(t *testing.T) {
 	got = reqs[1]
 	if got.body.Kind != "reply" || got.body.ReplyTo != "id42" || got.body.To != "" {
 		t.Errorf("reply 正文 %+v", got.body)
+	}
+	if !clientIDPat.MatchString(got.body.ClientID) || got.body.ClientID == reqs[0].body.ClientID {
+		t.Errorf("reply 的 client_id %q，该是独立于 send 的随机 hex", got.body.ClientID)
 	}
 
 	text, isErr = mcpResultText(t, resps[2])

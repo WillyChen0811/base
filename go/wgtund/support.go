@@ -17,6 +17,7 @@ import (
 	"github.com/WillyChen0811/base/go/sshterm"
 	"github.com/WillyChen0811/base/go/support"
 	"github.com/WillyChen0811/base/go/tmux"
+	"github.com/WillyChen0811/base/go/xxyica"
 )
 
 // supportConf 是 hosts.json 里可选的 support 段。
@@ -343,12 +344,23 @@ func startSupport(p *supportPrep, dir, knownHosts, httpAddr string, socksAddrs m
 		write:        msgSFTPWriter(pool, sc.Host),
 	}
 	cfg := support.Config{
-		Runner:     support.RunnerConfig{Bin: bin, Dir: p.workdir, Args: claudeArgs(sc, merged)},
-		Repos:      repos,
-		GitEnv:     gitEnv,
-		LogPath:    filepath.Join(dir, "support-log.jsonl"),
-		MsgSync:    bridge.Sync,
-		MsgDeliver: bridge.Deliver,
+		Runner:       support.RunnerConfig{Bin: bin, Dir: p.workdir, Args: claudeArgs(sc, merged)},
+		Repos:        repos,
+		GitEnv:       gitEnv,
+		LogPath:      filepath.Join(dir, "support-log.jsonl"),
+		MsgSync:      bridge.Sync,
+		MsgDeliver:   bridge.Deliver,
+		MsgCapture:   bridge.Capture,
+		MsgStorePath: filepath.Join(dir, "msg-store.json"),
+	}
+	// 证书校验/消息签名接进消息接口：CA 准备失败不能拖累 wgtund 启动，
+	// 换成永远拒绝的校验器——消息接口全 401，原因打在 stderr 给人看。
+	if ca, revoked, err := prepareMsgCA(); err != nil {
+		fmt.Fprintf(os.Stderr, "wgtund: 消息 CA 准备失败: %v；证书校验用拒绝器，消息接口不可用\n", err)
+		cfg.MsgAuth = denyAllVerifier()
+	} else {
+		cfg.MsgAuth = xxyica.NewVerifier(ca.Public(), revoked)
+		cfg.MsgSign = ca.Sign
 	}
 	if proj != nil {
 		cfg.ProjSyncNames = proj.Names() // 配置顺序的项目名，远端只能发起这些

@@ -1,6 +1,7 @@
 package xxyica
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/json"
@@ -433,5 +434,51 @@ func TestVerifyMessage(t *testing.T) {
 	}
 	if VerifyMessage(ca.Public()[:31], data, ca.Sign(data)) {
 		t.Error("短公钥不应通过")
+	}
+}
+
+// 消息签名原文的往返：CA.Sign(MessageSigningBytes(f)) 后核验为真；改任何签名域字段都假；
+// 同一时刻不同时区编出的原文一致（Created 折 UTC）。
+func TestMessageSigningBytesRoundTrip(t *testing.T) {
+	ca, err := NewCA()
+	if err != nil {
+		t.Fatalf("NewCA: %v", err)
+	}
+	f := MsgFields{
+		ID: "a1b2", From: "mac:frank", To: "ubuntu:claude", Kind: "request",
+		Text: "帮看下第三行", FileName: "note.txt", Repo: "base", Branch: "main",
+		FileSHA256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+		Created:    time.Date(2026, 10, 14, 12, 0, 0, 0, time.FixedZone("CST", 8*3600)),
+	}
+	sig := ca.Sign(MessageSigningBytes(f))
+	if !VerifyMessage(ca.Public(), MessageSigningBytes(f), sig) {
+		t.Error("CA 自己签的原文应验真")
+	}
+	// 同一时刻换个时区：原文不变、仍验真。
+	sameElsewhere := f
+	sameElsewhere.Created = f.Created.In(time.UTC)
+	if !bytes.Equal(MessageSigningBytes(f), MessageSigningBytes(sameElsewhere)) {
+		t.Error("同一时刻不同时区的签名原文应一致（Created 折 UTC）")
+	}
+	if !VerifyMessage(ca.Public(), MessageSigningBytes(sameElsewhere), sig) {
+		t.Error("换个时区的原文应仍验真")
+	}
+	// 逐字段篡改都验假。
+	for _, mod := range []func(f *MsgFields){
+		func(f *MsgFields) { f.Text = "改了正文" },
+		func(f *MsgFields) { f.To = "mac:boss" },
+		func(f *MsgFields) { f.Kind = "reply" },
+		func(f *MsgFields) { f.ReplyTo = "ffff" },
+		func(f *MsgFields) { f.FileName = "other.txt" },
+		func(f *MsgFields) { f.Repo = "other" },
+		func(f *MsgFields) { f.Branch = "dev" },
+		func(f *MsgFields) { f.FileSHA256 = "0000" },
+		func(f *MsgFields) { f.Created = f.Created.Add(time.Second) },
+	} {
+		g := f
+		mod(&g)
+		if VerifyMessage(ca.Public(), MessageSigningBytes(g), sig) {
+			t.Errorf("改过的字段不应验真: %+v", g)
+		}
 	}
 }

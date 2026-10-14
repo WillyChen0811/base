@@ -12,6 +12,8 @@ import (
 	"strings"
 	"time"
 	"unicode/utf8"
+
+	"github.com/WillyChen0811/base/go/xxyica"
 )
 
 const (
@@ -73,7 +75,11 @@ func checkSide(addr, side string) (int, string) {
 }
 
 // readMsgBody 读取 /msg/send 正文并限长；返回 nil 表示已经写好错误响应。
+// 证书门接口的 GET 没有正文也算读成功（空字节串），签名原文里 body 就是空。
 func readMsgBody(w http.ResponseWriter, r *http.Request) []byte {
+	if r.Body == nil {
+		return []byte{}
+	}
 	body, err := io.ReadAll(io.LimitReader(r.Body, maxMsgBodyBytes+1))
 	if err != nil {
 		errJSON(w, http.StatusBadRequest, "读取消息失败")
@@ -84,6 +90,70 @@ func readMsgBody(w http.ResponseWriter, r *http.Request) []byte {
 		return nil
 	}
 	return body
+}
+
+// certAuthHeader 是客户端（xxyi-msg）带证书与请求签名的头（xxyica.SignRequest 的产物）。
+const certAuthHeader = "X-XXYI-Auth"
+
+// certCheck 校验客户端接口的请求证书：用请求头对 method+RequestURI+body 验签，
+// 时间戳/nonce/吊销由 Verifier 管。MsgAuth 未配置时直接放行（返回空证书，权限检查一并跳过）。
+// 失败已写好 401，返回 false。
+func (s *Service) certCheck(w http.ResponseWriter, r *http.Request, body []byte) (xxyica.Cert, bool) {
+	if s.cfg.MsgAuth == nil {
+		return xxyica.Cert{}, true
+	}
+	cert, err := s.cfg.MsgAuth.Verify(r.Header.Get(certAuthHeader), r.Method, r.URL.RequestURI(), body, time.Now())
+	if err != nil {
+		errJSON(w, http.StatusUnauthorized, "证书校验失败："+err.Error())
+		return xxyica.Cert{}, false
+	}
+	return cert, true
+}
+
+// certSendPerm 检查发送请求是否落在证书权限内。
+// reply 可以不带 to（Hub 入库时补成原请求的发件人）：这种请求查不了最终 to，
+// 按规格降级为只查 From 前缀、消息类型、仓库、附件——kind 空时照 Hub 默认按 notice 查。
+func certSendPerm(perm xxyica.Perm, req msgSendReq) (int, string) {
+	kind := req.Kind
+	if kind == "" {
+		kind = KindNotice
+	}
+	if req.To != "" {
+		if err := perm.Allows(req.From, req.To, kind, req.Repo, len(req.File) > 0); err != nil {
+			return http.StatusForbidden, err.Error()
+		}
+		return 0, ""
+	}
+	if !strings.HasPrefix(req.From, perm.AddrPrefix) {
+		return http.StatusForbidden, fmt.Sprintf("发件地址 %s 不符合证书前缀 %s", req.From, perm.AddrPrefix)
+	}
+	if !containsStr(perm.Kinds, kind) {
+		return http.StatusForbidden, fmt.Sprintf("证书不允许消息类型 %s", kind)
+	}
+	if req.Repo != "" && !containsStr(perm.Repos, req.Repo) && !containsStr(perm.Repos, "*") {
+		return http.StatusForbidden, fmt.Sprintf("证书不允许同步仓库 %s", req.Repo)
+	}
+	if len(req.File) > 0 && !perm.Attach {
+		return http.StatusForbidden, "证书不允许带附件"
+	}
+	return 0, ""
+}
+
+// certAddrPerm 检查 state/inbox 上报/查询的地址是否落在证书前缀内。
+func certAddrPerm(perm xxyica.Perm, addr string) (int, string) {
+	if !strings.HasPrefix(addr, perm.AddrPrefix) {
+		return http.StatusForbidden, fmt.Sprintf("地址 %s 不符合证书前缀 %s", addr, perm.AddrPrefix)
+	}
+	return 0, ""
+}
+
+func containsStr(list []string, v string) bool {
+	for _, s := range list {
+		if s == v {
+			return true
+		}
+	}
+	return false
 }
 
 // msgErr 把 Hub 的 Decide/MarkDelivered 错误映射成响应码：查无此条 404，状态不满足 409。
@@ -120,16 +190,27 @@ func firstLineBrief(text string) string {
 }
 
 // msgSend 是 POST /msg/send；side 是本侧允许的 From 前缀。入库成功返回 {"id":...}。
+// 配了 MsgAuth 时是证书接口：先读正文验证书，再查发送权限，最后才走原有 side 校验入库。
 func (s *Service) msgSend(side string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		body := readMsgBody(w, r)
 		if body == nil {
 			return
 		}
+		cert, ok := s.certCheck(w, r, body)
+		if !ok {
+			return
+		}
 		var req msgSendReq
 		if err := json.Unmarshal(body, &req); err != nil {
 			errJSON(w, http.StatusBadRequest, "正文不是合法 JSON")
 			return
+		}
+		if s.cfg.MsgAuth != nil {
+			if code, msg := certSendPerm(cert.Perm, req); code != 0 {
+				errJSON(w, code, msg)
+				return
+			}
 		}
 		// From 必须站在本侧：远端不能冒充 mac，本机也不能冒充 ubuntu。
 		if code, msg := checkSide(req.From, side); code != 0 {
@@ -175,10 +256,25 @@ func unansweredBrief(ms []Message) []unansweredItem {
 // msgState 是 POST /msg/state?addr=&state=busy|idle|gone[&check=1]；addr 必须是本侧地址。
 // check=1 且上报 idle 时先自查欠回复（NagUnanswered）：还有还能提醒的欠回复就不改状态，
 // 把欠的列回去；每条欠回复最多提醒 nagMax 次，提醒满了就不再拦着上报 idle。
+// 配了 MsgAuth 时是证书接口：正文（正常为空）也要进签名原文。
 func (s *Service) msgState(side string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		body := readMsgBody(w, r)
+		if body == nil {
+			return
+		}
+		cert, ok := s.certCheck(w, r, body)
+		if !ok {
+			return
+		}
 		q := r.URL.Query()
 		addr := q.Get("addr")
+		if s.cfg.MsgAuth != nil {
+			if code, msg := certAddrPerm(cert.Perm, addr); code != 0 {
+				errJSON(w, code, msg)
+				return
+			}
+		}
 		if code, msg := checkSide(addr, side); code != 0 {
 			errJSON(w, code, msg)
 			return
@@ -201,10 +297,25 @@ func (s *Service) msgState(side string) http.HandlerFunc {
 
 // msgInbox 是 GET /msg/inbox?addr=&n=：本侧地址读自己的收件箱（最近 n 条，最新在前），
 // 附带还没回复的请求列表。n 缺省 20，给了必须 1..100。
+// 配了 MsgAuth 时是证书接口（GET 无正文，签名原文里 body 为空）。
 func (s *Service) msgInbox(side string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		body := readMsgBody(w, r)
+		if body == nil {
+			return
+		}
+		cert, ok := s.certCheck(w, r, body)
+		if !ok {
+			return
+		}
 		q := r.URL.Query()
 		addr := q.Get("addr")
+		if s.cfg.MsgAuth != nil {
+			if code, msg := certAddrPerm(cert.Perm, addr); code != 0 {
+				errJSON(w, code, msg)
+				return
+			}
+		}
 		if code, msg := checkSide(addr, side); code != 0 {
 			errJSON(w, code, msg)
 			return
@@ -297,7 +408,15 @@ func (s *Service) msgDelivered(w http.ResponseWriter, r *http.Request) {
 }
 
 // msgWho 是 GET /msg/who：对端忙闲表（远端用它确认自己上报的状态被看到）。
+// 证书接口：验证书即可，没有地址/发送维度可查权限。
 func (s *Service) msgWho(w http.ResponseWriter, r *http.Request) {
+	body := readMsgBody(w, r)
+	if body == nil {
+		return
+	}
+	if _, ok := s.certCheck(w, r, body); !ok {
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"peers": s.hub.Peers()})
 }
 

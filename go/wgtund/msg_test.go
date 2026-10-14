@@ -633,3 +633,85 @@ func TestWrapRC(t *testing.T) {
 		t.Errorf("没有回报行应返回 -1，得到 %d", code)
 	}
 }
+
+// 假 run：执行命令就报连接错误（线路不通）。
+func connErrRun(context.Context, string) ([]byte, int, error) {
+	return nil, -1, errors.New("ssh: dial 127.0.0.1:2223: connect: connection refused")
+}
+
+// 假 write：记账不落地。
+func okWrite(context.Context, string, []byte) error { return nil }
+
+// Deliver 和 Sync（mac→ubuntu 方向）遇到连接类错误必须标 ErrLinkDown，
+// 让 Hub 按线路暂停重试而不是直接算投递/同步失败。
+func TestMsgBridgeRunErrLinkDown(t *testing.T) {
+	b := &msgBridge{run: connErrRun, write: okWrite}
+	err := b.Deliver(context.Background(), support.Message{
+		ID: "ld1", From: "mac:x", To: "ubuntu:s", Text: "hi",
+	})
+	if !errors.Is(err, support.ErrLinkDown) {
+		t.Fatalf("Deliver 连接错误应标 ErrLinkDown，得到 %v", err)
+	}
+	if !strings.Contains(err.Error(), "连不上 Ubuntu") {
+		t.Errorf("错误应说清连不上 Ubuntu：%v", err)
+	}
+
+	// mac→ubuntu 的 Sync：本地推送（git 真跑）成功后，远端快进命令报连接错。
+	mac, ubuntu := newRepoPair(t)
+	gitCommit(t, mac, "c2")
+	b2 := &msgBridge{
+		repos:     map[string]support.Repo{"xxyi": {Dir: mac, Remote: ubuntu}},
+		remoteDir: map[string]string{"xxyi": ubuntu},
+		run:       connErrRun,
+	}
+	err = b2.Sync(context.Background(), support.Message{
+		ID: "ld2", From: "mac:x", To: "ubuntu:s", Text: "x", Repo: "xxyi", Branch: "main",
+	})
+	if !errors.Is(err, support.ErrLinkDown) {
+		t.Fatalf("Sync mac→ubuntu 连接错误应标 ErrLinkDown，得到 %v", err)
+	}
+	if !strings.Contains(err.Error(), "连不上 Ubuntu") {
+		t.Errorf("错误应说清连不上 Ubuntu：%v", err)
+	}
+}
+
+// Capture 对 ubuntu:<会话> 走 tmux capture-pane（定位用 =会话: 精确匹配），返回抓到的画面；
+// mac: 一侧本机自己会抓，这里返回空且不调 run。
+func TestMsgBridgeCapture(t *testing.T) {
+	var cmds []string
+	b := &msgBridge{
+		run: func(_ context.Context, cmd string) ([]byte, int, error) {
+			cmds = append(cmds, cmd)
+			return []byte("假画面第一行\n假画面第二行\n"), 0, nil
+		},
+		write: func(context.Context, string, []byte) error {
+			t.Fatal("Capture 不该写文件")
+			return nil
+		},
+	}
+	out, err := b.Capture(context.Background(), "ubuntu:s")
+	if err != nil {
+		t.Fatalf("Capture: %v", err)
+	}
+	if out != "假画面第一行\n假画面第二行\n" {
+		t.Errorf("Capture 应原样返回输出，得到 %q", out)
+	}
+	if len(cmds) != 1 || !strings.Contains(cmds[0], "capture-pane") || !strings.Contains(cmds[0], "=s:") {
+		t.Errorf("命令应是 ubuntu:s 的 capture-pane，得到 %v", cmds)
+	}
+
+	// mac: 一侧：空串、不报错、不起命令。
+	out, err = b.Capture(context.Background(), "mac:x")
+	if err != nil || out != "" {
+		t.Fatalf("mac 侧 Capture 应返回空且无错，得到 (%q, %v)", out, err)
+	}
+	if len(cmds) != 1 {
+		t.Errorf("mac 侧不该调 run，cmds=%v", cmds)
+	}
+
+	// 连接类错误同样标 ErrLinkDown。
+	_, err = (&msgBridge{run: connErrRun}).Capture(context.Background(), "ubuntu:s")
+	if !errors.Is(err, support.ErrLinkDown) {
+		t.Fatalf("Capture 连接错误应标 ErrLinkDown，得到 %v", err)
+	}
+}

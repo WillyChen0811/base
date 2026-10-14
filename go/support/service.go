@@ -18,6 +18,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/WillyChen0811/base/go/xxyica"
 )
 
 // Remote 由调用方（wgtund）实现：在远端主机上开监听、发布/撤销入口信息。
@@ -44,6 +46,13 @@ type Config struct {
 	MsgDeliver func(ctx context.Context, m Message) error
 	// MsgStorePath 透传给消息 Hub 的落盘路径（重启不丢消息）；空 = Hub 保持纯内存。
 	MsgStorePath string
+	// MsgAuth 是客户端消息接口（远端/本机的 send·state·inbox、远端 who）的证书校验器；
+	// nil = 不校验证书（现有行为，调用方没接 CA 时照常跑）。
+	MsgAuth *xxyica.Verifier
+	// MsgSign 是 XXYI CA 私钥签名（透传给 Hub，消息入库前算 Sig）；nil = 不签名。
+	MsgSign func([]byte) []byte
+	// MsgCapture 抓接收方终端画面（失败报告用），透传给 Hub；nil = 报告不带画面。
+	MsgCapture func(ctx context.Context, addr string) (string, error)
 }
 
 // Status 是协助服务的状态快照。
@@ -146,7 +155,14 @@ func NewService(cfg Config, remote Remote) *Service {
 		msgKick:   make(chan struct{}, 1),
 	}
 	// hub 依赖 s.logEvent，必须等 s 建好再接上
-	s.hub = NewHub(HubConfig{Sync: cfg.MsgSync, Deliver: cfg.MsgDeliver, Log: s.logEvent, StorePath: cfg.MsgStorePath})
+	s.hub = NewHub(HubConfig{
+		Sync:      cfg.MsgSync,
+		Deliver:   cfg.MsgDeliver,
+		Log:       s.logEvent,
+		StorePath: cfg.MsgStorePath,
+		Sign:      cfg.MsgSign,
+		Capture:   cfg.MsgCapture,
+	})
 	return s
 }
 

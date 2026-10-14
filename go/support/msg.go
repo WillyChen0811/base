@@ -2,6 +2,8 @@ package support
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"path"
@@ -10,6 +12,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/WillyChen0811/base/go/xxyica"
 )
 
 // MsgState 是一条中转消息的状态。
@@ -86,6 +90,30 @@ type Message struct {
 
 	Attempts []Attempt   `json:"attempts,omitempty"` // 自动重试失败记录，最多留最近 20 条
 	Report   *FailReport `json:"report,omitempty"`   // 转人工（failed/sync_failed）时的现场报告
+
+	// Sig 是 XXYI CA（HubConfig.Sign）对签名域（xxyica.MessageSigningBytes）的签名；
+	// 没配 Sign 为空。收件方拿 CA 公钥即可核验"这条消息确实出自本 XXYI 中转"。
+	Sig []byte `json:"sig,omitempty"`
+	// FileSHA256 是附件内容的 SHA-256 hex（Send 时算；没附件为空）。
+	// 在签名域里，附件释放（File 置 nil）后仍能核验"当时那个附件"。
+	FileSHA256 string `json:"file_sha256,omitempty"`
+}
+
+// msgSignFields 抽出消息的签名域。签名和核验两侧都只经这里取字段，防止漏字段。
+func msgSignFields(m Message) xxyica.MsgFields {
+	return xxyica.MsgFields{
+		ID:         m.ID,
+		From:       m.From,
+		To:         m.To,
+		Kind:       m.Kind,
+		ReplyTo:    m.ReplyTo,
+		Text:       m.Text,
+		FileName:   m.FileName,
+		Repo:       m.Repo,
+		Branch:     m.Branch,
+		FileSHA256: m.FileSHA256,
+		Created:    m.Created,
+	}
 }
 
 // ErrMsgNotFound 表示消息 ID 不在 Hub 里（不存在或已被淘汰）。
@@ -261,6 +289,9 @@ type HubConfig struct {
 	// ReplyTimeout 是请求送达后等回复的时限，<=0 取默认 2 小时；
 	// 超时把请求标 overdue 并发一条系统通知给原发件人。
 	ReplyTimeout time.Duration
+	// Sign 用 XXYI CA 私钥给消息签名（入参是 xxyica.MessageSigningBytes 的原文）；
+	// nil = 不签名（Message.Sig 为空）。凡经 Send/系统通知入库的消息都入库前签。
+	Sign func([]byte) []byte
 }
 
 // Hub 是消息中转队列，并发安全；网络与 git 由 cfg 注入。
@@ -659,6 +690,11 @@ func (h *Hub) sendSystemLocked(to, text string) Message {
 			break
 		}
 	}
+	// 系统通知同样入库前签（无附件，FileSHA256 为空）：收件方拿 CA 公钥能分辨
+	// "真系统通知"和别的来源。
+	if h.cfg.Sign != nil {
+		m.Sig = h.cfg.Sign(xxyica.MessageSigningBytes(msgSignFields(m)))
+	}
 	h.msgs = append(h.msgs, m)
 	return m
 }
@@ -912,6 +948,11 @@ func (h *Hub) Send(m Message) (string, error) {
 	m.Reason = ""
 	m.Now = false
 	m.Synced = false
+	// 附件哈希在这里算好进签名域并永久保留：附件送到/释放后仍能核验"当时那个附件"没被换。
+	if len(m.File) > 0 {
+		sum := sha256.Sum256(m.File)
+		m.FileSHA256 = hex.EncodeToString(sum[:])
+	}
 
 	h.mu.Lock()
 	open := 0
@@ -930,6 +971,10 @@ func (h *Hub) Send(m Message) (string, error) {
 		if h.findLocked(m.ID) < 0 {
 			break
 		}
+	}
+	// ID 定下来才签：签名域含 ID，入库后不再改。
+	if h.cfg.Sign != nil {
+		m.Sig = h.cfg.Sign(xxyica.MessageSigningBytes(msgSignFields(m)))
 	}
 	// AskUser 的消息即使自动模式开着也要停下来等用户：标了"要用户定"就不能自动放行。
 	if !h.autoUntil.IsZero() && now.Before(h.autoUntil) && !m.AskUser {

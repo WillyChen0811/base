@@ -108,7 +108,8 @@ func (b *msgBridge) Sync(ctx context.Context, m support.Message) error {
 		}
 		out, code, err := b.run(ctx, "sh -c "+tmux.Quote(script))
 		if err != nil {
-			return fmt.Errorf("连不上 Ubuntu: %v", err) // 连接类错误
+			// 连接类错误：标 ErrLinkDown 让 Hub 挂起线路重试而不是直接算同步失败
+			return fmt.Errorf("连不上 Ubuntu: %w", errors.Join(support.ErrLinkDown, err))
 		}
 		got, err := support.ParseFFResult(out, code)
 		if err != nil {
@@ -174,14 +175,14 @@ func (b *msgBridge) Deliver(ctx context.Context, m support.Message) error {
 	if len(m.File) > 0 {
 		inbox := "xxyi-work/inbox/" + m.ID + "-" + m.FileName
 		if err := b.write(ctx, inbox, m.File); err != nil {
-			return fmt.Errorf("附件写到 Ubuntu 失败: %v", err)
+			return fmt.Errorf("附件写到 Ubuntu 失败: %w", err)
 		}
 		attach = "~/" + inbox
 	}
 	text := support.Display(m, attach)
 	msgPath := ".xxyi-support/msg/" + m.ID + ".txt"
 	if err := b.write(ctx, msgPath, []byte(text)); err != nil {
-		return fmt.Errorf("消息正文写到 Ubuntu 失败: %v", err)
+		return fmt.Errorf("消息正文写到 Ubuntu 失败: %w", err)
 	}
 	paste, err := tmux.PasteCommand(session, "xxyi-"+m.ID)
 	if err != nil {
@@ -195,7 +196,8 @@ func (b *msgBridge) Deliver(ctx context.Context, m support.Message) error {
 	}
 	out, code, err := b.run(ctx, deliverCmd(m, paste, pane, msgPath))
 	if err != nil {
-		return fmt.Errorf("连不上 Ubuntu: %v", err)
+		// 连接类错误：标 ErrLinkDown 让 Hub 挂起线路重试而不是直接算投递失败
+		return fmt.Errorf("连不上 Ubuntu: %w", errors.Join(support.ErrLinkDown, err))
 	}
 	if code == 9 {
 		if prog, ok := paneProgOfNotClaude(out); ok {
@@ -210,6 +212,25 @@ func (b *msgBridge) Deliver(ctx context.Context, m support.Message) error {
 		return fmt.Errorf("注入 %s 失败：%s", m.To, strings.TrimSpace(string(msg)))
 	}
 	return nil
+}
+
+// Capture 抓 ubuntu:<会话> 最近 40 行终端画面（失败报告用，Hub 在转人工前调用）。
+// mac: 一侧的画面本机自己会抓，这里返回空不算错；连接类错误同样标 ErrLinkDown。
+func (b *msgBridge) Capture(ctx context.Context, addr string) (string, error) {
+	if !strings.HasPrefix(addr, "ubuntu:") {
+		return "", nil
+	}
+	cmd, err := tmux.CaptureCommand(strings.TrimPrefix(addr, "ubuntu:"), 40)
+	if err != nil {
+		return "", err
+	}
+	ctx, cancel := context.WithTimeout(ctx, msgRunTimeout)
+	defer cancel()
+	out, _, err := b.run(ctx, cmd)
+	if err != nil {
+		return "", fmt.Errorf("连不上 Ubuntu: %w", errors.Join(support.ErrLinkDown, err))
+	}
+	return string(out), nil
 }
 
 // remoteDirOf 从仓库 remote 推导 Ubuntu 上的仓库目录：
@@ -299,14 +320,15 @@ func msgSFTPWriter(pool *sshPool, host string) func(ctx context.Context, path st
 		var sc *sftp.Client // goroutine 拿到会话后放进来，ctx 分支要关它
 		var abandoned bool  // ctx 先结束时会话还没建好，由 goroutine 拿到后自己关
 		go func() {
+			// 建会话阶段的失败都是连接类：标 ErrLinkDown，Hub 按线路暂停处理
 			c, err := pool.conn(host)
 			if err != nil {
-				done <- err
+				done <- errors.Join(support.ErrLinkDown, err)
 				return
 			}
 			s, err := c.SFTP()
 			if err != nil {
-				done <- err
+				done <- errors.Join(support.ErrLinkDown, err)
 				return
 			}
 			mu.Lock()

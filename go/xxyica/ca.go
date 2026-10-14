@@ -198,6 +198,33 @@ func VerifyMessage(caPub ed25519.PublicKey, data, sig []byte) bool {
 	return ed25519.Verify(caPub, data, sig)
 }
 
+// MsgFields 是一条消息的签名域：收件方拿 CA 公钥核验时按这份域重算原文，
+// 所以字段集和顺序就是签名协议，改动会断开与已签消息的兼容。
+// 一律不带 omitempty：空值也占位输出，签名只看字节不看 JSON 语法糖。
+type MsgFields struct {
+	ID         string    `json:"id"`
+	From       string    `json:"from"`
+	To         string    `json:"to"`
+	Kind       string    `json:"kind"`
+	ReplyTo    string    `json:"reply_to"`
+	Text       string    `json:"text"`
+	FileName   string    `json:"file_name"`
+	Repo       string    `json:"repo"`
+	Branch     string    `json:"branch"`
+	FileSHA256 string    `json:"file_sha256"`
+	Created    time.Time `json:"created"`
+}
+
+// MessageSigningBytes 拼出消息签名的原文：json.Marshal（字段顺序即结构体顺序，确定性输出）。
+// Created 统一折成 UTC 再编——签名方存的是本地时区的 RFC3339，收件方解析回来的偏移可能不同，
+// 只要时刻相同折 UTC 后字节就一致，否则同一时刻不同时区会验不过。
+// 这几个字段的 Marshal 不可能出错，故忽略错误返回（同 certSigningBytes）。
+func MessageSigningBytes(f MsgFields) []byte {
+	f.Created = f.Created.UTC()
+	b, _ := json.Marshal(f)
+	return b
+}
+
 // authPayload 是 X-XXYI-Auth 请求头解码后的内容。
 type authPayload struct {
 	Cert  Cert   `json:"cert"`

@@ -23,12 +23,23 @@ const (
 	MsgSyncFailed MsgState = "sync_failed" // 代码同步失败，等用户处理
 )
 
-// PeerState 是对端上报的忙闲状态；没上报过的地址视为 idle。
+// PeerState 是对端上报的忙闲状态。只有明确上报过 idle 的地址才允许送非 Now 消息；
+// busy、gone（对方窗口里不是 Claude）、以及没上报过的地址都按住。
 type PeerState string
 
 const (
 	PeerBusy PeerState = "busy"
 	PeerIdle PeerState = "idle"
+	PeerGone PeerState = "gone"
+)
+
+// 消息类型：KindRequest 要对方做事并回复，KindReply 是对某条请求的回复，
+// KindNotice 只是通知，KindCode 表示代码已按 repo/branch 交过去。
+const (
+	KindRequest = "request"
+	KindReply   = "reply"
+	KindNotice  = "notice"
+	KindCode    = "code"
 )
 
 // Message 是一条中转消息。File 不进 JSON，由调用方经 Hub 流转。
@@ -46,10 +57,19 @@ type Message struct {
 	Now      bool      `json:"now,omitempty"` // 用户点了立即送达
 	Synced   bool      `json:"synced,omitempty"`
 	Created  time.Time `json:"created"`
+
+	Kind     string `json:"kind"`
+	ReplyTo  string `json:"reply_to,omitempty"` // 仅 reply 使用，指向被回复的 request
+	AskUser  bool   `json:"ask_user,omitempty"` // 发件人声明：涉及决定的部分要交给用户
+	Answered bool   `json:"answered,omitempty"` // 仅 request 有意义：收到过合法 reply
 }
 
 // ErrMsgNotFound 表示消息 ID 不在 Hub 里（不存在或已被淘汰）。
 var ErrMsgNotFound = errors.New("support: 没有这条消息")
+
+// ErrPeerNotClaude 表示送达时发现对方窗口里跑的不是 Claude。
+// 撞上它不算投递失败：不计数、不退避，只把对端记成 gone 按住消息，等对方重新上报 idle。
+var ErrPeerNotClaude = errors.New("对方窗口里不是 Claude")
 
 const (
 	maxMsgTextLen  = 64 * 1024   // Text 上限 64KB
@@ -256,6 +276,48 @@ func (h *Hub) trimLocked() (wake chan struct{}) {
 // Send 校验消息后入库，返回 ID。自动模式开着则直接 queued，否则 pending。
 // 入参里的 State/Reason/Now/Synced 会被重置，由 Hub 统一管理。
 func (h *Hub) Send(m Message) (string, error) {
+	if m.Kind == "" {
+		m.Kind = KindNotice
+	}
+	switch m.Kind {
+	case KindRequest, KindReply, KindNotice, KindCode:
+	default:
+		return "", fmt.Errorf("support: 未知消息类型 %q（只能是 request/reply/notice/code）", m.Kind)
+	}
+	// reply 的收件人来自被回复的那条请求，所以要先查出原消息才能校验 To。
+	var orig Message
+	var haveOrig bool
+	if m.Kind == KindReply {
+		if m.ReplyTo == "" {
+			return "", fmt.Errorf("support: 回复必须给 reply_to")
+		}
+		h.mu.Lock()
+		i := h.findLocked(m.ReplyTo)
+		if i >= 0 {
+			orig, haveOrig = h.msgs[i], true
+		}
+		h.mu.Unlock()
+		if !haveOrig {
+			return "", fmt.Errorf("support: reply_to %q: %w", m.ReplyTo, ErrMsgNotFound)
+		}
+		if orig.Kind != KindRequest {
+			return "", fmt.Errorf("support: #%s 不是请求，不能回复", m.ReplyTo)
+		}
+		if orig.To != m.From {
+			return "", fmt.Errorf("support: #%s 不是发给 %s 的，不能回复", m.ReplyTo, m.From)
+		}
+		// 收件人默认就是原请求的发件人；显式给了别的地址等于凭空换人，拒收。
+		if m.To == "" {
+			m.To = orig.From
+		} else if m.To != orig.From {
+			return "", fmt.Errorf("support: 回复的收件人应是原请求的发件人 %s，不能填 %q", orig.From, m.To)
+		}
+	} else if m.ReplyTo != "" {
+		return "", fmt.Errorf("support: 只有回复才能带 reply_to")
+	}
+	if m.Kind == KindCode && (m.Repo == "" || m.Branch == "") {
+		return "", fmt.Errorf("support: 交代码（code）必须带仓库和分支")
+	}
 	if err := ValidAddr(m.From); err != nil {
 		return "", err
 	}
@@ -324,12 +386,17 @@ func (h *Hub) Send(m Message) (string, error) {
 			break
 		}
 	}
-	if !h.autoUntil.IsZero() && now.Before(h.autoUntil) {
+	// AskUser 的消息即使自动模式开着也要停下来等用户：标了"要用户定"就不能自动放行。
+	if !h.autoUntil.IsZero() && now.Before(h.autoUntil) && !m.AskUser {
 		m.State = MsgQueued
 	} else {
 		m.State = MsgPending
 	}
 	h.msgs = append(h.msgs, m)
+	// 把被回复的请求标成已回复；这期间被淘汰了就就算了，不报错。
+	if j := h.findLocked(m.ReplyTo); j >= 0 {
+		h.msgs[j].Answered = true
+	}
 	wake := h.trimLocked()
 	h.mu.Unlock()
 
@@ -340,13 +407,14 @@ func (h *Hub) Send(m Message) (string, error) {
 	return m.ID, nil
 }
 
-// SetState 记录对端忙闲状态；没上报过的地址视为 idle。
+// SetState 记录对端忙闲状态（busy/idle/gone）；gone 表示对方窗口里此刻不是 Claude。
+// 没上报过的地址不在表里，与 busy/gone 一样按住非 Now 消息。
 // 每次调用都会翻转 wakeup：等待中的 TakeOutbox 要能在对方变 idle 时醒来重查。
 func (h *Hub) SetState(addr string, st PeerState) error {
 	if err := ValidAddr(addr); err != nil {
 		return err
 	}
-	if st != PeerBusy && st != PeerIdle {
+	if st != PeerBusy && st != PeerIdle && st != PeerGone {
 		return fmt.Errorf("support: 未知对端状态 %q", st)
 	}
 	h.mu.Lock()
@@ -364,6 +432,93 @@ func (h *Hub) Peers() map[string]PeerState {
 	out := make(map[string]PeerState, len(h.peers))
 	for k, v := range h.peers {
 		out[k] = v
+	}
+	return out
+}
+
+// kindLabel 是消息类型在终端里的中文说法。
+func kindLabel(kind string) string {
+	switch kind {
+	case KindRequest:
+		return "请求"
+	case KindReply:
+		return "回复"
+	case KindCode:
+		return "交代码"
+	default:
+		return "通知"
+	}
+}
+
+// Display 把消息渲染成注入终端的文本，Mac 与 Ubuntu 两侧共用同一套格式。
+// attachPath 由调用方算好（Mac 侧用 MacInboxPath），空表示不带附件行。
+func Display(m Message, attachPath string) string {
+	head := fmt.Sprintf("[XXYI 消息 #%s · ", m.ID)
+	if m.Kind == KindReply {
+		head += fmt.Sprintf("回复 #%s", m.ReplyTo)
+	} else {
+		head += kindLabel(m.Kind)
+	}
+	head += fmt.Sprintf(" · 来自 %s]", m.From)
+
+	out := head + "\n" + m.Text
+	if m.Kind == KindCode {
+		if m.Synced {
+			out += fmt.Sprintf("\n（代码已同步：仓库 %s 分支 %s）", m.Repo, m.Branch)
+		} else {
+			// 用户选了不同步直接送：必须让收件人知道代码还没到。
+			out += fmt.Sprintf("\n（注意：代码没有同步，仓库 %s 分支 %s）", m.Repo, m.Branch)
+		}
+	}
+	if attachPath != "" {
+		out += fmt.Sprintf("\n（附件：%s）", attachPath)
+	}
+	if m.Kind == KindRequest {
+		out += fmt.Sprintf("\n（这是请求：用 xxyi_reply 回复 #%s；做不了也要回复说明原因）", m.ID)
+	}
+	if m.AskUser {
+		out += "\n（对方标了「要用户定」：涉及决定的部分请交给用户，不要自己拍板）"
+	}
+	return out
+}
+
+// MacInboxPath 是附件落到 mac 收件箱的路径；没有附件返回空串。
+func MacInboxPath(m Message) string {
+	if m.FileName == "" {
+		return ""
+	}
+	return fmt.Sprintf("~/xxyi-work/inbox/%s-%s", m.ID, m.FileName)
+}
+
+// Unanswered 返回发给 addr、已送达但还没被回复的请求，按创建时间从旧到新。
+// 返回的是拷贝，不含 File。
+func (h *Hub) Unanswered(addr string) []Message {
+	h.mu.Lock()
+	var out []Message
+	for _, m := range h.msgs {
+		if m.To == addr && m.State == MsgDelivered && m.Kind == KindRequest && !m.Answered {
+			out = append(out, m)
+		}
+	}
+	h.mu.Unlock()
+	for i := range out {
+		out[i].File = nil
+	}
+	return out
+}
+
+// Inbox 返回发给 addr 的最近 n 条消息，最新在前；返回拷贝，不含 File。
+func (h *Hub) Inbox(addr string, n int) []Message {
+	h.mu.Lock()
+	var out []Message
+	for i := len(h.msgs) - 1; i >= 0 && len(out) < n; i-- {
+		if h.msgs[i].To == addr {
+			out = append(out, h.msgs[i])
+		}
+	}
+	h.mu.Unlock()
+	for i := range out {
+		out[i].File = nil
 	}
 	return out
 }
@@ -482,7 +637,7 @@ func (h *Hub) AutoUntil() time.Time {
 func (h *Hub) TakeOutbox(ctx context.Context, to string) (Message, bool) {
 	for {
 		h.mu.Lock()
-		busy := h.peers[to] == PeerBusy
+		ready := h.peers[to] == PeerIdle // 只有上报过 idle 才算可送；busy/gone/没上报都按住
 		for k := 0; k < len(h.outbox); k++ {
 			id := h.outbox[k]
 			i := h.findLocked(id)
@@ -495,8 +650,8 @@ func (h *Hub) TakeOutbox(ctx context.Context, to string) (Message, bool) {
 			if h.msgs[i].To != to {
 				continue // outbox 是全局队列，只取发给本收件人的
 			}
-			if busy && !h.msgs[i].Now {
-				continue // 对方还忙，非 now 的按住
+			if !ready && !h.msgs[i].Now {
+				continue // 对方没上报 idle（busy/gone/没上报），非 now 的按住
 			}
 			out := h.msgs[i]
 			h.outbox = append(h.outbox[:k], h.outbox[k+1:]...)
@@ -590,7 +745,8 @@ func (h *Hub) pumpOne(ctx context.Context, id string) {
 		reclaimed = &cp
 		m = cp
 	}
-	if !m.Now && h.peers[m.To] == PeerBusy {
+	// 只有明确上报过 idle 的对端才送非 Now 消息：busy、gone、以及没上报过的都按住。
+	if !m.Now && h.peers[m.To] != PeerIdle {
 		h.mu.Unlock()
 		if reclaimed != nil {
 			h.logMsg(*reclaimed)
@@ -659,6 +815,16 @@ func (h *Hub) pumpOne(ctx context.Context, id string) {
 
 	if macDest {
 		h.mu.Lock()
+		// 与取件端一致的闸门：对端不是 idle 时非 Now 消息不进 outbox，
+		// 等它回 idle 后由下一次 Pump 重新放进来。
+		if !m.Now && h.peers[m.To] != PeerIdle {
+			delete(h.inflight, id)
+			h.mu.Unlock()
+			if reclaimed != nil {
+				h.logMsg(*reclaimed)
+			}
+			return
+		}
 		var wake chan struct{}
 		if j := h.findLocked(id); j >= 0 && h.msgs[j].State == MsgQueued {
 			if !h.outPlaced[id] {
@@ -688,7 +854,12 @@ func (h *Hub) pumpOne(ctx context.Context, id string) {
 		// 取消不是失败：状态、Reason 都不动
 	} else if j := h.findLocked(id); j >= 0 {
 		if h.msgs[j].State == MsgQueued {
-			if err != nil {
+			if errors.Is(err, ErrPeerNotClaude) {
+				// 对面不是 Claude：记 gone 把后续消息整体按住。这不算投递失败——
+				// 不累计失败次数、不设退避，对方重新上报 idle 后下一轮 Pump 立刻重试。
+				h.peers[m.To] = PeerGone
+				h.msgs[j].Reason = err.Error()
+			} else if err != nil {
 				// 保持 queued，只记 Reason；指数退避，下次 Pump 到点才再试。
 				h.msgs[j].Reason = err.Error()
 				h.fails[id]++

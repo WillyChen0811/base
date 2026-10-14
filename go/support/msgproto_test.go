@@ -1,0 +1,643 @@
+package support
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"strings"
+	"testing"
+	"time"
+)
+
+// —— Hub 层：对端上报、消息类型、渲染、收件箱查询 ——
+
+// 没上报过忙闲的对端等同于 busy/gone：自动模式放行了也停在 queued，Deliver 一次都不调；
+// 上报 idle 才送出；gone 时按住；被点了 now 则无论什么状态都送。
+func TestUnreportedPeerHoldsQueued(t *testing.T) {
+	f := newMsgFixture()
+	ctx := context.Background()
+	if err := f.hub.SetAuto(10); err != nil {
+		t.Fatal(err)
+	}
+	m := okMsg()
+	m.To = "ubuntu:bob"
+	m.Kind = KindRequest
+	id, err := f.hub.Send(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st := stateOf(t, f.hub, id); st != MsgQueued {
+		t.Fatalf("自动模式 Send 应 queued，实际 %s", st)
+	}
+	if _, ok := f.hub.Peers()["ubuntu:bob"]; ok {
+		t.Fatalf("前提：ubuntu:bob 没上报过忙闲")
+	}
+	f.hub.Pump(ctx)
+	if n := len(f.delivered()); n != 0 {
+		t.Fatalf("没上报过 idle 不该调 Deliver，实际调了 %d 次", n)
+	}
+	if st := stateOf(t, f.hub, id); st != MsgQueued {
+		t.Fatalf("应停在 queued，实际 %s", st)
+	}
+	// gone 也按住
+	if err := f.hub.SetState("ubuntu:bob", PeerGone); err != nil {
+		t.Fatal(err)
+	}
+	f.hub.Pump(ctx)
+	if n := len(f.delivered()); n != 0 {
+		t.Fatalf("gone 时不该送达，实际调了 %d 次", n)
+	}
+	if st := stateOf(t, f.hub, id); st != MsgQueued {
+		t.Fatalf("gone 时应仍 queued，实际 %s", st)
+	}
+	// 上报 idle 后送出
+	if err := f.hub.SetState("ubuntu:bob", PeerIdle); err != nil {
+		t.Fatal(err)
+	}
+	f.hub.Pump(ctx)
+	if st := stateOf(t, f.hub, id); st != MsgDelivered {
+		t.Fatalf("上报 idle 后应 delivered，实际 %s", st)
+	}
+	if n := len(f.delivered()); n != 1 {
+		t.Fatalf("应送达 1 条，实际 %d", n)
+	}
+	// now：gone 也照送
+	m2 := okMsg()
+	m2.To = "ubuntu:bob"
+	m2.Text = "急事"
+	id2, err := f.hub.Send(m2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.hub.SetState("ubuntu:bob", PeerGone); err != nil {
+		t.Fatal(err)
+	}
+	f.hub.Pump(ctx)
+	if n := len(f.delivered()); n != 1 {
+		t.Fatalf("gone 且非 now 不该送达，实际共 %d 条", n)
+	}
+	if err := f.hub.Decide(id2, "now"); err != nil {
+		t.Fatal(err)
+	}
+	f.hub.Pump(ctx)
+	if st := stateOf(t, f.hub, id2); st != MsgDelivered {
+		t.Fatalf("now 应无视 gone 送达，实际 %s", st)
+	}
+	if n := len(f.delivered()); n != 2 {
+		t.Fatalf("now 后应送达第二条，实际共 %d 条", n)
+	}
+}
+
+// 发往 mac 的消息：对端没上报过就进不了 outbox，取件只能超时返回 false；
+// 上报 idle 后由 Pump 放进 outbox 才取得到。
+func TestTakeOutboxHoldsUnreportedPeer(t *testing.T) {
+	f := newMsgFixture()
+	ctx := context.Background()
+	id, err := f.hub.Send(okMsg()) // → mac:alice
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.hub.Decide(id, "approve"); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := f.hub.Peers()["mac:alice"]; ok {
+		t.Fatalf("前提：mac:alice 没上报过忙闲")
+	}
+	f.hub.Pump(ctx) // 入队闸门按着：进不了 outbox
+	shortCtx, cancel := context.WithTimeout(ctx, 200*time.Millisecond)
+	defer cancel()
+	if got, ok := f.hub.TakeOutbox(shortCtx, "mac:alice"); ok {
+		t.Fatalf("没上报过 idle 不该取到，实际 got=%+v", got)
+	}
+	if err := f.hub.SetState("mac:alice", PeerIdle); err != nil {
+		t.Fatal(err)
+	}
+	f.hub.Pump(ctx) // 上报过 idle 之后这条 Pump 才放进 outbox
+	got, ok := f.hub.TakeOutbox(ctx, "mac:alice")
+	if !ok || got.ID != id {
+		t.Fatalf("上报 idle 后应取到 %s，实际 ok=%v got=%+v", id, ok, got)
+	}
+	if err := f.hub.MarkDelivered(id); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// 撞上 ErrPeerNotClaude：对端记成 gone、消息仍 queued、Reason 说明原因；
+// 这不算投递失败——不累计失败次数、不设退避，对方重新上报 idle 后下一轮 Pump 立刻重试。
+func TestDeliverPeerNotClaudeNoBackoff(t *testing.T) {
+	f := newMsgFixture()
+	ctx := context.Background()
+	notClaude := fmt.Errorf("注入失败: %w", ErrPeerNotClaude)
+	f.setDeliverErr(notClaude)
+	m := okMsg()
+	m.To = "ubuntu:bob"
+	id, err := f.hub.Send(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.hub.Decide(id, "approve"); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.hub.SetState("ubuntu:bob", PeerIdle); err != nil {
+		t.Fatal(err)
+	}
+	f.hub.Pump(ctx)
+	if got := f.hub.Peers()["ubuntu:bob"]; got != PeerGone {
+		t.Fatalf("撞上不是 Claude 应记 gone，实际 %s", got)
+	}
+	if st := stateOf(t, f.hub, id); st != MsgQueued {
+		t.Fatalf("应仍 queued，实际 %s", st)
+	}
+	if r := peekHubMsg(t, f.hub, id).Reason; !strings.Contains(r, "不是 Claude") {
+		t.Errorf("Reason 应含「不是 Claude」，实际 %q", r)
+	}
+	if next, fails := peekBackoff(t, f.hub, id); fails != 0 || !next.IsZero() {
+		t.Errorf("不该计失败次数和退避，实际 fails=%d next=%v", fails, next)
+	}
+	// gone 期间不重试（这是 gone 闸门挡的，不是退避）
+	f.hub.Pump(ctx)
+	if n := len(f.delivered()); n != 1 {
+		t.Fatalf("gone 期间不该重试投递，实际调了 %d 次", n)
+	}
+	// 重新上报 idle：下一次 Pump 立刻再撞上，仍不被退避挡住
+	if err := f.hub.SetState("ubuntu:bob", PeerIdle); err != nil {
+		t.Fatal(err)
+	}
+	f.hub.Pump(ctx)
+	if n := len(f.delivered()); n != 2 {
+		t.Fatalf("重新上报 idle 后应立刻重试（第 2 次调用），实际调了 %d 次", n)
+	}
+	if next, fails := peekBackoff(t, f.hub, id); fails != 0 || !next.IsZero() {
+		t.Errorf("重复撞上仍不该退避，实际 fails=%d next=%v", fails, next)
+	}
+	// 对面变回 Claude：立刻送达
+	f.setDeliverErr(nil)
+	if err := f.hub.SetState("ubuntu:bob", PeerIdle); err != nil {
+		t.Fatal(err)
+	}
+	f.hub.Pump(ctx)
+	if st := stateOf(t, f.hub, id); st != MsgDelivered {
+		t.Fatalf("恢复正常后应 delivered，实际 %s", st)
+	}
+	if n := len(f.delivered()); n != 3 {
+		t.Errorf("应共调 3 次，实际 %d", n)
+	}
+}
+
+// 消息类型与回复指向的校验：类型缺省/未知、code 缺仓库分支、reply 缺/指错/换人，
+// 以及正常 reply 自动填收件人并把原请求标成已回复。
+func TestSendKindAndReplyValidation(t *testing.T) {
+	f := newMsgFixture()
+
+	// Kind 空 → 存成 notice
+	id, err := f.hub.Send(okMsg())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := peekHubMsg(t, f.hub, id).Kind; got != KindNotice {
+		t.Fatalf("Kind 空应存成 notice，实际 %q", got)
+	}
+	// 未知 kind
+	bad := Message{From: "ubuntu:bob", To: "mac:alice", Text: "x", Kind: "memo"}
+	if _, err := f.hub.Send(bad); err == nil || !strings.Contains(err.Error(), "未知消息类型") {
+		t.Errorf("未知 kind 应报错，实际 %v", err)
+	}
+	// code 必须带仓库和分支
+	noBranch := Message{From: "ubuntu:bob", To: "mac:alice", Text: "交活儿", Kind: KindCode, Repo: "base"}
+	if _, err := f.hub.Send(noBranch); err == nil || !strings.Contains(err.Error(), "仓库和分支") {
+		t.Errorf("code 缺 branch 应报错，实际 %v", err)
+	}
+	bare := noBranch
+	bare.Repo = ""
+	if _, err := f.hub.Send(bare); err == nil {
+		t.Errorf("code 不带仓库分支应报错")
+	}
+	goodCode := noBranch
+	goodCode.Branch = "feat/msg"
+	if _, err := f.hub.Send(goodCode); err != nil {
+		t.Errorf("code 带齐仓库分支应通过: %v", err)
+	}
+
+	// 原请求：mac:sue → ubuntu:bob
+	reqID, err := f.hub.Send(Message{From: "mac:sue", To: "ubuntu:bob", Text: "做点事", Kind: KindRequest})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// reply 缺 reply_to
+	if _, err := f.hub.Send(Message{From: "ubuntu:bob", Text: "做完了", Kind: KindReply}); err == nil ||
+		!strings.Contains(err.Error(), "reply_to") {
+		t.Errorf("reply 缺 reply_to 应报错，实际 %v", err)
+	}
+	// reply 指向不存在的消息
+	missing := Message{From: "ubuntu:bob", Text: "做完了", Kind: KindReply, ReplyTo: "deadbeefdeadbeef"}
+	if _, err := f.hub.Send(missing); !errors.Is(err, ErrMsgNotFound) {
+		t.Errorf("reply 指向不存在的消息应 ErrMsgNotFound，实际 %v", err)
+	}
+	// reply 指向 notice（上面第一条就是 notice）
+	toNotice := Message{From: "ubuntu:bob", Text: "做完了", Kind: KindReply, ReplyTo: id}
+	if _, err := f.hub.Send(toNotice); err == nil || !strings.Contains(err.Error(), "不是请求") {
+		t.Errorf("回复 notice 应报错，实际 %v", err)
+	}
+	// reply 指向发给别人的请求：reqID 是发给 ubuntu:bob 的
+	toOther := Message{From: "mac:carol", Text: "做完了", Kind: KindReply, ReplyTo: reqID}
+	if _, err := f.hub.Send(toOther); err == nil || !strings.Contains(err.Error(), "不能回复") {
+		t.Errorf("回复发给别人的请求应报错，实际 %v", err)
+	}
+	// 正常 reply：To 自动填成原请求的发件人，原请求标成已回复
+	replyID, err := f.hub.Send(Message{From: "ubuntu:bob", Text: "做完了", Kind: KindReply, ReplyTo: reqID})
+	if err != nil {
+		t.Fatalf("正常 reply 应通过: %v", err)
+	}
+	if got := peekHubMsg(t, f.hub, replyID); got.To != "mac:sue" || got.Kind != KindReply {
+		t.Errorf("reply 的 To 应自动填原请求发件人，实际 %+v", got)
+	}
+	if !peekHubMsg(t, f.hub, reqID).Answered {
+		t.Errorf("原请求应标成 Answered")
+	}
+	// To 填了别人：凭空换人，拒收
+	wrongTo := Message{From: "ubuntu:bob", To: "mac:mallory", Text: "做完了", Kind: KindReply, ReplyTo: reqID}
+	if _, err := f.hub.Send(wrongTo); err == nil || !strings.Contains(err.Error(), "原请求的发件人") {
+		t.Errorf("reply 的 To 填别人应报错，实际 %v", err)
+	}
+	// notice 不许带 reply_to
+	noticeWithReply := Message{From: "ubuntu:bob", To: "mac:alice", Text: "打声招呼", Kind: KindNotice, ReplyTo: reqID}
+	if _, err := f.hub.Send(noticeWithReply); err == nil || !strings.Contains(err.Error(), "只有回复") {
+		t.Errorf("notice 带 reply_to 应报错，实际 %v", err)
+	}
+}
+
+// AskUser 的消息即使自动模式开着也要停下等用户。
+func TestAskUserStopsAuto(t *testing.T) {
+	f := newMsgFixture()
+	if err := f.hub.SetAuto(10); err != nil {
+		t.Fatal(err)
+	}
+	m := okMsg()
+	m.AskUser = true
+	id, err := f.hub.Send(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st := stateOf(t, f.hub, id); st != MsgPending {
+		t.Fatalf("AskUser 的消息自动模式下也应 pending，实际 %s", st)
+	}
+	// 对照：同样的消息不标 AskUser 就自动放行
+	m.AskUser = false
+	id2, err := f.hub.Send(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st := stateOf(t, f.hub, id2); st != MsgQueued {
+		t.Fatalf("对照消息应 queued，实际 %s", st)
+	}
+}
+
+// 终端渲染：各类型的头部、代码同步提示、附件行、回复提示行、「要用户定」行的完整文本与顺序。
+func TestDisplayAndMacInboxPath(t *testing.T) {
+	const (
+		id16    = "aaaaaaaaaaaaaaaa"
+		replyTo = "1234567890abcdef"
+	)
+	cases := []struct {
+		name   string
+		m      Message
+		attach string
+		want   string
+	}{
+		{
+			name: "请求含回复提示行",
+			m:    Message{ID: id16, From: "ubuntu:bob", To: "mac:alice", Text: "帮我看看这个", Kind: KindRequest},
+			want: "[XXYI 消息 #" + id16 + " · 请求 · 来自 ubuntu:bob]\n帮我看看这个" +
+				"\n（这是请求：用 xxyi_reply 回复 #" + id16 + "；做不了也要回复说明原因）",
+		},
+		{
+			name: "回复头部指向原请求",
+			m:    Message{ID: id16, From: "mac:alice", To: "ubuntu:bob", Text: "看完了", Kind: KindReply, ReplyTo: replyTo},
+			want: "[XXYI 消息 #" + id16 + " · 回复 #" + replyTo + " · 来自 mac:alice]\n看完了",
+		},
+		{
+			name: "通知",
+			m:    Message{ID: id16, From: "ubuntu:bob", To: "mac:alice", Text: "水开了", Kind: KindNotice},
+			want: "[XXYI 消息 #" + id16 + " · 通知 · 来自 ubuntu:bob]\n水开了",
+		},
+		{
+			name: "交代码已同步",
+			m: Message{ID: id16, From: "ubuntu:bob", To: "mac:alice", Text: "代码给你",
+				Kind: KindCode, Repo: "base", Branch: "feat/msg", Synced: true},
+			want: "[XXYI 消息 #" + id16 + " · 交代码 · 来自 ubuntu:bob]\n代码给你" +
+				"\n（代码已同步：仓库 base 分支 feat/msg）",
+		},
+		{
+			name: "交代码未同步要说明",
+			m: Message{ID: id16, From: "ubuntu:bob", To: "mac:alice", Text: "代码给你",
+				Kind: KindCode, Repo: "base", Branch: "feat/msg"},
+			want: "[XXYI 消息 #" + id16 + " · 交代码 · 来自 ubuntu:bob]\n代码给你" +
+				"\n（注意：代码没有同步，仓库 base 分支 feat/msg）",
+		},
+		{
+			name:   "带附件",
+			m:      Message{ID: id16, From: "ubuntu:bob", To: "mac:alice", Text: "带附件", Kind: KindNotice},
+			attach: MacInboxPath(Message{ID: id16, FileName: "report.txt"}),
+			want: "[XXYI 消息 #" + id16 + " · 通知 · 来自 ubuntu:bob]\n带附件" +
+				"\n（附件：~/xxyi-work/inbox/" + id16 + "-report.txt）",
+		},
+		{
+			name: "请求标了要用户定",
+			m: Message{ID: id16, From: "ubuntu:bob", To: "mac:alice", Text: "要不要删库",
+				Kind: KindRequest, AskUser: true},
+			want: "[XXYI 消息 #" + id16 + " · 请求 · 来自 ubuntu:bob]\n要不要删库" +
+				"\n（这是请求：用 xxyi_reply 回复 #" + id16 + "；做不了也要回复说明原因）" +
+				"\n（对方标了「要用户定」：涉及决定的部分请交给用户，不要自己拍板）",
+		},
+		{
+			name: "交代码+附件+要用户定的行序",
+			m: Message{ID: id16, From: "ubuntu:bob", To: "mac:alice", Text: "一起给你",
+				Kind: KindCode, Repo: "base", Branch: "feat/msg", AskUser: true},
+			attach: "~/xxyi-work/inbox/" + id16 + "-patch.txt",
+			want: "[XXYI 消息 #" + id16 + " · 交代码 · 来自 ubuntu:bob]\n一起给你" +
+				"\n（注意：代码没有同步，仓库 base 分支 feat/msg）" +
+				"\n（附件：~/xxyi-work/inbox/" + id16 + "-patch.txt）" +
+				"\n（对方标了「要用户定」：涉及决定的部分请交给用户，不要自己拍板）",
+		},
+	}
+	for _, c := range cases {
+		if got := Display(c.m, c.attach); got != c.want {
+			t.Errorf("%s:\nwant %q\ngot  %q", c.name, c.want, got)
+		}
+	}
+
+	// MacInboxPath：没附件空串，有附件带消息 ID 前缀
+	if got := MacInboxPath(Message{ID: id16}); got != "" {
+		t.Errorf("没附件应为空串，实际 %q", got)
+	}
+	if got := MacInboxPath(Message{ID: id16, FileName: "note.md"}); got != "~/xxyi-work/inbox/"+id16+"-note.md" {
+		t.Errorf("MacInboxPath 不对，实际 %q", got)
+	}
+}
+
+// protoDeliverTo 走批准 → 上报空闲 → Pump，把 ubuntu 侧的消息真送达（返回 ID）。
+func protoDeliverTo(t *testing.T, f *msgFixture, m Message) string {
+	t.Helper()
+	id, err := f.hub.Send(m)
+	if err != nil {
+		t.Fatalf("Send(%q): %v", m.Text, err)
+	}
+	if err := f.hub.Decide(id, "approve"); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.hub.SetState(m.To, PeerIdle); err != nil {
+		t.Fatal(err)
+	}
+	f.hub.Pump(context.Background())
+	if st := stateOf(t, f.hub, id); st != MsgDelivered {
+		t.Fatalf("%q 应送达，实际 %s", m.Text, st)
+	}
+	return id
+}
+
+// Unanswered 只收「已送达 + 请求 + 发给这个地址 + 没回复过」，旧的在前；
+// Inbox 返回发给这个地址的最近 n 条，新的在前，都不带附件内容。
+func TestUnansweredAndInbox(t *testing.T) {
+	f := newMsgFixture()
+	const bob = "ubuntu:bob"
+
+	r1 := protoDeliverTo(t, f, Message{From: "mac:sue", To: bob, Text: "第一件事", Kind: KindRequest,
+		File: []byte("payload"), FileName: "a.txt"})
+	r2 := protoDeliverTo(t, f, Message{From: "mac:sue", To: bob, Text: "第二件事", Kind: KindRequest})
+	r3 := protoDeliverTo(t, f, Message{From: "mac:sue", To: bob, Text: "第三件事", Kind: KindRequest})
+	n1 := protoDeliverTo(t, f, Message{From: "mac:sue", To: bob, Text: "只是通知", Kind: KindNotice})
+	// 回复第三条 → 它不再算欠回复
+	if _, err := f.hub.Send(Message{From: bob, Text: "第三件做完了", Kind: KindReply, ReplyTo: r3}); err != nil {
+		t.Fatal(err)
+	}
+	// 发给别人的已送达请求不算在 bob 头上
+	protoDeliverTo(t, f, Message{From: "mac:sue", To: "ubuntu:carol", Text: "别人的事", Kind: KindRequest})
+	// 未送达（pending / queued）的请求都不算
+	pendID, err := f.hub.Send(Message{From: "mac:sue", To: bob, Text: "还没批", Kind: KindRequest})
+	if err != nil {
+		t.Fatal(err)
+	}
+	queID, err := f.hub.Send(Message{From: "mac:sue", To: bob, Text: "批了没送", Kind: KindRequest})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.hub.Decide(queID, "approve"); err != nil {
+		t.Fatal(err)
+	}
+
+	un := f.hub.Unanswered(bob)
+	if got := idsOf(un); strings.Join(got, ",") != r1+","+r2 {
+		t.Errorf("Unanswered 应为旧到新的 %s,%s，实际 %v", r1, r2, got)
+	}
+	for _, m := range un {
+		if m.File != nil {
+			t.Errorf("Unanswered 不该带出附件内容，实际 %q", m.File)
+		}
+	}
+
+	in := f.hub.Inbox(bob, 2)
+	if got := idsOf(in); strings.Join(got, ",") != queID+","+pendID {
+		t.Errorf("Inbox(n=2) 应最新在前两条，实际 %v", got)
+	}
+	in = f.hub.Inbox(bob, 100)
+	if got := strings.Join(idsOf(in), ","); got != strings.Join([]string{queID, pendID, n1, r3, r2, r1}, ",") {
+		t.Errorf("Inbox 应最新在前且只含发给 %s 的消息，实际 %s", bob, got)
+	}
+	for _, m := range in {
+		if m.File != nil {
+			t.Errorf("Inbox 不该带出附件内容，实际 %q", m.File)
+		}
+	}
+}
+
+func idsOf(ms []Message) []string {
+	out := make([]string, 0, len(ms))
+	for _, m := range ms {
+		out = append(out, m.ID)
+	}
+	return out
+}
+
+// —— HTTP 层 ——
+
+// protoMsgBody 拼带 kind/reply_to 的 /msg/send 正文。
+func protoMsgBody(t *testing.T, req msgSendReq) []byte {
+	t.Helper()
+	b, err := json.Marshal(req)
+	if err != nil {
+		t.Fatalf("拼正文: %v", err)
+	}
+	return b
+}
+
+// /msg/state?state=idle&check=1：还有没回复的请求时不许装空闲，把欠的列回去、状态不动；
+// 补齐回复后才真的变 idle。
+func TestMsgAPIStateCheckUnanswered(t *testing.T) {
+	a := newMsgAPI(t, 30)
+
+	code, body := post(t, a.lURL+"/send", protoMsgBody(t, msgSendReq{
+		From: "mac:frank", To: "ubuntu:bob", Text: "帮我看看\n第二行不该进摘要", Kind: KindRequest,
+	}))
+	if code != 200 {
+		t.Fatalf("发请求: %d %s", code, body)
+	}
+	var resp map[string]string
+	if err := json.Unmarshal(body, &resp); err != nil || resp["id"] == "" {
+		t.Fatalf("响应应带 id: %s", body)
+	}
+	id := resp["id"]
+	if code, body = post(t, a.lURL+"/decide?id="+id+"&action=approve", nil); code != 200 {
+		t.Fatalf("approve: %d %s", code, body)
+	}
+
+	// 收件方上报空闲（不带 check）→ 经 Deliver 送达，送达后本机把它置忙
+	if code, body = remoteDo(t, http.MethodPost, a.base+"/msg/state?addr=ubuntu:bob&state=idle", a.token, nil); code != 200 {
+		t.Fatalf("上报空闲: %d %s", code, body)
+	}
+	waitFor(t, 3*time.Second, "送达", func() bool {
+		return msgStateOf(t, a.lURL, id) == MsgDelivered
+	})
+
+	// 还欠着回复：check=1 把欠的列回去，状态不变（仍 busy，不是 idle）
+	code, body = remoteDo(t, http.MethodPost, a.base+"/msg/state?addr=ubuntu:bob&state=idle&check=1", a.token, nil)
+	if code != 200 {
+		t.Fatalf("check=1: %d %s", code, body)
+	}
+	var st struct {
+		OK         bool             `json:"ok"`
+		Unanswered []unansweredItem `json:"unanswered"`
+	}
+	if err := json.Unmarshal(body, &st); err != nil {
+		t.Fatalf("解 check=1 响应: %v %s", err, body)
+	}
+	if !st.OK || len(st.Unanswered) != 1 || st.Unanswered[0].ID != id {
+		t.Fatalf("应列出欠回复的那条请求，实际 %s", body)
+	}
+	if st.Unanswered[0].From != "mac:frank" || st.Unanswered[0].Text != "帮我看看" {
+		t.Errorf("摘要应是发件人和正文首行，实际 %+v", st.Unanswered[0])
+	}
+	if got := a.s.Hub().Peers()["ubuntu:bob"]; got == PeerIdle {
+		t.Errorf("欠回复时不该变 idle，实际 %s", got)
+	}
+
+	// 补上回复后再报空闲：没有欠的了，才真的变 idle
+	if code, body = remoteDo(t, http.MethodPost, a.base+"/msg/send", a.token, protoMsgBody(t, msgSendReq{
+		From: "ubuntu:bob", Text: "看完了", Kind: KindReply, ReplyTo: id,
+	})); code != 200 {
+		t.Fatalf("回复: %d %s", code, body)
+	}
+	if len(a.s.Hub().Unanswered("ubuntu:bob")) != 0 {
+		t.Fatalf("回复后不该再有欠回复")
+	}
+	code, body = remoteDo(t, http.MethodPost, a.base+"/msg/state?addr=ubuntu:bob&state=idle&check=1", a.token, nil)
+	if code != 200 {
+		t.Fatalf("补齐后上报空闲: %d %s", code, body)
+	}
+	st.Unanswered = nil // json.Unmarshal 不清空缺失字段，手动清掉上一轮的结果
+	if err := json.Unmarshal(body, &st); err != nil {
+		t.Fatalf("解响应: %v %s", err, body)
+	}
+	if !st.OK || len(st.Unanswered) != 0 {
+		t.Fatalf("不该再有 unanswered，实际 %s", body)
+	}
+	if got := a.s.Hub().Peers()["ubuntu:bob"]; got != PeerIdle {
+		t.Fatalf("没有欠回复后应变 idle，实际 %s", got)
+	}
+}
+
+// /msg/inbox 只许读本侧：远端读 mac 的收件箱 403，本机读 ubuntu 的也 403。
+func TestMsgAPIInboxSideEnforced(t *testing.T) {
+	a := newMsgAPI(t, 30)
+
+	// 远端有自己的一条收件消息，读自己的没问题
+	if code, body := post(t, a.lURL+"/send", protoMsgBody(t, msgSendReq{
+		From: "mac:frank", To: "ubuntu:bob", Text: "收件箱里有货", Kind: KindRequest,
+	})); code != 200 {
+		t.Fatalf("本机发消息: %d %s", code, body)
+	}
+	code, body := remoteDo(t, http.MethodGet, a.base+"/msg/inbox?addr=ubuntu:bob", a.token, nil)
+	if code != 200 {
+		t.Fatalf("远端读自己收件箱: %d %s", code, body)
+	}
+	var box struct {
+		Messages   []Message `json:"messages"`
+		Unanswered []Message `json:"unanswered"`
+	}
+	if err := json.Unmarshal(body, &box); err != nil {
+		t.Fatalf("解 inbox: %v %s", err, body)
+	}
+	if len(box.Messages) != 1 || box.Messages[0].Text != "收件箱里有货" {
+		t.Errorf("远端收件箱内容不对: %+v", box.Messages)
+	}
+	// 冒充另一侧一律 403
+	if code, _ := remoteDo(t, http.MethodGet, a.base+"/msg/inbox?addr=mac:frank", a.token, nil); code != http.StatusForbidden {
+		t.Fatalf("远端读 mac 收件箱应 403，得 %d", code)
+	}
+	if code, _ := get(t, a.lURL+"/inbox?addr=ubuntu:bob"); code != http.StatusForbidden {
+		t.Fatalf("本机读 ubuntu 收件箱应 403，得 %d", code)
+	}
+	if code, _ := get(t, a.lURL+"/inbox?addr=mac:frank"); code != 200 {
+		t.Fatalf("本机读自己收件箱应 200，得 %d", code)
+	}
+	// n 越界应 400
+	if code, _ := get(t, a.lURL+"/inbox?addr=mac:frank&n=0"); code != http.StatusBadRequest {
+		t.Fatalf("n=0 应 400，得 %d", code)
+	}
+}
+
+// 取件响应的 display 必须等于 Display(m, MacInboxPath(m))——取件端直接注入，不自己拼格式。
+func TestMsgAPIOutboxDisplay(t *testing.T) {
+	a := newMsgAPI(t, 30)
+
+	code, body := remoteDo(t, http.MethodPost, a.base+"/msg/send", a.token, protoMsgBody(t, msgSendReq{
+		From: "ubuntu:bob", To: "mac:frank", Text: "带附件的请求",
+		FileName: "/tmp/report.txt", File: []byte("payload"), Kind: KindRequest, AskUser: true,
+	}))
+	if code != 200 {
+		t.Fatalf("远端发带附件消息: %d %s", code, body)
+	}
+	var resp map[string]string
+	if err := json.Unmarshal(body, &resp); err != nil || resp["id"] == "" {
+		t.Fatalf("响应应带 id: %s", body)
+	}
+	id := resp["id"]
+	if code, body = post(t, a.lURL+"/decide?id="+id+"&action=approve", nil); code != 200 {
+		t.Fatalf("approve: %d %s", code, body)
+	}
+	if code, body = post(t, a.lURL+"/state?addr=mac:frank&state=idle", nil); code != 200 {
+		t.Fatalf("上报空闲: %d %s", code, body)
+	}
+
+	var env struct {
+		Message
+		Display string `json:"display"`
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		code, body = get(t, a.lURL+"/outbox?to=mac:frank")
+		if code == 200 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("取不到出站消息，最后状态码 %d %s", code, body)
+		}
+	}
+	if err := json.Unmarshal(body, &env); err != nil {
+		t.Fatalf("解取件响应: %v %s", err, body)
+	}
+	if env.ID != id || env.Kind != KindRequest || env.FileName != "report.txt" {
+		t.Fatalf("取件响应不对: %+v", env)
+	}
+	if want := Display(env.Message, MacInboxPath(env.Message)); env.Display != want {
+		t.Errorf("display 应等于 Display(m, MacInboxPath(m)):\nwant %q\ngot  %q", want, env.Display)
+	}
+	if !strings.Contains(env.Display, "（附件：~/xxyi-work/inbox/"+id+"-report.txt）") {
+		t.Errorf("display 应含附件行，实际 %q", env.Display)
+	}
+	if code, body = post(t, a.lURL+"/delivered?id="+id, nil); code != 200 {
+		t.Errorf("确认送达应 200，得 %d %s", code, body)
+	}
+}

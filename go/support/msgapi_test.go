@@ -118,6 +118,10 @@ func TestMsgLocalSendDecideDeliver(t *testing.T) {
 	if code != 200 {
 		t.Fatalf("approve: %d %s", code, body)
 	}
+	// 收件方要先上报过 idle，消息才会经 Deliver 送达（没上报/忙/gone 都按住）。
+	if code, body = remoteDo(t, http.MethodPost, a.base+"/msg/state?addr=ubuntu:bob&state=idle", a.token, nil); code != 200 {
+		t.Fatalf("上报空闲: %d %s", code, body)
+	}
 	waitFor(t, 3*time.Second, "消息送达", func() bool {
 		return msgStateOf(t, a.lURL, id) == MsgDelivered
 	})
@@ -176,6 +180,10 @@ func TestMsgOutboxFlow(t *testing.T) {
 
 	if code, body = post(t, a.lURL+"/decide?id="+id+"&action=approve", nil); code != 200 {
 		t.Fatalf("approve: %d %s", code, body)
+	}
+	// 收件方先上报空闲，消息才会被放进 outbox（没上报过的一律按住）。
+	if code, body = post(t, a.lURL+"/state?addr=mac:frank&state=idle", nil); code != 200 {
+		t.Fatalf("上报空闲: %d %s", code, body)
 	}
 
 	gcode, gbody := get(t, a.lURL+"/outbox?to=mac:frank")
@@ -285,6 +293,10 @@ func TestMsgAuto(t *testing.T) {
 		t.Fatalf("/msg 的 auto_until 应一致：%d vs %d", got, auto.AutoUntil)
 	}
 
+	// 收件方先上报空闲，queued 的消息才会真经 Deliver 送达。
+	if code, body = remoteDo(t, http.MethodPost, a.base+"/msg/state?addr=ubuntu:bob&state=idle", a.token, nil); code != 200 {
+		t.Fatalf("上报空闲: %d %s", code, body)
+	}
 	// 自动模式开着，新消息直接 queued（不等批准）。
 	code, body = post(t, a.lURL+"/send", msgBody("mac:frank", "ubuntu:bob", "自动单", nil, ""))
 	if code != 200 {
@@ -357,6 +369,10 @@ func TestMsgPumpLifecycle(t *testing.T) {
 
 	if err := s.Start(30); err != nil {
 		t.Fatalf("Start: %v", err)
+	}
+	// 收件方先上报空闲，推进循环才会真去送达。
+	if err := s.Hub().SetState("ubuntu:bob", PeerIdle); err != nil {
+		t.Fatal(err)
 	}
 	// 让 pending 那条批准：靠推进循环送达。
 	id := s.Hub().List()[0].ID

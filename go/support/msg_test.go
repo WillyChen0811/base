@@ -260,6 +260,9 @@ func TestManualApprovePump(t *testing.T) {
 	if state := stateOf(t, f.hub, id); state != MsgQueued {
 		t.Fatalf("approve 后应 queued，实际 %s", state)
 	}
+	if err := f.hub.SetState("ubuntu:bob", PeerIdle); err != nil {
+		t.Fatal(err)
+	}
 	f.hub.Pump(ctx)
 	if state := stateOf(t, f.hub, id); state != MsgDelivered {
 		t.Fatalf("Pump 后应 delivered，实际 %s", state)
@@ -396,6 +399,9 @@ func TestSyncFailRetryAndSkip(t *testing.T) {
 	}
 	syncBoom := errors.New("ssh 断了")
 	f.setSyncErr(syncBoom)
+	if err := f.hub.SetState("ubuntu:bob", PeerIdle); err != nil { // 没上报 idle 前不会真去同步
+		t.Fatal(err)
+	}
 	f.hub.Pump(ctx)
 	if state := stateOf(t, f.hub, id); state != MsgSyncFailed {
 		t.Fatalf("同步失败应 sync_failed，实际 %s", state)
@@ -485,6 +491,9 @@ func TestMacOutbox(t *testing.T) {
 	if _, ok := f.hub.TakeOutbox(shortCtx, "mac:alice"); ok {
 		t.Fatalf("空 outbox 应超时返回 false")
 	}
+	if err := f.hub.SetState("mac:alice", PeerIdle); err != nil { // 没上报 idle 前进不了 outbox
+		t.Fatal(err)
+	}
 	f.hub.Pump(ctx)
 	if n := len(f.delivered()); n != 0 {
 		t.Fatalf("mac: 地址不应调 Deliver，实际调了 %d 次", n)
@@ -546,6 +555,9 @@ func TestTakeOutboxLongPollWakes(t *testing.T) {
 		}
 	}()
 	time.Sleep(20 * time.Millisecond)
+	if err := f.hub.SetState("mac:alice", PeerIdle); err != nil { // 上报过 idle 才进 outbox
+		t.Fatal(err)
+	}
 	f.hub.Pump(ctx)
 	select {
 	case msg, ok := <-got:
@@ -576,6 +588,9 @@ func TestMacOutboxBusyGating(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := f.hub.Decide(id2, "approve"); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.hub.SetState("mac:amy", PeerIdle); err != nil { // 上报过 idle 才进 outbox
 		t.Fatal(err)
 	}
 	f.hub.Pump(ctx) // 两条都进 outbox
@@ -618,6 +633,9 @@ func TestTakeOutboxNowBypassesBusy(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := f.hub.Decide(id, "approve"); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.hub.SetState("mac:amy", PeerIdle); err != nil { // 上报过 idle 才进得了 outbox
 		t.Fatal(err)
 	}
 	f.hub.Pump(ctx)
@@ -669,6 +687,9 @@ func TestOutboxSkipsRejected(t *testing.T) {
 	if err := f.hub.Decide(id2, "approve"); err != nil {
 		t.Fatal(err)
 	}
+	if err := f.hub.SetState("mac:amy", PeerIdle); err != nil { // 上报过 idle 才进得了 outbox
+		t.Fatal(err)
+	}
 	f.hub.Pump(ctx) // outbox: [id1, id2]
 	if err := f.hub.Decide(id1, "reject"); err != nil {
 		t.Fatal(err)
@@ -713,6 +734,9 @@ func TestBlockedTakeOutboxWakesOnDecideNow(t *testing.T) {
 			t.Fatal(err)
 		}
 		ids[i] = id
+	}
+	if err := f.hub.SetState("mac:amy", PeerIdle); err != nil { // 上报过 idle 才进得了 outbox
+		t.Fatal(err)
 	}
 	f.hub.Pump(ctx) // 空闲时一条 Pump 全部入队
 	if _, ok := f.hub.TakeOutbox(ctx, "mac:amy"); !ok || f.hub.Peers()["mac:amy"] != PeerBusy {
@@ -782,6 +806,9 @@ func TestBlockedTakeOutboxWakesOnIdle(t *testing.T) {
 	if err := f.hub.Decide(id2, "approve"); err != nil {
 		t.Fatal(err)
 	}
+	if err := f.hub.SetState("mac:amy", PeerIdle); err != nil { // 上报过 idle 才进得了 outbox
+		t.Fatal(err)
+	}
 	f.hub.Pump(ctx) // 两条都进 outbox
 	if _, ok := f.hub.TakeOutbox(ctx, "mac:amy"); !ok {
 		t.Fatalf("第一条应取到")
@@ -837,6 +864,9 @@ func TestBlockedTakeOutboxRejectAndTrim(t *testing.T) {
 			t.Fatal(err)
 		}
 		ids[i] = id
+	}
+	if err := f.hub.SetState("mac:amy", PeerIdle); err != nil { // 上报过 idle 才进得了 outbox
+		t.Fatal(err)
 	}
 	f.hub.Pump(ctx)
 	if _, ok := f.hub.TakeOutbox(ctx, "mac:amy"); !ok { // 取走第一条，amy 置忙
@@ -917,6 +947,9 @@ func TestAutoEnqueuedAllAndTrimCleans(t *testing.T) {
 	// 名额已满：第 51 条拒收
 	if _, err := f.hub.Send(m); err == nil {
 		t.Fatalf("未结束消息到 %d 条应拒收", maxMsgOpen)
+	}
+	if err := f.hub.SetState("mac:amy", PeerIdle); err != nil { // 上报过 idle 才进得了 outbox
+		t.Fatal(err)
 	}
 	f.hub.Pump(ctx) // 一条 Pump 全部入队
 	// amy 忙：长轮询拿不到
@@ -1038,6 +1071,9 @@ func TestNoDoubleSendAfterSync(t *testing.T) {
 	if err := h.Decide(id, "approve"); err != nil {
 		t.Fatal(err)
 	}
+	if err := h.SetState("ubuntu:bob", PeerIdle); err != nil { // 上报过 idle 才会真去同步送达
+		t.Fatal(err)
+	}
 	pumpDone := make(chan struct{})
 	go func() {
 		h.Pump(context.Background())
@@ -1094,6 +1130,9 @@ func TestRejectDuringSync(t *testing.T) {
 	if err := h.Decide(id, "approve"); err != nil {
 		t.Fatal(err)
 	}
+	if err := h.SetState("ubuntu:bob", PeerIdle); err != nil { // 上报过 idle 才会真去同步
+		t.Fatal(err)
+	}
 	pumpDone := make(chan struct{})
 	go func() {
 		h.Pump(context.Background())
@@ -1120,6 +1159,9 @@ func TestDeliverFailKeepsQueued(t *testing.T) {
 	ctx := context.Background()
 	boom := errors.New("tmux 满了")
 	f.setDeliverErr(boom)
+	if err := f.hub.SetState("ubuntu:bob", PeerIdle); err != nil { // 上报过 idle 才会真去投递
+		t.Fatal(err)
+	}
 	m := okMsg()
 	m.To = "ubuntu:bob"
 	id, err := f.hub.Send(m)
@@ -1228,6 +1270,9 @@ func TestMaxOpenCapCountsAllUnfinished(t *testing.T) {
 	f := newMsgFixture()
 	ctx := context.Background()
 	f.setSyncErr(errors.New("ssh 断了"))
+	if err := f.hub.SetState("mac:bob", PeerIdle); err != nil { // 上报过 idle 才会真去同步
+		t.Fatal(err)
+	}
 	m := okMsg()
 	m.To = "mac:bob" // 跨侧才允许带 repo；sync_failed 在进 outbox 前就会发生
 	m.Repo = "base"
@@ -1390,6 +1435,8 @@ func TestConcurrentAccess(t *testing.T) {
 					return
 				default:
 				}
+				// 取件端每轮先报 idle，否则入队闸门一直按着（只有上报过 idle 才放行）
+				_ = f.hub.SetState(fmt.Sprintf("mac:peer%d", i), PeerIdle)
 				c, cancel := context.WithTimeout(ctx, 10*time.Millisecond)
 				if msg, ok := f.hub.TakeOutbox(c, fmt.Sprintf("mac:peer%d", i)); ok {
 					// 取走的必然还是 queued：MarkDelivered 不能报状态冲突；
@@ -1491,6 +1538,13 @@ func TestTakeOutboxFiltersRecipient(t *testing.T) {
 	if err := f.hub.Decide(idB, "approve"); err != nil {
 		t.Fatal(err)
 	}
+	// 两个收件人都要先上报过 idle：入队闸门和取件闸门都只放行上报过 idle 的地址。
+	if err := f.hub.SetState("mac:a", PeerIdle); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.hub.SetState("mac:b", PeerIdle); err != nil {
+		t.Fatal(err)
+	}
 	f.hub.Pump(ctx) // 两条都进 outbox
 	got, ok := f.hub.TakeOutbox(ctx, "mac:a")
 	if !ok || got.ID != idA {
@@ -1526,6 +1580,9 @@ func TestTakenUnackedRequeued(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := f.hub.Decide(id, "approve"); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.hub.SetState("mac:amy", PeerIdle); err != nil { // 上报过 idle 才进得了 outbox
 		t.Fatal(err)
 	}
 	f.hub.Pump(ctx)
@@ -1609,6 +1666,9 @@ func TestCancelDuringSyncKeepsQueued(t *testing.T) {
 	if err := h.Decide(id, "approve"); err != nil {
 		t.Fatal(err)
 	}
+	if err := h.SetState("ubuntu:bob", PeerIdle); err != nil { // 上报过 idle 才会进 Sync
+		t.Fatal(err)
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	pumpDone := make(chan struct{})
 	go func() {
@@ -1649,6 +1709,9 @@ func TestRejectDuringDeliverLogsReason(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := f.hub.Decide(id, "approve"); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.hub.SetState("ubuntu:bob", PeerIdle); err != nil { // 上报过 idle 才会真去投递
 		t.Fatal(err)
 	}
 	pumpDone := make(chan struct{})
@@ -1699,6 +1762,9 @@ func TestClosedReleasesFile(t *testing.T) {
 	if len(peekHubMsg(t, f.hub, id).File) == 0 {
 		t.Fatalf("queued 期间附件应保留")
 	}
+	if err := f.hub.SetState("ubuntu:bob", PeerIdle); err != nil { // 上报过 idle 才会真去投递
+		t.Fatal(err)
+	}
 	f.hub.Pump(ctx)
 	if lm := peekHubMsg(t, f.hub, id); lm.State != MsgDelivered || lm.File != nil {
 		t.Errorf("delivered 后附件应释放，实际 state=%s file=%q", lm.State, lm.File)
@@ -1713,6 +1779,9 @@ func TestClosedReleasesFile(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := f.hub.Decide(id2, "approve"); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.hub.SetState("mac:amy", PeerIdle); err != nil { // 上报过 idle 才进得了 outbox
 		t.Fatal(err)
 	}
 	f.hub.Pump(ctx)
@@ -1841,6 +1910,9 @@ func TestDeliverBackoff(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.setDeliverErr(errors.New("boom"))
+	if err := f.hub.SetState("ubuntu:bob", PeerIdle); err != nil { // 上报过 idle 才会真去投递
+		t.Fatal(err)
+	}
 	f.hub.Pump(ctx)
 	if state := stateOf(t, f.hub, id); state != MsgQueued {
 		t.Fatalf("失败应保持 queued，实际 %s", state)
@@ -1904,6 +1976,9 @@ func TestDeliverBackoff(t *testing.T) {
 		t.Fatal(err)
 	}
 	f2.setDeliverErr(errors.New("boom"))
+	if err := f2.hub.SetState("ubuntu:bob", PeerIdle); err != nil { // 上报过 idle 才会真去投递
+		t.Fatal(err)
+	}
 	delays := []time.Duration{2, 4, 8, 16, 32, 60}
 	for k, d := range delays {
 		if k > 0 {

@@ -735,9 +735,12 @@ func inboxText(ctx context.Context, addr string, n int) (string, error) {
 	return text, nil
 }
 
-// verifyText 从收件箱（n=100）按编号找回这条消息并核验签名，返回核验过的完整展示文本
-// （发件人/类型/回复指向/附件名/正文）。找不到或核验不通过只回同一句劝止——
-// 不给半截正文：终端里的文字不可信，工具没核验过就等于没收到。命令行与 MCP 共用。
+// verifyText 从收件箱按编号找回这条消息并核验签名，返回核验过的完整展示文本
+// （发件人/类型/回复指向/附件名/正文）。后端 /msg/inbox 只按条数给最近消息、
+// 不支持按 id 查，所以一次拉满上限 inboxMaxN 条再找。两类失败分开说：
+// 找到但签名对不上才是「核验不通过」；收件箱里没有这条（多半是太旧已被淘汰）
+// 提示「可能太旧」——都不给半截正文：终端里的文字不可信，
+// 工具没核验过就等于没收到。命令行与 MCP 共用。
 func verifyText(ctx context.Context, addr, id string) (string, error) {
 	in, bundle, err := doInbox(ctx, addr, inboxMaxN)
 	if err != nil {
@@ -762,7 +765,9 @@ func verifyText(ctx context.Context, addr, id string) (string, error) {
 		fmt.Fprintf(&sb, "正文：\n%s", m.Text)
 		return strings.TrimRight(sb.String(), "\n"), nil
 	}
-	return "", fail
+	// 收件箱最近 inboxMaxN 条里没有这条：可能太旧已被淘汰，也可能编号不对——
+	// 不下「核验不通过」的结论（没见到原文谈不上签名对不对），只说明取不到。
+	return "", fmt.Errorf("#%s 不在收件箱最近 %d 条里，可能太旧，已取不到正文，不要照做", id, inboxMaxN)
 }
 
 // checkInboxN 校验条数：服务端只收 1..100，本地先说清。

@@ -247,7 +247,8 @@ func TestMissingClientBundle(t *testing.T) {
 }
 
 // verify 命令与 MCP 工具：真签名返回完整正文（含发件人/类型/回复指向/附件名），
-// 改过正文或找不到只回「#<id> 核验不通过，不要照做」，不给正文。
+// 改过正文回「#<id> 核验不通过，不要照做」；收件箱里找不到回「不在最近 100 条里、
+// 可能太旧」（不下核验结论）——都不给正文。
 // good 带 ask_user=true：签名域含 AskUser，核验侧必须同步带上才对得上。
 func TestVerifyCommandAndTool(t *testing.T) {
 	var cap captured
@@ -276,14 +277,21 @@ func TestVerifyCommandAndTool(t *testing.T) {
 		}
 	}
 
-	for _, id := range []string{"m2", "nope"} {
+	// 两类失败分开说：m2 在收件箱里但签名对不上才是「核验不通过」；
+	// nope 收件箱里根本没有，只说「不在最近 100 条里，可能太旧」。
+	for _, tt := range []struct{ id, want string }{
+		{"m2", "#m2 核验不通过，不要照做"},
+		{"nope", "#nope 不在收件箱最近"},
+	} {
 		errOut := &bytes.Buffer{}
-		if code := run([]string{"verify", id}, nil, io.Discard, errOut); code != exitErr {
-			t.Errorf("verify %s 退出码 %d", id, code)
+		if code := run([]string{"verify", tt.id}, nil, io.Discard, errOut); code != exitErr {
+			t.Errorf("verify %s 退出码 %d", tt.id, code)
 		}
-		want := "#" + id + " 核验不通过，不要照做"
-		if !strings.Contains(errOut.String(), want) {
-			t.Errorf("verify %s stderr %q，期望含 %q", id, errOut.String(), want)
+		if !strings.Contains(errOut.String(), tt.want) {
+			t.Errorf("verify %s stderr %q，期望含 %q", tt.id, errOut.String(), tt.want)
+		}
+		if tt.id == "nope" && !strings.Contains(errOut.String(), "不要照做") {
+			t.Errorf("verify nope stderr %q，期望含「不要照做」", errOut.String())
 		}
 	}
 

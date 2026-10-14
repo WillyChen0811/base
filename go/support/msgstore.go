@@ -185,60 +185,77 @@ func (h *Hub) snapshotLocked() hubSnapshot {
 	}
 }
 
-// persist 在锁内拷快照（含待删附件清单）、解锁后序列化并原子落盘。
-// 凡是改了落盘状态的点都已在锁内置 h.dirty=true（见 msg.go）；dirty 没置起就直接返回，
-// 一次磁盘 I/O 都不碰——是否写过盘看状态变化，不再靠序列化出来的字节比较。
-// 附件释放/淘汰攒下的 pendingFileDelete 在锁外删。生成的 JSON 在锁内提交序号
-// （snapSeq 只增），flush 按序号写最新，后落盘的文件内容一定不比先落盘的旧。
+// marshalSnap 是快照序列化入口；测试里替换成会阻塞/失败的实现，
+// 制造多个 persist 的锁外序列化窗口交错的场景。
+var marshalSnap = json.Marshal
+
+// persist 把当前改动落盘：dirty 没置起一次磁盘 I/O 都不碰（是否碰磁盘看状态变化，
+// 不靠序列化出来的字节比较）。见 persistNow。
 func (h *Hub) persist() {
+	// 写失败已由 persistNow 记日志；dirty 保留，下一轮再试。
+	_ = h.persistNow()
+}
+
+// persistNow 同步落盘当前状态并把写盘错误原样返回（调用方需要"盘上确有这份状态"
+// 才继续往下走时用，见 pumpOne 注入前打标记）；不落盘或没有改动返回 nil。
+// 序号在 h.mu 内与快照一起分配（nextSnapSeq 只增）：内容归属由拍快照的先后决定，
+// 序列化再慢也不会让先拍的内容顶着后拍的序号——flush 按序号比对，
+// 序号不比已写盘的新就丢弃，后拍的快照不会被先拍的覆盖。
+// 待删附件清单与快照同锁摘下：本轮写出的快照里这些消息已不带 has_file，
+// 写盘成功后再删文件（先写后删）；写失败把清单放回，下次写成功再删。
+func (h *Hub) persistNow() error {
 	if h.storePath == "" {
-		return
+		return nil
 	}
 	h.mu.Lock()
 	if !h.dirty {
 		h.mu.Unlock()
-		return
+		return nil
 	}
+	seq := h.nextSnapSeq
+	h.nextSnapSeq++
 	snap := h.snapshotLocked()
 	del := h.pendingFileDelete
 	h.pendingFileDelete = nil
 	h.dirty = false
 	h.mu.Unlock()
 
-	for _, id := range del {
-		h.removeAttachFile(id)
-	}
-	data, err := json.Marshal(snap)
+	data, err := marshalSnap(snap)
 	if err != nil { // 本结构理论上 marshal 不会失败；真失败了保留 dirty 下次重试，保住上一次快照
 		h.mu.Lock()
 		h.dirty = true
+		h.pendingFileDelete = append(del, h.pendingFileDelete...)
 		h.mu.Unlock()
-		return
+		return err
 	}
-	h.mu.Lock()
-	h.snapSeq++
-	h.snap = data
-	h.mu.Unlock()
-	h.flush()
+	if err := h.flush(seq, data); err != nil {
+		h.mu.Lock()
+		h.pendingFileDelete = append(del, h.pendingFileDelete...)
+		h.mu.Unlock()
+		return err
+	}
+	for _, id := range del {
+		h.removeAttachFile(id)
+	}
+	return nil
 }
 
-// flush 把尚未落盘的最近快照原子写出去。saveMu 串行化所有磁盘写，writtenSeq 只增：
-// 即使多个 persist 的锁外窗口交错，后落盘的文件内容也一定不比先落盘的旧。
-// writtenSeq 只在持 saveMu 时读写。写失败只记日志，内存状态不动。
-func (h *Hub) flush() {
+// flush 按序号原子写快照。saveMu 串行化所有磁盘写，writtenSeq 只增：
+// 序号是拍快照时定的，即使多个 persist 的锁外窗口交错、老的晚到，
+// 序号不比已写盘的新就丢弃，落盘的内容一定不比上一次旧。
+// writtenSeq 只在持 saveMu 时读写。写失败只记日志并返回给调用方，内存状态不动。
+func (h *Hub) flush(seq uint64, data []byte) error {
 	h.saveMu.Lock()
 	defer h.saveMu.Unlock()
-	h.mu.Lock()
-	seq, data := h.snapSeq, h.snap
-	h.mu.Unlock()
-	if seq == 0 || seq <= h.writtenSeq {
-		return
+	if seq <= h.writtenSeq {
+		return nil
 	}
 	if err := atomicWriteFile(h.storePath, data); err != nil {
 		h.logStoreError("write", err)
-		return
+		return err
 	}
 	h.writtenSeq = seq
+	return nil
 }
 
 // loadStore 读回上次落盘的快照，由 NewHub 在把 Hub 交出去之前调用（尚未共享，不用加锁）。
@@ -250,6 +267,7 @@ func (h *Hub) flush() {
 // V1 快照（附件内嵌）照常加载，附件迁移成单独文件；V2 快照 has_file 而文件读不出
 // 的消息按无附件处理、Reason 记「附件丢失」。带 injecting 标记的 queued 消息转人工，
 // 不自动重投（见 injectingAtRestartReason）。
+// 最后清理 <StorePath>.files/ 下的孤儿附件（见 cleanupOrphanAttachments）。
 func (h *Hub) loadStore() {
 	b, err := os.ReadFile(h.storePath)
 	if err != nil {
@@ -388,6 +406,39 @@ func (h *Hub) loadStore() {
 	// takenAt/outbox/outPlaced/inflight/nextTry/fails/peerSeq/hookBusySeq 保持 NewHub 给的空表：
 	// 加载出的 queued 消息会被下一次 Pump 正常处理，不保留"已放进 outbox"的痕迹；
 	// lastProbe 归零——重启后第一次 Pump 正好立刻放一条探测。
+
+	h.cleanupOrphanAttachments()
+}
+
+// cleanupOrphanAttachments 删掉 <StorePath>.files/ 下不属于任何未结束消息的文件。
+// 正常收尾时附件文件跟着消息结束被删；能剩下来的是崩溃窗口：
+// 消息先写附件后入库（Send）、快照先写新盘后删附件（persistNow），两步之间崩溃
+// 就会留下没有消息认领的文件。未结束消息（pending/queued/injected/sync_failed/failed）
+// 的文件必须保留——还要靠它重投/读回；已结束消息的 has_file 早已不在快照里，
+// 它们的文件留在盘上只会白占空间。loadStore 末尾调用（尚未共享，不加锁）。
+func (h *Hub) cleanupOrphanAttachments() {
+	dir := h.storePath + ".files"
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if !errors.Is(err, fs.ErrNotExist) {
+			h.logStoreError("attach_dir", err)
+		}
+		return
+	}
+	keep := make(map[string]bool)
+	for _, m := range h.msgs {
+		if m.State != MsgDelivered && m.State != MsgRejected {
+			keep[m.ID] = true
+		}
+	}
+	for _, e := range entries {
+		if e.IsDir() || keep[e.Name()] {
+			continue
+		}
+		if rerr := os.Remove(filepath.Join(dir, e.Name())); rerr != nil && !errors.Is(rerr, fs.ErrNotExist) {
+			h.logStoreError("attach_orphan_remove", rerr)
+		}
+	}
 }
 
 // quarantineStore 把坏快照挪成 <path>.corrupt-<Unix 秒>（保证下次启动不再撞上它）并记日志。

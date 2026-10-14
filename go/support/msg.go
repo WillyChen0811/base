@@ -352,15 +352,15 @@ type Hub struct {
 	wakeup      chan struct{}        // outbox 有变化或 SetState 时翻转，唤醒长轮询的 TakeOutbox
 
 	// 落盘（见 msgstore.go）：改动状态的点在锁内置 dirty；persist 只在 dirty 时
-	// 锁内拷快照、锁外序列化并提交序号（snapSeq 只增），解锁后 flush 拿 saveMu 原子写，
-	// 只有序号比上次写盘的大才真写，锁外并发不乱序。
+	// 锁内分配快照序号并拷快照（nextSnapSeq 只增，序号跟快照一起定，序列化多慢都不改归属），
+	// 锁外序列化后 flush 拿 saveMu 原子写，只有序号比上次写盘的大才真写——
+	// 后拍的快照不会被先拍晚到的覆盖。
 	// 附件不进快照：首次入库写 <StorePath>.files/<id>（0700/0600，原子写），
 	// 释放/淘汰时删；hasFile 记账，快照里只留 has_file 标记。
 	storePath         string          // cfg.StorePath；空 = 不落盘（loadStore 保不住原文件时也会置空）
 	saveMu            sync.Mutex      // 串行化磁盘写
 	dirty             bool            // 有改动还没进快照；只在 h.mu 内读写
-	snapSeq           uint64          // 快照序号：每生成一份新快照 +1；只在 h.mu 内读写
-	snap              []byte          // 最近一次提交的快照 JSON（内容不可变，锁外引用安全）
+	nextSnapSeq       uint64          // 下一个要分配的快照序号；拍快照时在 h.mu 内取号（从 1 起），序号与内容同时定
 	writtenSeq        uint64          // 最近成功写盘的快照序号；只在 flush 持 saveMu 时读写
 	hasFile           map[string]bool // 附件文件已写入磁盘的消息 ID；释放/淘汰时删文件并撤账
 	pendingFileDelete []string        // 待删的附件文件 ID（释放/淘汰时攒下，persist 锁外清掉）
@@ -405,6 +405,7 @@ func NewHub(cfg HubConfig) *Hub {
 		wakeup:        make(chan struct{}),
 		storePath:     cfg.StorePath,
 		hasFile:       make(map[string]bool),
+		nextSnapSeq:   1, // 序号从 1 起：0 留作"从没拍过快照"，flush 只认比 writtenSeq 新的
 	}
 	if h.storePath != "" {
 		h.loadStore()
@@ -961,6 +962,20 @@ func (h *Hub) trimLocked() (wake chan struct{}) {
 // Send 校验消息后入库，返回 ID。自动模式开着则直接 queued，否则 pending。
 // 入参里的 State/Reason/Now/Synced 会被重置，由 Hub 统一管理。
 func (h *Hub) Send(m Message) (string, error) {
+	// client_id 查重放在最前（任何校验之前，包括 reply 的「已经回复过了」拦截）：
+	// 同 From 同 ClientID 重发一律直接返回原 ID——重发的那次哪怕字段填得不合规，
+	// 也早就在第一次入库时被幂等吸收，不该再报别的错。
+	if m.ClientID != "" {
+		h.mu.Lock()
+		for i := range h.msgs {
+			if h.msgs[i].From == m.From && h.msgs[i].ClientID == m.ClientID {
+				dupID := h.msgs[i].ID
+				h.mu.Unlock()
+				return dupID, nil
+			}
+		}
+		h.mu.Unlock()
+	}
 	if m.Kind == "" {
 		m.Kind = KindNotice
 	}
@@ -1079,18 +1094,9 @@ func (h *Hub) Send(m Message) (string, error) {
 		m.FileSHA256 = hex.EncodeToString(sum[:])
 	}
 
+	// 先预留 ID、附件先写盘、消息后进 h.msgs：文件在消息可见之前就已存在，
+	// 中途崩溃只会留下孤儿附件（loadStore 清理），不会出现快照说有附件而文件不在。
 	h.mu.Lock()
-	// ClientID 幂等：同 From 同 ClientID 已经发过就不再新建，把原 ID 原样还回去
-	//（客户端超时重发不会刷出两条一样的消息）。
-	if m.ClientID != "" {
-		for i := range h.msgs {
-			if h.msgs[i].From == m.From && h.msgs[i].ClientID == m.ClientID {
-				dupID := h.msgs[i].ID
-				h.mu.Unlock()
-				return dupID, nil
-			}
-		}
-	}
 	open := 0
 	for i := range h.msgs {
 		switch h.msgs[i].State {
@@ -1102,32 +1108,66 @@ func (h *Hub) Send(m Message) (string, error) {
 		h.mu.Unlock()
 		return "", fmt.Errorf("support: 未处理的消息太多（%d 条），先处理再发", maxMsgOpen)
 	}
-	m.ID = h.reserveIDLocked()
+	m.ID = h.reserveIDLocked() // 锁内预留，附件按这个 ID 先落盘
+	h.mu.Unlock()
+
+	// 附件先落盘再入库：写一次 <StorePath>.files/<id>（0700/0600，原子写）。
+	// 写失败只记日志：消息照常入库、附件留在内存照常投递，只是重启后回不来
+	//（拿 FileSHA256 能查出来）。
+	hasFile := false
+	if len(m.File) > 0 && h.storePath != "" {
+		if err := h.writeAttachFile(m.ID, m.File); err != nil {
+			h.logStoreError("attach_write", err)
+		} else {
+			hasFile = true
+		}
+	}
+
+	h.mu.Lock()
+	// ClientID 幂等复查（与入库同一把锁，防并发双发穿过最前面的预检）：
+	// 同 From 同 ClientID 已经发过就不再新建，把原 ID 原样还回去
+	//（客户端超时重发不会刷出两条一样的消息）；刚写到盘的附件删掉别成孤儿。
+	if m.ClientID != "" {
+		for i := range h.msgs {
+			if h.msgs[i].From == m.From && h.msgs[i].ClientID == m.ClientID {
+				dupID := h.msgs[i].ID
+				h.mu.Unlock()
+				if hasFile {
+					h.removeAttachFile(m.ID)
+				}
+				return dupID, nil
+			}
+		}
+	}
+	open = 0 // 写附件期间可能有新消息入库，名额重新数一遍
+	for i := range h.msgs {
+		switch h.msgs[i].State {
+		case MsgPending, MsgQueued, MsgSyncFailed, MsgFailed:
+			open++
+		}
+	}
+	if open >= maxMsgOpen {
+		h.mu.Unlock()
+		if hasFile {
+			h.removeAttachFile(m.ID)
+		}
+		return "", fmt.Errorf("support: 未处理的消息太多（%d 条），先处理再发", maxMsgOpen)
+	}
 	// AskUser 的消息即使自动模式开着也要停下来等用户：标了"要用户定"就不能自动放行。
 	if !h.autoUntil.IsZero() && now.Before(h.autoUntil) && !m.AskUser {
 		m.State = MsgQueued
 	} else {
 		m.State = MsgPending
 	}
-	h.msgs = append(h.msgs, m) // 先以未签名入库；Sign 在锁外算，签完写回
+	h.msgs = append(h.msgs, m) // 附件文件已在盘上才入库；先以未签名入库，Sign 在锁外算，签完写回
+	if hasFile {
+		h.hasFile[m.ID] = true // 快照里 has_file=true 时文件一定已经在
+	}
 	// 这里不把被回复的请求标成 Answered：回复只有真正送达（pumpOne 成功 / MarkDelivered）
 	// 才算回了；发出后被拒/一直没送，原请求仍算欠回复。
 	h.markDirtyLocked()
 	wake := h.trimLocked()
 	h.mu.Unlock()
-
-	// 附件单独落盘：首次入库写一次 <StorePath>.files/<id>（0700/0600，原子写），
-	// 在 persist 之前写完并记 has_file，快照里 has_file=true 时文件一定已经在。
-	// 写失败只记日志：附件留在内存照常投递，只是重启后回不来（拿 FileSHA256 能查出来）。
-	if len(m.File) > 0 && h.storePath != "" {
-		if err := h.writeAttachFile(m.ID, m.File); err != nil {
-			h.logStoreError("attach_write", err)
-		} else {
-			h.mu.Lock()
-			h.hasFile[m.ID] = true
-			h.mu.Unlock()
-		}
-	}
 
 	// 签名挪到锁外：Sign（CA 私钥，可能是外部实现）不许持 h.mu 跑。
 	// 签名域含 ID，入库后不再改；期间消息若已被 reject/淘汰，写回自动跳过。
@@ -1137,6 +1177,7 @@ func (h *Hub) Send(m Message) (string, error) {
 		h.mu.Lock()
 		if j := h.findLocked(m.ID); j >= 0 {
 			h.msgs[j].Sig = sig
+			h.markDirtyLocked() // Sig 进快照；写回了就得落盘（下面/后续的 persist 靠它碰磁盘）
 		}
 		h.mu.Unlock()
 	}
@@ -1856,6 +1897,28 @@ func (h *Hub) pumpOne(ctx context.Context, id string) {
 	h.injecting[id] = true
 	h.markDirtyLocked()
 	h.mu.Unlock()
+
+	// 注入前标记必须真正同步写进盘里才能调 Deliver——只在内存里置起 injecting，
+	// 注入中途崩溃就永远不会出现在快照里，重启后会当成"从没投过"重投第二条。
+	// 写盘失败则撤销标记、本轮不投递：不记 Attempt、不计次数，按普通退避下次再试。
+	if err := h.persistNow(); err != nil {
+		h.mu.Lock()
+		delete(h.injecting, id)
+		delete(h.ackBase, id)
+		var out *Message
+		if j := h.findLocked(id); j >= 0 && h.msgs[j].State == MsgQueued {
+			h.msgs[j].Reason = fmt.Sprintf("落盘失败，暂不投递：%v", err)
+			h.backoffLocked(id) // 落盘失败不算投递失败：不记 Attempt，只按普通退避
+			cp := h.msgs[j]
+			out = &cp
+		}
+		delete(h.inflight, id)
+		h.mu.Unlock()
+		if out != nil {
+			h.logMsg(*out)
+		}
+		return // persistNow 已把写盘失败记进日志；dirty 还在，下轮 persist 把撤销后的状态写回去
+	}
 
 	var err error
 	if h.cfg.Deliver == nil {

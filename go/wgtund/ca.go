@@ -140,11 +140,12 @@ func copyIfChanged(src, dst string) error {
 // ——所有序列号都当已吊销，并 stderr 记录。吊销表读不成却"全放进来"的后果
 // 远大于暂时按住没吊销的证书：宁可误拦，不可误放。
 type revokedTable struct {
-	path    string
-	mu      sync.Mutex
-	mtime   time.Time
-	haveAll bool            // 是否成功确定过表内容（读到好 JSON，或确认不存在=空表）
-	serials map[string]bool // 上次成功读到的表
+	path     string
+	mu       sync.Mutex
+	mtime    time.Time
+	haveAll  bool            // 是否成功确定过表内容（读到好 JSON，或确认不存在=空表）
+	serials  map[string]bool // 上次成功读到的表
+	lastWarn string          // 上次 stderr 打过的失败文本；同一原因只打一次，读成功后清零
 }
 
 func (rt *revokedTable) revoked(serial string) bool {
@@ -156,6 +157,7 @@ func (rt *revokedTable) revoked(serial string) bool {
 			rt.serials = nil
 			rt.mtime = time.Time{}
 			rt.haveAll = true
+			rt.lastWarn = "" // 恢复正常：之后的失败重新提示
 			rt.mu.Unlock()
 			return false
 		}
@@ -190,18 +192,30 @@ func (rt *revokedTable) revoked(serial string) bool {
 	rt.serials = serials
 	rt.mtime = st.ModTime()
 	rt.haveAll = true
+	rt.lastWarn = "" // 恢复正常：之后的失败重新提示
 	rt.mu.Unlock()
 	return serials[serial]
 }
 
 // fallbackLocked 读失败兜底（调用方须持锁）：有上次成功读到的表就沿用；
-// 从没成功读到过就 fail-closed（一律当已吊销）。两种都要 stderr 记录。
+// 从没成功读到过就 fail-closed（一律当已吊销）。两种都要 stderr 记录，
+// 但同一原因（同一句话）只打一次——revoked 是每次校验都会走的热路径，
+// 表一直读不了会把 stderr 刷满；换个失败原因（文本不同）会重新打。
+// 成功读到表后 lastWarn 清零，之后再次失败哪怕同一原因也会再打一次。
 func (rt *revokedTable) fallbackLocked(what string, err error, serial string) bool {
 	if rt.haveAll {
-		fmt.Fprintf(os.Stderr, "wgtund: 吊销表 %s %s失败（%v），沿用上次成功读到的表\n", rt.path, what, err)
+		msg := fmt.Sprintf("wgtund: 吊销表 %s %s失败（%v），沿用上次成功读到的表", rt.path, what, err)
+		if msg != rt.lastWarn {
+			fmt.Fprintln(os.Stderr, msg)
+			rt.lastWarn = msg
+		}
 		return rt.serials[serial]
 	}
-	fmt.Fprintf(os.Stderr, "wgtund: 吊销表 %s %s失败（%v），此前从未成功读到，按全部吊销处理\n", rt.path, what, err)
+	msg := fmt.Sprintf("wgtund: 吊销表 %s %s失败（%v），此前从未成功读到，按全部吊销处理", rt.path, what, err)
+	if msg != rt.lastWarn {
+		fmt.Fprintln(os.Stderr, msg)
+		rt.lastWarn = msg
+	}
 	return true
 }
 

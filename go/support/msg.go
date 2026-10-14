@@ -18,13 +18,14 @@ type MsgState string
 const (
 	MsgPending    MsgState = "pending"     // 待用户批准
 	MsgQueued     MsgState = "queued"      // 已批准，等对方空闲
-	MsgDelivered  MsgState = "delivered"   // 已送达
+	MsgInjected   MsgState = "injected"    // 已注入对方终端，等对方下一次上报确认（Now 消息不做这一步）
+	MsgDelivered  MsgState = "delivered"   // 已送达（对方确认收到）
 	MsgRejected   MsgState = "rejected"    // 用户拒绝
 	MsgSyncFailed MsgState = "sync_failed" // 同步重试用完（预算内先自动重试），等用户处理
 	MsgFailed     MsgState = "failed"      // 重试预算用完，需人工处理（带失败报告）
 )
 
-// Attempt 是一次自动重试的失败记录（Stage：sync=代码同步、deliver=送达）。
+// Attempt 是一次自动重试的失败记录（Stage：sync=代码同步、deliver=注入、ack=注入后等确认）。
 type Attempt struct {
 	At    time.Time `json:"at"`
 	Stage string    `json:"stage"`
@@ -79,6 +80,9 @@ type Message struct {
 	ReplyTo  string `json:"reply_to,omitempty"` // 仅 reply 使用，指向被回复的 request
 	AskUser  bool   `json:"ask_user,omitempty"` // 发件人声明：涉及决定的部分要交给用户
 	Answered bool   `json:"answered,omitempty"` // 仅 request 有意义：收到过合法 reply
+	// Overdue 仅 request 有意义：送达后超过 HubConfig.ReplyTimeout 仍没有回复，
+	// Hub 标一次并由系统通知（From xxyi:hub）提醒原发件人。界面据此标红。
+	Overdue bool `json:"overdue,omitempty"`
 
 	Attempts []Attempt   `json:"attempts,omitempty"` // 自动重试失败记录，最多留最近 20 条
 	Report   *FailReport `json:"report,omitempty"`   // 转人工（failed/sync_failed）时的现场报告
@@ -99,7 +103,7 @@ const (
 	maxMsgTextLen  = 64 * 1024   // Text 上限 64KB
 	maxMsgFileLen  = 1024 * 1024 // 附件上限 1MB
 	maxMsgKeep     = 200         // 内存保留的消息条数（只淘汰已结束的）
-	maxMsgOpen     = 50          // 未结束（pending/queued/sync_failed/failed）消息上限，超了拒收新消息
+	maxMsgOpen     = 50          // 未结束（pending/queued/sync_failed/failed）消息上限，超了拒收新消息；injected 不占名额（最多 AckTimeout 就会自己动）
 	maxNameLen     = 100         // 附件名净化后按字节截断的长度
 	maxAutoMinutes = 600         // 自动模式最长分钟数
 
@@ -111,8 +115,14 @@ const (
 	// （failed / sync_failed）。线路不通的暂停时间不计入经过时间。
 	defaultMaxAttempts = 5
 	defaultRetryWindow = 30 * time.Minute
-	maxAttemptsKept    = 20              // Attempts 最多保留最近条数
-	captureTimeout     = 5 * time.Second // 转人工时抓屏的超时
+
+	// defaultAckTimeout：注入成功后再过这么久对端没有任何新上报，视为对方根本没开始处理
+	// （额度用尽、界面报错、卡在确认框）——按 ack 阶段失败重回 queued 走同一套重试预算。
+	defaultAckTimeout = 30 * time.Second
+	// defaultReplyTimeout：请求送达后再过这么久仍没有回复，Hub 标 overdue 并通知原发件人。
+	defaultReplyTimeout = 2 * time.Hour
+	maxAttemptsKept     = 20              // Attempts 最多保留最近条数
+	captureTimeout      = 5 * time.Second // 转人工时抓屏的超时
 
 	// linkProbeEvery：暂停期间多久允许挑一条需要线路的消息做探测（测试可调小）。
 	linkProbeEvery = 30 * time.Second
@@ -142,6 +152,19 @@ const unackedReason = "取走后 60 秒未确认送达，重新排队"
 
 // deliveredWhileRejectedReason 是送达成功但消息已被拒绝时写进日志的提示语（不改状态）。
 const deliveredWhileRejectedReason = "拒绝时已经送达"
+
+// HubSenderAddr 是 Hub 自己发的系统通知的 From。ValidAddr 不接受这个前缀，
+// 所以正常 Send（含远端代发）冒充不了它；它只当发件人，不再被回复、也不参与欠回复超时。
+const HubSenderAddr = "xxyi:hub"
+
+const (
+	// ackErrFmt 是注入后等不到对方确认写进 Attempt/Reason 的提示语。
+	ackErrFmt = "注入后 %s 对方没开始处理（可能额度用尽、报错或卡在确认框）"
+	// overdueNoticeFmt 是欠回复超时系统通知的正文。
+	overdueNoticeFmt = "#%s 发给 %s 的请求超过 %s没有回复（对方状态：%s）。需要的话请换个方式或交给用户。"
+	// overdueLogKind 是欠回复超时的日志 kind。
+	overdueLogKind = "msg_overdue"
+)
 
 var addrNameIllegal = regexp.MustCompile(`[^A-Za-z0-9._-]`)
 
@@ -182,6 +205,19 @@ func sanitizeFileName(name string) (string, error) {
 	return out, nil
 }
 
+// humanDuration 把时长写成中文（"2 小时"、"30 分钟"、"45 秒"），给用户看的提示语用。
+// 能整除小时写小时，能整除分钟写分钟，其余写秒。
+func humanDuration(d time.Duration) string {
+	switch {
+	case d >= time.Hour && d%time.Hour == 0:
+		return fmt.Sprintf("%d 小时", int(d/time.Hour))
+	case d >= time.Minute && d%time.Minute == 0:
+		return fmt.Sprintf("%d 分钟", int(d/time.Minute))
+	default:
+		return fmt.Sprintf("%d 秒", int(d/time.Second))
+	}
+}
+
 // ValidAddr 校验中转地址：必须是 "mac:<名>" 或 "ubuntu:<名>"，
 // 名字 1..64 字节，只允许 ASCII 字母数字和 . _ -。
 func ValidAddr(addr string) error {
@@ -218,6 +254,13 @@ type HubConfig struct {
 	RetryWindow time.Duration
 	// Capture 抓接收方终端画面（最后 40 行）用于失败报告；可为 nil（报告不带画面）。
 	Capture func(ctx context.Context, addr string) (string, error)
+	// AckTimeout 是注入成功后等对方新上报（钩子报忙闲都算"我这边动了"）的时限，
+	// <=0 取默认 30 秒；超时按 ack 阶段失败重回 queued 走重试预算。
+	// 发往 mac: 的 outbox 取走后 unackedTakeTimeout 未确认的重排与此无关，各自独立。
+	AckTimeout time.Duration
+	// ReplyTimeout 是请求送达后等回复的时限，<=0 取默认 2 小时；
+	// 超时把请求标 overdue 并发一条系统通知给原发件人。
+	ReplyTimeout time.Duration
 }
 
 // Hub 是消息中转队列，并发安全；网络与 git 由 cfg 注入。
@@ -248,6 +291,9 @@ type Hub struct {
 	peers       map[string]PeerState
 	peerAt      map[string]time.Time // 对端状态最近一次变化的时间（busy 失联判定用）
 	peerSeq     map[string]uint64    // 对端状态版本号：送达期间有新上报就不覆盖对方状态
+	injectedAt  map[string]time.Time // 注入成功、开始等对方确认的时间（AckTimeout 起算点）
+	ackSeq      map[string]uint64    // 注入时（置 busy 之后）的对端版本号；变大才算对方接收了
+	deliveredAt map[string]time.Time // 变成 delivered 的时间（ReplyTimeout 起算点）
 	nagged      map[string]int       // 单条欠回复请求已提醒过的次数（NagUnanswered 用）
 	autoUntil   time.Time            // 零值表示自动模式关闭
 	wakeup      chan struct{}        // outbox 有变化或 SetState 时翻转，唤醒长轮询的 TakeOutbox
@@ -270,6 +316,12 @@ func NewHub(cfg HubConfig) *Hub {
 	if cfg.RetryWindow <= 0 {
 		cfg.RetryWindow = defaultRetryWindow
 	}
+	if cfg.AckTimeout <= 0 {
+		cfg.AckTimeout = defaultAckTimeout
+	}
+	if cfg.ReplyTimeout <= 0 {
+		cfg.ReplyTimeout = defaultReplyTimeout
+	}
 	h := &Hub{
 		cfg:           cfg,
 		outbox:        nil,
@@ -284,6 +336,9 @@ func NewHub(cfg HubConfig) *Hub {
 		peers:         make(map[string]PeerState),
 		peerAt:        make(map[string]time.Time),
 		peerSeq:       make(map[string]uint64),
+		injectedAt:    make(map[string]time.Time),
+		ackSeq:        make(map[string]uint64),
+		deliveredAt:   make(map[string]time.Time),
 		nagged:        make(map[string]int),
 		wakeup:        make(chan struct{}),
 		storePath:     cfg.StorePath,
@@ -428,6 +483,8 @@ func resetRetryLocked(h *Hub, id string, cur *Message) {
 	delete(h.pausedAtFirst, id)
 	delete(h.nextTry, id)
 	delete(h.fails, id)
+	delete(h.injectedAt, id)
+	delete(h.ackSeq, id)
 	clearStageFailsLocked(h, id)
 	cur.Report = nil
 }
@@ -495,6 +552,172 @@ func (h *Hub) markAnsweredLocked(reply Message) {
 	}
 	if j := h.findLocked(reply.ReplyTo); j >= 0 {
 		h.msgs[j].Answered = true
+	}
+}
+
+// finishDeliveredLocked 把消息落到 delivered 并做完送达收尾：清退避与重试预算、释放附件、
+// 记下送达时间（欠回复超时的起算点），回复则把原请求标成已回复。调用方须持锁。
+func (h *Hub) finishDeliveredLocked(i int) {
+	cur := &h.msgs[i]
+	cur.State = MsgDelivered
+	cur.Reason = ""
+	cur.File = nil // 已结束，附件不再占内存
+	h.deliveredAt[cur.ID] = h.now()
+	// 回复真正送达，这条请求才算真被回了
+	h.markAnsweredLocked(*cur)
+	delete(h.nextTry, cur.ID)
+	delete(h.fails, cur.ID)
+	delete(h.firstFail, cur.ID)
+	delete(h.pausedAtFirst, cur.ID)
+	delete(h.injectedAt, cur.ID)
+	delete(h.ackSeq, cur.ID)
+	clearStageFailsLocked(h, cur.ID)
+}
+
+// markInjectedLocked 把刚注入成功的非 Now 消息记成 injected：记下注入时间和
+// "注入时（置 busy 之后）的对端版本号"，之后该对端任何一次新上报都算对方接收了。
+// 注入成功不等于对方开始处理：附件、预算起点都留着，等真送达才收尾。调用方须持锁。
+func (h *Hub) markInjectedLocked(i int) {
+	cur := &h.msgs[i]
+	cur.State = MsgInjected
+	cur.Reason = ""
+	h.injectedAt[cur.ID] = h.now()
+	h.ackSeq[cur.ID] = h.peerSeq[cur.To]
+	// 注入本身成功了：送达阶段的退避作废；预算起点（firstFail）留着，
+	// 等确认这一段仍算同一条消息的重试过程。
+	delete(h.nextTry, cur.ID)
+	delete(h.fails, cur.ID)
+	clearStageFailsLocked(h, cur.ID)
+}
+
+// checkInjectedLocked 推进 injected 消息：对端版本号超过注入时记下的 ackSeq
+// 就落 delivered；注入后超过 AckTimeout 仍没有任何新上报，就记一次 ack 阶段失败、
+// 重回 queued 走重试预算（用完转 failed，报告 Stage=ack）。
+// onlyAddr 非空时只看该对端（SetState 用：刚上报的那个地址必然版本号变了）；
+// 空则扫全部对端（Pump 用：查超时）。
+// 返回要记日志的消息拷贝，和要在锁外抓屏转人工的报告请求。调用方须持锁。
+func (h *Hub) checkInjectedLocked(now time.Time, onlyAddr string) (logged []Message, reps []*reportReq) {
+	var timedOut []string
+	for i := range h.msgs {
+		m := &h.msgs[i]
+		if m.State != MsgInjected {
+			continue
+		}
+		if onlyAddr != "" && m.To != onlyAddr {
+			continue
+		}
+		if h.peerSeq[m.To] > h.ackSeq[m.ID] {
+			// 注入之后对端又上报过一次：说明消息真被接住了，开始处理
+			h.finishDeliveredLocked(i)
+			logged = append(logged, *m)
+			continue
+		}
+		if now.Sub(h.injectedAt[m.ID]) <= h.cfg.AckTimeout {
+			continue
+		}
+		err := fmt.Errorf(ackErrFmt, humanDuration(h.cfg.AckTimeout))
+		m.State = MsgQueued
+		m.Reason = err.Error()
+		delete(h.injectedAt, m.ID)
+		delete(h.ackSeq, m.ID)
+		h.recordAttemptLocked(m.ID, "ack", err)
+		if h.budgetExhaustedLocked(m.ID, "ack") {
+			m.State = MsgFailed
+			delete(h.nextTry, m.ID)
+			delete(h.fails, m.ID)
+			reps = append(reps, newReportReqLocked(h, m.ID, "ack", m.To))
+		} else {
+			h.backoffLocked(m.ID) // 留在 queued，退避后重新注入
+		}
+		timedOut = append(timedOut, m.To)
+		logged = append(logged, *m)
+	}
+	// 超时那条把对端标成不可送（busy 且时间戳重置），等它再上报或熬过 busyStale 才试下一次。
+	// 这一步必须等上面全判完：置 busy 会让版本号 +1，先 bump 会把同批别的
+	// injected 消息误判成"对方已经接收"。
+	for _, to := range timedOut {
+		h.setPeerLocked(to, PeerBusy)
+	}
+	return logged, reps
+}
+
+// sendSystemLocked 生成一条 Hub 系统通知（From 固定 HubSenderAddr）直接入库 queued。
+// 不走 Send：ValidAddr 不接受 xxyi: 前缀，而系统通知只当发件人；也不需要对方回复。
+// 调用方须持锁。
+func (h *Hub) sendSystemLocked(to, text string) Message {
+	m := Message{
+		From:    HubSenderAddr,
+		To:      to,
+		Text:    sanitizeText(text),
+		Kind:    KindNotice,
+		State:   MsgQueued,
+		Created: h.now(),
+	}
+	for {
+		m.ID = newID()
+		if h.findLocked(m.ID) < 0 {
+			break
+		}
+	}
+	h.msgs = append(h.msgs, m)
+	return m
+}
+
+// markOverdueReplies 扫已送达的请求：没回复（Answered 和"已经发出去、没被拒绝的回复"
+// 都没有）且从变成 delivered 起算超过 ReplyTimeout，就标 overdue（只标一次）、
+// 记 msg_overdue 日志，并给原发件人发一条系统通知。
+// 系统通知本身是 notice，不参与欠回复判定，也不会再触发超时。
+func (h *Hub) markOverdueReplies() {
+	h.mu.Lock()
+	now := h.now()
+	var overdue, notices []Message
+	var logs []map[string]string
+	for i := range h.msgs {
+		m := &h.msgs[i]
+		if m.State != MsgDelivered || m.Kind != KindRequest || m.Overdue || m.Answered {
+			continue
+		}
+		at, ok := h.deliveredAt[m.ID]
+		if !ok || now.Sub(at) <= h.cfg.ReplyTimeout {
+			continue
+		}
+		if _, live := h.hasLiveReplyLocked(m.ID, m.To); live {
+			continue // 回复已经发出去了（哪怕还没送到），不算超时
+		}
+		m.Overdue = true
+		ps := "unknown"
+		if st, ok := h.peers[m.To]; ok {
+			ps = string(st)
+		}
+		text := fmt.Sprintf(overdueNoticeFmt, m.ID, m.To, humanDuration(h.cfg.ReplyTimeout), ps)
+		notice := h.sendSystemLocked(m.From, text)
+		overdue = append(overdue, *m)
+		notices = append(notices, notice)
+		logs = append(logs, map[string]string{
+			"id":           m.ID,
+			"from":         m.From,
+			"to":           m.To,
+			"peer_state":   ps,
+			"delivered_at": at.Format(time.RFC3339),
+		})
+	}
+	wake := h.trimLocked()
+	h.mu.Unlock()
+
+	if h.cfg.Log != nil { // 日志回调放锁外：不让外部代码在持 Hub 锁时运行
+		for _, d := range logs {
+			h.cfg.Log(overdueLogKind, d)
+		}
+	}
+
+	if wake != nil {
+		close(wake)
+	}
+	for _, n := range notices {
+		h.logMsg(n)
+	}
+	if len(overdue) > 0 {
+		h.persist() // overdue 标记和系统通知落盘
 	}
 }
 
@@ -569,6 +792,9 @@ func (h *Hub) trimLocked() (wake chan struct{}) {
 		delete(h.pausedAtFirst, gone.ID)
 		clearStageFailsLocked(h, gone.ID)
 		delete(h.nagged, gone.ID)
+		delete(h.injectedAt, gone.ID)
+		delete(h.ackSeq, gone.ID)
+		delete(h.deliveredAt, gone.ID)
 		if h.removeFromOutboxLocked(gone.ID) {
 			touched = true
 		}
@@ -728,6 +954,8 @@ func (h *Hub) Send(m Message) (string, error) {
 // SetState 记录对端忙闲状态（busy/idle/gone）；gone 表示对方窗口里此刻不是 Claude。
 // 没上报过的地址不在表里，与 busy/gone 一样按住非 Now 消息。
 // 每次调用都会翻转 wakeup：等待中的 TakeOutbox 要能在对方变 idle 时醒来重查。
+// 上报本身就是"对方还在跑、已经接收了消息"的证据：发给这个地址、正等确认（injected）
+// 的消息在这里落 delivered（附件释放、回复把原请求标成已回复）。
 func (h *Hub) SetState(addr string, st PeerState) error {
 	if err := ValidAddr(addr); err != nil {
 		return err
@@ -737,10 +965,14 @@ func (h *Hub) SetState(addr string, st PeerState) error {
 	}
 	h.mu.Lock()
 	h.setPeerLocked(addr, st)
+	acked, _ := h.checkInjectedLocked(h.now(), addr)
 	wake := h.flipWakeupLocked()
 	h.mu.Unlock()
 	close(wake)
-	h.persist() // 对端状态和 peerAt 落盘
+	for _, m := range acked {
+		h.logMsg(m)
+	}
+	h.persist() // 对端状态、peerAt 以及顺带落 delivered 的消息一起落盘
 	return nil
 }
 
@@ -771,14 +1003,20 @@ func kindLabel(kind string) string {
 
 // Display 把消息渲染成注入终端的文本，Mac 与 Ubuntu 两侧共用同一套格式。
 // attachPath 由调用方算好（Mac 侧用 MacInboxPath），空表示不带附件行。
+// Hub 自己发的系统通知（From == HubSenderAddr）头部不写"来自 xxyi:hub"，直接标系统通知。
 func Display(m Message, attachPath string) string {
-	head := fmt.Sprintf("[XXYI 消息 #%s · ", m.ID)
-	if m.Kind == KindReply {
-		head += fmt.Sprintf("回复 #%s", m.ReplyTo)
+	var head string
+	if m.From == HubSenderAddr {
+		head = fmt.Sprintf("[XXYI 系统通知 #%s]", m.ID)
 	} else {
-		head += kindLabel(m.Kind)
+		head = fmt.Sprintf("[XXYI 消息 #%s · ", m.ID)
+		if m.Kind == KindReply {
+			head += fmt.Sprintf("回复 #%s", m.ReplyTo)
+		} else {
+			head += kindLabel(m.Kind)
+		}
+		head += fmt.Sprintf(" · 来自 %s]", m.From)
 	}
-	head += fmt.Sprintf(" · 来自 %s]", m.From)
 
 	out := head + "\n" + m.Text
 	if m.Kind == KindCode {
@@ -949,6 +1187,9 @@ func (h *Hub) Decide(id, action string) error {
 		delete(h.firstFail, id)
 		delete(h.pausedAtFirst, id)
 		clearStageFailsLocked(h, id)
+		delete(h.injectedAt, id)
+		delete(h.ackSeq, id)
+		delete(h.deliveredAt, id)
 		cur.File = nil
 	}
 	out := *cur
@@ -1016,6 +1257,9 @@ func (h *Hub) Redirect(id, to string) (string, error) {
 		delete(h.firstFail, id)
 		delete(h.pausedAtFirst, id)
 		clearStageFailsLocked(h, id)
+		delete(h.injectedAt, id)
+		delete(h.ackSeq, id)
+		delete(h.deliveredAt, id)
 		cur.File = nil
 		cp := *cur
 		out = &cp
@@ -1103,7 +1347,9 @@ func (h *Hub) TakeOutbox(ctx context.Context, to string) (Message, bool) {
 	}
 }
 
-// MarkDelivered 把 outbox 里被取走、已确认注入终端的消息标为 delivered。
+// MarkDelivered 确认 outbox 里被取走的消息已注入终端。
+// Now 消息（用户强送，对方可能是 shell）到此就算送达；非 Now 只进 injected，
+// 等接收方下一次上报忙闲才算真送达——注入成功不代表对方的 Claude 接住了它。
 func (h *Hub) MarkDelivered(id string) error {
 	h.mu.Lock()
 	i := h.findLocked(id)
@@ -1116,16 +1362,12 @@ func (h *Hub) MarkDelivered(id string) error {
 		h.mu.Unlock()
 		return fmt.Errorf("support: 消息 %s 当前状态 %s，不能确认送达", id, cur.State)
 	}
-	cur.State = MsgDelivered
 	delete(h.takenAt, id)
-	delete(h.nextTry, id)
-	delete(h.fails, id)
-	delete(h.firstFail, id)
-	delete(h.pausedAtFirst, id)
-	clearStageFailsLocked(h, id)
-	cur.File = nil // 已结束，附件不再占内存
-	// 回复确认送达，原请求才算真被回了；原请求已被淘汰就算了
-	h.markAnsweredLocked(*cur)
+	if cur.Now {
+		h.finishDeliveredLocked(i)
+	} else {
+		h.markInjectedLocked(i) // 附件等确认后才释放
+	}
 	out := *cur
 	h.mu.Unlock()
 
@@ -1134,15 +1376,19 @@ func (h *Hub) MarkDelivered(id string) error {
 	return nil
 }
 
-// Pump 按创建时间先后尝试推进所有 queued 消息一次。
+// Pump 推进一轮消息：先处理正等送达确认（injected）的消息和欠回复超时，
+// 再按创建时间先后尝试推进所有 queued 消息。
 // 规则：接收方忙且不是 Now 则跳过；要先同步且没同步过则先调 Sync；
 // 发往 mac: 的进 outbox 等 TakeOutbox，其余调 Deliver；
 // Deliver 成功或消息被取走后把接收方置忙。Sync/Deliver 在锁外调用。
+// 注入成功的非 Now 消息只进 injected，等对端下一次上报才落 delivered；
+// 超过 AckTimeout 没上报按 ack 阶段失败重回 queued（SetState 里也会推进）。
 // 线路暂停（LinkDown）时碰线路的消息按住不推进，每 linkProbeEvery 放一条做探测；
 // 发往 mac: 且不用同步的消息照常。真失败按预算（MaxAttempts/RetryWindow）自动重试，
-// 用完转 failed（送达）/ sync_failed（同步）并生成 FailReport。
+// 用完转 failed（送达/确认）/ sync_failed（同步）并生成 FailReport。
 func (h *Hub) Pump(ctx context.Context) {
 	h.mu.Lock()
+	advanced, reps := h.checkInjectedLocked(h.now(), "")
 	var queue []Message
 	for _, m := range h.msgs {
 		if m.State == MsgQueued {
@@ -1150,6 +1396,15 @@ func (h *Hub) Pump(ctx context.Context) {
 		}
 	}
 	h.mu.Unlock()
+	for _, m := range advanced {
+		h.logMsg(m) // injected → delivered，或确认超时回 queued/failed
+	}
+	if len(advanced) > 0 {
+		h.persist()
+	}
+	for _, rep := range reps {
+		h.attachReport(rep, h.captureScreen(ctx, rep.addr)) // 抓屏在锁外
+	}
 
 	sort.SliceStable(queue, func(i, j int) bool {
 		return queue[i].Created.Before(queue[j].Created)
@@ -1161,6 +1416,7 @@ func (h *Hub) Pump(ctx context.Context) {
 		}
 		h.pumpOne(ctx, m.ID)
 	}
+	h.markOverdueReplies() // 送达后一直没人回复的请求：标 overdue 并通知原发件人
 }
 
 // pumpOne 推进一条 queued 消息。锁内只做检查和落状态，Sync/Deliver 在锁外调用。
@@ -1384,20 +1640,17 @@ func (h *Hub) pumpOne(ctx context.Context, id string) {
 					}
 				}
 			} else {
-				h.msgs[j].State = MsgDelivered
-				h.msgs[j].Reason = ""
-				h.msgs[j].File = nil // 已结束，附件不再占内存
 				// 送达期间对端没再上报才置 busy，别把钩子刚报的 idle 覆盖掉
 				if h.peerSeq[m.To] == seq0 {
 					h.setPeerLocked(m.To, PeerBusy)
 				}
-				// 回复送达成功，这条请求才算真被回了
-				h.markAnsweredLocked(h.msgs[j])
-				delete(h.nextTry, id)
-				delete(h.fails, id)
-				delete(h.firstFail, id)
-				delete(h.pausedAtFirst, id)
-				clearStageFailsLocked(h, id)
+				// Now 是用户强送（对方窗口里可能是 shell，不会有钩子来确认），
+				// 注入成功就算送达；其余先进 injected，等对端下一次上报。
+				if m.Now {
+					h.finishDeliveredLocked(j)
+				} else {
+					h.markInjectedLocked(j)
+				}
 				cp := h.msgs[j]
 				out = &cp
 			}

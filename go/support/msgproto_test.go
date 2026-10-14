@@ -57,8 +57,15 @@ func TestUnreportedPeerHoldsQueued(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.hub.Pump(ctx)
+	if st := stateOf(t, f.hub, id); st != MsgInjected {
+		t.Fatalf("上报 idle 后应注入并 injected，实际 %s", st)
+	}
+	// 再上报一次才算对方接收了 → delivered
+	if err := f.hub.SetState("ubuntu:bob", PeerBusy); err != nil {
+		t.Fatal(err)
+	}
 	if st := stateOf(t, f.hub, id); st != MsgDelivered {
-		t.Fatalf("上报 idle 后应 delivered，实际 %s", st)
+		t.Fatalf("再次上报后应 delivered，实际 %s", st)
 	}
 	if n := len(f.delivered()); n != 1 {
 		t.Fatalf("应送达 1 条，实际 %d", n)
@@ -178,6 +185,7 @@ func TestDeliverPeerNotClaudeNoBackoff(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.hub.Pump(ctx)
+	ackPeer(t, f.hub, "ubuntu:bob", PeerBusy) // 对端钩子下一次上报，确认 injected → delivered
 	if st := stateOf(t, f.hub, id); st != MsgDelivered {
 		t.Fatalf("恢复正常后应 delivered，实际 %s", st)
 	}
@@ -263,6 +271,7 @@ func TestSendKindAndReplyValidation(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.hub.Pump(context.Background())
+	ackPeer(t, f.hub, "ubuntu:bob", PeerBusy) // 对端钩子下一次上报，确认 injected → delivered
 	if st := stateOf(t, f.hub, reqID); st != MsgDelivered {
 		t.Fatalf("原请求应已送达，实际 %s", st)
 	}
@@ -301,6 +310,8 @@ func TestSendKindAndReplyValidation(t *testing.T) {
 	if err := f.hub.MarkDelivered(replyID); err != nil {
 		t.Fatal(err)
 	}
+	// 注入确认只到 injected：mac 侧钩子再上报一次这条回复才算真正送达，原请求这时才标 Answered
+	ackPeer(t, f.hub, "mac:sue", PeerBusy)
 	if !peekHubMsg(t, f.hub, reqID).Answered {
 		t.Errorf("回复送达后原请求应标 Answered")
 	}
@@ -439,6 +450,8 @@ func protoDeliverTo(t *testing.T, f *msgFixture, m Message) string {
 		t.Fatal(err)
 	}
 	f.hub.Pump(context.Background())
+	// 注入成功后等收件对端钩子再上报一次才算送达；后面还要送下一条，上报完放回空闲
+	ackPeer(t, f.hub, m.To, PeerIdle)
 	if st := stateOf(t, f.hub, id); st != MsgDelivered {
 		t.Fatalf("%q 应送达，实际 %s", m.Text, st)
 	}
@@ -565,9 +578,17 @@ func TestMsgAPIStateCheckUnanswered(t *testing.T) {
 		t.Fatalf("approve: %d %s", code, body)
 	}
 
-	// 收件方上报空闲（不带 check）→ 经 Deliver 送达，送达后本机把它置忙
+	// 收件方上报空闲（不带 check）→ 经 Deliver 注入；注入只到 injected，
+	// 等收件方钩子再上报一次（这里报 busy）才落 delivered
 	if code, body = remoteDo(t, http.MethodPost, a.base+"/msg/state?addr=ubuntu:bob&state=idle", a.token, nil); code != 200 {
 		t.Fatalf("上报空闲: %d %s", code, body)
+	}
+	waitFor(t, 3*time.Second, "注入", func() bool {
+		st := msgStateOf(t, a.lURL, id)
+		return st == MsgInjected || st == MsgDelivered
+	})
+	if code, body = remoteDo(t, http.MethodPost, a.base+"/msg/state?addr=ubuntu:bob&state=busy", a.token, nil); code != 200 {
+		t.Fatalf("再次上报置忙: %d %s", code, body)
 	}
 	waitFor(t, 3*time.Second, "送达", func() bool {
 		return msgStateOf(t, a.lURL, id) == MsgDelivered
@@ -798,6 +819,7 @@ func TestBusyStaleTreatedAsReady(t *testing.T) {
 	}
 	f.clock.Add(time.Second)
 	f.hub.Pump(ctx)
+	ackPeer(t, f.hub, "ubuntu:bob", PeerBusy) // 对端钩子下一次上报，确认 injected → delivered
 	if st := stateOf(t, f.hub, id); st != MsgDelivered {
 		t.Fatalf("busy 失联后应送达，实际 %s", st)
 	}
@@ -979,6 +1001,7 @@ func TestIdleDuringDeliverNotOverwritten(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.hub.Pump(context.Background())
+	ackPeer(t, f.hub, "ubuntu:bob", PeerIdle) // 对端钩子再上报确认；上报 idle，不被 busy 覆盖
 	if st := stateOf(t, f.hub, id); st != MsgDelivered {
 		t.Fatalf("应送达，实际 %s", st)
 	}

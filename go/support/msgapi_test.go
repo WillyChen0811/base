@@ -122,6 +122,13 @@ func TestMsgLocalSendDecideDeliver(t *testing.T) {
 	if code, body = remoteDo(t, http.MethodPost, a.base+"/msg/state?addr=ubuntu:bob&state=idle", a.token, nil); code != 200 {
 		t.Fatalf("上报空闲: %d %s", code, body)
 	}
+	waitFor(t, 3*time.Second, "消息注入", func() bool {
+		return msgStateOf(t, a.lURL, id) == MsgInjected
+	})
+	// 注入不等于送达：收件方下一次上报（钩子报忙闲都算接收了）才落 delivered。
+	if code, body = remoteDo(t, http.MethodPost, a.base+"/msg/state?addr=ubuntu:bob&state=busy", a.token, nil); code != 200 {
+		t.Fatalf("再次上报置忙: %d %s", code, body)
+	}
 	waitFor(t, 3*time.Second, "消息送达", func() bool {
 		return msgStateOf(t, a.lURL, id) == MsgDelivered
 	})
@@ -215,10 +222,17 @@ func TestMsgOutboxFlow(t *testing.T) {
 	}
 
 	if code, body = post(t, a.lURL+"/delivered?id="+id, nil); code != 200 {
-		t.Fatalf("确认送达: %d %s", code, body)
+		t.Fatalf("确认注入: %d %s", code, body)
+	}
+	if st := msgStateOf(t, a.lURL, id); st != MsgInjected {
+		t.Fatalf("确认注入后应 injected（等对方上报），得 %s", st)
+	}
+	// 收件方下一次上报才算真送达。
+	if code, body = post(t, a.lURL+"/state?addr=mac:frank&state=busy", nil); code != 200 {
+		t.Fatalf("上报置忙: %d %s", code, body)
 	}
 	if st := msgStateOf(t, a.lURL, id); st != MsgDelivered {
-		t.Fatalf("确认后状态应 delivered，得 %s", st)
+		t.Fatalf("上报后状态应 delivered，得 %s", st)
 	}
 	// 重复确认 409；不存在的 id 404。
 	if code, _ := post(t, a.lURL+"/delivered?id="+id, nil); code != 409 {
@@ -305,6 +319,13 @@ func TestMsgAuto(t *testing.T) {
 	var resp map[string]string
 	if err := json.Unmarshal(body, &resp); err != nil {
 		t.Fatal(err)
+	}
+	waitFor(t, 3*time.Second, "自动模式注入", func() bool {
+		return msgStateOf(t, a.lURL, resp["id"]) == MsgInjected
+	})
+	// 收件方再上报一次才算接收。
+	if code, body = remoteDo(t, http.MethodPost, a.base+"/msg/state?addr=ubuntu:bob&state=busy", a.token, nil); code != 200 {
+		t.Fatalf("再次上报置忙: %d %s", code, body)
 	}
 	waitFor(t, 3*time.Second, "自动模式送达", func() bool {
 		return msgStateOf(t, a.lURL, resp["id"]) == MsgDelivered

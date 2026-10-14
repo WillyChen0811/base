@@ -16,10 +16,13 @@ import (
 const hubStoreVersion = 1
 
 // hubSnapshot 是落盘的最小状态集：消息（含附件、Attempts/Report）、对端状态、自动模式、
-// 欠回复计数，以及重试预算与线路暂停进度（firstFail/pausedAtFirst/linkDown/pausedTotal，
-// 重启后预算和暂停累计接着算，不能从头再来）。
+// 欠回复计数，重试预算与线路暂停进度（firstFail/pausedAtFirst/linkDown/pausedTotal，
+// 重启后预算和暂停累计接着算，不能从头再来），以及送达确认与欠回复超时的进度
+// （injectedAt/ackSeq/deliveredAt）。
 // takenAt/outbox/outPlaced/inflight/nextTry/fails/peerSeq 不存：
-// 重启后 queued 消息由下一次 Pump 正常重新处理（发往 mac: 的重新进 outbox）。
+// 重启后 queued 消息由下一次 Pump 正常重新处理（发往 mac: 的重新进 outbox），
+// injected 消息的 ackSeq 归零、injectedAt 记成加载时刻——重启后重新等满 AckTimeout
+// （见 loadStore），因为重启期间对端有没有上报已无从判断。
 type hubSnapshot struct {
 	Version       int                      `json:"version"`
 	Messages      []storedMsg              `json:"messages"`
@@ -32,6 +35,9 @@ type hubSnapshot struct {
 	PausedTotal   time.Duration            `json:"paused_total"`
 	FirstFail     map[string]time.Time     `json:"first_fail"`
 	PausedAtFirst map[string]time.Duration `json:"paused_at_first"`
+	InjectedAt    map[string]time.Time     `json:"injected_at,omitempty"`
+	AckSeq        map[string]uint64        `json:"ack_seq,omitempty"`
+	DeliveredAt   map[string]time.Time     `json:"delivered_at,omitempty"`
 }
 
 // storedMsg 包一层 Message 单独存附件：Message.File 是 json:"-"（对外 JSON 不带正文），
@@ -77,6 +83,18 @@ func (h *Hub) saveLocked() {
 	for k, v := range h.nagged {
 		nagged[k] = v
 	}
+	injectedAt := make(map[string]time.Time, len(h.injectedAt))
+	for k, v := range h.injectedAt {
+		injectedAt[k] = v
+	}
+	ackSeq := make(map[string]uint64, len(h.ackSeq))
+	for k, v := range h.ackSeq {
+		ackSeq[k] = v
+	}
+	deliveredAt := make(map[string]time.Time, len(h.deliveredAt))
+	for k, v := range h.deliveredAt {
+		deliveredAt[k] = v
+	}
 	b, err := json.Marshal(hubSnapshot{
 		Version:       hubStoreVersion,
 		Messages:      msgs,
@@ -89,6 +107,9 @@ func (h *Hub) saveLocked() {
 		PausedTotal:   h.pausedTotal,
 		FirstFail:     h.firstFail,
 		PausedAtFirst: h.pausedAtFirst,
+		InjectedAt:    injectedAt,
+		AckSeq:        ackSeq,
+		DeliveredAt:   deliveredAt,
 	})
 	if err != nil { // 本结构理论上 marshal 不会失败；真失败了不递增，保住上一次快照
 		return
@@ -100,9 +121,9 @@ func (h *Hub) saveLocked() {
 	h.snap = b
 }
 
-// persist 持锁取快照、解锁后落盘。凡是改了消息/对端状态/自动模式/nagged 的
+// persist 持锁取快照、解锁后落盘。凡是改了消息/对端状态/自动模式/nagged/送达确认进度的
 // 公开方法（Send、SetState、Decide、SetAuto、TakeOutbox 取走、MarkDelivered、
-// pumpOne 各结果分支、trim 淘汰经由 Send）都在解锁后调它。
+// Pump 的确认推进与欠回复超时、pumpOne 各结果分支、trim 淘汰经由 Send）都在解锁后调它。
 func (h *Hub) persist() {
 	if h.storePath == "" {
 		return
@@ -183,6 +204,27 @@ func (h *Hub) loadStore() {
 	h.linkDown = snap.LinkDown
 	h.pausedSince = snap.PausedSince
 	h.pausedTotal = snap.PausedTotal
+	// 送达确认与欠回复超时的进度：injected 消息重新等满 AckTimeout
+	// （重启期间对端到底上报过没有已无从判断，ackSeq 归零等于"下一次上报就算确认"，
+	// injectedAt 记加载时刻让计时从头开始）；delivered 的起算点原样恢复，
+	// 老快照里没记过的退回创建时间，至少不会一重启就误报超时之外的极端情况。
+	h.injectedAt = make(map[string]time.Time)
+	h.ackSeq = make(map[string]uint64)
+	h.deliveredAt = make(map[string]time.Time, len(snap.DeliveredAt))
+	now := h.now()
+	for _, m := range h.msgs {
+		switch m.State {
+		case MsgInjected:
+			h.injectedAt[m.ID] = now
+			h.ackSeq[m.ID] = 0
+		case MsgDelivered:
+			if at, ok := snap.DeliveredAt[m.ID]; ok {
+				h.deliveredAt[m.ID] = at
+			} else {
+				h.deliveredAt[m.ID] = m.Created
+			}
+		}
+	}
 	// takenAt/outbox/outPlaced/inflight/nextTry/fails/peerSeq 保持 NewHub 给的空表：
 	// 加载出的 queued 消息会被下一次 Pump 正常处理，不保留"已放进 outbox"的痕迹；
 	// lastProbe 归零——重启后第一次 Pump 正好立刻放一条探测。

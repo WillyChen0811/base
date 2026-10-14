@@ -126,6 +126,14 @@ func stateOf(t *testing.T, h *Hub, id string) MsgState {
 	return ""
 }
 
+// ackPeer 模拟收件对端的钩子上报，让 injected 的消息确认为 delivered。
+func ackPeer(t *testing.T, h *Hub, addr string, st PeerState) {
+	t.Helper()
+	if err := h.SetState(addr, st); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestValidAddr(t *testing.T) {
 	good := []string{"mac:alice", "ubuntu:lab-1", "mac:a", "ubuntu:A.b_c-9", "mac:" + strings.Repeat("x", 64)}
 	for _, a := range good {
@@ -264,8 +272,15 @@ func TestManualApprovePump(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.hub.Pump(ctx)
+	if state := stateOf(t, f.hub, id); state != MsgInjected {
+		t.Fatalf("Pump 注入成功后应先 injected（等对方上报确认），实际 %s", state)
+	}
+	// 对方钩子下一次上报（这里报 busy）才算接收了 → delivered
+	if err := f.hub.SetState("ubuntu:bob", PeerBusy); err != nil {
+		t.Fatal(err)
+	}
 	if state := stateOf(t, f.hub, id); state != MsgDelivered {
-		t.Fatalf("Pump 后应 delivered，实际 %s", state)
+		t.Fatalf("对端上报后应 delivered，实际 %s", state)
 	}
 	d := f.delivered()
 	if len(d) != 1 || d[0].ID != id || d[0].Text != "hello" {
@@ -275,7 +290,7 @@ func TestManualApprovePump(t *testing.T) {
 		t.Errorf("送达后接收方应置忙")
 	}
 	states := f.loggedStates(id)
-	want := []string{string(MsgPending), string(MsgQueued), string(MsgDelivered)}
+	want := []string{string(MsgPending), string(MsgQueued), string(MsgInjected), string(MsgDelivered)}
 	if strings.Join(states, ",") != strings.Join(want, ",") {
 		t.Errorf("状态日志应依次 %v，实际 %v", want, states)
 	}
@@ -435,6 +450,7 @@ func TestSyncFailRetryAndSkip(t *testing.T) {
 	}
 	f.setSyncErr(nil)
 	f.hub.Pump(ctx)
+	ackPeer(t, f.hub, "ubuntu:bob", PeerBusy) // 对端钩子下一次上报，确认 injected → delivered
 	if state := stateOf(t, f.hub, id); state != MsgDelivered {
 		t.Fatalf("重试同步成功后应 delivered，实际 %s", state)
 	}
@@ -473,6 +489,7 @@ func TestSyncFailRetryAndSkip(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.hub.Pump(ctx)
+	ackPeer(t, f.hub, "ubuntu:bob", PeerIdle) // 对端钩子下一次上报确认；后面还要再送，放回空闲
 	for _, lm := range f.hub.List() {
 		if lm.ID == id2 && lm.State != MsgDelivered {
 			t.Errorf("skip_sync 后应不再同步直接送达，实际 %s", lm.State)
@@ -532,6 +549,7 @@ func TestMacOutbox(t *testing.T) {
 	if err := f.hub.MarkDelivered(id); err != nil {
 		t.Fatal(err)
 	}
+	ackPeer(t, f.hub, "mac:alice", PeerBusy) // 接收方钩子下一次上报，确认 injected → delivered
 	if state := stateOf(t, f.hub, id); state != MsgDelivered {
 		t.Fatalf("MarkDelivered 后应 delivered，实际 %s", state)
 	}
@@ -1102,6 +1120,7 @@ func TestNoDoubleSendAfterSync(t *testing.T) {
 	if deliverCalls != 1 {
 		t.Errorf("Deliver 应只调 1 次（双发！），实际 %d", deliverCalls)
 	}
+	ackPeer(t, h, "ubuntu:bob", PeerBusy) // 对端钩子下一次上报，确认 injected → delivered
 	if state := stateOf(t, h, id); state != MsgDelivered {
 		t.Errorf("最终应 delivered，实际 %s", state)
 	}
@@ -1194,8 +1213,14 @@ func TestDeliverFailKeepsQueued(t *testing.T) {
 	f.setDeliverErr(nil)
 	f.clock.Add(2 * time.Second) // 失败后退避 2 秒才允许重试
 	f.hub.Pump(ctx)
+	if state := stateOf(t, f.hub, id); state != MsgInjected {
+		t.Fatalf("第二次 Pump 注入成功应 injected，实际 %s", state)
+	}
+	if err := f.hub.SetState("ubuntu:bob", PeerBusy); err != nil { // 对方下一次上报才算接收
+		t.Fatal(err)
+	}
 	if state := stateOf(t, f.hub, id); state != MsgDelivered {
-		t.Fatalf("第二次 Pump 应成功，实际 %s", state)
+		t.Fatalf("对端上报后应 delivered，实际 %s", state)
 	}
 	if n := len(f.delivered()); n != 2 {
 		t.Errorf("Deliver 应被调 2 次，实际 %d", n)
@@ -1247,13 +1272,20 @@ func TestCapacityEvicts(t *testing.T) {
 		if err := f2.hub.Decide(id, "approve"); err != nil {
 			t.Fatal(err)
 		}
-		// 上一条送达时把 bob 置了忙——先放回空闲这条才会真送达
+		// 上一条确认时把 bob 置了忙——先放回空闲这条才会真投递
 		if err := f2.hub.SetState("ubuntu:bob", PeerIdle); err != nil {
 			t.Fatal(err)
 		}
 		f2.hub.Pump(ctx)
+		if state := stateOf(t, f2.hub, id); state != MsgInjected {
+			t.Fatalf("d%03d 注入后应 injected，实际 %s", i, state)
+		}
+		// 对方再上报一次（报忙也行，版本号变了就算接收）才落 delivered
+		if err := f2.hub.SetState("ubuntu:bob", PeerBusy); err != nil {
+			t.Fatal(err)
+		}
 		if state := stateOf(t, f2.hub, id); state != MsgDelivered {
-			t.Fatalf("d%03d 应 delivered，实际 %s", i, state)
+			t.Fatalf("d%03d 确认后应 delivered，实际 %s", i, state)
 		}
 		if i == 0 {
 			first = id
@@ -1828,8 +1860,14 @@ func TestClosedReleasesFile(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.hub.Pump(ctx)
+	if lm := peekHubMsg(t, f.hub, id); lm.State != MsgInjected || len(lm.File) == 0 {
+		t.Errorf("injected 期间附件应保留（还没确认），实际 state=%s file=%q", lm.State, lm.File)
+	}
+	if err := f.hub.SetState("ubuntu:bob", PeerBusy); err != nil { // 对方上报确认
+		t.Fatal(err)
+	}
 	if lm := peekHubMsg(t, f.hub, id); lm.State != MsgDelivered || lm.File != nil {
-		t.Errorf("delivered 后附件应释放，实际 state=%s file=%q", lm.State, lm.File)
+		t.Errorf("确认后附件应释放，实际 state=%s file=%q", lm.State, lm.File)
 	}
 	// mac outbox 路径：取走时带内容，MarkDelivered 才释放
 	m2 := okMsg()
@@ -1857,8 +1895,14 @@ func TestClosedReleasesFile(t *testing.T) {
 	if err := f.hub.MarkDelivered(id2); err != nil {
 		t.Fatal(err)
 	}
-	if lm := peekHubMsg(t, f.hub, id2); lm.File != nil {
-		t.Errorf("MarkDelivered 后附件应释放，实际 %q", lm.File)
+	if lm := peekHubMsg(t, f.hub, id2); lm.State != MsgInjected || len(lm.File) == 0 {
+		t.Errorf("注入确认前应 injected 且附件保留，实际 state=%s file=%q", lm.State, lm.File)
+	}
+	if err := f.hub.SetState("mac:amy", PeerBusy); err != nil { // 接收方上报确认才算送达
+		t.Fatal(err)
+	}
+	if lm := peekHubMsg(t, f.hub, id2); lm.State != MsgDelivered || lm.File != nil {
+		t.Errorf("确认后附件应释放，实际 state=%s file=%q", lm.State, lm.File)
 	}
 	// rejected 路径
 	m3 := okMsg()

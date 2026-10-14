@@ -268,6 +268,7 @@ func TestLinkDownPauseProbeAndRecover(t *testing.T) {
 	if f.hub.LinkDown() {
 		t.Errorf("探测成功后应解除暂停")
 	}
+	ackPeer(t, f.hub, "ubuntu:bob", PeerBusy) // 对端钩子下一次上报，确认 injected → delivered
 	if st := stateOf(t, f.hub, id); st != MsgDelivered {
 		t.Fatalf("恢复后消息应送出，实际 %s", st)
 	}
@@ -628,6 +629,7 @@ func TestRedirectFailedMessage(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.hub.Pump(ctx)
+	ackPeer(t, f.hub, "ubuntu:carol", PeerBusy) // 对端钩子下一次上报，确认 injected → delivered
 	if st := stateOf(t, f.hub, id2); st != MsgDelivered {
 		t.Fatalf("前置条件：应 delivered，实际 %s", st)
 	}
@@ -701,6 +703,7 @@ func TestPeerNotClaudeDoesNotConsumeBudget(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.hub.Pump(ctx)
+	ackPeer(t, f.hub, "ubuntu:bob", PeerBusy) // 对端钩子下一次上报，确认 injected → delivered
 	if st := stateOf(t, f.hub, id); st != MsgDelivered {
 		t.Fatalf("恢复后应送达，实际 %s", st)
 	}

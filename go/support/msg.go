@@ -315,6 +315,7 @@ type Hub struct {
 	outbox    []string             // 等 mac: 接收方取的消息 ID，按放入顺序；内容以 h.msgs 当前值为准
 	outPlaced map[string]bool      // 已放进过 outbox 的消息 ID（同一条只放一次；取走后超时未确认才允许重放）
 	inflight  map[string]bool      // 正在 pumpOne 处理（Sync/Deliver）的消息 ID，防并发双发；整个 pumpOne 结束才释放
+	injecting map[string]bool      // 正被 Deliver 注入的消息 ID（调前置上、返回即清）；落盘，重启撞上它转人工（见 loadStore）
 	takenAt   map[string]time.Time // 出站消息被 TakeOutbox 取走的时间；超时未确认由 pumpOne 重新排队
 	nextTry   map[string]time.Time // 失败后的下次可重试时间（指数退避）
 	fails     map[string]int       // 连续失败次数，退避用
@@ -349,13 +350,19 @@ type Hub struct {
 	autoUntil   time.Time            // 零值表示自动模式关闭
 	wakeup      chan struct{}        // outbox 有变化或 SetState 时翻转，唤醒长轮询的 TakeOutbox
 
-	// 落盘（见 msgstore.go）：持锁时 saveLocked 拍快照（snap/snapSeq），
-	// 解锁后 flush 拿 saveMu 原子写，只有序号比上次写盘的大才真写，锁外并发不乱序。
-	storePath  string     // cfg.StorePath；空 = 不落盘
-	saveMu     sync.Mutex // 串行化磁盘写
-	snapSeq    uint64     // 快照序号：内容每变一次 +1
-	snap       []byte     // 最近一次持锁拍下的快照 JSON（内容不可变，锁外引用安全）
-	writtenSeq uint64     // 最近成功写盘的快照序号；只在 flush 持 saveMu 时读写
+	// 落盘（见 msgstore.go）：改动状态的点在锁内置 dirty；persist 只在 dirty 时
+	// 锁内拷快照、锁外序列化并提交序号（snapSeq 只增），解锁后 flush 拿 saveMu 原子写，
+	// 只有序号比上次写盘的大才真写，锁外并发不乱序。
+	// 附件不进快照：首次入库写 <StorePath>.files/<id>（0700/0600，原子写），
+	// 释放/淘汰时删；hasFile 记账，快照里只留 has_file 标记。
+	storePath         string          // cfg.StorePath；空 = 不落盘（loadStore 保不住原文件时也会置空）
+	saveMu            sync.Mutex      // 串行化磁盘写
+	dirty             bool            // 有改动还没进快照；只在 h.mu 内读写
+	snapSeq           uint64          // 快照序号：每生成一份新快照 +1；只在 h.mu 内读写
+	snap              []byte          // 最近一次提交的快照 JSON（内容不可变，锁外引用安全）
+	writtenSeq        uint64          // 最近成功写盘的快照序号；只在 flush 持 saveMu 时读写
+	hasFile           map[string]bool // 附件文件已写入磁盘的消息 ID；释放/淘汰时删文件并撤账
+	pendingFileDelete []string        // 待删的附件文件 ID（释放/淘汰时攒下，persist 锁外清掉）
 }
 
 // NewHub 新建 Hub。cfg.StorePath 非空时读回上次落盘的快照（消息含附件、对端状态、
@@ -378,6 +385,7 @@ func NewHub(cfg HubConfig) *Hub {
 		outbox:        nil,
 		outPlaced:     make(map[string]bool),
 		inflight:      make(map[string]bool),
+		injecting:     make(map[string]bool),
 		takenAt:       make(map[string]time.Time),
 		nextTry:       make(map[string]time.Time),
 		fails:         make(map[string]int),
@@ -395,6 +403,7 @@ func NewHub(cfg HubConfig) *Hub {
 		nagged:        make(map[string]int),
 		wakeup:        make(chan struct{}),
 		storePath:     cfg.StorePath,
+		hasFile:       make(map[string]bool),
 	}
 	if h.storePath != "" {
 		h.loadStore()
@@ -423,11 +432,29 @@ func (h *Hub) logMsg(m Message) {
 	})
 }
 
+// markDirtyLocked 标记"有落盘状态改动还没进快照"；每个改了落盘状态（快照里的字段，
+// 见 msgstore.go hubSnapshot）的点都要在锁内调它，persist 靠它决定这次碰不碰磁盘。
+// 调用方须持锁。
+func (h *Hub) markDirtyLocked() { h.dirty = true }
+
+// releaseAttachLocked 释放消息的附件：内存里的 File 置 nil，磁盘上已落盘的附件文件
+// 记入待删清单（附件跟着消息一起走，消息结束了文件就不该再留着）。
+// 只撤账不直接删——磁盘 IO 必须在锁外，由 persist 排干 pendingFileDelete。
+// 调用方须持锁。
+func (h *Hub) releaseAttachLocked(m *Message) {
+	m.File = nil
+	if h.hasFile[m.ID] {
+		delete(h.hasFile, m.ID)
+		h.pendingFileDelete = append(h.pendingFileDelete, m.ID)
+	}
+}
+
 // setPeerLocked 更新对端状态并盖时间戳、版本号（版本号每次变化 +1）；调用方须持锁。
 func (h *Hub) setPeerLocked(addr string, st PeerState) {
 	h.peers[addr] = st
 	h.peerAt[addr] = h.now()
 	h.peerSeq[addr]++
+	h.markDirtyLocked()
 }
 
 // stageKey 拼阶段预算的 map 键；stage 取 retryStages 之一。
@@ -461,6 +488,7 @@ func (h *Hub) recordAttemptLocked(id, stage string, err error) {
 		}
 		h.pausedAtFirst[key] = base
 	}
+	h.markDirtyLocked() // Attempts 历史与阶段预算起点都在快照里
 }
 
 // retryElapsedLocked 算该阶段从首次失败起的有效经过时间（key = stageKey(id, stage)）：
@@ -504,6 +532,7 @@ func (h *Hub) enterPauseLocked() {
 	if !h.linkDown {
 		h.linkDown = true
 		h.pausedSince = h.now()
+		h.markDirtyLocked()
 	}
 }
 
@@ -516,6 +545,7 @@ func (h *Hub) recoverLinkLocked() {
 			h.pausedTotal += h.now().Sub(h.pausedSince)
 			h.pausedSince = time.Time{}
 		}
+		h.markDirtyLocked()
 	}
 }
 
@@ -552,6 +582,7 @@ func clearStageBudgetLocked(h *Hub, id string) {
 		delete(h.firstFail, stageKey(id, st))
 		delete(h.pausedAtFirst, stageKey(id, st))
 	}
+	h.markDirtyLocked() // firstFail/pausedAtFirst 在快照里
 }
 
 // clearDoneStageLocked 清掉某个已成功阶段的记录（同步成功/注入成功时）：
@@ -560,6 +591,7 @@ func clearDoneStageLocked(h *Hub, id, stage string) {
 	delete(h.stageFails, stageKey(id, stage))
 	delete(h.firstFail, stageKey(id, stage))
 	delete(h.pausedAtFirst, stageKey(id, stage))
+	h.markDirtyLocked()
 }
 
 // resetRetryLocked 清空一条消息的重试预算（retry/now 重开时用）；Attempts 历史保留。
@@ -572,6 +604,7 @@ func resetRetryLocked(h *Hub, id string, cur *Message) {
 	delete(h.ackBase, id)
 	clearStageBudgetLocked(h, id)
 	cur.Report = nil
+	h.markDirtyLocked()
 }
 
 // reportReq 是转人工时在锁内摘好的报告素材；Screen 必须锁外经 Capture 抓，抓完再 attach。
@@ -610,9 +643,10 @@ func (h *Hub) attachReport(req *reportReq, screen string) {
 	h.mu.Lock()
 	if j := h.findLocked(req.id); j >= 0 && (h.msgs[j].State == MsgFailed || h.msgs[j].State == MsgSyncFailed) {
 		h.msgs[j].Report = &FailReport{Stage: req.stage, At: req.at, PeerState: req.peerState, Screen: screen}
+		h.markDirtyLocked()
 	}
 	h.mu.Unlock()
-	h.persist() // Report 落盘；没挂上（消息已 retry/淘汰）时内容没变不会写盘
+	h.persist() // Report 落盘；没挂上（消息已 retry/淘汰）时 dirty 没置起，不会碰磁盘
 }
 
 // peerReadyLocked 判断能否给 addr 送非 Now 消息：上报过 idle 可送；
@@ -635,8 +669,9 @@ func (h *Hub) markAnsweredLocked(reply Message) {
 	if reply.Kind != KindReply || reply.ReplyTo == "" {
 		return
 	}
-	if j := h.findLocked(reply.ReplyTo); j >= 0 {
+	if j := h.findLocked(reply.ReplyTo); j >= 0 && !h.msgs[j].Answered {
 		h.msgs[j].Answered = true
+		h.markDirtyLocked()
 	}
 }
 
@@ -646,7 +681,7 @@ func (h *Hub) finishDeliveredLocked(i int) {
 	cur := &h.msgs[i]
 	cur.State = MsgDelivered
 	cur.Reason = ""
-	cur.File = nil // 已结束，附件不再占内存
+	h.releaseAttachLocked(cur) // 已结束：附件不再占内存，磁盘上的附件文件也一起清掉
 	h.deliveredAt[cur.ID] = h.now()
 	// 回复真正送达，这条请求才算真被回了
 	h.markAnsweredLocked(*cur)
@@ -679,6 +714,7 @@ func (h *Hub) markInjectedLocked(i int) {
 	delete(h.fails, cur.ID)
 	clearDoneStageLocked(h, cur.ID, "sync")
 	clearDoneStageLocked(h, cur.ID, "deliver")
+	h.markDirtyLocked() // state=injected、injectedAt/ackSeq 都在快照里
 	if h.hookBusySeq[cur.To] > h.ackSeq[cur.ID] {
 		// 注入前/注入期间钩子已报过忙：对方收到了，不必再等下一次上报。
 		h.finishDeliveredLocked(i)
@@ -785,6 +821,7 @@ func (h *Hub) markOverdueReplies() {
 			continue // 回复已经发出去了（哪怕还没送到），不算超时
 		}
 		m.Overdue = true // 在锁内标记：并发两路（Pump/CheckTimers）只会有一路拿到这条超时
+		h.markDirtyLocked()
 		ps := "unknown"
 		if st, ok := h.peers[m.To]; ok {
 			ps = string(st)
@@ -813,6 +850,7 @@ func (h *Hub) markOverdueReplies() {
 		}
 		h.mu.Lock()
 		h.msgs = append(h.msgs, n)
+		h.markDirtyLocked()
 		h.mu.Unlock()
 		notices = append(notices, n)
 	}
@@ -898,6 +936,7 @@ func (h *Hub) trimLocked() (wake chan struct{}) {
 		h.msgs = append(h.msgs[:idx], h.msgs[idx+1:]...)
 		delete(h.outPlaced, gone.ID)
 		delete(h.inflight, gone.ID)
+		delete(h.injecting, gone.ID)
 		delete(h.takenAt, gone.ID)
 		delete(h.nextTry, gone.ID)
 		delete(h.fails, gone.ID)
@@ -907,6 +946,7 @@ func (h *Hub) trimLocked() (wake chan struct{}) {
 		delete(h.ackSeq, gone.ID)
 		delete(h.ackBase, gone.ID)
 		delete(h.deliveredAt, gone.ID)
+		h.releaseAttachLocked(&gone) // 被淘汰：附件文件也跟着清（正常早已释放，防漏网）
 		if h.removeFromOutboxLocked(gone.ID) {
 			touched = true
 		}
@@ -1071,8 +1111,22 @@ func (h *Hub) Send(m Message) (string, error) {
 	h.msgs = append(h.msgs, m) // 先以未签名入库；Sign 在锁外算，签完写回
 	// 这里不把被回复的请求标成 Answered：回复只有真正送达（pumpOne 成功 / MarkDelivered）
 	// 才算回了；发出后被拒/一直没送，原请求仍算欠回复。
+	h.markDirtyLocked()
 	wake := h.trimLocked()
 	h.mu.Unlock()
+
+	// 附件单独落盘：首次入库写一次 <StorePath>.files/<id>（0700/0600，原子写），
+	// 在 persist 之前写完并记 has_file，快照里 has_file=true 时文件一定已经在。
+	// 写失败只记日志：附件留在内存照常投递，只是重启后回不来（拿 FileSHA256 能查出来）。
+	if len(m.File) > 0 && h.storePath != "" {
+		if err := h.writeAttachFile(m.ID, m.File); err != nil {
+			h.logStoreError("attach_write", err)
+		} else {
+			h.mu.Lock()
+			h.hasFile[m.ID] = true
+			h.mu.Unlock()
+		}
+	}
 
 	// 签名挪到锁外：Sign（CA 私钥，可能是外部实现）不许持 h.mu 跑。
 	// 签名域含 ID，入库后不再改；期间消息若已被 reject/淘汰，写回自动跳过。
@@ -1090,7 +1144,7 @@ func (h *Hub) Send(m Message) (string, error) {
 		close(wake) // 淘汰顺带清了 outbox 条目，叫醒等待中的 TakeOutbox
 	}
 	h.logMsg(m)
-	h.persist() // 新消息入库（含附件）连同 trim 淘汰一起落盘
+	h.persist() // 新消息入库连同 trim 淘汰一起落盘（附件已单独写成文件，快照只记 has_file）
 	return m.ID, nil
 }
 
@@ -1126,9 +1180,11 @@ func (h *Hub) SetState(addr string, st PeerState) error {
 				delete(h.injectedAt, m.ID)
 				delete(h.ackSeq, m.ID)
 				delete(h.ackBase, m.ID)
+				delete(h.injecting, m.ID) // 注入半途对端退出：标记别再留到重启
 				// mac 侧已取走过：清掉痕迹让下一轮 Pump 能重新放进 outbox
 				delete(h.outPlaced, m.ID)
 				delete(h.takenAt, m.ID)
+				h.markDirtyLocked() // 附件没释放：退回 queued 还要靠它重投
 				evicted = append(evicted, *m)
 			}
 		}
@@ -1351,7 +1407,7 @@ func (h *Hub) Decide(id, action string) error {
 		if h.removeFromOutboxLocked(id) {
 			wake = h.flipWakeupLocked()
 		}
-		// 已结束：清退避/预算/取走跟踪，附件不再占内存
+		// 已结束：清退避/预算/取走跟踪/注入标记，附件连同磁盘文件一起释放
 		delete(h.takenAt, id)
 		delete(h.nextTry, id)
 		delete(h.fails, id)
@@ -1360,8 +1416,10 @@ func (h *Hub) Decide(id, action string) error {
 		delete(h.ackSeq, id)
 		delete(h.ackBase, id)
 		delete(h.deliveredAt, id)
-		cur.File = nil
+		delete(h.injecting, id)
+		h.releaseAttachLocked(cur)
 	}
+	h.markDirtyLocked()
 	out := *cur
 	h.mu.Unlock()
 
@@ -1369,7 +1427,7 @@ func (h *Hub) Decide(id, action string) error {
 		close(wake)
 	}
 	h.logMsg(out)
-	h.persist() // 决定后的状态/Now/Synced/附件清理落盘
+	h.persist() // 决定后的状态/Now/Synced/附件释放（删附件文件）落盘
 	return nil
 }
 
@@ -1429,7 +1487,9 @@ func (h *Hub) Redirect(id, to string) (string, error) {
 		delete(h.ackSeq, id)
 		delete(h.ackBase, id)
 		delete(h.deliveredAt, id)
-		cur.File = nil
+		delete(h.injecting, id)
+		h.releaseAttachLocked(cur) // 原消息结束：它的附件文件删掉（新消息那份由 Send 落）
+		h.markDirtyLocked()
 		cp := *cur
 		out = &cp
 	}
@@ -1441,7 +1501,7 @@ func (h *Hub) Redirect(id, to string) (string, error) {
 	if out != nil {
 		h.logMsg(*out)
 	}
-	h.persist() // 原消息 rejected（含改送原因）落盘
+	h.persist() // 原消息 rejected（含改送原因、删原附件文件）落盘
 	return newID, nil
 }
 
@@ -1456,6 +1516,7 @@ func (h *Hub) SetAuto(minutes int) error {
 	} else {
 		h.autoUntil = h.now().Add(time.Duration(minutes) * time.Minute)
 	}
+	h.markDirtyLocked()
 	h.mu.Unlock()
 	h.persist() // 自动模式开关落盘
 	return nil
@@ -1501,7 +1562,7 @@ func (h *Hub) TakeOutbox(ctx context.Context, to string) (Message, bool) {
 			h.ackBase[id] = h.peerSeq[to] // 置忙**之前**的版本号：MarkDelivered 后确认基准
 			h.setPeerLocked(to, PeerBusy) // 取走即算送出，置忙避免连发
 			h.mu.Unlock()
-			h.persist() // 对端置 busy 落盘（takenAt 不存，重启后由重放/确认收敛）
+			h.persist() // 对端置 busy 落盘（takenAt/ackBase 不存，重启后由重放/确认收敛）
 			return out, true
 		}
 		wake := h.wakeup
@@ -1533,6 +1594,7 @@ func (h *Hub) MarkDelivered(id string) error {
 		return fmt.Errorf("support: 消息 %s 当前状态 %s，不能确认送达", id, cur.State)
 	}
 	delete(h.takenAt, id)
+	delete(h.injecting, id) // mac 侧的注入由取件端完成，这里的确认即收尾，不留注入标记
 	if cur.Now {
 		h.finishDeliveredLocked(i)
 	} else {
@@ -1630,25 +1692,27 @@ func (h *Hub) pumpOne(ctx context.Context, id string) {
 		delete(h.outPlaced, id)
 		delete(h.takenAt, id)
 		h.msgs[i].Reason = unackedReason
+		h.markDirtyLocked() // Reason 进快照
 		cp := h.msgs[i]
 		reclaimed = &cp
 		m = cp
 	}
-	// 只对可送的对端推进非 Now 消息：idle 或失联的 busy；gone、没上报过的都按住。
+	// 每个早退分支：这一路只有 reclaim 改过落盘状态（Reason），没 reclaim 就什么都没改，
+	// 不调 persist——是否碰磁盘由 dirty 决定，不再序列化比字节。
 	if !m.Now && !h.peerReadyLocked(m.To) {
 		h.mu.Unlock()
 		if reclaimed != nil {
 			h.logMsg(*reclaimed)
+			h.persist() // reclaim 写的 Reason 落盘
 		}
-		h.persist() // 内容没变时不写盘；有 reclaim 的 Reason 改动则落盘
 		return
 	}
 	if next, ok := h.nextTry[id]; ok && h.now().Before(next) {
 		h.mu.Unlock() // 失败退避中，Now 也要遵守
 		if reclaimed != nil {
 			h.logMsg(*reclaimed)
+			h.persist()
 		}
-		h.persist()
 		return
 	}
 	needSync := m.Repo != "" && !m.Synced
@@ -1662,18 +1726,18 @@ func (h *Hub) pumpOne(ctx context.Context, id string) {
 			h.mu.Unlock()
 			if reclaimed != nil {
 				h.logMsg(*reclaimed)
+				h.persist()
 			}
-			h.persist()
 			return
 		}
-		h.lastProbe = now
+		h.lastProbe = now // lastProbe 不进快照，不用置 dirty
 	}
 	if h.inflight[id] {
 		h.mu.Unlock()
 		if reclaimed != nil {
 			h.logMsg(*reclaimed)
+			h.persist()
 		}
-		h.persist()
 		return
 	}
 	h.inflight[id] = true
@@ -1694,7 +1758,8 @@ func (h *Hub) pumpOne(ctx context.Context, id string) {
 		var out *Message
 		var rep *reportReq
 		if ctx.Err() != nil {
-			// 取消不是失败：状态、Reason、Synced 都不动
+			// 取消不是失败：状态、Reason、Synced 都不动；
+			// inflight 不进快照，这里没改任何落盘状态，末尾 persist 空转不写盘
 			delete(h.inflight, id)
 		} else {
 			if errors.Is(err, ErrLinkDown) {
@@ -1707,6 +1772,7 @@ func (h *Hub) pumpOne(ctx context.Context, id string) {
 				if err != nil {
 					if errors.Is(err, ErrLinkDown) {
 						h.msgs[j].Reason = linkDownReason
+						h.markDirtyLocked() // 已在暂停中时 enterPauseLocked 不再置 dirty，这里补
 					} else {
 						h.msgs[j].Reason = err.Error()
 						h.recordAttemptLocked(id, "sync", err)
@@ -1737,7 +1803,7 @@ func (h *Hub) pumpOne(ctx context.Context, id string) {
 		if out != nil {
 			h.logMsg(*out)
 		}
-		h.persist() // 同步结果（含暂停/预算状态）落盘；内容没变则不写
+		h.persist() // 同步结果（含暂停/预算状态）落盘；没置 dirty 就不碰磁盘
 		if rep != nil {
 			h.attachReport(rep, h.captureScreen(ctx, rep.addr))
 		}
@@ -1755,8 +1821,8 @@ func (h *Hub) pumpOne(ctx context.Context, id string) {
 			h.mu.Unlock()
 			if reclaimed != nil {
 				h.logMsg(*reclaimed)
+				h.persist()
 			}
-			h.persist()
 			return
 		}
 		var wake chan struct{}
@@ -1772,8 +1838,8 @@ func (h *Hub) pumpOne(ctx context.Context, id string) {
 		if wake != nil {
 			close(wake)
 		}
-		// 进 outbox 不算状态变化，也不置忙（被取走时才置），不写日志。
-		h.persist() // outbox/outPlaced 不进快照：内容没变时 saveLocked 不会递增序号
+		// 进 outbox 不算状态变化，也不置忙（被取走时才置），不写日志；
+		// outbox/outPlaced 不进快照，这一段没改任何落盘状态，不调 persist。
 		return
 	}
 
@@ -1781,9 +1847,13 @@ func (h *Hub) pumpOne(ctx context.Context, id string) {
 	// ① 送达期间对端若有新上报（比如钩子报了 idle/busy），回来后不能拿 busy/gone 覆盖掉；
 	// ② 同时作为 ack 基准（ackBase）：注入过程中到的钩子 busy 也是注入之后发生的，
 	// 注入成功时（markInjectedLocked）拿它比 hookBusySeq，已经忙过就直接落 delivered。
+	// ③ injecting：注入进行中的标记先落盘再调 Deliver——进程若在注入中途重启，
+	// 加载时撞上它就知道"可能已经送进去了"，转人工不盲目重投（见 loadStore）。
 	h.mu.Lock()
 	seq0 := h.peerSeq[m.To]
 	h.ackBase[id] = seq0
+	h.injecting[id] = true
+	h.markDirtyLocked()
 	h.mu.Unlock()
 
 	var err error
@@ -1817,10 +1887,12 @@ func (h *Hub) pumpOne(ctx context.Context, id string) {
 					h.setPeerLocked(m.To, PeerGone)
 				}
 				h.msgs[j].Reason = err.Error()
+				h.markDirtyLocked() // 对端在 Deliver 期间上报过状态时 setPeerLocked 不会走，这里补
 			} else if err != nil {
 				if errors.Is(err, ErrLinkDown) {
 					// 线路不通不算投递失败：不记 Attempt 不计次数，暂停等探测恢复
 					h.msgs[j].Reason = linkDownReason
+					h.markDirtyLocked() // 已在暂停中时 enterPauseLocked 不再置 dirty，这里补
 				} else {
 					h.msgs[j].Reason = err.Error()
 					h.recordAttemptLocked(id, "deliver", err)
@@ -1847,17 +1919,22 @@ func (h *Hub) pumpOne(ctx context.Context, id string) {
 				} else {
 					h.markInjectedLocked(j)
 				}
+				h.markDirtyLocked() // 注入阶段成功记一笔；即便 finish 早已置过 dirty 也无妨
 				cp := h.msgs[j]
 				out = &cp
 			}
 		} else if err == nil {
-			// 送达成功但这期间已被 reject/淘汰：状态不动，只写一条日志提示
+			// 送达成功但这期间已被 reject/淘汰：状态不动，只写一条日志提示；
+			// dirty 兜底——确保 injecting 标记被尽快带出快照，重启不误判"正在注入"
 			cp := h.msgs[j]
 			cp.Reason = deliveredWhileRejectedReason
 			out = &cp
+			h.markDirtyLocked()
 		}
 	}
 	delete(h.inflight, id)
+	delete(h.injecting, id) // 注入结束（成功、失败、被取消都算）：清掉进行中标记
+	h.markDirtyLocked()
 	h.mu.Unlock()
 	if out != nil {
 		h.logMsg(*out)

@@ -79,7 +79,7 @@ var tmuxSession = func() (string, error) {
 const usage = "用法：xxyi-msg send <收件人> [文字|-] [--file 路径] [--repo 名 --branch 名] [--kind request|notice|code] [--ask-user]" +
 	" | xxyi-msg reply <消息id> [文字|-] [--file 路径]" +
 	" | xxyi-msg inbox [n] | xxyi-msg who" +
-	" | xxyi-msg state busy|idle|gone [--check] | xxyi-msg mcp"
+	" | xxyi-msg state busy|idle|gone [--check|--start] | xxyi-msg mcp"
 
 // errNoSelfAddr 是 send 找不到自己地址时的提示。
 var errNoSelfAddr = errors.New("不知道自己的地址：请在 XXYI 的终端里运行，或设 XXYI_ADDR")
@@ -429,21 +429,96 @@ func formatPeers(peers map[string]string) string {
 	return strings.Join(lines, "\n")
 }
 
+// pathUnder 判 abs 是否落在 root 之下（含 root 自身）；两者都应是已解开符号链接的绝对路径。
+// root 之下的隐藏目录/文件（.ssh、.git、.env 等）一律不算：Claude 在家目录里启动时工作目录就是 ~，
+// 不能因此把凭据发出去。
+func pathUnder(root, abs string) bool {
+	rel, err := filepath.Rel(root, abs)
+	if err != nil {
+		return false
+	}
+	if rel == "." {
+		return true
+	}
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return false
+	}
+	for _, part := range strings.Split(rel, string(filepath.Separator)) {
+		if strings.HasPrefix(part, ".") {
+			return false
+		}
+	}
+	return true
+}
+
+// attachAllowedRoots 列附件允许位于的目录：当前工作目录与 ~/xxyi-work（工作目录一并解开符号链接）。
+// ~/xxyi-work 不存在时保留未解析路径——不存在也就判不中任何文件，行为一致。
+func attachAllowedRoots() ([]string, error) {
+	cwd, err := os.Getwd()
+	if err != nil {
+		return nil, err
+	}
+	cwd, err = filepath.EvalSymlinks(cwd)
+	if err != nil {
+		return nil, err
+	}
+	roots := []string{cwd}
+	if home, err := os.UserHomeDir(); err == nil {
+		work := filepath.Join(home, "xxyi-work")
+		if r, err := filepath.EvalSymlinks(work); err == nil {
+			work = r
+		}
+		roots = append(roots, work)
+	}
+	return roots, nil
+}
+
 // loadAttach 读附件并限长，返回文件名和内容；path 为空表示没有附件。
+// 位置限制：解开符号链接后必须落在当前工作目录或 ~/xxyi-work 之下（别把机器上任意路径的文件发出去）；
+// 必须是普通文件；超限用 io.LimitReader 兜底（读出来的长度说了算，不信 Stat）。
 func loadAttach(path string) (string, []byte, error) {
 	if path == "" {
 		return "", nil, nil
 	}
-	st, err := os.Stat(path)
+	abs, err := filepath.Abs(path)
+	if err == nil {
+		abs, err = filepath.EvalSymlinks(abs)
+	}
 	if err != nil {
 		return "", nil, fmt.Errorf("附件读不了：%w", err)
 	}
-	if st.Size() > maxAttachBytes {
-		return "", nil, fmt.Errorf("附件超过 1MB：%s（%d 字节）", path, st.Size())
+	roots, err := attachAllowedRoots()
+	if err != nil {
+		return "", nil, fmt.Errorf("附件路径检查失败：%w", err)
 	}
-	data, err := os.ReadFile(path)
+	ok := false
+	for _, root := range roots {
+		if pathUnder(root, abs) {
+			ok = true
+			break
+		}
+	}
+	if !ok {
+		return "", nil, fmt.Errorf("附件只能是当前项目目录或 ~/xxyi-work 下的文件：%s", path)
+	}
+	f, err := os.Open(abs)
 	if err != nil {
 		return "", nil, fmt.Errorf("附件读不了：%w", err)
+	}
+	defer f.Close()
+	st, err := f.Stat()
+	if err != nil {
+		return "", nil, fmt.Errorf("附件读不了：%w", err)
+	}
+	if !st.Mode().IsRegular() {
+		return "", nil, errors.New("附件必须是普通文件")
+	}
+	data, err := io.ReadAll(io.LimitReader(f, maxAttachBytes+1))
+	if err != nil {
+		return "", nil, fmt.Errorf("附件读不了：%w", err)
+	}
+	if len(data) > maxAttachBytes {
+		return "", nil, fmt.Errorf("附件超过 1MB：%s", path)
 	}
 	return filepath.Base(path), data, nil
 }
@@ -752,6 +827,33 @@ func stopHookActive(ctx context.Context, stdin io.Reader) (active bool, ok bool)
 	}
 }
 
+// sessionSourceCompact 是 SessionStart 钩子 JSON 的 source 之一：上下文压缩触发的"重新开始"。
+const sessionSourceCompact = "compact"
+
+// sessionStartSource 读 SessionStart 钩子塞进来的 JSON，取 source。
+// 读法同 stopHookActive：goroutine 里限时读，读不到返回空串（照常上报状态）。
+func sessionStartSource(ctx context.Context, stdin io.Reader) string {
+	readCtx, cancel := context.WithTimeout(ctx, stopHookWait)
+	defer cancel()
+	ch := make(chan string, 1)
+	go func() {
+		var h struct {
+			Source string `json:"source"`
+		}
+		if json.NewDecoder(stdin).Decode(&h) != nil {
+			ch <- ""
+			return
+		}
+		ch <- h.Source
+	}()
+	select {
+	case got := <-ch:
+		return got
+	case <-readCtx.Done():
+		return ""
+	}
+}
+
 // blockJSON 是 stop hook 的拒绝响应（一行 JSON）：reason 里逐条列出欠回复的请求。
 func blockJSON(un []inboxMessage) string {
 	items := make([]string, 0, len(un))
@@ -769,15 +871,20 @@ func blockJSON(un []inboxMessage) string {
 }
 
 // cmdState 给 Claude Code 钩子用：任何错误都静默退出 0，总耗时不超过 stateDeadline。
-// 只有 "idle --check" 才读标准输入（拿 stop_hook_active 决定要不要让服务端查欠回复）；
+// 只有 "idle --check" 才读标准输入拿 stop_hook_active（决定要不要让服务端查欠回复）；
+// "--start"（SessionStart 钩子用）也读标准输入取 source：compact 是压缩中途，
+// Claude 正在干活，什么都不做退出 0；其余（startup/resume/clear/读不到）照常上报；
 // 其余情况绝不碰标准输入，免得等 EOF 卡住钩子。
 func cmdState(args []string, stdin io.Reader, stdout io.Writer) int {
 	state := ""
 	check := false
+	start := false
 	for _, a := range args {
 		switch a {
 		case "--check":
 			check = true
+		case "--start":
+			start = true
 		case stateBusy, stateIdle, stateGone:
 			if state != "" {
 				return exitOK // 给了两个状态值：当参数不合法处理
@@ -792,6 +899,9 @@ func cmdState(args []string, stdin io.Reader, stdout io.Writer) int {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), stateDeadline)
 	defer cancel()
+	if start && sessionStartSource(ctx, stdin) == sessionSourceCompact {
+		return exitOK // 压缩触发的 SessionStart：不上报状态，免得把干活中的 Claude 记成空闲
+	}
 	from, err := selfAddr()
 	if err != nil {
 		return exitOK

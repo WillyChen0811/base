@@ -179,6 +179,7 @@ func TestUbuntuSend(t *testing.T) {
 	if err := os.WriteFile(file, []byte("附件内容"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	t.Chdir(dir) // 附件必须在当前工作目录下
 
 	out := &bytes.Buffer{}
 	// 选项写在位置参数前面也要能解析
@@ -508,6 +509,7 @@ func TestSendArgValidation(t *testing.T) {
 	if err := os.WriteFile(big, bytes.Repeat([]byte("x"), maxAttachBytes+1), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	t.Chdir(dir) // 附件必须在当前工作目录下，才能走到"超限"这一步
 	errOut := &bytes.Buffer{}
 	n := cap.count()
 	if code := run([]string{"send", "mac:boss", "hi", "--file", big}, strings.NewReader(""), io.Discard, errOut); code != exitErr {
@@ -645,6 +647,7 @@ func TestReplyCommand(t *testing.T) {
 	if err := os.WriteFile(file, []byte("附件"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	t.Chdir(dir) // 附件必须在当前工作目录下
 	out.Reset()
 	if code := run([]string{"reply", "ab12", "-", "--file", file}, strings.NewReader("管道正文\n"), out, io.Discard); code != exitOK {
 		t.Fatalf("退出码 %d", code)
@@ -899,9 +902,133 @@ func TestStateGoneAndBadArgs(t *testing.T) {
 	if got := cap.last(t); !strings.Contains(got.query, "state=gone") {
 		t.Errorf("state 请求 %s?%s", got.path, got.query)
 	}
-	for _, args := range [][]string{{"state"}, {"state", "asleep"}, {"state", "busy", "idle"}, {"state", "--check"}} {
+	for _, args := range [][]string{{"state"}, {"state", "asleep"}, {"state", "busy", "idle"}, {"state", "--check"}, {"state", "--start"}} {
 		if code := run(args, strings.NewReader(`{"stop_hook_active":false}`), io.Discard, io.Discard); code != exitOK {
 			t.Errorf("%v 退出码 %d", args, code)
+		}
+	}
+}
+
+// --start（SessionStart 钩子）：source 是 compact（压缩中途）时什么都不做、不发请求；
+// startup/resume/clear/读不到都照常上报 idle。
+func TestStateStartCompactSkips(t *testing.T) {
+	var cap captured
+	srv := httptest.NewServer(cap.handler())
+	defer srv.Close()
+	useEndpoint(t, srv.URL)
+	t.Setenv("XXYI_ADDR", "ubuntu:cw")
+
+	if code := run([]string{"state", "idle", "--start"}, strings.NewReader(`{"source":"compact"}`), io.Discard, io.Discard); code != exitOK {
+		t.Fatalf("compact 退出码 %d", code)
+	}
+	if n := cap.count(); n != 0 {
+		t.Errorf("compact 时不该发请求，已发 %d", n)
+	}
+
+	for _, src := range []string{"startup", "resume", "clear"} {
+		if code := run([]string{"state", "idle", "--start"}, strings.NewReader(`{"source":"`+src+`"}`), io.Discard, io.Discard); code != exitOK {
+			t.Fatalf("%s 退出码 %d", src, code)
+		}
+		got := cap.last(t)
+		if got.path != "/msg/state" || !strings.Contains(got.query, "state=idle") {
+			t.Errorf("%s 请求 %s?%s", src, got.path, got.query)
+		}
+	}
+
+	// 标准输入不关（读不到钩子 JSON）：等满限时后照常上报
+	pr, pw := io.Pipe()
+	t.Cleanup(func() { pw.Close() })
+	if code := run([]string{"state", "idle", "--start"}, pr, io.Discard, io.Discard); code != exitOK {
+		t.Fatalf("读不到 JSON 退出码 %d", code)
+	}
+	if got := cap.last(t); !strings.Contains(got.query, "state=idle") {
+		t.Errorf("读不到 JSON 时该照常上报：%s?%s", got.path, got.query)
+	}
+}
+
+// 附件位置限制：只能是当前工作目录或 ~/xxyi-work 之下、必须普通文件；超限的报错文案不变。
+func TestAttachPathRestrictions(t *testing.T) {
+	var cap captured
+	srv := httptest.NewServer(cap.handler())
+	defer srv.Close()
+	useEndpoint(t, srv.URL)
+	t.Setenv("XXYI_ADDR", "ubuntu:cw")
+
+	proj := t.TempDir()
+	t.Chdir(proj)
+	outside := t.TempDir()
+	outsideFile := filepath.Join(outside, "out.txt")
+	if err := os.WriteFile(outsideFile, []byte("外面"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	n := cap.count()
+	errOut := &bytes.Buffer{}
+	if code := run([]string{"send", "mac:boss", "hi", "--file", outsideFile}, strings.NewReader(""), io.Discard, errOut); code != exitErr {
+		t.Fatalf("工作目录外附件退出码 %d", code)
+	}
+	if !strings.Contains(errOut.String(), "附件只能是当前项目目录或 ~/xxyi-work 下的文件") {
+		t.Errorf("stderr %q", errOut.String())
+	}
+	if cap.count() != n {
+		t.Errorf("附件被拦下不该发请求，已发 %d", cap.count()-n)
+	}
+
+	// 符号链接指向目录外：解开后拦下
+	link := filepath.Join(proj, "link.txt")
+	if err := os.Symlink(outsideFile, link); err != nil {
+		t.Fatal(err)
+	}
+	errOut.Reset()
+	if code := run([]string{"send", "mac:boss", "hi", "--file", link}, strings.NewReader(""), io.Discard, errOut); code != exitErr {
+		t.Fatalf("指向目录外的符号链接退出码 %d", code)
+	}
+	if !strings.Contains(errOut.String(), "附件只能是当前项目目录或 ~/xxyi-work 下的文件") {
+		t.Errorf("符号链接 stderr %q", errOut.String())
+	}
+
+	// /dev/null：设备文件。工作目录设在 / 让位置检查先放行，才能验到"必须普通文件"这一步
+	t.Chdir("/")
+	errOut.Reset()
+	if code := run([]string{"send", "mac:boss", "hi", "--file", "/dev/null"}, strings.NewReader(""), io.Discard, errOut); code != exitErr {
+		t.Fatalf("/dev/null 退出码 %d", code)
+	}
+	if !strings.Contains(errOut.String(), "附件必须是普通文件") {
+		t.Errorf("/dev/null stderr %q", errOut.String())
+	}
+
+	// 工作目录下的普通文件通过（相对路径也行）
+	t.Chdir(proj)
+	okFile := filepath.Join(proj, "ok.txt")
+	if err := os.WriteFile(okFile, []byte("好的"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	out := &bytes.Buffer{}
+	if code := run([]string{"send", "mac:boss", "hi", "--file", "ok.txt"}, strings.NewReader(""), out, io.Discard); code != exitOK {
+		t.Fatalf("正常附件退出码 %d，输出 %q", code, out.String())
+	}
+	got := cap.last(t)
+	if got.body.FileName != "ok.txt" || string(got.body.File) != "好的" {
+		t.Errorf("附件 %q %q", got.body.FileName, got.body.File)
+	}
+}
+
+func TestPathUnderRejectsHidden(t *testing.T) {
+	cases := []struct {
+		abs  string
+		want bool
+	}{
+		{"/home/u", true},
+		{"/home/u/proj/a.txt", true},
+		{"/home/u/.ssh/id_ed25519", false},
+		{"/home/u/proj/.env", false},
+		{"/home/u/proj/.git/config", false},
+		{"/home/other/a.txt", false},
+		{"/home/u/..x/a.txt", false},
+	}
+	for _, c := range cases {
+		if got := pathUnder("/home/u", c.abs); got != c.want {
+			t.Errorf("pathUnder(/home/u, %s) = %v，应为 %v", c.abs, got, c.want)
 		}
 	}
 }

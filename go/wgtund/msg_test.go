@@ -187,6 +187,135 @@ func TestMsgBridgeDeliver(t *testing.T) {
 	}
 }
 
+// 用真 sh 跑 deliverCmd，tmux 换成 t.TempDir() 里的假脚本（PATH 顶在前，并断言 LookPath 命中它，
+// 防止误调真 tmux）。覆盖：前台 claude/node/版本号→放行粘贴；bash→退 9 拦下且正文已删；
+// 查询失败→退 1 带 tmux 原话、不粘贴；Now→不查前台直接粘贴。
+func TestDeliverCmdRealScript(t *testing.T) {
+	dir := t.TempDir()
+	fake := filepath.Join(dir, "tmux")
+	logPath := filepath.Join(dir, "tmux.log")
+	script := `#!/bin/sh
+printf '%s\n' "$*" >> "$FAKE_LOG"
+case "$*" in
+*display-message*)
+	if [ "$FAKE_FAIL" = 1 ]; then
+		echo "can't find session: claude" >&2
+		exit 1
+	fi
+	printf '%s\n' "$FAKE_PANE"
+	;;
+esac
+exit 0
+`
+	if err := os.WriteFile(fake, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("TMUX", "")
+	t.Setenv("TMUX_PANE", "")
+	if got, err := exec.LookPath("tmux"); err != nil || got != fake {
+		t.Fatalf("tmux 必须解析到假脚本 %s，得到 %q（err=%v）——宁可中止也不碰真 tmux", fake, got, err)
+	}
+
+	logText := func() string {
+		b, err := os.ReadFile(logPath)
+		if err != nil {
+			return ""
+		}
+		return string(b)
+	}
+	// runDeliver 备好正文文件、拼命令、经 sh 真跑；返回合并输出和退出码。
+	runDeliver := func(t *testing.T, m support.Message, paneProg string, queryFails bool) (string, int) {
+		t.Helper()
+		if err := os.WriteFile(logPath, nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		msgPath := filepath.Join(dir, m.ID+".txt")
+		if err := os.WriteFile(msgPath, []byte("正文"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		paste, err := tmux.PasteCommand("claude", "xxyi-"+m.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		pane := ""
+		if !m.Now {
+			if pane, err = tmux.PaneCommandCommand("claude"); err != nil {
+				t.Fatal(err)
+			}
+		}
+		fail := "0"
+		if queryFails {
+			fail = "1"
+		}
+		cmd := exec.Command("sh", "-c", deliverCmd(m, paste, pane, msgPath))
+		cmd.Dir = dir
+		cmd.Env = append(os.Environ(), "FAKE_LOG="+logPath, "FAKE_PANE="+paneProg, "FAKE_FAIL="+fail)
+		out, err := cmd.CombinedOutput()
+		code := 0
+		if err != nil {
+			var ee *exec.ExitError
+			if !errors.As(err, &ee) {
+				t.Fatalf("sh 执行失败：%v", err)
+			}
+			code = ee.ExitCode()
+		}
+		return string(out), code
+	}
+	pasted := func() bool { return strings.Contains(logText(), "paste-buffer") }
+
+	for _, prog := range []string{"claude", "node", "2.1.296"} {
+		out, code := runDeliver(t, support.Message{
+			ID: "ok", From: "mac:x", To: "ubuntu:claude", Text: "hi",
+		}, prog, false)
+		if code != 0 {
+			t.Errorf("前台 %s 应退出 0，得到 %d：%s", prog, code, out)
+		}
+		if !pasted() {
+			t.Errorf("前台 %s 应发生粘贴，日志：%s", prog, logText())
+		}
+	}
+
+	// bash：退 9 带标记，不粘贴，正文文件已删
+	out, code := runDeliver(t, support.Message{ID: "bad", From: "mac:x", To: "ubuntu:claude", Text: "hi"}, "bash", false)
+	if code != 9 {
+		t.Fatalf("前台 bash 应退出 9，得到 %d：%s", code, out)
+	}
+	if !strings.Contains(out, "XXYI_NOTCLAUDE bash") {
+		t.Errorf("输出要含标记和程序名：%q", out)
+	}
+	if pasted() {
+		t.Errorf("bash 不该粘贴，日志：%s", logText())
+	}
+	if _, err := os.Stat(filepath.Join(dir, "bad.txt")); err == nil {
+		t.Error("拦下时正文文件应已删掉")
+	}
+
+	// 查询失败（会话不存在）：退 1 带 tmux 原话，不算"不是 Claude"、不粘贴
+	out, code = runDeliver(t, support.Message{ID: "ff", From: "mac:x", To: "ubuntu:claude", Text: "hi"}, "claude", true)
+	if code != 1 {
+		t.Fatalf("查询失败应退出 1，得到 %d：%s", code, out)
+	}
+	if !strings.Contains(out, "can't find session") {
+		t.Errorf("输出要带 tmux 原话：%q", out)
+	}
+	if pasted() {
+		t.Errorf("查询失败不该粘贴，日志：%s", logText())
+	}
+
+	// Now：不查前台程序，直接粘贴
+	out, code = runDeliver(t, support.Message{ID: "now", From: "mac:x", To: "ubuntu:claude", Text: "hi", Now: true}, "claude", false)
+	if code != 0 {
+		t.Fatalf("Now 应退出 0，得到 %d：%s", code, out)
+	}
+	if !pasted() {
+		t.Errorf("Now 该直接粘贴，日志：%s", logText())
+	}
+	if strings.Contains(logText(), "display-message") {
+		t.Errorf("Now 不该查前台程序，日志：%s", logText())
+	}
+}
+
 // ── 真 git 仓库的 Sync ──────────────────────────────
 
 func gitSh(t *testing.T, dir string, args ...string) string {

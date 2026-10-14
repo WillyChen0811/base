@@ -130,8 +130,11 @@ func (b *msgBridge) Sync(ctx context.Context, m support.Message) error {
 // notClaudeMark 是注入包装命令在"窗格里不是 Claude"时打印的标记（配合退出码 9）。
 const notClaudeMark = "XXYI_NOTCLAUDE"
 
-// deliverCmd 拼注入命令：非立即送达时先查窗格前台程序，
-// 不是 claude/node 就删掉正文文件、打印标记并以 9 退出（不进粘贴）；
+// deliverCmd 拼注入命令：非立即送达时先查窗格前台程序——
+// 查询本身失败（会话不存在等）不能当成"不是 Claude"：stderr 并进输出后原样打印并以 1 退出，
+// 走普通的注入失败分支，错误里带 tmux 原话；
+// 放行 claude、node 和形如版本号的名字（[0-9]*.[0-9]*.[0-9]*，有的发行版前台进程名就是版本号）；
+// 其余删掉正文文件、打印标记并以 9 退出（不进粘贴）；
 // 然后括号粘贴正文、删正文文件，退出码取粘贴的结果。
 // Now（用户点了立即送达）不查前台程序，pane 传空串。
 func deliverCmd(m support.Message, paste, pane, msgPath string) string {
@@ -140,7 +143,8 @@ func deliverCmd(m support.Message, paste, pane, msgPath string) string {
 	if m.Now {
 		return body
 	}
-	check := "c=$(" + pane + " 2>/dev/null); case \"$c\" in claude|node) ;; *) rm -f " + q +
+	check := "c=$(" + pane + " 2>&1) || { printf '%s\\n' \"$c\"; exit 1; };" +
+		" case \"$c\" in claude|node|[0-9]*.[0-9]*.[0-9]*) ;; *) rm -f " + q +
 		"; printf '" + notClaudeMark + " %s\\n' \"$c\"; exit 9;; esac; "
 	return check + body
 }
@@ -157,8 +161,8 @@ func paneProgOfNotClaude(out []byte) (string, bool) {
 
 // Deliver 把发往 ubuntu:<会话> 的消息注入 tmux：附件放收件箱，正文（support.Display 统一格式）
 // 写成临时文件，经括号粘贴喂进会话后立即删掉临时文件。
-// 非立即送达时先确认窗格里跑的是 Claude（claude/node），不是就报 ErrPeerNotClaude。
-// 会话不存在时 tmux 的报错原样带上。
+// 非立即送达时先确认窗格里跑的是 Claude（claude/node/版本号样的名字），不是就报 ErrPeerNotClaude；
+// 前台程序查询本身失败（如会话不存在）按普通注入失败报错，tmux 的原话原样带上。
 func (b *msgBridge) Deliver(ctx context.Context, m support.Message) error {
 	// 开头就套超时：写文件和执行命令共用，协助 Stop / Hub 取消时不会卡在 SFTP 上
 	ctx, cancel := context.WithTimeout(ctx, msgRunTimeout)

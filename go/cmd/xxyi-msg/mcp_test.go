@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -355,5 +357,51 @@ func TestMCPBadJSONAndUnknownMethod(t *testing.T) {
 func TestMCPEOIReturnsNil(t *testing.T) {
 	if err := serveMCP(strings.NewReader(""), &bytes.Buffer{}); err != nil {
 		t.Fatalf("空输入应返回 nil，得到 %v", err)
+	}
+}
+
+// file_path 与命令行共用 loadAttach：目录外的附件 isError 且不发消息，工作目录下的正常通过。
+func TestMCPAttachPathRestriction(t *testing.T) {
+	var cap captured
+	srv := httptest.NewServer(cap.handler())
+	defer srv.Close()
+	useEndpoint(t, srv.URL)
+	t.Setenv("XXYI_ADDR", "ubuntu:cw")
+
+	proj := t.TempDir()
+	t.Chdir(proj)
+	good := filepath.Join(proj, "a.txt")
+	if err := os.WriteFile(good, []byte("A"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	outsideFile := filepath.Join(t.TempDir(), "b.txt")
+	if err := os.WriteFile(outsideFile, []byte("B"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	resps := mcpRound(t,
+		mcpCall(1, "tools/call", map[string]any{"name": "xxyi_send", "arguments": map[string]any{
+			"to": "mac:boss", "kind": "notice", "text": "带附件", "file_path": good,
+		}})+
+			mcpCall(2, "tools/call", map[string]any{"name": "xxyi_reply", "arguments": map[string]any{
+				"id": "id42", "text": "带目录外附件", "file_path": outsideFile,
+			}}))
+	if len(resps) != 2 {
+		t.Fatalf("回应条数 %d", len(resps))
+	}
+	text, isErr := mcpResultText(t, resps[0])
+	if isErr {
+		t.Fatalf("工作目录内附件该通过：%q", text)
+	}
+	got := cap.last(t)
+	if got.body.FileName != "a.txt" || string(got.body.File) != "A" {
+		t.Errorf("附件 %q %q", got.body.FileName, got.body.File)
+	}
+	text, isErr = mcpResultText(t, resps[1])
+	if !isErr || !strings.Contains(text, "附件只能是当前项目目录或 ~/xxyi-work 下的文件") {
+		t.Errorf("目录外附件 %q isError=%v", text, isErr)
+	}
+	if n := cap.count(); n != 1 {
+		t.Errorf("目录外附件不该发请求，共收到 %d", n)
 	}
 }

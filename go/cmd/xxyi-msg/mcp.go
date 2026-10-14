@@ -127,7 +127,7 @@ var mcpTools = []map[string]any{
 				"text":      map[string]any{"type": "string", "description": "消息正文，要自包含"},
 				"repo":      map[string]any{"type": "string", "description": "kind=code 时的仓库名"},
 				"branch":    map[string]any{"type": "string", "description": "kind=code 时的分支名"},
-				"file_path": map[string]any{"type": "string", "description": "可选附件的本地路径，上限 1MB"},
+				"file_path": map[string]any{"type": "string", "description": "可选附件的本地路径：只能是当前项目目录或 ~/xxyi-work 下的普通文件，上限 1MB"},
 				"ask_user":  map[string]any{"type": "boolean", "description": "涉及需要用户决定的事设 true"},
 			},
 			"required": []string{"to", "kind", "text"},
@@ -141,7 +141,7 @@ var mcpTools = []map[string]any{
 			"properties": map[string]any{
 				"id":        map[string]any{"type": "string", "description": "被回复的请求的消息 id"},
 				"text":      map[string]any{"type": "string", "description": "回复正文"},
-				"file_path": map[string]any{"type": "string", "description": "可选附件的本地路径，上限 1MB"},
+				"file_path": map[string]any{"type": "string", "description": "可选附件的本地路径：只能是当前项目目录或 ~/xxyi-work 下的普通文件，上限 1MB"},
 			},
 			"required": []string{"id", "text"},
 		},

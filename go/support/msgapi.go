@@ -172,7 +172,8 @@ func unansweredBrief(ms []Message) []unansweredItem {
 }
 
 // msgState 是 POST /msg/state?addr=&state=busy|idle|gone[&check=1]；addr 必须是本侧地址。
-// check=1 且上报 idle 时先自查欠回复：还有没回复的请求就不改状态，把欠的列回去。
+// check=1 且上报 idle 时先自查欠回复（NagUnanswered）：还有还能提醒的欠回复就不改状态，
+// 把欠的列回去；每条欠回复最多提醒 nagMax 次，提醒满了就不再拦着上报 idle。
 func (s *Service) msgState(side string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		q := r.URL.Query()
@@ -183,7 +184,7 @@ func (s *Service) msgState(side string) http.HandlerFunc {
 		}
 		st := PeerState(q.Get("state"))
 		if st == PeerIdle && q.Get("check") == "1" {
-			if un := s.hub.Unanswered(addr); len(un) > 0 {
+			if un := s.hub.NagUnanswered(addr); len(un) > 0 {
 				writeJSON(w, http.StatusOK, map[string]any{"ok": true, "unanswered": unansweredBrief(un)})
 				return
 			}

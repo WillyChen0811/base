@@ -25,6 +25,7 @@ const (
 
 // PeerState 是对端上报的忙闲状态。只有明确上报过 idle 的地址才允许送非 Now 消息；
 // busy、gone（对方窗口里不是 Claude）、以及没上报过的地址都按住。
+// busy 超过 busyStale 没再变化视为失联，按可送处理（见 peerReadyLocked）。
 type PeerState string
 
 const (
@@ -82,6 +83,10 @@ const (
 	unackedTakeTimeout = 60 * time.Second // 出站消息被取走后多久没确认送达就重新排队
 	backoffBase        = 2 * time.Second  // Deliver 失败退避基数
 	backoffMax         = 60 * time.Second // Deliver 失败退避上限
+
+	busyStale = 15 * time.Minute // busy 这么久没再变化视为失联，非 Now 消息按可送处理
+	nagMax    = 2                // 单条欠回复请求经 NagUnanswered 提醒的次数上限
+	nagWindow = 24 * time.Hour   // 欠回复提醒窗口，创建超过窗口的不再提醒
 )
 
 // unackedReason 是取走后超时未确认写进 Reason 的提示语。
@@ -168,8 +173,11 @@ type Hub struct {
 	nextTry   map[string]time.Time // Deliver 失败后的下次可重试时间（指数退避）
 	fails     map[string]int       // Deliver 连续失败次数，退避用
 	peers     map[string]PeerState
-	autoUntil time.Time     // 零值表示自动模式关闭
-	wakeup    chan struct{} // outbox 有变化或 SetState 时翻转，唤醒长轮询的 TakeOutbox
+	peerAt    map[string]time.Time // 对端状态最近一次变化的时间（busy 失联判定用）
+	peerSeq   map[string]uint64    // 对端状态版本号：送达期间有新上报就不覆盖对方状态
+	nagged    map[string]int       // 单条欠回复请求已提醒过的次数（NagUnanswered 用）
+	autoUntil time.Time            // 零值表示自动模式关闭
+	wakeup    chan struct{}        // outbox 有变化或 SetState 时翻转，唤醒长轮询的 TakeOutbox
 }
 
 // NewHub 新建一个空的 Hub。
@@ -183,6 +191,9 @@ func NewHub(cfg HubConfig) *Hub {
 		nextTry:   make(map[string]time.Time),
 		fails:     make(map[string]int),
 		peers:     make(map[string]PeerState),
+		peerAt:    make(map[string]time.Time),
+		peerSeq:   make(map[string]uint64),
+		nagged:    make(map[string]int),
 		wakeup:    make(chan struct{}),
 	}
 }
@@ -206,6 +217,38 @@ func (h *Hub) logMsg(m Message) {
 		"state":  string(m.State),
 		"reason": m.Reason,
 	})
+}
+
+// setPeerLocked 更新对端状态并盖时间戳、版本号（版本号每次变化 +1）；调用方须持锁。
+func (h *Hub) setPeerLocked(addr string, st PeerState) {
+	h.peers[addr] = st
+	h.peerAt[addr] = h.now()
+	h.peerSeq[addr]++
+}
+
+// peerReadyLocked 判断能否给 addr 送非 Now 消息：上报过 idle 可送；
+// busy 超过 busyStale 视为失联（进程挂了/忘了报），也按可送处理；
+// gone 与没上报过仍按住。调用方须持锁。
+func (h *Hub) peerReadyLocked(addr string) bool {
+	switch h.peers[addr] {
+	case PeerIdle:
+		return true
+	case PeerBusy:
+		return h.now().Sub(h.peerAt[addr]) > busyStale
+	default: // gone、没上报过
+		return false
+	}
+}
+
+// markAnsweredLocked 把一条已送达回复指向的原请求标成已回复；原请求已被淘汰就算了。
+// 只有回复真正送达时才调；调用方须持锁。
+func (h *Hub) markAnsweredLocked(reply Message) {
+	if reply.Kind != KindReply || reply.ReplyTo == "" {
+		return
+	}
+	if j := h.findLocked(reply.ReplyTo); j >= 0 {
+		h.msgs[j].Answered = true
+	}
 }
 
 // findLocked 按 ID 找消息下标，找不到返回 -1。调用方须持锁。
@@ -263,6 +306,7 @@ func (h *Hub) trimLocked() (wake chan struct{}) {
 		delete(h.takenAt, gone.ID)
 		delete(h.nextTry, gone.ID)
 		delete(h.fails, gone.ID)
+		delete(h.nagged, gone.ID)
 		if h.removeFromOutboxLocked(gone.ID) {
 			touched = true
 		}
@@ -306,6 +350,9 @@ func (h *Hub) Send(m Message) (string, error) {
 		if orig.To != m.From {
 			return "", fmt.Errorf("support: #%s 不是发给 %s 的，不能回复", m.ReplyTo, m.From)
 		}
+		if orig.State != MsgDelivered {
+			return "", fmt.Errorf("support: #%s 还没送达，不能回复", m.ReplyTo)
+		}
 		// 收件人默认就是原请求的发件人；显式给了别的地址等于凭空换人，拒收。
 		if m.To == "" {
 			m.To = orig.From
@@ -317,6 +364,9 @@ func (h *Hub) Send(m Message) (string, error) {
 	}
 	if m.Kind == KindCode && (m.Repo == "" || m.Branch == "") {
 		return "", fmt.Errorf("support: 交代码（code）必须带仓库和分支")
+	}
+	if m.Kind == KindReply && (m.Repo != "" || m.Branch != "") {
+		return "", fmt.Errorf("support: 回复不能带仓库和分支，交代码请用 code")
 	}
 	if err := ValidAddr(m.From); err != nil {
 		return "", err
@@ -393,10 +443,8 @@ func (h *Hub) Send(m Message) (string, error) {
 		m.State = MsgPending
 	}
 	h.msgs = append(h.msgs, m)
-	// 把被回复的请求标成已回复；这期间被淘汰了就就算了，不报错。
-	if j := h.findLocked(m.ReplyTo); j >= 0 {
-		h.msgs[j].Answered = true
-	}
+	// 这里不把被回复的请求标成 Answered：回复只有真正送达（pumpOne 成功 / MarkDelivered）
+	// 才算回了；发出后被拒/一直没送，原请求仍算欠回复。
 	wake := h.trimLocked()
 	h.mu.Unlock()
 
@@ -418,7 +466,7 @@ func (h *Hub) SetState(addr string, st PeerState) error {
 		return fmt.Errorf("support: 未知对端状态 %q", st)
 	}
 	h.mu.Lock()
-	h.peers[addr] = st
+	h.setPeerLocked(addr, st)
 	wake := h.flipWakeupLocked()
 	h.mu.Unlock()
 	close(wake)
@@ -503,6 +551,25 @@ func (h *Hub) Unanswered(addr string) []Message {
 	h.mu.Unlock()
 	for i := range out {
 		out[i].File = nil
+	}
+	return out
+}
+
+// NagUnanswered 从 Unanswered(addr) 里挑出还能提醒的：已提醒次数没到 nagMax、
+// 且创建时间在 nagWindow 之内的，每条计数加一后返回。超窗或提醒够数的不再打扰，
+// 调用方（界面轮询）反复调也只会在每条上限内返回。
+func (h *Hub) NagUnanswered(addr string) []Message {
+	un := h.Unanswered(addr)
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	now := h.now()
+	var out []Message
+	for _, m := range un {
+		if h.nagged[m.ID] >= nagMax || now.Sub(m.Created) > nagWindow {
+			continue
+		}
+		h.nagged[m.ID]++
+		out = append(out, m)
 	}
 	return out
 }
@@ -637,7 +704,7 @@ func (h *Hub) AutoUntil() time.Time {
 func (h *Hub) TakeOutbox(ctx context.Context, to string) (Message, bool) {
 	for {
 		h.mu.Lock()
-		ready := h.peers[to] == PeerIdle // 只有上报过 idle 才算可送；busy/gone/没上报都按住
+		ready := h.peerReadyLocked(to) // idle 可送；失联的 busy 也可送；gone/没上报按住
 		for k := 0; k < len(h.outbox); k++ {
 			id := h.outbox[k]
 			i := h.findLocked(id)
@@ -651,12 +718,12 @@ func (h *Hub) TakeOutbox(ctx context.Context, to string) (Message, bool) {
 				continue // outbox 是全局队列，只取发给本收件人的
 			}
 			if !ready && !h.msgs[i].Now {
-				continue // 对方没上报 idle（busy/gone/没上报），非 now 的按住
+				continue // 对方不可送（busy 未失联/gone/没上报），非 now 的按住
 			}
 			out := h.msgs[i]
 			h.outbox = append(h.outbox[:k], h.outbox[k+1:]...)
-			h.takenAt[id] = h.now() // 记取走时间，超时未确认由 pumpOne 重新排队
-			h.peers[to] = PeerBusy  // 取走即算送出，置忙避免连发
+			h.takenAt[id] = h.now()       // 记取走时间，超时未确认由 pumpOne 重新排队
+			h.setPeerLocked(to, PeerBusy) // 取走即算送出，置忙避免连发
 			h.mu.Unlock()
 			return out, true
 		}
@@ -688,6 +755,8 @@ func (h *Hub) MarkDelivered(id string) error {
 	delete(h.nextTry, id)
 	delete(h.fails, id)
 	cur.File = nil // 已结束，附件不再占内存
+	// 回复确认送达，原请求才算真被回了；原请求已被淘汰就算了
+	h.markAnsweredLocked(*cur)
 	out := *cur
 	h.mu.Unlock()
 
@@ -745,8 +814,8 @@ func (h *Hub) pumpOne(ctx context.Context, id string) {
 		reclaimed = &cp
 		m = cp
 	}
-	// 只有明确上报过 idle 的对端才送非 Now 消息：busy、gone、以及没上报过的都按住。
-	if !m.Now && h.peers[m.To] != PeerIdle {
+	// 只对可送的对端推进非 Now 消息：idle 或失联的 busy；gone、没上报过的都按住。
+	if !m.Now && !h.peerReadyLocked(m.To) {
 		h.mu.Unlock()
 		if reclaimed != nil {
 			h.logMsg(*reclaimed)
@@ -817,7 +886,7 @@ func (h *Hub) pumpOne(ctx context.Context, id string) {
 		h.mu.Lock()
 		// 与取件端一致的闸门：对端不是 idle 时非 Now 消息不进 outbox，
 		// 等它回 idle 后由下一次 Pump 重新放进来。
-		if !m.Now && h.peers[m.To] != PeerIdle {
+		if !m.Now && !h.peerReadyLocked(m.To) {
 			delete(h.inflight, id)
 			h.mu.Unlock()
 			if reclaimed != nil {
@@ -842,6 +911,12 @@ func (h *Hub) pumpOne(ctx context.Context, id string) {
 		return
 	}
 
+	// 记下调用 Deliver 前的对端状态版本号：送达期间对端若有新上报（比如钩子报了 idle），
+	// 回来后不能拿 busy 把人覆盖掉。
+	h.mu.Lock()
+	seq0 := h.peerSeq[m.To]
+	h.mu.Unlock()
+
 	var err error
 	if h.cfg.Deliver == nil {
 		err = errors.New("未配置 Deliver，无法送达")
@@ -857,7 +932,7 @@ func (h *Hub) pumpOne(ctx context.Context, id string) {
 			if errors.Is(err, ErrPeerNotClaude) {
 				// 对面不是 Claude：记 gone 把后续消息整体按住。这不算投递失败——
 				// 不累计失败次数、不设退避，对方重新上报 idle 后下一轮 Pump 立刻重试。
-				h.peers[m.To] = PeerGone
+				h.setPeerLocked(m.To, PeerGone)
 				h.msgs[j].Reason = err.Error()
 			} else if err != nil {
 				// 保持 queued，只记 Reason；指数退避，下次 Pump 到点才再试。
@@ -872,7 +947,12 @@ func (h *Hub) pumpOne(ctx context.Context, id string) {
 				h.msgs[j].State = MsgDelivered
 				h.msgs[j].Reason = ""
 				h.msgs[j].File = nil // 已结束，附件不再占内存
-				h.peers[m.To] = PeerBusy
+				// 送达期间对端没再上报才置 busy，别把钩子刚报的 idle 覆盖掉
+				if h.peerSeq[m.To] == seq0 {
+					h.setPeerLocked(m.To, PeerBusy)
+				}
+				// 回复送达成功，这条请求才算真被回了
+				h.markAnsweredLocked(h.msgs[j])
 				delete(h.nextTry, id)
 				delete(h.fails, id)
 				cp := h.msgs[j]

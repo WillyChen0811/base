@@ -1379,6 +1379,57 @@ func TestPeersCopy(t *testing.T) {
 	}
 }
 
+func peekBusyState(t *testing.T, h *Hub, addr string) (PeerState, time.Time, uint64) {
+	t.Helper()
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.peers[addr], h.peerAt[addr], h.peerSeq[addr]
+}
+
+// SetState 每次都会盖时间戳并把版本号 +1；Hub 内部置 busy 也一样。
+func TestPeersCopyCheckingSeqAndAt(t *testing.T) {
+	f := newMsgFixture()
+	for _, st := range []PeerState{PeerBusy, PeerIdle, PeerBusy} {
+		if err := f.hub.SetState("mac:amy", st); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, at, seq := peekBusyState(t, f.hub, "mac:amy")
+	if got != PeerBusy || seq != 3 {
+		t.Errorf("SetState 应记 busy 且版本号递增到 3，实际 %s/%d", got, seq)
+	}
+	if !at.Equal(f.clock.Now()) {
+		t.Errorf("SetState 应盖时间戳，实际 %v", at)
+	}
+	// 副本改动不影响内部
+	p := f.hub.Peers()
+	p["mac:amy"] = PeerIdle
+	if g2, _, _ := peekBusyState(t, f.hub, "mac:amy"); g2 != PeerBusy {
+		t.Errorf("Peers 副本不该影响内部状态")
+	}
+	// auto queued 的 mac 消息直接进 outbox；取走后 Hub 置 busy，同样更新 at 并 bump seq
+	if err := f.hub.SetState("mac:amy", PeerIdle); err != nil { // 上报过 idle 才进得了 outbox
+		t.Fatal(err)
+	}
+	if err := f.hub.SetAuto(60); err != nil {
+		t.Fatal(err)
+	}
+	m := okMsg()
+	m.To = "mac:amy"
+	if _, err := f.hub.Send(m); err != nil {
+		t.Fatal(err)
+	}
+	f.hub.Pump(context.Background())
+	if _, ok := f.hub.TakeOutbox(context.Background(), "mac:amy"); !ok {
+		t.Fatalf("应取到出站消息")
+	}
+	// seq：三次循环 SetState + 放回空闲 + 取走置忙 = 5
+	st2, at2, seq2 := peekBusyState(t, f.hub, "mac:amy")
+	if st2 != PeerBusy || seq2 != 5 || !at2.Equal(f.clock.Now()) {
+		t.Errorf("取走置忙应更新 at 并把版本号 +1，实际 %s/%v/%d", st2, at2, seq2)
+	}
+}
+
 func TestConcurrentAccess(t *testing.T) {
 	f := newMsgFixture()
 	ctx, cancel := context.WithCancel(context.Background())

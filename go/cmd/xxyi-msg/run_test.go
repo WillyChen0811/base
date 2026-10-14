@@ -2,6 +2,9 @@ package main
 
 import (
 	"bytes"
+	"crypto/ed25519"
+	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -15,14 +18,17 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/WillyChen0811/base/go/xxyica"
 )
 
 // captured 记假服务收到的请求；假服务在别的 goroutine 里写，测试读要加锁。
 type captured struct {
-	mu      sync.Mutex
-	reqs    []capturedReq
-	respID  string
-	respErr string // 非空则回 400 + {"error":...}
+	mu          sync.Mutex
+	reqs        []capturedReq
+	respID      string
+	respErr     string // 非空则所有接口回 400 + {"error":...}
+	respSendErr string // 非空则只有 /msg/send 回 400（模拟补发被拒）
 
 	// 各接口的响应正文，留空用默认值（都在建服务之前设好，不与处理协程并发写）。
 	respPeers string
@@ -55,6 +61,7 @@ type capturedReq struct {
 	method string
 	path   string
 	auth   string
+	xxauth string // X-XXYI-Auth 请求头（客户端证书签名）
 	query  string
 	body   sendBody
 	raw    []byte // /msg/send 的原始正文，用来断言字段有没有出现在 JSON 里
@@ -98,8 +105,9 @@ func (c *captured) handler() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		rec := capturedReq{
 			method: r.Method, path: r.URL.Path,
-			auth:  r.Header.Get("Authorization"),
-			query: r.URL.RawQuery,
+			auth:   r.Header.Get("Authorization"),
+			xxauth: r.Header.Get("X-XXYI-Auth"),
+			query:  r.URL.RawQuery,
 		}
 		if r.Method == http.MethodPost && r.URL.Path == "/msg/send" {
 			b, _ := io.ReadAll(r.Body)
@@ -115,6 +123,11 @@ func (c *captured) handler() http.HandlerFunc {
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
 		case "/msg/send":
+			if c.respSendErr != "" {
+				w.WriteHeader(http.StatusBadRequest)
+				fmt.Fprintf(w, `{"error":%q}`, c.respSendErr)
+				return
+			}
 			id := c.respID
 			if id == "" {
 				id = "ab12"
@@ -133,12 +146,124 @@ func (c *captured) handler() http.HandlerFunc {
 	}
 }
 
-// setPaths 把配置文件路径指到临时目录并保证还原。
-func setPaths(t *testing.T, ep, cfg string) {
+// writeTestBundle 给一侧造一份合法证书包（CA 现签，perm 按侧默认）。
+func writeTestBundle(t *testing.T, ca *xxyica.CA, path, side string) {
+	t.Helper()
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cert, err := ca.Issue(side+"-client", pub, xxyica.DefaultPerm(side), 90*24*time.Hour, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := xxyica.WriteClientBundle(path, cert, priv, ca.Public()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// setPaths 把配置/证书/暂存路径指到临时目录并保证还原，两侧的证书包都预先装好，返回 CA。
+// 不想装证书的测试拿返回值之后把 clientBundlePath* 指到别处即可。
+func setPaths(t *testing.T, ep, cfg string) *xxyica.CA {
 	t.Helper()
 	oldEP, oldCfg := endpointPath, xxyiConfigPath
-	t.Cleanup(func() { endpointPath, xxyiConfigPath = oldEP, oldCfg })
+	oldBU, oldBM := clientBundlePathUbuntu, clientBundlePathMac
+	oldSU, oldSM := spoolDirUbuntu, spoolDirMac
+	t.Cleanup(func() {
+		endpointPath, xxyiConfigPath = oldEP, oldCfg
+		clientBundlePathUbuntu, clientBundlePathMac = oldBU, oldBM
+		spoolDirUbuntu, spoolDirMac = oldSU, oldSM
+		spoolRejections = nil
+	})
 	endpointPath, xxyiConfigPath = ep, cfg
+	dir := filepath.Dir(ep)
+	clientBundlePathUbuntu = filepath.Join(dir, "ubuntu-client.json")
+	clientBundlePathMac = filepath.Join(dir, "mac-client.json")
+	spoolDirUbuntu = filepath.Join(dir, "spool-ubuntu")
+	spoolDirMac = filepath.Join(dir, "spool-mac")
+	ca, err := xxyica.NewCA()
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeTestBundle(t, ca, clientBundlePathUbuntu, "ubuntu")
+	writeTestBundle(t, ca, clientBundlePathMac, "mac")
+	return ca
+}
+
+// fakeMsg 是一条假收件箱消息；Signed 为真时按签名域带上 CA 签名。
+type fakeMsg struct {
+	ID      string
+	From    string
+	To      string
+	Kind    string
+	State   string
+	Text    string
+	ReplyTo string
+	Created time.Time
+	Signed  bool
+}
+
+// fakeInboxResp 渲染 GET /msg/inbox 的响应 JSON（messages + unanswered）。
+func fakeInboxResp(t *testing.T, ca *xxyica.CA, msgs, unanswered []fakeMsg) string {
+	t.Helper()
+	render := func(list []fakeMsg) []map[string]any {
+		items := make([]map[string]any, 0, len(list))
+		for _, m := range list {
+			created := m.Created
+			if created.IsZero() {
+				created = time.Date(2026, 10, 14, 12, 0, 0, 0, time.UTC)
+			}
+			item := map[string]any{
+				"id": m.ID, "from": m.From, "to": m.To, "kind": m.Kind,
+				"state": m.State, "text": m.Text, "reply_to": m.ReplyTo, "created": created,
+			}
+			if m.Signed {
+				if ca == nil {
+					t.Fatalf("消息 %s 要签名但没 CA", m.ID)
+				}
+				sig := ca.Sign(xxyica.MessageSigningBytes(xxyica.MsgFields{
+					ID: m.ID, From: m.From, To: m.To, Kind: m.Kind, ReplyTo: m.ReplyTo,
+					Text: m.Text, Created: created,
+				}))
+				item["sig"] = base64.StdEncoding.EncodeToString(sig)
+			}
+			items = append(items, item)
+		}
+		return items
+	}
+	raw, err := json.Marshal(map[string]any{"messages": render(msgs), "unanswered": render(unanswered)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(raw)
+}
+
+// listenFreeAddr 要一个没人占的本地端口（服务端断开后还能在原地址重开，模拟通道恢复）。
+func listenFreeAddr(t *testing.T) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := ln.Addr().String()
+	if err := ln.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return addr
+}
+
+// startServerAt 在固定地址起假服务（重复 Close 无害）。
+func startServerAt(t *testing.T, addr string, h http.HandlerFunc) *httptest.Server {
+	t.Helper()
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		t.Fatalf("监听 %s 失败：%v", addr, err)
+	}
+	srv := httptest.NewUnstartedServer(h)
+	srv.Listener = ln
+	srv.Start()
+	t.Cleanup(func() { srv.Close() })
+	return srv
 }
 
 // authority 取假服务 URL 的 host:port。
@@ -156,15 +281,15 @@ func portOf(t *testing.T, srvURL string) string {
 	return port
 }
 
-// useEndpoint 写一个指向假服务的 endpoint.json（Ubuntu 一侧）。
-func useEndpoint(t *testing.T, srvURL string) {
+// useEndpoint 写一个指向假服务的 endpoint.json（Ubuntu 一侧），返回装好证书包的 CA。
+func useEndpoint(t *testing.T, srvURL string) *xxyica.CA {
 	t.Helper()
 	dir := t.TempDir()
 	ep := filepath.Join(dir, "endpoint.json")
 	if err := os.WriteFile(ep, []byte(fmt.Sprintf(`{"addr":%q,"token":"tk"}`, authority(srvURL))), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	setPaths(t, ep, filepath.Join(dir, "config.json"))
+	return setPaths(t, ep, filepath.Join(dir, "config.json"))
 }
 
 func TestUbuntuSend(t *testing.T) {
@@ -256,12 +381,16 @@ func TestSendServerErrorAndConnFail(t *testing.T) {
 	}
 	srv.Close()
 
-	errOut.Reset()
-	if code := run([]string{"send", "mac:boss", "hi"}, strings.NewReader(""), io.Discard, errOut); code != exitErr {
-		t.Fatalf("退出码 %d", code)
+	// 连不上：不再直接报错，本地暂存并退出 0（补发见 spool_test.go）。
+	out := &bytes.Buffer{}
+	if code := run([]string{"send", "mac:boss", "hi"}, strings.NewReader(""), out, errOut); code != exitOK {
+		t.Fatalf("退出码 %d，stderr %q", code, errOut.String())
 	}
-	if !strings.Contains(errOut.String(), "连不上 XXYI：") || !strings.Contains(errOut.String(), "协助开着吗") {
-		t.Errorf("stderr %q", errOut.String())
+	if out.String() != "已暂存，通道恢复后自动补发（暂存 1 条）\n" {
+		t.Errorf("stdout %q", out.String())
+	}
+	if files := spoolList(spoolDirUbuntu); len(files) != 1 {
+		t.Errorf("暂存 %d 条", len(files))
 	}
 }
 
@@ -678,22 +807,26 @@ func TestReplyCommand(t *testing.T) {
 
 func TestInboxCommand(t *testing.T) {
 	var cap captured
-	cap.respInbox = `{"messages":[` +
-		`{"id":"m2","from":"mac:boss","to":"ubuntu:cw","text":"收到\n别的","state":"queued","kind":"reply","reply_to":"m1"},` +
-		`{"id":"m1","from":"ubuntu:cw","to":"mac:boss","text":"帮我改\n细节","state":"delivered","kind":"request","ask_user":true}` +
-		`],"unanswered":[{"id":"m1","from":"ubuntu:cw","to":"mac:boss","text":"帮我改\n细节","state":"delivered","kind":"request"}]}`
 	srv := httptest.NewServer(cap.handler())
 	defer srv.Close()
-	useEndpoint(t, srv.URL)
+	ca := useEndpoint(t, srv.URL)
+	cap.respInbox = fakeInboxResp(t, ca,
+		[]fakeMsg{
+			{ID: "m2", From: "mac:boss", To: "ubuntu:cw", Text: "收到\n别的", State: "queued", Kind: "reply", ReplyTo: "m1", Signed: true},
+			{ID: "m1", From: "ubuntu:cw", To: "mac:boss", Text: "帮我改\n细节", State: "delivered", Kind: "request", Signed: true},
+		},
+		[]fakeMsg{
+			{ID: "m1", From: "ubuntu:cw", To: "mac:boss", Text: "帮我改\n细节", State: "delivered", Kind: "request", Signed: true},
+		})
 	t.Setenv("XXYI_ADDR", "ubuntu:cw")
 
 	out := &bytes.Buffer{}
 	if code := run([]string{"inbox"}, nil, out, io.Discard); code != exitOK {
 		t.Fatalf("退出码 %d，stderr %q", code, out.String())
 	}
-	want := "未回复 #m1 来自 ubuntu:cw：帮我改\n" +
-		"#m2 reply mac:boss → ubuntu:cw queued：收到\n" +
-		"#m1 request ubuntu:cw → mac:boss delivered：帮我改\n"
+	want := "✓ 未回复 #m1 来自 ubuntu:cw：帮我改\n" +
+		"✓ #m2 reply mac:boss → ubuntu:cw queued：收到\n" +
+		"✓ #m1 request ubuntu:cw → mac:boss delivered：帮我改\n"
 	if out.String() != want {
 		t.Errorf("inbox 输出 %q，期望 %q", out.String(), want)
 	}

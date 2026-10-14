@@ -185,9 +185,11 @@ func callTool(params json.RawMessage) (string, bool) {
 }
 
 // runTool 是四个工具的实现；每次调用自带 httpTimeout。
+// 每次工具调用前先尝试补发暂存（连不上/超时就放下，不挡这次的调用）。
 func runTool(ctx context.Context, name string, args map[string]any) (string, error) {
 	ctx, cancel := context.WithTimeout(ctx, httpTimeout)
 	defer cancel()
+	spoolRejections = flushSpool(ctx)
 	switch name {
 	case "xxyi_send":
 		return toolSend(ctx, args)
@@ -259,7 +261,7 @@ func toolSend(ctx context.Context, args map[string]any) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	id, err := doSend(ctx, sendBody{
+	id, spooled, err := doSendSpool(ctx, sendBody{
 		From:     from,
 		To:       to,
 		Text:     text,
@@ -272,6 +274,9 @@ func toolSend(ctx context.Context, args map[string]any) (string, error) {
 	})
 	if err != nil {
 		return "", err
+	}
+	if spooled > 0 {
+		return stagedText(spooled), nil
 	}
 	return "已排队 #" + id, nil
 }
@@ -301,7 +306,7 @@ func toolReply(ctx context.Context, args map[string]any) (string, error) {
 		return "", err
 	}
 	// 收件人留空：服务端按被回复的那条请求回填。
-	newID, err := doSend(ctx, sendBody{
+	newID, spooled, err := doSendSpool(ctx, sendBody{
 		From:     from,
 		Text:     text,
 		FileName: fileName,
@@ -311,6 +316,9 @@ func toolReply(ctx context.Context, args map[string]any) (string, error) {
 	})
 	if err != nil {
 		return "", err
+	}
+	if spooled > 0 {
+		return stagedText(spooled), nil
 	}
 	return "已排队 #" + newID, nil
 }

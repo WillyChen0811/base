@@ -223,11 +223,12 @@ func TestMCPCallSendReplyPeers(t *testing.T) {
 
 func TestMCPCallInbox(t *testing.T) {
 	var cap captured
-	cap.respInbox = `{"messages":[{"id":"m1","from":"mac:boss","to":"ubuntu:cw","text":"在吗","state":"delivered","kind":"notice"}],` +
-		`"unanswered":[{"id":"m0","from":"mac:boss","to":"ubuntu:cw","text":"推一下","state":"delivered","kind":"request"}]}`
 	srv := httptest.NewServer(cap.handler())
 	defer srv.Close()
-	useEndpoint(t, srv.URL)
+	ca := useEndpoint(t, srv.URL)
+	cap.respInbox = fakeInboxResp(t, ca,
+		[]fakeMsg{{ID: "m1", From: "mac:boss", To: "ubuntu:cw", Text: "在吗", State: "delivered", Kind: "notice", Signed: true}},
+		[]fakeMsg{{ID: "m0", From: "mac:boss", To: "ubuntu:cw", Text: "推一下", State: "delivered", Kind: "request", Signed: true}})
 	t.Setenv("XXYI_ADDR", "ubuntu:cw")
 
 	resps := mcpRound(t,
@@ -240,7 +241,7 @@ func TestMCPCallInbox(t *testing.T) {
 	if isErr {
 		t.Fatalf("inbox 失败：%q", text)
 	}
-	want := "未回复 #m0 来自 mac:boss：推一下\n#m1 notice mac:boss → ubuntu:cw delivered：在吗"
+	want := "✓ 未回复 #m0 来自 mac:boss：推一下\n✓ #m1 notice mac:boss → ubuntu:cw delivered：在吗"
 	if text != want {
 		t.Errorf("inbox 文字 %q，期望 %q", text, want)
 	}

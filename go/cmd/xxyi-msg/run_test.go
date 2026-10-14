@@ -1190,3 +1190,23 @@ func TestTmuxSessionArgsOrder(t *testing.T) {
 		t.Errorf("参数 %q", got)
 	}
 }
+
+func TestUbuntuSupportOffMessage(t *testing.T) {
+	dir := t.TempDir()
+	setPaths(t, filepath.Join(dir, "endpoint.json"), filepath.Join(dir, "config.json"))
+	bundle := filepath.Join(dir, "client.json")
+	if err := os.WriteFile(bundle, []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	old := clientBundlePathUbuntu
+	clientBundlePathUbuntu = bundle
+	t.Cleanup(func() { clientBundlePathUbuntu = old })
+	t.Setenv("XXYI_ADDR", "ubuntu:a")
+	errOut := &bytes.Buffer{}
+	if code := run([]string{"who"}, strings.NewReader(""), io.Discard, errOut); code != exitErr {
+		t.Fatalf("退出码 %d", code)
+	}
+	if !strings.Contains(errOut.String(), "没有协助端点") || strings.Contains(errOut.String(), "8765") {
+		t.Errorf("stderr %q", errOut.String())
+	}
+}

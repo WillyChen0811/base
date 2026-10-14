@@ -84,7 +84,8 @@ func tmuxSessionArgs(pane string) []string {
 const usage = "用法：xxyi-msg send <收件人> [文字|-] [--file 路径] [--repo 名 --branch 名] [--kind request|notice|code] [--ask-user]" +
 	" | xxyi-msg reply <消息id> [文字|-] [--file 路径]" +
 	" | xxyi-msg inbox [n] | xxyi-msg verify <消息id> | xxyi-msg who" +
-	" | xxyi-msg state busy|idle|gone [--check|--start] | xxyi-msg mcp"
+	" | xxyi-msg state busy|idle|gone [--check|--start] | xxyi-msg mcp" +
+	" | xxyi-msg approve-hook [--agent claude|codex]"
 
 // errNoSelfAddr 是 send 找不到自己地址时的提示。
 var errNoSelfAddr = errors.New("不知道自己的地址：请在 XXYI 的终端里运行，或设 XXYI_ADDR")

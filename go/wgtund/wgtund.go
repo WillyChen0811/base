@@ -288,7 +288,7 @@ func Run(ctx context.Context, dir string, stdin io.Reader, stdout io.Writer) (er
 		// 开始/停止/批准只许从 xxyi 页面发起：要求带白名单内的 Origin（curl 等没有 Origin 的调用拿主令牌也不行）
 		if r.Method == http.MethodPost {
 			switch r.URL.Path {
-			case "/support/start", "/support/stop", "/support/decide", "/msg/decide", "/msg/auto":
+			case "/support/start", "/support/stop", "/support/decide", "/msg/decide", "/msg/auto", "/approval/decide":
 				if o := r.Header.Get("Origin"); o == "" || !originAllowed(o, conf.AllowedOrigins) {
 					errJSON(w, http.StatusForbidden, "需要从 xxyi 页面操作")
 					return
@@ -301,6 +301,9 @@ func Run(ctx context.Context, dir string, stdin io.Reader, stdout io.Writer) (er
 	mux.HandleFunc("/support/", supportRoute)
 	mux.HandleFunc("/msg", supportRoute)
 	mux.HandleFunc("/msg/", supportRoute)
+	// 通用审批（任意会话的 PermissionRequest）：同样整段转给 support；decide 的 Origin 校验在上面
+	mux.HandleFunc("/approval", supportRoute)
+	mux.HandleFunc("/approval/", supportRoute)
 	type hostItem struct {
 		Name      string `json:"name"`
 		Tunnel    string `json:"tunnel"`

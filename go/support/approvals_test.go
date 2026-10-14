@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/url"
 	"strings"
@@ -401,6 +402,81 @@ func TestApprovalStopKeepsRequests(t *testing.T) {
 		t.Fatalf("Stop 后通用审批请求应还在: %+v", got)
 	}
 	approvalDecide(t, f.lbase, got[0].ID, true, "")
+}
+
+// TestApprovalDecideCancelRace decide 与取消（显式 cancel / ctx 超时交替）同时抢同一条请求，
+// 重复 200 次：谁抢到都行，但两边看到的结果必须一致——
+// decide 成功 ⇔ ask 拿到那个决定；decide 撞空（ErrNotFound）⇔ ask decided=false。
+// 每次等待都必须在有界时间内结束，簿最终干净（items/order 都空）。
+func TestApprovalDecideCancelRace(t *testing.T) {
+	oldWait := approvalWait
+	t.Cleanup(func() { approvalWait = oldWait })
+	approvalWait = 30 * time.Second // 单次循环只该由 decide/cancel 叫醒，不该等满这里
+
+	start := time.Now()
+	for i := 0; i < 200; i++ {
+		b := newApprovalBook()
+		w, err := b.add(ApprovalRequest{
+			Addr: "mac:frank", Agent: "claude", Tool: "Bash",
+			Input: json.RawMessage(`{"command":"race"}`),
+		})
+		if err != nil {
+			t.Fatalf("入簿 %d: %v", i, err)
+		}
+		id := w.req.ID
+
+		ctx := context.Background()
+		var cancel context.CancelFunc
+		if i%2 == 0 {
+			ctx, cancel = context.WithCancel(ctx)
+		} else {
+			ctx, cancel = context.WithTimeout(ctx, 2*time.Millisecond) // 模拟 ask 的 approvalWait 超时
+		}
+
+		want := Decision{Allow: i%3 == 0, Message: "race"}
+		waitCh := make(chan Decision, 1)
+		decidedCh := make(chan bool, 1)
+		go func() { d, ok := b.wait(ctx, w); waitCh <- d; decidedCh <- ok }()
+		dErr := make(chan error, 1)
+		go func() { dErr <- b.decide(id, want) }()
+		if i%2 == 0 {
+			cancel() // 显式取消，跟 decide 真并发
+		}
+
+		var got Decision
+		var ok bool
+		select {
+		case got = <-waitCh:
+			ok = <-decidedCh
+		case <-time.After(5 * time.Second):
+			t.Fatalf("第 %d 轮等待没在有界时间内结束", i)
+		}
+		derr := <-dErr
+		cancel() // 超时那几轮用它兜底收尾
+
+		if derr == nil {
+			if !ok || got != want {
+				t.Fatalf("第 %d 轮 decide 成功但 ask 结果不一致: ok=%v got=%+v", i, ok, got)
+			}
+		} else {
+			if !errors.Is(derr, ErrNotFound) {
+				t.Fatalf("第 %d 轮 decide 应撞空 ErrNotFound，得到 %v", i, derr)
+			}
+			if ok {
+				t.Fatalf("第 %d 轮 decide 失败但 ask 说已决定: %+v", i, got)
+			}
+		}
+
+		b.mu.Lock()
+		nItems, nOrder := len(b.items), len(b.order)
+		b.mu.Unlock()
+		if nItems != 0 || nOrder != 0 {
+			t.Fatalf("第 %d 轮结束后簿应清空: items=%d order=%d", i, nItems, nOrder)
+		}
+	}
+	if el := time.Since(start); el > 30*time.Second {
+		t.Fatalf("整体耗时超预期: %v", el)
+	}
 }
 
 // TestApprovalMsgAuthGating 配了 MsgAuth：/approval/ask 无证书一律 401（远端+本机）；

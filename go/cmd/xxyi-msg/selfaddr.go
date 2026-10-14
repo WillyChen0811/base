@@ -189,10 +189,13 @@ func ubuntuSide() bool {
 }
 
 // hookLog 给 state 钩子追加一行排查日志："时间 参数 结果"。
+func hookLog(args []string, result string) { hookLogCmd("state", args, result) }
+
+// hookLogCmd 给钩子类子命令追加一行排查日志："时间 子命令 参数 结果"（state 与 approve-hook 共用）。
 // 目录跟证书包同一侧（Ubuntu 是 ~/.xxyi-support，Mac 是 ~/.xxyi）；目录不存在就不写。
 // 超过 256KB 先整份改名 .1 再写新的。任何失败静默忽略：日志只给排查用，
 // 不影响退出码，也不占 2 秒上报预算（本地一次 stat 加一次追加）。
-func hookLog(args []string, result string) {
+func hookLogCmd(cmd string, args []string, result string) {
 	home, err := os.UserHomeDir()
 	if err != nil || home == "" {
 		return
@@ -213,5 +216,5 @@ func hookLog(args []string, result string) {
 		return
 	}
 	defer f.Close()
-	fmt.Fprintf(f, "%s state %s %s\n", time.Now().Format("2006-01-02 15:04:05.000"), strings.Join(args, " "), result)
+	fmt.Fprintf(f, "%s %s %s %s\n", time.Now().Format("2006-01-02 15:04:05.000"), cmd, strings.Join(args, " "), result)
 }

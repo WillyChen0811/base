@@ -347,7 +347,7 @@ func (s *Service) stop(reason string, expired *session) {
 	for _, p := range s.queue.Pending() {
 		s.logEvent("cancelled", map[string]string{"id": p.ID, "tool": p.Tool, "reason": "协助已结束"})
 	}
-	s.queue.CancelAll("协助已结束")
+	s.queue.CancelAll(supportEndedMsg)
 	if srv != nil {
 		_ = srv.Close() // 顺带关掉 listener 上的活动连接
 	}
@@ -373,7 +373,7 @@ func (s *Service) stop(reason string, expired *session) {
 		s.logEvent("remote", map[string]string{"event": "unpublish_failed", "error": err.Error()})
 	}
 	_ = s.runner.Stop()
-	s.queue.CancelAll("协助已结束")
+	s.queue.CancelAll(supportEndedMsg)
 	s.logEvent("stop", map[string]string{"reason": reason})
 }
 
@@ -682,6 +682,9 @@ func (s *Service) remoteStopClaude(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
+// supportEndedMsg 是停止协助时取消所有待批请求用的原因。
+const supportEndedMsg = "协助已结束"
+
 func (s *Service) remoteProjSync(w http.ResponseWriter, r *http.Request) {
 	name := r.URL.Query().Get("name")
 	detail := map[string]string{"project": truncRunes(name, 100)}
@@ -751,6 +754,14 @@ func (s *Service) remoteProjSync(w http.ResponseWriter, r *http.Request) {
 			s.logEvent("projsync", detail)
 			errJSON(w, http.StatusGatewayTimeout, "等待授权超时")
 		}
+		return
+	}
+
+	// 协助结束时 CancelAll 会以「拒绝」收场：那不是用户拒绝，按协助已结束回 503
+	if !decision.Allow && decision.Message == supportEndedMsg {
+		detail["result"] = "cancelled"
+		s.logEvent("projsync", detail)
+		errJSON(w, http.StatusServiceUnavailable, supportEndedMsg)
 		return
 	}
 

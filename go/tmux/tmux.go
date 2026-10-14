@@ -154,6 +154,15 @@ func CaptureCommand(name string, lines int) (string, error) {
 	return fmt.Sprintf("tmux -u capture-pane -p -J -t %s -S -%d", Quote("="+name+":"), lines), nil
 }
 
+// PaneCommandCommand 返回查询会话活动窗格前台程序名的命令（如 claude、node、bash）。
+// 注入消息前用它确认窗格里跑的是 Claude，不是就别往里灌文字。
+func PaneCommandCommand(session string) (string, error) {
+	if err := ValidTarget(session); err != nil {
+		return "", err
+	}
+	return "tmux -u display-message -p -t " + Quote("="+session+":") + " " + Quote("#{pane_current_command}"), nil
+}
+
 // ── 输出解析 ──────────────────────────────────────────
 
 // ParseList 解析 ListCommand 的标准输出。

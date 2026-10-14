@@ -293,6 +293,35 @@ func TestPasteCommand(t *testing.T) {
 	}
 }
 
+func TestPaneCommandCommand(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  string
+		err   bool
+	}{
+		{"普通", "ab", "tmux -u display-message -p -t '=ab:' '#{pane_current_command}'", false},
+		{"含空格", "my session", "tmux -u display-message -p -t '=my session:' '#{pane_current_command}'", false},
+		{"含中文", "中文名", "tmux -u display-message -p -t '=中文名:' '#{pane_current_command}'", false},
+		{"含单引号", "a'b", "tmux -u display-message -p -t '=a'\\''b:' '#{pane_current_command}'", false},
+		{"空会话名", "", "", true},
+		{"会话名含冒号", "a:b", "", true},
+		{"会话名含点", "a.b", "", true},
+	}
+	for _, tt := range tests {
+		got, err := PaneCommandCommand(tt.input)
+		if tt.err && err == nil {
+			t.Errorf("PaneCommandCommand(%q) 期望报错但没有", tt.input)
+		}
+		if !tt.err && err != nil {
+			t.Errorf("PaneCommandCommand(%q) 期望通过但报错: %v", tt.input, err)
+		}
+		if !tt.err && got != tt.want {
+			t.Errorf("PaneCommandCommand(%q) =\n%q\n期望\n%q", tt.input, got, tt.want)
+		}
+	}
+}
+
 // 真跑：去掉 $TMUX、用独立 TMUX_TMPDIR 起服务器（不碰用户的 tmux），
 // 建 detached 会话跑 cat，PasteCommand 经 stdin 喂两行中文，capture-pane 检查都在。
 func TestPasteCommand_real(t *testing.T) {

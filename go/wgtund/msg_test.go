@@ -88,7 +88,7 @@ func TestMsgBridgeDeliver(t *testing.T) {
 	if string(rec.writes[inbox]) != "patch-data" {
 		t.Errorf("附件内容不对: %q", rec.writes[inbox])
 	}
-	wantText := "[来自 mac:frank] 看下第三行（附件：~/" + inbox + "）"
+	wantText := support.Display(m, "~/"+inbox)
 	if got := string(rec.writes[msgPath]); got != wantText {
 		t.Errorf("注入文字 = %q，want %q", got, wantText)
 	}
@@ -96,13 +96,58 @@ func TestMsgBridgeDeliver(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantCmd := "(" + paste + ") < " + tmux.Quote(msgPath) +
-		"; rc=$?; rm -f " + tmux.Quote(msgPath) + "; exit $rc"
+	pane, err := tmux.PaneCommandCommand("claude")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantCmd := deliverCmd(m, paste, pane, msgPath)
 	if len(rec.cmds) != 1 || rec.cmds[0] != wantCmd {
 		t.Errorf("注入命令 = %q\nwant %q", rec.cmds, wantCmd)
 	}
+	// 非立即送达：先查窗格前台程序，不是 Claude 时以 9 退出
+	if !strings.Contains(wantCmd, "pane_current_command") || !strings.Contains(wantCmd, "exit 9") {
+		t.Errorf("非 Now 命令应含前台程序检查和 exit 9: %q", wantCmd)
+	}
 
-	// 没附件：只写正文一个文件，文字不带附件提示
+	// 立即送达（Now）：不查前台程序
+	recNow := &deliverRecorder{writes: map[string][]byte{}}
+	bNow := &msgBridge{
+		run: func(ctx context.Context, cmd string) ([]byte, int, error) {
+			recNow.cmds = append(recNow.cmds, cmd)
+			return nil, 0, nil
+		},
+		write: func(_ context.Context, p string, data []byte) error {
+			recNow.writes[p] = data
+			return nil
+		},
+	}
+	if err := bNow.Deliver(context.Background(), support.Message{
+		ID: "now1", From: "mac:frank", To: "ubuntu:claude", Text: "hi", Now: true,
+	}); err != nil {
+		t.Fatalf("Deliver Now: %v", err)
+	}
+	if len(recNow.cmds) != 1 || strings.Contains(recNow.cmds[0], "pane_current_command") || strings.Contains(recNow.cmds[0], "exit 9") {
+		t.Errorf("Now 命令不该查前台程序: %q", recNow.cmds)
+	}
+
+	// 窗格里不是 Claude：退出 9 带标记 → ErrPeerNotClaude，错误里说明是哪个程序
+	recNC := &deliverRecorder{writes: map[string][]byte{}, out: []byte("XXYI_NOTCLAUDE bash\n"), code: 9}
+	bNC := &msgBridge{
+		run: func(ctx context.Context, cmd string) ([]byte, int, error) { return recNC.out, recNC.code, nil },
+		write: func(_ context.Context, p string, data []byte) error {
+			recNC.writes[p] = data
+			return nil
+		},
+	}
+	err = bNC.Deliver(context.Background(), support.Message{
+		ID: "nc1", From: "mac:frank", To: "ubuntu:claude", Text: "hi",
+	})
+	if !errors.Is(err, support.ErrPeerNotClaude) || !strings.Contains(err.Error(), "bash") {
+		t.Fatalf("应报 ErrPeerNotClaude 并带 bash，得到 %v", err)
+	}
+
+	// 没附件：只写正文一个文件，正文不带附件行
+	noFileMsg := support.Message{ID: "def456", From: "mac:frank", To: "ubuntu:claude", Text: "hi"}
 	rec2 := &deliverRecorder{writes: map[string][]byte{}}
 	b2 := &msgBridge{
 		run: func(ctx context.Context, cmd string) ([]byte, int, error) {
@@ -115,16 +160,14 @@ func TestMsgBridgeDeliver(t *testing.T) {
 			return nil
 		},
 	}
-	if err := b2.Deliver(context.Background(), support.Message{
-		ID: "def456", From: "mac:frank", To: "ubuntu:claude", Text: "hi",
-	}); err != nil {
+	if err := b2.Deliver(context.Background(), noFileMsg); err != nil {
 		t.Fatalf("Deliver 无附件: %v", err)
 	}
 	if len(rec2.order) != 1 || rec2.order[0] != ".xxyi-support/msg/def456.txt" {
 		t.Errorf("无附件应只写正文: %v", rec2.order)
 	}
-	if got := string(rec2.writes[".xxyi-support/msg/def456.txt"]); got != "[来自 mac:frank] hi" {
-		t.Errorf("无附件文字 = %q", got)
+	if got := string(rec2.writes[".xxyi-support/msg/def456.txt"]); got != support.Display(noFileMsg, "") {
+		t.Errorf("无附件文字 = %q，want %q", got, support.Display(noFileMsg, ""))
 	}
 
 	// 远端非零退出：报错带上地址和输出（会话不存在时 tmux 的报错原样带上）

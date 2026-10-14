@@ -63,13 +63,23 @@ func (b *msgBridge) Sync(ctx context.Context, m support.Message) error {
 	// 同仓库的同步（页面手动同步、别条消息触发的同步）串行；拿不到锁就等，超时放弃
 	if b.lock != nil {
 		if mu := b.lock(m.Repo); mu != nil {
-			locked := make(chan struct{})
-			go func() { mu.Lock(); close(locked) }()
+			// 无缓冲交接：锁要么交到这里（由这里 Unlock），要么等到放弃信号后由取锁协程自己放回，
+			// 不会出现取到了却没人放的情况。
+			handoff := make(chan struct{})
+			giveUp := make(chan struct{})
+			go func() {
+				mu.Lock()
+				select {
+				case handoff <- struct{}{}:
+				case <-giveUp:
+					mu.Unlock()
+				}
+			}()
 			select {
-			case <-locked:
+			case <-handoff:
 				defer mu.Unlock()
 			case <-ctx.Done():
-				go func() { mu.Lock(); mu.Unlock() }() // 真等到了也立刻放回，不把锁白白占着
+				close(giveUp)
 				return ctx.Err()
 			}
 		}
@@ -117,21 +127,52 @@ func (b *msgBridge) Sync(ctx context.Context, m support.Message) error {
 	}
 }
 
-// Deliver 把发往 ubuntu:<会话> 的消息注入 tmux：附件放收件箱，正文写成临时文件，
-// 经括号粘贴喂进会话后立即删掉临时文件。会话不存在时 tmux 的报错原样带上。
+// notClaudeMark 是注入包装命令在"窗格里不是 Claude"时打印的标记（配合退出码 9）。
+const notClaudeMark = "XXYI_NOTCLAUDE"
+
+// deliverCmd 拼注入命令：非立即送达时先查窗格前台程序，
+// 不是 claude/node 就删掉正文文件、打印标记并以 9 退出（不进粘贴）；
+// 然后括号粘贴正文、删正文文件，退出码取粘贴的结果。
+// Now（用户点了立即送达）不查前台程序，pane 传空串。
+func deliverCmd(m support.Message, paste, pane, msgPath string) string {
+	q := tmux.Quote(msgPath)
+	body := "(" + paste + ") < " + q + "; rc=$?; rm -f " + q + "; exit $rc"
+	if m.Now {
+		return body
+	}
+	check := "c=$(" + pane + " 2>/dev/null); case \"$c\" in claude|node) ;; *) rm -f " + q +
+		"; printf '" + notClaudeMark + " %s\\n' \"$c\"; exit 9;; esac; "
+	return check + body
+}
+
+// paneProgOfNotClaude 从注入命令的输出里取出标记后面的程序名；没有标记返回 false。
+func paneProgOfNotClaude(out []byte) (string, bool) {
+	s := string(out)
+	i := strings.Index(s, notClaudeMark)
+	if i < 0 {
+		return "", false
+	}
+	return strings.TrimSpace(s[i+len(notClaudeMark):]), true
+}
+
+// Deliver 把发往 ubuntu:<会话> 的消息注入 tmux：附件放收件箱，正文（support.Display 统一格式）
+// 写成临时文件，经括号粘贴喂进会话后立即删掉临时文件。
+// 非立即送达时先确认窗格里跑的是 Claude（claude/node），不是就报 ErrPeerNotClaude。
+// 会话不存在时 tmux 的报错原样带上。
 func (b *msgBridge) Deliver(ctx context.Context, m support.Message) error {
 	// 开头就套超时：写文件和执行命令共用，协助 Stop / Hub 取消时不会卡在 SFTP 上
 	ctx, cancel := context.WithTimeout(ctx, msgRunTimeout)
 	defer cancel()
 	session := strings.TrimPrefix(m.To, "ubuntu:")
-	text := "[来自 " + m.From + "] " + m.Text
+	attach := ""
 	if len(m.File) > 0 {
 		inbox := "xxyi-work/inbox/" + m.ID + "-" + m.FileName
 		if err := b.write(ctx, inbox, m.File); err != nil {
 			return fmt.Errorf("附件写到 Ubuntu 失败: %v", err)
 		}
-		text += "（附件：~/" + inbox + "）"
+		attach = "~/" + inbox
 	}
+	text := support.Display(m, attach)
 	msgPath := ".xxyi-support/msg/" + m.ID + ".txt"
 	if err := b.write(ctx, msgPath, []byte(text)); err != nil {
 		return fmt.Errorf("消息正文写到 Ubuntu 失败: %v", err)
@@ -140,11 +181,20 @@ func (b *msgBridge) Deliver(ctx context.Context, m support.Message) error {
 	if err != nil {
 		return err
 	}
-	cmd := "(" + paste + ") < " + tmux.Quote(msgPath) +
-		"; rc=$?; rm -f " + tmux.Quote(msgPath) + "; exit $rc"
-	out, code, err := b.run(ctx, cmd)
+	pane := ""
+	if !m.Now {
+		if pane, err = tmux.PaneCommandCommand(session); err != nil {
+			return err
+		}
+	}
+	out, code, err := b.run(ctx, deliverCmd(m, paste, pane, msgPath))
 	if err != nil {
 		return fmt.Errorf("连不上 Ubuntu: %v", err)
+	}
+	if code == 9 {
+		if prog, ok := paneProgOfNotClaude(out); ok {
+			return fmt.Errorf("%w（%s 窗格里是 %q）", support.ErrPeerNotClaude, m.To, prog)
+		}
 	}
 	if code != 0 {
 		msg := out

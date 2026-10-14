@@ -20,8 +20,24 @@ const (
 	MsgQueued     MsgState = "queued"      // 已批准，等对方空闲
 	MsgDelivered  MsgState = "delivered"   // 已送达
 	MsgRejected   MsgState = "rejected"    // 用户拒绝
-	MsgSyncFailed MsgState = "sync_failed" // 代码同步失败，等用户处理
+	MsgSyncFailed MsgState = "sync_failed" // 同步重试用完（预算内先自动重试），等用户处理
+	MsgFailed     MsgState = "failed"      // 重试预算用完，需人工处理（带失败报告）
 )
+
+// Attempt 是一次自动重试的失败记录（Stage：sync=代码同步、deliver=送达）。
+type Attempt struct {
+	At    time.Time `json:"at"`
+	Stage string    `json:"stage"`
+	Err   string    `json:"err"`
+}
+
+// FailReport 是转人工时的现场报告：卡在哪个阶段、当时对端什么状态、对方终端最后画面。
+type FailReport struct {
+	Stage     string    `json:"stage"`
+	At        time.Time `json:"at"`
+	PeerState string    `json:"peer_state"`       // 当时对端状态，没上报过为 "unknown"
+	Screen    string    `json:"screen,omitempty"` // Capture 给的对方终端最后 40 行
+}
 
 // PeerState 是对端上报的忙闲状态。只有明确上报过 idle 的地址才允许送非 Now 消息；
 // busy、gone（对方窗口里不是 Claude）、以及没上报过的地址都按住。
@@ -63,6 +79,9 @@ type Message struct {
 	ReplyTo  string `json:"reply_to,omitempty"` // 仅 reply 使用，指向被回复的 request
 	AskUser  bool   `json:"ask_user,omitempty"` // 发件人声明：涉及决定的部分要交给用户
 	Answered bool   `json:"answered,omitempty"` // 仅 request 有意义：收到过合法 reply
+
+	Attempts []Attempt   `json:"attempts,omitempty"` // 自动重试失败记录，最多留最近 20 条
+	Report   *FailReport `json:"report,omitempty"`   // 转人工（failed/sync_failed）时的现场报告
 }
 
 // ErrMsgNotFound 表示消息 ID 不在 Hub 里（不存在或已被淘汰）。
@@ -72,17 +91,37 @@ var ErrMsgNotFound = errors.New("support: 没有这条消息")
 // 撞上它不算投递失败：不计数、不退避，只把对端记成 gone 按住消息，等对方重新上报 idle。
 var ErrPeerNotClaude = errors.New("对方窗口里不是 Claude")
 
+// ErrLinkDown 表示线路不通（SSH/隧道断了这类）。Sync/Deliver 撞上它不算失败：
+// 不记 Attempt、不计次数、不退避，Hub 整体进入暂停，之后按 linkProbeEvery 探测恢复。
+var ErrLinkDown = errors.New("线路不通")
+
 const (
 	maxMsgTextLen  = 64 * 1024   // Text 上限 64KB
 	maxMsgFileLen  = 1024 * 1024 // 附件上限 1MB
 	maxMsgKeep     = 200         // 内存保留的消息条数（只淘汰已结束的）
-	maxMsgOpen     = 50          // 未结束（pending/queued/sync_failed）消息上限，超了拒收新消息
+	maxMsgOpen     = 50          // 未结束（pending/queued/sync_failed/failed）消息上限，超了拒收新消息
 	maxNameLen     = 100         // 附件名净化后按字节截断的长度
 	maxAutoMinutes = 600         // 自动模式最长分钟数
 
 	unackedTakeTimeout = 60 * time.Second // 出站消息被取走后多久没确认送达就重新排队
-	backoffBase        = 2 * time.Second  // Deliver 失败退避基数
-	backoffMax         = 60 * time.Second // Deliver 失败退避上限
+	backoffBase        = 2 * time.Second  // 失败退避基数
+	backoffMax         = 5 * time.Minute  // 失败退避上限
+
+	// 重试预算：同一阶段累计失败次数或有效经过时间先到者触发转人工
+	// （failed / sync_failed）。线路不通的暂停时间不计入经过时间。
+	defaultMaxAttempts = 5
+	defaultRetryWindow = 30 * time.Minute
+	maxAttemptsKept    = 20              // Attempts 最多保留最近条数
+	captureTimeout     = 5 * time.Second // 转人工时抓屏的超时
+
+	// linkProbeEvery：暂停期间多久允许挑一条需要线路的消息做探测（测试可调小）。
+	linkProbeEvery = 30 * time.Second
+
+	// linkDownReason 是线路不通暂停时写进 Reason 的提示语。
+	linkDownReason = "线路不通，暂停重试"
+
+	// redirectReasonFmt 是 Redirect 给原消息写的拒绝原因。
+	redirectReasonFmt = "已改送 #%s"
 
 	// busyStale：busy 这么久没再变化视为失联，非 Now 消息按可送处理。
 	// 取 30 分钟的取舍：Claude Code 会把输入排到当前任务后面，
@@ -171,6 +210,14 @@ type HubConfig struct {
 	// StorePath 是落盘文件路径：消息（含附件）、对端状态、自动模式、欠回复计数写进这个文件，
 	// NewHub 时读回来，wgtund 重启不丢消息；空 = 不落盘（保持纯内存行为）。
 	StorePath string
+	// MaxAttempts 是单个阶段（sync/deliver）的自动重试次数预算，<=0 取默认 5；
+	// 用完转人工（sync_failed / failed）并生成 FailReport。
+	MaxAttempts int
+	// RetryWindow 是重试预算的时间窗，<=0 取默认 30 分钟；从首次失败起算，
+	// 线路不通的暂停时间不算。窗口先到也转人工。
+	RetryWindow time.Duration
+	// Capture 抓接收方终端画面（最后 40 行）用于失败报告；可为 nil（报告不带画面）。
+	Capture func(ctx context.Context, addr string) (string, error)
 }
 
 // Hub 是消息中转队列，并发安全；网络与 git 由 cfg 注入。
@@ -183,14 +230,27 @@ type Hub struct {
 	outPlaced map[string]bool      // 已放进过 outbox 的消息 ID（同一条只放一次；取走后超时未确认才允许重放）
 	inflight  map[string]bool      // 正在 pumpOne 处理（Sync/Deliver）的消息 ID，防并发双发；整个 pumpOne 结束才释放
 	takenAt   map[string]time.Time // 出站消息被 TakeOutbox 取走的时间；超时未确认由 pumpOne 重新排队
-	nextTry   map[string]time.Time // Deliver 失败后的下次可重试时间（指数退避）
-	fails     map[string]int       // Deliver 连续失败次数，退避用
-	peers     map[string]PeerState
-	peerAt    map[string]time.Time // 对端状态最近一次变化的时间（busy 失联判定用）
-	peerSeq   map[string]uint64    // 对端状态版本号：送达期间有新上报就不覆盖对方状态
-	nagged    map[string]int       // 单条欠回复请求已提醒过的次数（NagUnanswered 用）
-	autoUntil time.Time            // 零值表示自动模式关闭
-	wakeup    chan struct{}        // outbox 有变化或 SetState 时翻转，唤醒长轮询的 TakeOutbox
+	nextTry   map[string]time.Time // 失败后的下次可重试时间（指数退避）
+	fails     map[string]int       // 连续失败次数，退避用
+	// 重试预算：firstFail 是该消息首次真失败（非线路不通）的时间，
+	// pausedAtFirst 是当时已累计的暂停时长；RetryWindow 只算两者差出来之后的时间。
+	firstFail     map[string]time.Time
+	pausedAtFirst map[string]time.Duration
+	// stageFails 是本轮预算内的逐阶段失败计数（key: id+"|"+stage）。
+	// 不能拿 Attempts 历史数：retry 保留历史但预算要重新给；不落盘，重启视为重新起算。
+	stageFails map[string]int
+	// 线路暂停：linkDown 时需要同步或经线路送达的消息全部按住，
+	// 每 linkProbeEvery 放一条做探测；pausedTotal 累计暂停时长（预算窗要扣除）。
+	linkDown    bool
+	pausedSince time.Time
+	pausedTotal time.Duration
+	lastProbe   time.Time // 上一次放探测消息的时间
+	peers       map[string]PeerState
+	peerAt      map[string]time.Time // 对端状态最近一次变化的时间（busy 失联判定用）
+	peerSeq     map[string]uint64    // 对端状态版本号：送达期间有新上报就不覆盖对方状态
+	nagged      map[string]int       // 单条欠回复请求已提醒过的次数（NagUnanswered 用）
+	autoUntil   time.Time            // 零值表示自动模式关闭
+	wakeup      chan struct{}        // outbox 有变化或 SetState 时翻转，唤醒长轮询的 TakeOutbox
 
 	// 落盘（见 msgstore.go）：持锁时 saveLocked 拍快照（snap/snapSeq），
 	// 解锁后 flush 拿 saveMu 原子写，只有序号比上次写盘的大才真写，锁外并发不乱序。
@@ -204,20 +264,29 @@ type Hub struct {
 // NewHub 新建 Hub。cfg.StorePath 非空时读回上次落盘的快照（消息含附件、对端状态、
 // 自动模式、欠回复计数；takenAt/outbox/inflight 等瞬时状态一律从空开始，见 msgstore.go）。
 func NewHub(cfg HubConfig) *Hub {
+	if cfg.MaxAttempts <= 0 {
+		cfg.MaxAttempts = defaultMaxAttempts
+	}
+	if cfg.RetryWindow <= 0 {
+		cfg.RetryWindow = defaultRetryWindow
+	}
 	h := &Hub{
-		cfg:       cfg,
-		outbox:    nil,
-		outPlaced: make(map[string]bool),
-		inflight:  make(map[string]bool),
-		takenAt:   make(map[string]time.Time),
-		nextTry:   make(map[string]time.Time),
-		fails:     make(map[string]int),
-		peers:     make(map[string]PeerState),
-		peerAt:    make(map[string]time.Time),
-		peerSeq:   make(map[string]uint64),
-		nagged:    make(map[string]int),
-		wakeup:    make(chan struct{}),
-		storePath: cfg.StorePath,
+		cfg:           cfg,
+		outbox:        nil,
+		outPlaced:     make(map[string]bool),
+		inflight:      make(map[string]bool),
+		takenAt:       make(map[string]time.Time),
+		nextTry:       make(map[string]time.Time),
+		fails:         make(map[string]int),
+		firstFail:     make(map[string]time.Time),
+		pausedAtFirst: make(map[string]time.Duration),
+		stageFails:    make(map[string]int),
+		peers:         make(map[string]PeerState),
+		peerAt:        make(map[string]time.Time),
+		peerSeq:       make(map[string]uint64),
+		nagged:        make(map[string]int),
+		wakeup:        make(chan struct{}),
+		storePath:     cfg.StorePath,
 	}
 	if h.storePath != "" {
 		h.loadStore()
@@ -251,6 +320,157 @@ func (h *Hub) setPeerLocked(addr string, st PeerState) {
 	h.peers[addr] = st
 	h.peerAt[addr] = h.now()
 	h.peerSeq[addr]++
+}
+
+// recordAttemptLocked 给消息追加一条失败记录（首次失败时记下预算起点 firstFail 和
+// 当时的累计暂停时长 pausedAtFirst）；Attempts 只留最近 maxAttemptsKept 条。调用方须持锁。
+func (h *Hub) recordAttemptLocked(id, stage string, err error) {
+	i := h.findLocked(id)
+	if i < 0 {
+		return
+	}
+	now := h.now()
+	cur := &h.msgs[i]
+	cur.Attempts = append(cur.Attempts, Attempt{At: now, Stage: stage, Err: err.Error()})
+	if len(cur.Attempts) > maxAttemptsKept {
+		trimmed := make([]Attempt, maxAttemptsKept)
+		copy(trimmed, cur.Attempts[len(cur.Attempts)-maxAttemptsKept:])
+		cur.Attempts = trimmed
+	}
+	h.stageFails[id+"|"+stage]++
+	if _, ok := h.firstFail[id]; !ok {
+		h.firstFail[id] = now
+		h.pausedAtFirst[id] = h.pausedTotal
+	}
+}
+
+// retryElapsedLocked 算消息从首次失败起的有效经过时间：扣掉首败之后累计的暂停时长，
+// 正在暂停中的这一段（now - pausedSince）也扣。没有 firstFail 返回 false。调用方须持锁。
+func (h *Hub) retryElapsedLocked(id string, now time.Time) (time.Duration, bool) {
+	first, ok := h.firstFail[id]
+	if !ok {
+		return 0, false
+	}
+	d := now.Sub(first) - (h.pausedTotal - h.pausedAtFirst[id])
+	if h.linkDown && !h.pausedSince.IsZero() {
+		d -= now.Sub(h.pausedSince)
+	}
+	if d < 0 {
+		d = 0
+	}
+	return d, true
+}
+
+// budgetExhaustedLocked 判断该消息在这一阶段的重试预算是否用完：
+// 同阶段失败次数到 MaxAttempts，或有效经过时间到 RetryWindow。调用方须持锁（且在记录本次失败之后）。
+func (h *Hub) budgetExhaustedLocked(id, stage string) bool {
+	if h.findLocked(id) < 0 {
+		return false
+	}
+	n := h.stageFails[id+"|"+stage]
+	if n >= h.cfg.MaxAttempts {
+		return true
+	}
+	if el, ok := h.retryElapsedLocked(id, h.now()); ok && el >= h.cfg.RetryWindow {
+		return true
+	}
+	return false
+}
+
+// enterPauseLocked 进入线路暂停（已在暂停中就不重置 pausedSince）。调用方须持锁。
+func (h *Hub) enterPauseLocked() {
+	if !h.linkDown {
+		h.linkDown = true
+		h.pausedSince = h.now()
+	}
+}
+
+// recoverLinkLocked 结束线路暂停：把这段暂停时长计入 pausedTotal。
+// 探测成功或返回的不是 ErrLinkDown 都算线路回来了。调用方须持锁。
+func (h *Hub) recoverLinkLocked() {
+	if h.linkDown {
+		h.linkDown = false
+		if !h.pausedSince.IsZero() {
+			h.pausedTotal += h.now().Sub(h.pausedSince)
+			h.pausedSince = time.Time{}
+		}
+	}
+}
+
+// LinkDown 报告 Hub 是否处于线路暂停。
+func (h *Hub) LinkDown() bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.linkDown
+}
+
+// backoffLocked 按连续失败次数记指数退避（base 起翻倍，封顶 backoffMax）。调用方须持锁。
+func (h *Hub) backoffLocked(id string) {
+	h.fails[id]++
+	delay := backoffBase << uint(h.fails[id]-1)
+	if delay > backoffMax || delay <= 0 { // 溢出视为封顶
+		delay = backoffMax
+	}
+	h.nextTry[id] = h.now().Add(delay)
+}
+
+// clearStageFailsLocked 清掉一条消息两个阶段的预算计数（retry 重开、或消息结束时回收）。
+// 调用方须持锁。
+func clearStageFailsLocked(h *Hub, id string) {
+	delete(h.stageFails, id+"|sync")
+	delete(h.stageFails, id+"|deliver")
+}
+
+// resetRetryLocked 清空一条消息的重试预算（retry/now 重开时用）；Attempts 历史保留。
+// 调用方须持锁。
+func resetRetryLocked(h *Hub, id string, cur *Message) {
+	delete(h.firstFail, id)
+	delete(h.pausedAtFirst, id)
+	delete(h.nextTry, id)
+	delete(h.fails, id)
+	clearStageFailsLocked(h, id)
+	cur.Report = nil
+}
+
+// reportReq 是转人工时在锁内摘好的报告素材；Screen 必须锁外经 Capture 抓，抓完再 attach。
+type reportReq struct {
+	id        string
+	stage     string
+	addr      string
+	peerState string
+	at        time.Time
+}
+
+func newReportReqLocked(h *Hub, id, stage, addr string) *reportReq {
+	ps := "unknown"
+	if st, ok := h.peers[addr]; ok {
+		ps = string(st)
+	}
+	return &reportReq{id: id, stage: stage, addr: addr, peerState: ps, at: h.now()}
+}
+
+// captureScreen 锁外抓接收方终端画面；Capture 没配返回空串，抓失败把原因写进画面文本。
+func (h *Hub) captureScreen(ctx context.Context, addr string) string {
+	if h.cfg.Capture == nil {
+		return ""
+	}
+	cctx, cancel := context.WithTimeout(ctx, captureTimeout)
+	defer cancel()
+	s, err := h.cfg.Capture(cctx, addr)
+	if err != nil {
+		return "抓屏失败：" + err.Error()
+	}
+	return s
+}
+
+// attachReport 把抓好的报告挂回消息（消息还在转人工状态才挂，期间被 retry/淘汰就放弃）。
+func (h *Hub) attachReport(req *reportReq, screen string) {
+	h.mu.Lock()
+	if j := h.findLocked(req.id); j >= 0 && (h.msgs[j].State == MsgFailed || h.msgs[j].State == MsgSyncFailed) {
+		h.msgs[j].Report = &FailReport{Stage: req.stage, At: req.at, PeerState: req.peerState, Screen: screen}
+	}
+	h.mu.Unlock()
+	h.persist() // Report 落盘；没挂上（消息已 retry/淘汰）时内容没变不会写盘
 }
 
 // peerReadyLocked 判断能否给 addr 送非 Now 消息：上报过 idle 可送；
@@ -345,6 +565,9 @@ func (h *Hub) trimLocked() (wake chan struct{}) {
 		delete(h.takenAt, gone.ID)
 		delete(h.nextTry, gone.ID)
 		delete(h.fails, gone.ID)
+		delete(h.firstFail, gone.ID)
+		delete(h.pausedAtFirst, gone.ID)
+		clearStageFailsLocked(h, gone.ID)
 		delete(h.nagged, gone.ID)
 		if h.removeFromOutboxLocked(gone.ID) {
 			touched = true
@@ -468,7 +691,7 @@ func (h *Hub) Send(m Message) (string, error) {
 	open := 0
 	for i := range h.msgs {
 		switch h.msgs[i].State {
-		case MsgPending, MsgQueued, MsgSyncFailed:
+		case MsgPending, MsgQueued, MsgSyncFailed, MsgFailed:
 			open++
 		}
 	}
@@ -662,7 +885,9 @@ func (h *Hub) List() []Message {
 	return out
 }
 
-// Decide 对一条消息做决定。action：approve / now / reject / retry_sync / skip_sync。
+// Decide 对一条消息做决定。action：approve / now / reject / retry / retry_sync / skip_sync。
+// retry（retry_sync 是其别名，保留兼容）把 failed/sync_failed 重新排队并清空重试预算
+// （Attempts 历史保留、Report 清掉）；now 对 failed 也可用，等于 retry + 立即送达。
 // 状态不满足返回错误；id 不存在返回 ErrMsgNotFound。
 // reject 时若消息还躺在 outbox 里（已放未取），一并移除。
 func (h *Hub) Decide(id, action string) error {
@@ -681,11 +906,11 @@ func (h *Hub) Decide(id, action string) error {
 	case "approve":
 		target, ok = MsgQueued, m.State == MsgPending
 	case "now":
-		target, ok = MsgQueued, m.State == MsgPending || m.State == MsgQueued
+		target, ok = MsgQueued, m.State == MsgPending || m.State == MsgQueued || m.State == MsgFailed
 	case "reject":
-		target, ok = MsgRejected, m.State == MsgPending || m.State == MsgQueued || m.State == MsgSyncFailed
-	case "retry_sync":
-		target, ok = MsgQueued, m.State == MsgSyncFailed
+		target, ok = MsgRejected, m.State == MsgPending || m.State == MsgQueued || m.State == MsgSyncFailed || m.State == MsgFailed
+	case "retry", "retry_sync":
+		target, ok = MsgQueued, m.State == MsgSyncFailed || m.State == MsgFailed
 	case "skip_sync":
 		target, ok = MsgQueued, m.State == MsgSyncFailed
 	default:
@@ -704,8 +929,12 @@ func (h *Hub) Decide(id, action string) error {
 		cur.Now = true
 		// 消息可能正躺在 outbox 里等对方空闲：now 让它立刻可取，必须叫醒长轮询
 		wake = h.flipWakeupLocked()
-	case "retry_sync":
+		if m.State == MsgFailed || m.State == MsgSyncFailed {
+			resetRetryLocked(h, id, cur) // now 对已转人工的消息等于 retry + 立即送达
+		}
+	case "retry", "retry_sync":
 		cur.Reason = ""
+		resetRetryLocked(h, id, cur)
 	case "skip_sync":
 		cur.Synced = true
 	case "reject":
@@ -713,10 +942,13 @@ func (h *Hub) Decide(id, action string) error {
 		if h.removeFromOutboxLocked(id) {
 			wake = h.flipWakeupLocked()
 		}
-		// 已结束：清退避/取走跟踪，附件不再占内存
+		// 已结束：清退避/预算/取走跟踪，附件不再占内存
 		delete(h.takenAt, id)
 		delete(h.nextTry, id)
 		delete(h.fails, id)
+		delete(h.firstFail, id)
+		delete(h.pausedAtFirst, id)
+		clearStageFailsLocked(h, id)
 		cur.File = nil
 	}
 	out := *cur
@@ -728,6 +960,76 @@ func (h *Hub) Decide(id, action string) error {
 	h.logMsg(out)
 	h.persist() // 决定后的状态/Now/Synced/附件清理落盘
 	return nil
+}
+
+// Redirect 把一条消息改送给别人：按原消息内容（Kind/正文/附件/仓库/地址侧校验都走 Send）
+// 复制一条新消息发给 to，原消息 rejected、Reason 写「已改送 #<新id>」。
+// 原消息必须是 pending/queued/failed/sync_failed 之一。返回新消息 ID。
+func (h *Hub) Redirect(id, to string) (string, error) {
+	h.mu.Lock()
+	i := h.findLocked(id)
+	if i < 0 {
+		h.mu.Unlock()
+		return "", ErrMsgNotFound
+	}
+	m := h.msgs[i]
+	switch m.State {
+	case MsgPending, MsgQueued, MsgFailed, MsgSyncFailed:
+	default:
+		h.mu.Unlock()
+		return "", fmt.Errorf("support: 消息 %s 当前状态 %s，不能改送", id, m.State)
+	}
+	h.mu.Unlock()
+
+	// 校验和入库完全交给 Send：新消息按正常消息重新过一遍规则（含自动模式判定）。
+	newID, err := h.Send(Message{
+		From:     m.From,
+		To:       to,
+		Text:     m.Text,
+		FileName: m.FileName,
+		File:     m.File,
+		Repo:     m.Repo,
+		Branch:   m.Branch,
+		Kind:     m.Kind,
+		ReplyTo:  m.ReplyTo,
+		AskUser:  m.AskUser,
+	})
+	if err != nil {
+		return "", err
+	}
+
+	h.mu.Lock()
+	var (
+		wake chan struct{}
+		out  *Message
+	)
+	if j := h.findLocked(id); j >= 0 {
+		cur := &h.msgs[j]
+		cur.State = MsgRejected
+		cur.Reason = fmt.Sprintf(redirectReasonFmt, newID)
+		if h.removeFromOutboxLocked(id) {
+			wake = h.flipWakeupLocked()
+		}
+		delete(h.takenAt, id)
+		delete(h.nextTry, id)
+		delete(h.fails, id)
+		delete(h.firstFail, id)
+		delete(h.pausedAtFirst, id)
+		clearStageFailsLocked(h, id)
+		cur.File = nil
+		cp := *cur
+		out = &cp
+	}
+	h.mu.Unlock()
+
+	if wake != nil {
+		close(wake)
+	}
+	if out != nil {
+		h.logMsg(*out)
+	}
+	h.persist() // 原消息 rejected（含改送原因）落盘
+	return newID, nil
 }
 
 // SetAuto 开/关自动模式：minutes 为 0 关闭，1..600 表示从现在起开放的分钟数，其余报错。
@@ -818,6 +1120,9 @@ func (h *Hub) MarkDelivered(id string) error {
 	delete(h.takenAt, id)
 	delete(h.nextTry, id)
 	delete(h.fails, id)
+	delete(h.firstFail, id)
+	delete(h.pausedAtFirst, id)
+	clearStageFailsLocked(h, id)
 	cur.File = nil // 已结束，附件不再占内存
 	// 回复确认送达，原请求才算真被回了；原请求已被淘汰就算了
 	h.markAnsweredLocked(*cur)
@@ -833,6 +1138,9 @@ func (h *Hub) MarkDelivered(id string) error {
 // 规则：接收方忙且不是 Now 则跳过；要先同步且没同步过则先调 Sync；
 // 发往 mac: 的进 outbox 等 TakeOutbox，其余调 Deliver；
 // Deliver 成功或消息被取走后把接收方置忙。Sync/Deliver 在锁外调用。
+// 线路暂停（LinkDown）时碰线路的消息按住不推进，每 linkProbeEvery 放一条做探测；
+// 发往 mac: 且不用同步的消息照常。真失败按预算（MaxAttempts/RetryWindow）自动重试，
+// 用完转 failed（送达）/ sync_failed（同步）并生成 FailReport。
 func (h *Hub) Pump(ctx context.Context) {
 	h.mu.Lock()
 	var queue []Message
@@ -889,7 +1197,7 @@ func (h *Hub) pumpOne(ctx context.Context, id string) {
 		return
 	}
 	if next, ok := h.nextTry[id]; ok && h.now().Before(next) {
-		h.mu.Unlock() // 送达失败退避中，Now 也要遵守
+		h.mu.Unlock() // 失败退避中，Now 也要遵守
 		if reclaimed != nil {
 			h.logMsg(*reclaimed)
 		}
@@ -898,6 +1206,21 @@ func (h *Hub) pumpOne(ctx context.Context, id string) {
 	}
 	needSync := m.Repo != "" && !m.Synced
 	macDest := strings.HasPrefix(m.To, "mac:")
+	// 线路暂停：要先同步的、以及要经 Deliver 送出去的都得等线路；
+	// 每 linkProbeEvery 放一条做探测（lastProbe 当场扣掉，同锁内并发也只放过一条）。
+	// 发往 mac: 且不用同步的走 outbox 等本机来取，不碰线路，照常推进。
+	if h.linkDown && (needSync || !macDest) {
+		now := h.now()
+		if now.Sub(h.lastProbe) < linkProbeEvery {
+			h.mu.Unlock()
+			if reclaimed != nil {
+				h.logMsg(*reclaimed)
+			}
+			h.persist()
+			return
+		}
+		h.lastProbe = now
+	}
 	if h.inflight[id] {
 		h.mu.Unlock()
 		if reclaimed != nil {
@@ -922,20 +1245,40 @@ func (h *Hub) pumpOne(ctx context.Context, id string) {
 		h.mu.Lock()
 		continueSend := false
 		var out *Message
+		var rep *reportReq
 		if ctx.Err() != nil {
 			// 取消不是失败：状态、Reason、Synced 都不动
 			delete(h.inflight, id)
-		} else if j := h.findLocked(id); j >= 0 && h.msgs[j].State == MsgQueued {
-			if err != nil {
-				h.msgs[j].State = MsgSyncFailed
-				h.msgs[j].Reason = err.Error()
-				delete(h.nextTry, id) // 离开 queued，退避作废
-				delete(h.fails, id)
-				cp := h.msgs[j]
-				out = &cp
+		} else {
+			if errors.Is(err, ErrLinkDown) {
+				// 线路不通不算同步失败：不记 Attempt 不计次数，Hub 整体暂停等探测恢复
+				h.enterPauseLocked()
 			} else {
-				h.msgs[j].Synced = true
-				continueSend = true // 保持 inflight，送达/进 outbox 后再释放
+				h.recoverLinkLocked()
+			}
+			if j := h.findLocked(id); j >= 0 && h.msgs[j].State == MsgQueued {
+				if err != nil {
+					if errors.Is(err, ErrLinkDown) {
+						h.msgs[j].Reason = linkDownReason
+					} else {
+						h.msgs[j].Reason = err.Error()
+						h.recordAttemptLocked(id, "sync", err)
+						if h.budgetExhaustedLocked(id, "sync") {
+							// 预算用完：转人工，离开 queued，退避作废；抓屏在锁外做
+							h.msgs[j].State = MsgSyncFailed
+							delete(h.nextTry, id)
+							delete(h.fails, id)
+							rep = newReportReqLocked(h, id, "sync", m.To)
+						} else {
+							h.backoffLocked(id) // 留在 queued，退避后自动重试
+						}
+					}
+					cp := h.msgs[j]
+					out = &cp
+				} else {
+					h.msgs[j].Synced = true
+					continueSend = true // 保持 inflight，送达/进 outbox 后再释放
+				}
 			}
 		}
 		if !continueSend {
@@ -945,9 +1288,12 @@ func (h *Hub) pumpOne(ctx context.Context, id string) {
 		if out != nil {
 			h.logMsg(*out)
 		}
+		h.persist() // 同步结果（含暂停/预算状态）落盘；内容没变则不写
+		if rep != nil {
+			h.attachReport(rep, h.captureScreen(ctx, rep.addr))
+		}
 		if !continueSend {
-			h.persist() // sync_failed 的 State/Reason 落盘；取消/被拒时内容没变则不写
-			return      // 同步失败、被取消，或同步期间被 reject/淘汰
+			return // 同步失败、被取消，或同步期间被 reject/淘汰
 		}
 	}
 
@@ -995,10 +1341,20 @@ func (h *Hub) pumpOne(ctx context.Context, id string) {
 		err = h.cfg.Deliver(ctx, m)
 	}
 	h.mu.Lock()
-	var out *Message
+	var (
+		out *Message
+		rep *reportReq
+	)
 	if ctx.Err() != nil {
 		// 取消不是失败：状态、Reason 都不动
-	} else if j := h.findLocked(id); j >= 0 {
+	} else {
+		if errors.Is(err, ErrLinkDown) {
+			h.enterPauseLocked()
+		} else {
+			h.recoverLinkLocked()
+		}
+	}
+	if j := h.findLocked(id); j >= 0 {
 		if h.msgs[j].State == MsgQueued {
 			if errors.Is(err, ErrPeerNotClaude) {
 				// 对面不是 Claude：记 gone 把后续消息整体按住。这不算投递失败——
@@ -1010,14 +1366,23 @@ func (h *Hub) pumpOne(ctx context.Context, id string) {
 				}
 				h.msgs[j].Reason = err.Error()
 			} else if err != nil {
-				// 保持 queued，只记 Reason；指数退避，下次 Pump 到点才再试。
-				h.msgs[j].Reason = err.Error()
-				h.fails[id]++
-				delay := backoffBase << uint(h.fails[id]-1)
-				if delay > backoffMax || delay <= 0 { // 溢出视为封顶
-					delay = backoffMax
+				if errors.Is(err, ErrLinkDown) {
+					// 线路不通不算投递失败：不记 Attempt 不计次数，暂停等探测恢复
+					h.msgs[j].Reason = linkDownReason
+				} else {
+					h.msgs[j].Reason = err.Error()
+					h.recordAttemptLocked(id, "deliver", err)
+					if h.budgetExhaustedLocked(id, "deliver") {
+						// 预算用完：转人工 failed，退避作废；抓屏在锁外做
+						h.msgs[j].State = MsgFailed
+						delete(h.nextTry, id)
+						delete(h.fails, id)
+						rep = newReportReqLocked(h, id, "deliver", m.To)
+					} else {
+						// 保持 queued，记退避，下次 Pump 到点才再试
+						h.backoffLocked(id)
+					}
 				}
-				h.nextTry[id] = h.now().Add(delay)
 			} else {
 				h.msgs[j].State = MsgDelivered
 				h.msgs[j].Reason = ""
@@ -1030,6 +1395,9 @@ func (h *Hub) pumpOne(ctx context.Context, id string) {
 				h.markAnsweredLocked(h.msgs[j])
 				delete(h.nextTry, id)
 				delete(h.fails, id)
+				delete(h.firstFail, id)
+				delete(h.pausedAtFirst, id)
+				clearStageFailsLocked(h, id)
 				cp := h.msgs[j]
 				out = &cp
 			}
@@ -1045,5 +1413,8 @@ func (h *Hub) pumpOne(ctx context.Context, id string) {
 	if out != nil {
 		h.logMsg(*out)
 	}
-	h.persist() // delivered/gone/退避 Reason 等送达结果落盘
+	h.persist() // delivered/gone/暂停/退避 Reason 等送达结果落盘
+	if rep != nil {
+		h.attachReport(rep, h.captureScreen(ctx, rep.addr))
+	}
 }

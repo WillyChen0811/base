@@ -15,16 +15,23 @@ import (
 // hubStoreVersion 是消息快照文件的格式版本；加载时不等于它的文件按损坏处理。
 const hubStoreVersion = 1
 
-// hubSnapshot 是落盘的最小状态集：消息（含附件）、对端状态、自动模式、欠回复计数。
+// hubSnapshot 是落盘的最小状态集：消息（含附件、Attempts/Report）、对端状态、自动模式、
+// 欠回复计数，以及重试预算与线路暂停进度（firstFail/pausedAtFirst/linkDown/pausedTotal，
+// 重启后预算和暂停累计接着算，不能从头再来）。
 // takenAt/outbox/outPlaced/inflight/nextTry/fails/peerSeq 不存：
 // 重启后 queued 消息由下一次 Pump 正常重新处理（发往 mac: 的重新进 outbox）。
 type hubSnapshot struct {
-	Version   int                  `json:"version"`
-	Messages  []storedMsg          `json:"messages"`
-	Peers     map[string]PeerState `json:"peers"`
-	PeerAt    map[string]time.Time `json:"peer_at"`
-	AutoUntil time.Time            `json:"auto_until"`
-	Nagged    map[string]int       `json:"nagged"`
+	Version       int                      `json:"version"`
+	Messages      []storedMsg              `json:"messages"`
+	Peers         map[string]PeerState     `json:"peers"`
+	PeerAt        map[string]time.Time     `json:"peer_at"`
+	AutoUntil     time.Time                `json:"auto_until"`
+	Nagged        map[string]int           `json:"nagged"`
+	LinkDown      bool                     `json:"link_down"`
+	PausedSince   time.Time                `json:"paused_since"`
+	PausedTotal   time.Duration            `json:"paused_total"`
+	FirstFail     map[string]time.Time     `json:"first_fail"`
+	PausedAtFirst map[string]time.Duration `json:"paused_at_first"`
 }
 
 // storedMsg 包一层 Message 单独存附件：Message.File 是 json:"-"（对外 JSON 不带正文），
@@ -71,12 +78,17 @@ func (h *Hub) saveLocked() {
 		nagged[k] = v
 	}
 	b, err := json.Marshal(hubSnapshot{
-		Version:   hubStoreVersion,
-		Messages:  msgs,
-		Peers:     peers,
-		PeerAt:    peerAt,
-		AutoUntil: h.autoUntil,
-		Nagged:    nagged,
+		Version:       hubStoreVersion,
+		Messages:      msgs,
+		Peers:         peers,
+		PeerAt:        peerAt,
+		AutoUntil:     h.autoUntil,
+		Nagged:        nagged,
+		LinkDown:      h.linkDown,
+		PausedSince:   h.pausedSince,
+		PausedTotal:   h.pausedTotal,
+		FirstFail:     h.firstFail,
+		PausedAtFirst: h.pausedAtFirst,
 	})
 	if err != nil { // 本结构理论上 marshal 不会失败；真失败了不递增，保住上一次快照
 		return
@@ -159,9 +171,21 @@ func (h *Hub) loadStore() {
 	for k, v := range snap.Nagged {
 		h.nagged[k] = v
 	}
+	h.firstFail = make(map[string]time.Time, len(snap.FirstFail))
+	for k, v := range snap.FirstFail {
+		h.firstFail[k] = v
+	}
+	h.pausedAtFirst = make(map[string]time.Duration, len(snap.PausedAtFirst))
+	for k, v := range snap.PausedAtFirst {
+		h.pausedAtFirst[k] = v
+	}
 	h.autoUntil = snap.AutoUntil
+	h.linkDown = snap.LinkDown
+	h.pausedSince = snap.PausedSince
+	h.pausedTotal = snap.PausedTotal
 	// takenAt/outbox/outPlaced/inflight/nextTry/fails/peerSeq 保持 NewHub 给的空表：
-	// 加载出的 queued 消息会被下一次 Pump 正常处理，不保留"已放进 outbox"的痕迹。
+	// 加载出的 queued 消息会被下一次 Pump 正常处理，不保留"已放进 outbox"的痕迹；
+	// lastProbe 归零——重启后第一次 Pump 正好立刻放一条探测。
 }
 
 // quarantineStore 把坏快照挪成 <path>.corrupt-<Unix 秒>（保证下次启动不再撞上它）并记日志。

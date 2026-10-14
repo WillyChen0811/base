@@ -95,12 +95,13 @@ func msgErr(w http.ResponseWriter, err error) {
 	errJSON(w, http.StatusConflict, err.Error())
 }
 
-// msgList 是 GET /msg：全部消息 + 自动模式截止时间 + 对端忙闲。
+// msgList 是 GET /msg：全部消息 + 自动模式截止时间 + 对端忙闲 + 线路是否暂停。
 func (s *Service) msgList(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"messages":   s.hub.List(),
 		"auto_until": autoUntilUnix(s.hub),
 		"peers":      s.hub.Peers(),
+		"link_down":  s.hub.LinkDown(),
 	})
 }
 
@@ -228,9 +229,20 @@ func (s *Service) msgInbox(side string) http.HandlerFunc {
 	}
 }
 
-// msgDecide 是 POST /msg/decide?id=&action=...（approve|now|reject|retry_sync|skip_sync）。
+// msgDecide 是 POST /msg/decide?id=&action=...（approve|now|reject|retry|retry_sync|skip_sync）；
+// action=redirect 必须带 to=，改送成功返回 {"ok":true,"id":新消息id}，原消息由 Hub 置 rejected。
 func (s *Service) msgDecide(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
+	if q.Get("action") == "redirect" {
+		newID, err := s.hub.Redirect(q.Get("id"), q.Get("to"))
+		if err != nil {
+			msgErr(w, err)
+			return
+		}
+		s.kickMsgPump()
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "id": newID})
+		return
+	}
 	if err := s.hub.Decide(q.Get("id"), q.Get("action")); err != nil {
 		msgErr(w, err)
 		return

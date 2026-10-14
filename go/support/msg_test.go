@@ -403,8 +403,8 @@ func TestSyncFailRetryAndSkip(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.hub.Pump(ctx)
-	if state := stateOf(t, f.hub, id); state != MsgSyncFailed {
-		t.Fatalf("同步失败应 sync_failed，实际 %s", state)
+	if state := stateOf(t, f.hub, id); state != MsgQueued {
+		t.Fatalf("同步首次失败应先按预算自动重试（保持 queued），实际 %s", state)
 	}
 	for _, lm := range f.hub.List() {
 		if lm.ID == id && lm.Reason != syncBoom.Error() {
@@ -414,19 +414,22 @@ func TestSyncFailRetryAndSkip(t *testing.T) {
 	if n := len(f.delivered()); n != 0 {
 		t.Fatalf("同步失败不应送达，实际 %d 条", n)
 	}
+	// 沿退避（2,4,8,16 秒）再撞 4 次：第 5 次失败预算用完才 sync_failed
+	for k := 0; k < defaultMaxAttempts-1; k++ {
+		f.clock.Add((2 << uint(k)) * time.Second)
+		f.hub.Pump(ctx)
+	}
+	if state := stateOf(t, f.hub, id); state != MsgSyncFailed {
+		t.Fatalf("同步失败 %d 次应转 sync_failed，实际 %s", defaultMaxAttempts, state)
+	}
+	if lm := peekHubMsg(t, f.hub, id); lm.Report == nil || lm.Report.Stage != "sync" {
+		t.Errorf("sync 转人工应带 Stage=sync 的报告，实际 %+v", lm.Report)
+	}
 	// sync_failed 时 approve 应报错
 	if err := f.hub.Decide(id, "approve"); err == nil {
 		t.Errorf("sync_failed 不能 approve")
 	}
-	// retry_sync：重新同步
-	if err := f.hub.Decide(id, "retry_sync"); err != nil {
-		t.Fatal(err)
-	}
-	f.hub.Pump(ctx) // 还是错，回到 sync_failed——sync_failed 不会被 Pump 再碰
-	if state := stateOf(t, f.hub, id); state != MsgSyncFailed {
-		t.Fatalf("Sync 仍失败应回 sync_failed，实际 %s", state)
-	}
-	// sync_failed 必须先 retry_sync 才会重新进 Pump
+	// retry_sync：清预算重新同步
 	if err := f.hub.Decide(id, "retry_sync"); err != nil {
 		t.Fatal(err)
 	}
@@ -439,7 +442,7 @@ func TestSyncFailRetryAndSkip(t *testing.T) {
 		t.Errorf("应送达 1 条，实际 %d", n)
 	}
 
-	// skip_sync：不再同步直接送
+	// skip_sync：不再同步直接送（先撞满预算进 sync_failed）
 	m2 := okMsg()
 	m2.From = "mac:srv"
 	m2.To = "ubuntu:bob"
@@ -457,7 +460,12 @@ func TestSyncFailRetryAndSkip(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.setSyncErr(syncBoom)
-	f.hub.Pump(ctx)
+	for k := 0; k < defaultMaxAttempts; k++ {
+		if k > 0 {
+			f.clock.Add((2 << uint(k-1)) * time.Second)
+		}
+		f.hub.Pump(ctx)
+	}
 	if state := stateOf(t, f.hub, id2); state != MsgSyncFailed {
 		t.Fatalf("应 sync_failed，实际 %s", state)
 	}
@@ -1269,6 +1277,9 @@ func TestCapacityEvicts(t *testing.T) {
 func TestMaxOpenCapCountsAllUnfinished(t *testing.T) {
 	f := newMsgFixture()
 	ctx := context.Background()
+	// 同步失败现在先按预算重试、用完才 sync_failed；这里把预算设为 1，
+	// 第一次失败即转人工，保持本测试"sync_failed 占未结束名额"的原意。
+	f.hub.cfg.MaxAttempts = 1
 	f.setSyncErr(errors.New("ssh 断了"))
 	if err := f.hub.SetState("mac:bob", PeerIdle); err != nil { // 上报过 idle 才会真去同步
 		t.Fatal(err)
@@ -2015,8 +2026,10 @@ func TestDeliverBackoff(t *testing.T) {
 		t.Errorf("成功后退避应清零，实际 fails=%d next=%v", fails, next)
 	}
 
-	// 封顶：连续失败退避 2,4,8,16,32,60(封顶)
+	// 封顶：连续失败退避 2,4,8,16,32,64,128,256,300(封顶 5 分钟)
+	// 预算（MaxAttempts）放宽到 20，免得第 5 次失败先转人工打断退避观察。
 	f2 := newMsgFixture()
+	f2.hub.cfg.MaxAttempts = 20
 	m2 := okMsg()
 	m2.To = "ubuntu:bob"
 	id2, err := f2.hub.Send(m2)
@@ -2030,7 +2043,7 @@ func TestDeliverBackoff(t *testing.T) {
 	if err := f2.hub.SetState("ubuntu:bob", PeerIdle); err != nil { // 上报过 idle 才会真去投递
 		t.Fatal(err)
 	}
-	delays := []time.Duration{2, 4, 8, 16, 32, 60}
+	delays := []time.Duration{2, 4, 8, 16, 32, 64, 128, 256, 300}
 	for k, d := range delays {
 		if k > 0 {
 			f2.clock.Add(delays[k-1] * time.Second)

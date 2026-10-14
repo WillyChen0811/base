@@ -64,6 +64,12 @@ const (
 	KindCode    = "code"
 )
 
+// retryStages 是参与重试预算的阶段；预算键一律 id+"|"+stage。
+var retryStages = []string{"sync", "deliver", "ack"}
+
+// maxClientIDLen 是客户端幂等 ID（Message.ClientID）的字节上限。
+const maxClientIDLen = 64
+
 // Message 是一条中转消息。File 不进 JSON，由调用方经 Hub 流转。
 type Message struct {
 	ID       string    `json:"id"` // 随机 16 位十六进制
@@ -80,9 +86,12 @@ type Message struct {
 	Synced   bool      `json:"synced,omitempty"`
 	Created  time.Time `json:"created"`
 
-	Kind     string `json:"kind"`
-	ReplyTo  string `json:"reply_to,omitempty"` // 仅 reply 使用，指向被回复的 request
-	AskUser  bool   `json:"ask_user,omitempty"` // 发件人声明：涉及决定的部分要交给用户
+	Kind    string `json:"kind"`
+	ReplyTo string `json:"reply_to,omitempty"` // 仅 reply 使用，指向被回复的 request
+	AskUser bool   `json:"ask_user,omitempty"` // 发件人声明：涉及决定的部分要交给用户
+	// ClientID 是发送客户端生成的幂等 ID（可空，≤64 字节、只许 [A-Za-z0-9._-]）：
+	// 同 From 且同 ClientID 的 Send 不新建消息，直接返回已有那条的 ID。
+	ClientID string `json:"client_id,omitempty"`
 	Answered bool   `json:"answered,omitempty"` // 仅 request 有意义：收到过合法 reply
 	// Overdue 仅 request 有意义：送达后超过 HubConfig.ReplyTimeout 仍没有回复，
 	// Hub 标一次并由系统通知（From xxyi:hub）提醒原发件人。界面据此标红。
@@ -188,6 +197,9 @@ const HubSenderAddr = "xxyi:hub"
 const (
 	// ackErrFmt 是注入后等不到对方确认写进 Attempt/Reason 的提示语。
 	ackErrFmt = "注入后 %s 对方没开始处理（可能额度用尽、报错或卡在确认框）"
+	// peerGoneReason 是钩子上报 gone 时把该地址 injected 消息退回 queued 写的 Reason；
+	// 对方退出不是投递失败，不记 Attempt、不退避。
+	peerGoneReason = "对方已退出"
 	// overdueNoticeFmt 是欠回复超时系统通知的正文。
 	overdueNoticeFmt = "#%s 发给 %s 的请求超过 %s没有回复（对方状态：%s）。需要的话请换个方式或交给用户。"
 	// overdueLogKind 是欠回复超时的日志 kind。
@@ -306,8 +318,11 @@ type Hub struct {
 	takenAt   map[string]time.Time // 出站消息被 TakeOutbox 取走的时间；超时未确认由 pumpOne 重新排队
 	nextTry   map[string]time.Time // 失败后的下次可重试时间（指数退避）
 	fails     map[string]int       // 连续失败次数，退避用
-	// 重试预算：firstFail 是该消息首次真失败（非线路不通）的时间，
-	// pausedAtFirst 是当时已累计的暂停时长；RetryWindow 只算两者差出来之后的时间。
+	// 重试预算按阶段各算各的（key: id+"|"+stage，stage：sync/deliver/ack）：
+	// firstFail 是该阶段首次真失败（非线路不通）的时间，pausedAtFirst 是当时已累计的
+	// 暂停时长（首败发生在暂停中就再加上当时那段 now-pausedSince）；
+	// RetryWindow 只算两者差出来之后的时间。某阶段成功就把该阶段的三个键一起清掉，
+	// 别的阶段的预算不受牵连（同步失败过 40 分钟不该压缩送达/确认阶段的窗口）。
 	firstFail     map[string]time.Time
 	pausedAtFirst map[string]time.Duration
 	// stageFails 是本轮预算内的逐阶段失败计数（key: id+"|"+stage）。
@@ -323,7 +338,12 @@ type Hub struct {
 	peerAt      map[string]time.Time // 对端状态最近一次变化的时间（busy 失联判定用）
 	peerSeq     map[string]uint64    // 对端状态版本号：送达期间有新上报就不覆盖对方状态
 	injectedAt  map[string]time.Time // 注入成功、开始等对方确认的时间（AckTimeout 起算点）
-	ackSeq      map[string]uint64    // 注入时（置 busy 之后）的对端版本号；变大才算对方接收了
+	ackSeq      map[string]uint64    // 注入前的对端基准（取自 ackBase）；钩子 busy 上报的编号大于它才算确认
+	ackBase     map[string]uint64    // 取走/注入前的对端版本号：Ubuntu 在调 Deliver 前、Mac 在 TakeOutbox 置忙前记下，markInjectedLocked 消费
+	// hookBusySeq 是钩子经 SetState 上报 busy 时最近一次的 peerSeq；只有它大于
+	// ackSeq 才把 injected 落 delivered。Hub 自己置的 busy（送达/取走/确认超时）
+	// 不记这里；idle 上报也不确认（空闲不代表对方接住了消息）。
+	hookBusySeq map[string]uint64
 	deliveredAt map[string]time.Time // 变成 delivered 的时间（ReplyTimeout 起算点）
 	nagged      map[string]int       // 单条欠回复请求已提醒过的次数（NagUnanswered 用）
 	autoUntil   time.Time            // 零值表示自动模式关闭
@@ -369,6 +389,8 @@ func NewHub(cfg HubConfig) *Hub {
 		peerSeq:       make(map[string]uint64),
 		injectedAt:    make(map[string]time.Time),
 		ackSeq:        make(map[string]uint64),
+		ackBase:       make(map[string]uint64),
+		hookBusySeq:   make(map[string]uint64),
 		deliveredAt:   make(map[string]time.Time),
 		nagged:        make(map[string]int),
 		wakeup:        make(chan struct{}),
@@ -408,8 +430,14 @@ func (h *Hub) setPeerLocked(addr string, st PeerState) {
 	h.peerSeq[addr]++
 }
 
-// recordAttemptLocked 给消息追加一条失败记录（首次失败时记下预算起点 firstFail 和
-// 当时的累计暂停时长 pausedAtFirst）；Attempts 只留最近 maxAttemptsKept 条。调用方须持锁。
+// stageKey 拼阶段预算的 map 键；stage 取 retryStages 之一。
+func stageKey(id, stage string) string { return id + "|" + stage }
+
+// recordAttemptLocked 给消息追加一条失败记录，并记该阶段的预算起点：
+// firstFail[id|stage] 是该阶段首次真失败的时间，pausedAtFirst 是当时已累计的暂停时长——
+// 若首败正发生在暂停中，把当前这段暂停（now - pausedSince）也算进起点，
+// 这样 retryElapsedLocked 照旧"再扣当前暂停段"时，只扣 [首败, now] 内的部分，
+// 暂停早于首败的那截不会被冤枉多扣。Attempts 只留最近 maxAttemptsKept 条。调用方须持锁。
 func (h *Hub) recordAttemptLocked(id, stage string, err error) {
 	i := h.findLocked(id)
 	if i < 0 {
@@ -423,21 +451,28 @@ func (h *Hub) recordAttemptLocked(id, stage string, err error) {
 		copy(trimmed, cur.Attempts[len(cur.Attempts)-maxAttemptsKept:])
 		cur.Attempts = trimmed
 	}
-	h.stageFails[id+"|"+stage]++
-	if _, ok := h.firstFail[id]; !ok {
-		h.firstFail[id] = now
-		h.pausedAtFirst[id] = h.pausedTotal
+	key := stageKey(id, stage)
+	h.stageFails[key]++
+	if _, ok := h.firstFail[key]; !ok {
+		h.firstFail[key] = now
+		base := h.pausedTotal
+		if h.linkDown && !h.pausedSince.IsZero() {
+			base += now.Sub(h.pausedSince)
+		}
+		h.pausedAtFirst[key] = base
 	}
 }
 
-// retryElapsedLocked 算消息从首次失败起的有效经过时间：扣掉首败之后累计的暂停时长，
-// 正在暂停中的这一段（now - pausedSince）也扣。没有 firstFail 返回 false。调用方须持锁。
-func (h *Hub) retryElapsedLocked(id string, now time.Time) (time.Duration, bool) {
-	first, ok := h.firstFail[id]
+// retryElapsedLocked 算该阶段从首次失败起的有效经过时间（key = stageKey(id, stage)）：
+// 扣掉首败之后累计的暂停时长，正在暂停中的这一段（now - pausedSince）也扣——
+// 首败若在暂停中发生，pausedAtFirst 已把当时那段算进起点，这里不会重复扣。
+// 没记过该阶段起点返回 false。调用方须持锁。
+func (h *Hub) retryElapsedLocked(key string, now time.Time) (time.Duration, bool) {
+	first, ok := h.firstFail[key]
 	if !ok {
 		return 0, false
 	}
-	d := now.Sub(first) - (h.pausedTotal - h.pausedAtFirst[id])
+	d := now.Sub(first) - (h.pausedTotal - h.pausedAtFirst[key])
 	if h.linkDown && !h.pausedSince.IsZero() {
 		d -= now.Sub(h.pausedSince)
 	}
@@ -448,16 +483,17 @@ func (h *Hub) retryElapsedLocked(id string, now time.Time) (time.Duration, bool)
 }
 
 // budgetExhaustedLocked 判断该消息在这一阶段的重试预算是否用完：
-// 同阶段失败次数到 MaxAttempts，或有效经过时间到 RetryWindow。调用方须持锁（且在记录本次失败之后）。
+// 同阶段失败次数到 MaxAttempts，或该阶段窗口（从该阶段首败起算）到 RetryWindow。
+// 调用方须持锁（且在记录本次失败之后）。
 func (h *Hub) budgetExhaustedLocked(id, stage string) bool {
 	if h.findLocked(id) < 0 {
 		return false
 	}
-	n := h.stageFails[id+"|"+stage]
+	n := h.stageFails[stageKey(id, stage)]
 	if n >= h.cfg.MaxAttempts {
 		return true
 	}
-	if el, ok := h.retryElapsedLocked(id, h.now()); ok && el >= h.cfg.RetryWindow {
+	if el, ok := h.retryElapsedLocked(stageKey(id, stage), h.now()); ok && el >= h.cfg.RetryWindow {
 		return true
 	}
 	return false
@@ -500,23 +536,41 @@ func (h *Hub) backoffLocked(id string) {
 	h.nextTry[id] = h.now().Add(delay)
 }
 
-// clearStageFailsLocked 清掉一条消息两个阶段的预算计数（retry 重开、或消息结束时回收）。
-// 调用方须持锁。
+// clearStageFailsLocked 清掉一条消息所有阶段（sync/deliver/ack）的预算计数
+// （retry 重开、或消息结束时回收；ack 预算一并覆盖）。调用方须持锁。
 func clearStageFailsLocked(h *Hub, id string) {
-	delete(h.stageFails, id+"|sync")
-	delete(h.stageFails, id+"|deliver")
+	for _, st := range retryStages {
+		delete(h.stageFails, stageKey(id, st))
+	}
+}
+
+// clearStageBudgetLocked 清掉一条消息所有阶段的完整预算：失败计数加预算起点。
+// 消息结束（delivered/rejected/淘汰）或 retry/now 重开时用。调用方须持锁。
+func clearStageBudgetLocked(h *Hub, id string) {
+	for _, st := range retryStages {
+		delete(h.stageFails, stageKey(id, st))
+		delete(h.firstFail, stageKey(id, st))
+		delete(h.pausedAtFirst, stageKey(id, st))
+	}
+}
+
+// clearDoneStageLocked 清掉某个已成功阶段的记录（同步成功/注入成功时）：
+// 该阶段之前的失败不再占用它的窗口；别的阶段的预算不受牵连。调用方须持锁。
+func clearDoneStageLocked(h *Hub, id, stage string) {
+	delete(h.stageFails, stageKey(id, stage))
+	delete(h.firstFail, stageKey(id, stage))
+	delete(h.pausedAtFirst, stageKey(id, stage))
 }
 
 // resetRetryLocked 清空一条消息的重试预算（retry/now 重开时用）；Attempts 历史保留。
 // 调用方须持锁。
 func resetRetryLocked(h *Hub, id string, cur *Message) {
-	delete(h.firstFail, id)
-	delete(h.pausedAtFirst, id)
 	delete(h.nextTry, id)
 	delete(h.fails, id)
 	delete(h.injectedAt, id)
 	delete(h.ackSeq, id)
-	clearStageFailsLocked(h, id)
+	delete(h.ackBase, id)
+	clearStageBudgetLocked(h, id)
 	cur.Report = nil
 }
 
@@ -598,33 +652,45 @@ func (h *Hub) finishDeliveredLocked(i int) {
 	h.markAnsweredLocked(*cur)
 	delete(h.nextTry, cur.ID)
 	delete(h.fails, cur.ID)
-	delete(h.firstFail, cur.ID)
-	delete(h.pausedAtFirst, cur.ID)
 	delete(h.injectedAt, cur.ID)
 	delete(h.ackSeq, cur.ID)
-	clearStageFailsLocked(h, cur.ID)
+	delete(h.ackBase, cur.ID)
+	clearStageBudgetLocked(h, cur.ID) // 确认成功：所有阶段的预算到此为止
 }
 
 // markInjectedLocked 把刚注入成功的非 Now 消息记成 injected：记下注入时间和
-// "注入时（置 busy 之后）的对端版本号"，之后该对端任何一次新上报都算对方接收了。
-// 注入成功不等于对方开始处理：附件、预算起点都留着，等真送达才收尾。调用方须持锁。
+// "注入前的对端基准"（ackBase：Ubuntu 在调 Deliver 前、Mac 在 TakeOutbox 置忙前
+// 记下的版本号；缺兜底取当前 peerSeq）。之后该对端钩子 busy 上报的编号大于它才算
+// 注入期间或之后对方真的动过——注入前记基准，注入过程中到的 busy 也算确认。
+// 注入成功不等于对方开始处理：附件、ack 阶段预算留着，等真送达才收尾。调用方须持锁。
 func (h *Hub) markInjectedLocked(i int) {
 	cur := &h.msgs[i]
 	cur.State = MsgInjected
 	cur.Reason = ""
 	h.injectedAt[cur.ID] = h.now()
-	h.ackSeq[cur.ID] = h.peerSeq[cur.To]
-	// 注入本身成功了：送达阶段的退避作废；预算起点（firstFail）留着，
-	// 等确认这一段仍算同一条消息的重试过程。
+	base, ok := h.ackBase[cur.ID]
+	if !ok {
+		base = h.peerSeq[cur.To] // 没走 TakeOutbox/Deliver 记点的调用路径：退回当前版本号
+	}
+	delete(h.ackBase, cur.ID)
+	h.ackSeq[cur.ID] = base
+	// 注入本身成功了：同步/送达阶段的退避作废（ack 阶段的预算另算）。
 	delete(h.nextTry, cur.ID)
 	delete(h.fails, cur.ID)
-	clearStageFailsLocked(h, cur.ID)
+	clearDoneStageLocked(h, cur.ID, "sync")
+	clearDoneStageLocked(h, cur.ID, "deliver")
+	if h.hookBusySeq[cur.To] > h.ackSeq[cur.ID] {
+		// 注入前/注入期间钩子已报过忙：对方收到了，不必再等下一次上报。
+		h.finishDeliveredLocked(i)
+	}
 }
 
-// checkInjectedLocked 推进 injected 消息：对端版本号超过注入时记下的 ackSeq
-// 就落 delivered；注入后超过 AckTimeout 仍没有任何新上报，就记一次 ack 阶段失败、
+// checkInjectedLocked 推进 injected 消息：钩子 busy 上报的编号（hookBusySeq）超过
+// 注入前记下的 ackSeq 就落 delivered——只有钩子报忙才算对方接住了并开始处理，
+// idle 不算（空闲不代表收过）、Hub 自己置的 busy 不算。
+// 注入后超过 AckTimeout 仍没有钩子 busy，就记一次 ack 阶段失败、
 // 重回 queued 走重试预算（用完转 failed，报告 Stage=ack）。
-// onlyAddr 非空时只看该对端（SetState 用：刚上报的那个地址必然版本号变了）；
+// onlyAddr 非空时只看该对端（SetState 用：刚上报的那个地址）；
 // 空则扫全部对端（Pump 用：查超时）。
 // 返回要记日志的消息拷贝，和要在锁外抓屏转人工的报告请求。调用方须持锁。
 func (h *Hub) checkInjectedLocked(now time.Time, onlyAddr string) (logged []Message, reps []*reportReq) {
@@ -637,8 +703,8 @@ func (h *Hub) checkInjectedLocked(now time.Time, onlyAddr string) (logged []Mess
 		if onlyAddr != "" && m.To != onlyAddr {
 			continue
 		}
-		if h.peerSeq[m.To] > h.ackSeq[m.ID] {
-			// 注入之后对端又上报过一次：说明消息真被接住了，开始处理
+		if h.hookBusySeq[m.To] > h.ackSeq[m.ID] {
+			// 注入基准之后钩子报过忙：说明消息真被接住了，开始处理
 			h.finishDeliveredLocked(i)
 			logged = append(logged, *m)
 			continue
@@ -672,31 +738,29 @@ func (h *Hub) checkInjectedLocked(now time.Time, onlyAddr string) (logged []Mess
 	return logged, reps
 }
 
-// sendSystemLocked 生成一条 Hub 系统通知（From 固定 HubSenderAddr）直接入库 queued。
+// newSystemNotice 组装一条 Hub 系统通知（From 固定 HubSenderAddr、queued、未签名）。
+// 纯组装不加锁：ID 在持锁时查重后预留好传进来，签名在锁外算，签完再加锁入库。
 // 不走 Send：ValidAddr 不接受 xxyi: 前缀，而系统通知只当发件人；也不需要对方回复。
-// 调用方须持锁。
-func (h *Hub) sendSystemLocked(to, text string) Message {
-	m := Message{
+func newSystemNotice(now time.Time, id, to, text string) Message {
+	return Message{
+		ID:      id,
 		From:    HubSenderAddr,
 		To:      to,
 		Text:    sanitizeText(text),
 		Kind:    KindNotice,
 		State:   MsgQueued,
-		Created: h.now(),
+		Created: now,
 	}
+}
+
+// reserveIDLocked 预留一个不与现有消息冲突的 ID。调用方须持锁。
+func (h *Hub) reserveIDLocked() string {
 	for {
-		m.ID = newID()
-		if h.findLocked(m.ID) < 0 {
-			break
+		id := newID()
+		if h.findLocked(id) < 0 {
+			return id
 		}
 	}
-	// 系统通知同样入库前签（无附件，FileSHA256 为空）：收件方拿 CA 公钥能分辨
-	// "真系统通知"和别的来源。
-	if h.cfg.Sign != nil {
-		m.Sig = h.cfg.Sign(xxyica.MessageSigningBytes(msgSignFields(m)))
-	}
-	h.msgs = append(h.msgs, m)
-	return m
 }
 
 // markOverdueReplies 扫已送达的请求：没回复（Answered 和"已经发出去、没被拒绝的回复"
@@ -706,7 +770,7 @@ func (h *Hub) sendSystemLocked(to, text string) Message {
 func (h *Hub) markOverdueReplies() {
 	h.mu.Lock()
 	now := h.now()
-	var overdue, notices []Message
+	var overdue, drafts []Message
 	var logs []map[string]string
 	for i := range h.msgs {
 		m := &h.msgs[i]
@@ -720,15 +784,16 @@ func (h *Hub) markOverdueReplies() {
 		if _, live := h.hasLiveReplyLocked(m.ID, m.To); live {
 			continue // 回复已经发出去了（哪怕还没送到），不算超时
 		}
-		m.Overdue = true
+		m.Overdue = true // 在锁内标记：并发两路（Pump/CheckTimers）只会有一路拿到这条超时
 		ps := "unknown"
 		if st, ok := h.peers[m.To]; ok {
 			ps = string(st)
 		}
 		text := fmt.Sprintf(overdueNoticeFmt, m.ID, m.To, humanDuration(h.cfg.ReplyTimeout), ps)
-		notice := h.sendSystemLocked(m.From, text)
+		// ID 锁内预留，签名留到锁外算（不允许持 h.mu 调 Sign）
+		draft := newSystemNotice(now, h.reserveIDLocked(), m.From, text)
+		drafts = append(drafts, draft)
 		overdue = append(overdue, *m)
-		notices = append(notices, notice)
 		logs = append(logs, map[string]string{
 			"id":           m.ID,
 			"from":         m.From,
@@ -739,6 +804,18 @@ func (h *Hub) markOverdueReplies() {
 	}
 	wake := h.trimLocked()
 	h.mu.Unlock()
+
+	// 锁外逐条签名，签完加锁入库（ID 已在锁内预留，不会撞）。
+	var notices []Message
+	for _, n := range drafts {
+		if h.cfg.Sign != nil {
+			n.Sig = h.cfg.Sign(xxyica.MessageSigningBytes(msgSignFields(n)))
+		}
+		h.mu.Lock()
+		h.msgs = append(h.msgs, n)
+		h.mu.Unlock()
+		notices = append(notices, n)
+	}
 
 	if h.cfg.Log != nil { // 日志回调放锁外：不让外部代码在持 Hub 锁时运行
 		for _, d := range logs {
@@ -824,12 +901,11 @@ func (h *Hub) trimLocked() (wake chan struct{}) {
 		delete(h.takenAt, gone.ID)
 		delete(h.nextTry, gone.ID)
 		delete(h.fails, gone.ID)
-		delete(h.firstFail, gone.ID)
-		delete(h.pausedAtFirst, gone.ID)
-		clearStageFailsLocked(h, gone.ID)
+		clearStageBudgetLocked(h, gone.ID)
 		delete(h.nagged, gone.ID)
 		delete(h.injectedAt, gone.ID)
 		delete(h.ackSeq, gone.ID)
+		delete(h.ackBase, gone.ID)
 		delete(h.deliveredAt, gone.ID)
 		if h.removeFromOutboxLocked(gone.ID) {
 			touched = true
@@ -942,6 +1018,14 @@ func (h *Hub) Send(m Message) (string, error) {
 			return "", err
 		}
 	}
+	if m.ClientID != "" {
+		if len(m.ClientID) > maxClientIDLen {
+			return "", fmt.Errorf("support: client_id 超过 %d 字节（%d 字节）", maxClientIDLen, len(m.ClientID))
+		}
+		if bad := addrNameIllegal.FindString(m.ClientID); bad != "" {
+			return "", fmt.Errorf("support: client_id 包含非法字符 %q，只允许 ASCII 字母数字和 . _ -", bad)
+		}
+	}
 
 	now := h.now()
 	m.Created = now
@@ -955,6 +1039,17 @@ func (h *Hub) Send(m Message) (string, error) {
 	}
 
 	h.mu.Lock()
+	// ClientID 幂等：同 From 同 ClientID 已经发过就不再新建，把原 ID 原样还回去
+	//（客户端超时重发不会刷出两条一样的消息）。
+	if m.ClientID != "" {
+		for i := range h.msgs {
+			if h.msgs[i].From == m.From && h.msgs[i].ClientID == m.ClientID {
+				dupID := h.msgs[i].ID
+				h.mu.Unlock()
+				return dupID, nil
+			}
+		}
+	}
 	open := 0
 	for i := range h.msgs {
 		switch h.msgs[i].State {
@@ -966,27 +1061,30 @@ func (h *Hub) Send(m Message) (string, error) {
 		h.mu.Unlock()
 		return "", fmt.Errorf("support: 未处理的消息太多（%d 条），先处理再发", maxMsgOpen)
 	}
-	for {
-		m.ID = newID()
-		if h.findLocked(m.ID) < 0 {
-			break
-		}
-	}
-	// ID 定下来才签：签名域含 ID，入库后不再改。
-	if h.cfg.Sign != nil {
-		m.Sig = h.cfg.Sign(xxyica.MessageSigningBytes(msgSignFields(m)))
-	}
+	m.ID = h.reserveIDLocked()
 	// AskUser 的消息即使自动模式开着也要停下来等用户：标了"要用户定"就不能自动放行。
 	if !h.autoUntil.IsZero() && now.Before(h.autoUntil) && !m.AskUser {
 		m.State = MsgQueued
 	} else {
 		m.State = MsgPending
 	}
-	h.msgs = append(h.msgs, m)
+	h.msgs = append(h.msgs, m) // 先以未签名入库；Sign 在锁外算，签完写回
 	// 这里不把被回复的请求标成 Answered：回复只有真正送达（pumpOne 成功 / MarkDelivered）
 	// 才算回了；发出后被拒/一直没送，原请求仍算欠回复。
 	wake := h.trimLocked()
 	h.mu.Unlock()
+
+	// 签名挪到锁外：Sign（CA 私钥，可能是外部实现）不许持 h.mu 跑。
+	// 签名域含 ID，入库后不再改；期间消息若已被 reject/淘汰，写回自动跳过。
+	if h.cfg.Sign != nil {
+		sig := h.cfg.Sign(xxyica.MessageSigningBytes(msgSignFields(m)))
+		m.Sig = sig
+		h.mu.Lock()
+		if j := h.findLocked(m.ID); j >= 0 {
+			h.msgs[j].Sig = sig
+		}
+		h.mu.Unlock()
+	}
 
 	if wake != nil {
 		close(wake) // 淘汰顺带清了 outbox 条目，叫醒等待中的 TakeOutbox
@@ -999,8 +1097,12 @@ func (h *Hub) Send(m Message) (string, error) {
 // SetState 记录对端忙闲状态（busy/idle/gone）；gone 表示对方窗口里此刻不是 Claude。
 // 没上报过的地址不在表里，与 busy/gone 一样按住非 Now 消息。
 // 每次调用都会翻转 wakeup：等待中的 TakeOutbox 要能在对方变 idle 时醒来重查。
-// 上报本身就是"对方还在跑、已经接收了消息"的证据：发给这个地址、正等确认（injected）
-// 的消息在这里落 delivered（附件释放、回复把原请求标成已回复）。
+// 送达确认只认 busy：上报 busy 记下钩子版本号（hookBusySeq），发给这个地址、
+// 注入基准更早的 injected 消息在这里落 delivered（附件释放、回复标 Answered）；
+// idle 不算确认（空闲不代表接住过消息）。
+// 上报 gone：发给这个地址、正等确认的 injected 消息全部退回 queued
+// （Reason「对方已退出」）——对方窗口关了消息多半没被处理；退回不算失败，
+// 不记 Attempt、不退避，等对方重新上报 idle 再走正常送达。
 func (h *Hub) SetState(addr string, st PeerState) error {
 	if err := ValidAddr(addr); err != nil {
 		return err
@@ -1010,6 +1112,27 @@ func (h *Hub) SetState(addr string, st PeerState) error {
 	}
 	h.mu.Lock()
 	h.setPeerLocked(addr, st)
+	if st == PeerBusy {
+		// 只有钩子报的忙算确认证据；Hub 自己置 busy 的几处不经这里
+		h.hookBusySeq[addr] = h.peerSeq[addr]
+	}
+	var evicted []Message
+	if st == PeerGone {
+		for i := range h.msgs {
+			m := &h.msgs[i]
+			if m.State == MsgInjected && m.To == addr {
+				m.State = MsgQueued
+				m.Reason = peerGoneReason
+				delete(h.injectedAt, m.ID)
+				delete(h.ackSeq, m.ID)
+				delete(h.ackBase, m.ID)
+				// mac 侧已取走过：清掉痕迹让下一轮 Pump 能重新放进 outbox
+				delete(h.outPlaced, m.ID)
+				delete(h.takenAt, m.ID)
+				evicted = append(evicted, *m)
+			}
+		}
+	}
 	acked, _ := h.checkInjectedLocked(h.now(), addr)
 	wake := h.flipWakeupLocked()
 	h.mu.Unlock()
@@ -1017,7 +1140,10 @@ func (h *Hub) SetState(addr string, st PeerState) error {
 	for _, m := range acked {
 		h.logMsg(m)
 	}
-	h.persist() // 对端状态、peerAt 以及顺带落 delivered 的消息一起落盘
+	for _, m := range evicted {
+		h.logMsg(m)
+	}
+	h.persist() // 对端状态、peerAt 以及落 delivered/退回 queued 的消息一起落盘
 	return nil
 }
 
@@ -1229,11 +1355,10 @@ func (h *Hub) Decide(id, action string) error {
 		delete(h.takenAt, id)
 		delete(h.nextTry, id)
 		delete(h.fails, id)
-		delete(h.firstFail, id)
-		delete(h.pausedAtFirst, id)
-		clearStageFailsLocked(h, id)
+		clearStageBudgetLocked(h, id)
 		delete(h.injectedAt, id)
 		delete(h.ackSeq, id)
+		delete(h.ackBase, id)
 		delete(h.deliveredAt, id)
 		cur.File = nil
 	}
@@ -1299,11 +1424,10 @@ func (h *Hub) Redirect(id, to string) (string, error) {
 		delete(h.takenAt, id)
 		delete(h.nextTry, id)
 		delete(h.fails, id)
-		delete(h.firstFail, id)
-		delete(h.pausedAtFirst, id)
-		clearStageFailsLocked(h, id)
+		clearStageBudgetLocked(h, id)
 		delete(h.injectedAt, id)
 		delete(h.ackSeq, id)
+		delete(h.ackBase, id)
 		delete(h.deliveredAt, id)
 		cur.File = nil
 		cp := *cur
@@ -1374,6 +1498,7 @@ func (h *Hub) TakeOutbox(ctx context.Context, to string) (Message, bool) {
 			out := h.msgs[i]
 			h.outbox = append(h.outbox[:k], h.outbox[k+1:]...)
 			h.takenAt[id] = h.now()       // 记取走时间，超时未确认由 pumpOne 重新排队
+			h.ackBase[id] = h.peerSeq[to] // 置忙**之前**的版本号：MarkDelivered 后确认基准
 			h.setPeerLocked(to, PeerBusy) // 取走即算送出，置忙避免连发
 			h.mu.Unlock()
 			h.persist() // 对端置 busy 落盘（takenAt 不存，重启后由重放/确认收敛）
@@ -1462,6 +1587,27 @@ func (h *Hub) Pump(ctx context.Context) {
 		h.pumpOne(ctx, m.ID)
 	}
 	h.markOverdueReplies() // 送达后一直没人回复的请求：标 overdue 并通知原发件人
+}
+
+// CheckTimers 只推进"靠时钟到期"的消息：injected 的确认超时（ack 阶段）与请求
+// 欠回复超时（overdue），不碰 queued、不做注入。Pump 每轮也做这些；但 Pump 可能
+// 被慢 Sync/Deliver 拖住一整轮，导致 ack 超时迟判——调用方可用独立循环定期调它，
+// 保证时间判定不受慢投递牵连。转人工的抓屏在锁外做。
+func (h *Hub) CheckTimers() {
+	h.mu.Lock()
+	advanced, reps := h.checkInjectedLocked(h.now(), "")
+	h.mu.Unlock()
+	for _, m := range advanced {
+		h.logMsg(m) // injected → delivered，或确认超时回 queued/failed
+	}
+	if len(advanced) > 0 {
+		h.persist()
+	}
+	ctx := context.Background()
+	for _, rep := range reps {
+		h.attachReport(rep, h.captureScreen(ctx, rep.addr)) // 抓屏在锁外
+	}
+	h.markOverdueReplies()
 }
 
 // pumpOne 推进一条 queued 消息。锁内只做检查和落状态，Sync/Deliver 在锁外调用。
@@ -1578,6 +1724,8 @@ func (h *Hub) pumpOne(ctx context.Context, id string) {
 					out = &cp
 				} else {
 					h.msgs[j].Synced = true
+					// 同步成功：sync 阶段的预算记录作废（后面阶段各算各的窗口）
+					clearDoneStageLocked(h, id, "sync")
 					continueSend = true // 保持 inflight，送达/进 outbox 后再释放
 				}
 			}
@@ -1629,10 +1777,13 @@ func (h *Hub) pumpOne(ctx context.Context, id string) {
 		return
 	}
 
-	// 记下调用 Deliver 前的对端状态版本号：送达期间对端若有新上报（比如钩子报了 idle），
-	// 回来后不能拿 busy/gone 把人覆盖掉。
+	// 记下调用 Deliver 前的对端状态版本号：
+	// ① 送达期间对端若有新上报（比如钩子报了 idle/busy），回来后不能拿 busy/gone 覆盖掉；
+	// ② 同时作为 ack 基准（ackBase）：注入过程中到的钩子 busy 也是注入之后发生的，
+	// 注入成功时（markInjectedLocked）拿它比 hookBusySeq，已经忙过就直接落 delivered。
 	h.mu.Lock()
 	seq0 := h.peerSeq[m.To]
+	h.ackBase[id] = seq0
 	h.mu.Unlock()
 
 	var err error

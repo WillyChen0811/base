@@ -35,12 +35,12 @@ func peekStageFails(t *testing.T, h *Hub, id, stage string) int {
 	return h.stageFails[id+"|"+stage]
 }
 
-// peekFirstFail 读预算起点：没记过（或已被 retry/成功清掉）返回零值 false。
-func peekFirstFail(t *testing.T, h *Hub, id string) (time.Time, bool) {
+// peekFirstFail 读某阶段的预算起点：没记过（或已被 retry/成功清掉）返回零值 false。
+func peekFirstFail(t *testing.T, h *Hub, id, stage string) (time.Time, bool) {
 	t.Helper()
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	v, ok := h.firstFail[id]
+	v, ok := h.firstFail[stageKey(id, stage)]
 	return v, ok
 }
 
@@ -86,7 +86,7 @@ func TestDeliverBudgetExhaustedToFailed(t *testing.T) {
 			t.Errorf("第 %d 次失败后 Attempts 应记 %d 条，实际 %d", k+1, k+1, len(lm.Attempts))
 		}
 	}
-	if _, ok := peekFirstFail(t, f.hub, id); !ok {
+	if _, ok := peekFirstFail(t, f.hub, id, "deliver"); !ok {
 		t.Errorf("首次失败应已记预算起点 firstFail")
 	}
 	lm := peekHubMsg(t, f.hub, id)
@@ -231,7 +231,7 @@ func TestLinkDownPauseProbeAndRecover(t *testing.T) {
 	if next, fails := peekBackoff(t, f.hub, id); fails != 0 || !next.IsZero() {
 		t.Errorf("线路不通不该退避计数，实际 fails=%d next=%v", fails, next)
 	}
-	if _, ok := peekFirstFail(t, f.hub, id); ok {
+	if _, ok := peekFirstFail(t, f.hub, id, "deliver"); ok {
 		t.Errorf("线路不通不该开预算窗，实际 firstFail 已记")
 	}
 	if n := len(f.delivered()); n != 1 {
@@ -307,7 +307,7 @@ func TestRetryWindowExcludesLinkDownPause(t *testing.T) {
 	if st := stateOf(t, f.hub, id); st != MsgQueued {
 		t.Fatalf("两次失败远未到预算，应仍 queued，实际 %s", st)
 	}
-	first, ok := peekFirstFail(t, f.hub, id)
+	first, ok := peekFirstFail(t, f.hub, id, "deliver")
 	if !ok {
 		t.Fatalf("应已记预算起点 firstFail")
 	}
@@ -372,7 +372,7 @@ func TestRetryWindowExcludesLinkDownPause(t *testing.T) {
 	if got := peekStageFails(t, f.hub, id, "deliver"); got != 4 {
 		t.Errorf("deliver 阶段应累计 4 次真失败，实际 %d", got)
 	}
-	if ff, ok := peekFirstFail(t, f.hub, id); !ok || !ff.Equal(first) {
+	if ff, ok := peekFirstFail(t, f.hub, id, "deliver"); !ok || !ff.Equal(first) {
 		t.Errorf("firstFail 应保持暂停前首次失败的时间 %v，实际 %v ok=%v", first, ff, ok)
 	}
 }
@@ -488,7 +488,7 @@ func TestRetryResetsBudgetKeepsAttemptsHistory(t *testing.T) {
 	if got := peekStageFails(t, f.hub, id, "deliver"); got != 0 {
 		t.Errorf("retry 应清阶段预算，实际 %d", got)
 	}
-	if _, ok := peekFirstFail(t, f.hub, id); ok {
+	if _, ok := peekFirstFail(t, f.hub, id, "deliver"); ok {
 		t.Errorf("retry 应清预算起点，实际 firstFail 还在")
 	}
 	// 重新满 5 次才转人工：前 4 次仍 queued
@@ -608,7 +608,7 @@ func TestRedirectFailedMessage(t *testing.T) {
 	if next, fails := peekBackoff(t, f.hub, id); fails != 0 || !next.IsZero() {
 		t.Errorf("改送后原消息退避应清零，实际 fails=%d next=%v", fails, next)
 	}
-	if _, ok := peekFirstFail(t, f.hub, id); ok {
+	if _, ok := peekFirstFail(t, f.hub, id, "deliver"); ok {
 		t.Errorf("改送后原消息预算起点应清掉")
 	}
 	if got := peekStageFails(t, f.hub, id, "deliver"); got != 0 {
@@ -688,7 +688,7 @@ func TestPeerNotClaudeDoesNotConsumeBudget(t *testing.T) {
 	if lm.Reason != notClaude.Error() {
 		t.Errorf("Reason 应记错误原文，实际 %q", lm.Reason)
 	}
-	if _, ok := peekFirstFail(t, f.hub, id); ok {
+	if _, ok := peekFirstFail(t, f.hub, id, "deliver"); ok {
 		t.Errorf("不该开预算窗，实际 firstFail 已记")
 	}
 	if got := peekStageFails(t, f.hub, id, "deliver"); got != 0 {
@@ -786,7 +786,7 @@ func TestFailedReportPersistedAcrossRestart(t *testing.T) {
 	if len(lm.Attempts) != defaultMaxAttempts {
 		t.Errorf("Attempts 应还在（%d 条），实际 %d", defaultMaxAttempts, len(lm.Attempts))
 	}
-	if _, ok := peekFirstFail(t, h2, id); !ok {
+	if _, ok := peekFirstFail(t, h2, id, "deliver"); !ok {
 		t.Errorf("预算起点应随快照恢复")
 	}
 	// 重启不重开预算：failed 的消息推多久时钟都不会自己动

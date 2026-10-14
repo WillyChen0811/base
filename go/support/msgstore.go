@@ -9,20 +9,22 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 )
 
 // hubStoreVersion 是消息快照文件的格式版本；加载时不等于它的文件按损坏处理。
 const hubStoreVersion = 1
 
-// hubSnapshot 是落盘的最小状态集：消息（含附件、Attempts/Report）、对端状态、自动模式、
-// 欠回复计数，重试预算与线路暂停进度（firstFail/pausedAtFirst/linkDown/pausedTotal，
-// 重启后预算和暂停累计接着算，不能从头再来），以及送达确认与欠回复超时的进度
-// （injectedAt/ackSeq/deliveredAt）。
-// takenAt/outbox/outPlaced/inflight/nextTry/fails/peerSeq 不存：
+// hubSnapshot 是落盘的最小状态集：消息（含附件、Attempts/Report，Message 上的
+// ClientID 随之进出快照）、对端状态、自动模式、欠回复计数，
+// 重试预算与线路暂停进度（firstFail/pausedAtFirst 键为 id+"|"+stage，按阶段各算各的；
+// linkDown/pausedTotal，重启后预算和暂停累计接着算，不能从头再来），
+// 以及送达确认与欠回复超时的进度（injectedAt/ackSeq/deliveredAt）。
+// takenAt/outbox/outPlaced/inflight/nextTry/fails/peerSeq/hookBusySeq/ackBase 不存：
 // 重启后 queued 消息由下一次 Pump 正常重新处理（发往 mac: 的重新进 outbox），
-// injected 消息的 ackSeq 归零、injectedAt 记成加载时刻——重启后重新等满 AckTimeout
-// （见 loadStore），因为重启期间对端有没有上报已无从判断。
+// injected 消息的 ackSeq 归零、injectedAt 记成加载时刻——重启后重新等满 AckTimeout、
+// 等一次钩子 busy 上报才算确认（见 loadStore），因为重启期间对端有没有上报已无从判断。
 type hubSnapshot struct {
 	Version       int                      `json:"version"`
 	Messages      []storedMsg              `json:"messages"`
@@ -192,12 +194,20 @@ func (h *Hub) loadStore() {
 	for k, v := range snap.Nagged {
 		h.nagged[k] = v
 	}
+	// 预算键是 id+"|"+stage；老快照里裸 id 的键（按消息共享窗口的旧格式）没有
+	// 阶段归属，读回也用不上，直接丢弃，免得在 map 里越积越多。
 	h.firstFail = make(map[string]time.Time, len(snap.FirstFail))
 	for k, v := range snap.FirstFail {
+		if !strings.Contains(k, "|") {
+			continue
+		}
 		h.firstFail[k] = v
 	}
 	h.pausedAtFirst = make(map[string]time.Duration, len(snap.PausedAtFirst))
 	for k, v := range snap.PausedAtFirst {
+		if !strings.Contains(k, "|") {
+			continue
+		}
 		h.pausedAtFirst[k] = v
 	}
 	h.autoUntil = snap.AutoUntil

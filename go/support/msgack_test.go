@@ -401,8 +401,8 @@ func TestStoreInjectedProgressSurvivesRestart(t *testing.T) {
 	if st := stateOf(t, h2, idB); st != MsgInjected {
 		t.Fatalf("重启后 B 应仍是 injected，实际 %s", st)
 	}
-	// 重启期间有没有上报无从判断：ackSeq 归零，新 Hub 上任何一次上报都算确认。
-	ackPeer(t, h2, "ubuntu:bob", PeerIdle)
+	// 重启期间有没有上报无从判断：ackSeq 归零，新 Hub 上钩子报忙就算确认。
+	ackPeer(t, h2, "ubuntu:bob", PeerBusy)
 	if st := stateOf(t, h2, idA); st != MsgDelivered {
 		t.Fatalf("新 Hub 上 bob 上报后 A 应 delivered，实际 %s", st)
 	}

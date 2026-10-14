@@ -44,6 +44,7 @@ type msgSendReq struct {
 	Kind     string `json:"kind,omitempty"`
 	ReplyTo  string `json:"reply_to,omitempty"`
 	AskUser  bool   `json:"ask_user,omitempty"`
+	ClientID string `json:"client_id,omitempty"` // 客户端幂等 ID：同 From 同值重发只入库一次
 }
 
 // msgEnvelope 是取件响应：Message 原字段 + base64 附件（Message 的 File 是 json:"-"）
@@ -228,6 +229,7 @@ func (s *Service) msgSend(side string) http.HandlerFunc {
 			Kind:     req.Kind,
 			ReplyTo:  req.ReplyTo,
 			AskUser:  req.AskUser,
+			ClientID: req.ClientID,
 		})
 		if err != nil {
 			errJSON(w, http.StatusBadRequest, err.Error())

@@ -489,7 +489,7 @@ func TestSyncFailRetryAndSkip(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.hub.Pump(ctx)
-	ackPeer(t, f.hub, "ubuntu:bob", PeerIdle) // 对端钩子下一次上报确认；后面还要再送，放回空闲
+	ackPeer(t, f.hub, "ubuntu:bob", PeerBusy) // 对端钩子报忙才算确认（idle 不算）
 	for _, lm := range f.hub.List() {
 		if lm.ID == id2 && lm.State != MsgDelivered {
 			t.Errorf("skip_sync 后应不再同步直接送达，实际 %s", lm.State)

@@ -82,6 +82,9 @@ var (
 	maxPending = 50
 	// msgPumpInterval 是会话内消息推进循环的间隔；测试可调小。
 	msgPumpInterval = 2 * time.Second
+	// msgTimersInterval 是会话内独立时钟检查循环（hub.CheckTimers）的间隔：
+	// 确认超时/欠回复判定不被慢 Pump 拖住；测试可调小。
+	msgTimersInterval = 2 * time.Second
 )
 
 const (
@@ -201,6 +204,24 @@ func (s *Service) msgPumpLoop(sess *session) {
 	}
 }
 
+// msgTimersLoop 独立于 Pump 的时钟检查循环：每 msgTimersInterval 调一次
+// hub.CheckTimers（injected 确认超时、欠回复 overdue）。Pump 可能被慢 Sync/Deliver
+// 拖住一整轮，光靠它 ack 超时会迟判；这个循环不碰投递，保证时间判定准点。
+// 会话 ctx 结束就退出，占会话 wg 的一个名额（写法照 msgPumpLoop）。
+func (s *Service) msgTimersLoop(sess *session) {
+	defer sess.wg.Done()
+	ticker := time.NewTicker(msgTimersInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-sess.ctx.Done():
+			return
+		case <-ticker.C:
+			s.hub.CheckTimers()
+		}
+	}
+}
+
 // randHex32 生成 32 字节随机数的十六进制串（64 位）。读不到随机数就 panic（fail closed）。
 func randHex32() string {
 	var b [32]byte
@@ -317,11 +338,12 @@ func (s *Service) Start(minutes int) error {
 	s.srv = srv
 	s.ln = ln
 	s.timer = time.AfterFunc(time.Until(s.until), func() { s.stop("到时自动结束", sess) })
-	sess.wg.Add(2) // serveLoop + msgPumpLoop；在 opMu 内、Stop 不可能同时进行，Add 安全
+	sess.wg.Add(3) // serveLoop + msgPumpLoop + msgTimersLoop；在 opMu 内、Stop 不可能同时进行，Add 安全
 	s.mu.Unlock()
 
 	go s.serveLoop(sess, ln, srv)
 	go s.msgPumpLoop(sess)
+	go s.msgTimersLoop(sess)
 	s.logEvent("start", map[string]string{"minutes": strconv.Itoa(minutes), "addr": addr})
 	return nil
 }

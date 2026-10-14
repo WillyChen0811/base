@@ -450,8 +450,11 @@ func protoDeliverTo(t *testing.T, f *msgFixture, m Message) string {
 		t.Fatal(err)
 	}
 	f.hub.Pump(context.Background())
-	// 注入成功后等收件对端钩子再上报一次才算送达；后面还要送下一条，上报完放回空闲
-	ackPeer(t, f.hub, m.To, PeerIdle)
+	// 注入成功后等收件对端钩子报忙才算送达（idle 不算确认）；后面还要送下一条，确认完放回空闲
+	ackPeer(t, f.hub, m.To, PeerBusy)
+	if err := f.hub.SetState(m.To, PeerIdle); err != nil {
+		t.Fatal(err)
+	}
 	if st := stateOf(t, f.hub, id); st != MsgDelivered {
 		t.Fatalf("%q 应送达，实际 %s", m.Text, st)
 	}
@@ -1001,11 +1004,14 @@ func TestIdleDuringDeliverNotOverwritten(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.hub.Pump(context.Background())
-	ackPeer(t, f.hub, "ubuntu:bob", PeerIdle) // 对端钩子再上报确认；上报 idle，不被 busy 覆盖
-	if st := stateOf(t, f.hub, id); st != MsgDelivered {
-		t.Fatalf("应送达，实际 %s", st)
-	}
 	if got := f.hub.Peers()["ubuntu:bob"]; got != PeerIdle {
 		t.Errorf("送达期间报的 idle 不该被 busy 覆盖，实际 %s", got)
+	}
+	if st := stateOf(t, f.hub, id); st != MsgInjected {
+		t.Fatalf("idle 上报不算确认，注入后应 injected，实际 %s", st)
+	}
+	ackPeer(t, f.hub, "ubuntu:bob", PeerBusy) // 钩子报忙才确认送达
+	if st := stateOf(t, f.hub, id); st != MsgDelivered {
+		t.Fatalf("应送达，实际 %s", st)
 	}
 }

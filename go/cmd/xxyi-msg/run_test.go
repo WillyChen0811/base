@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -22,6 +23,32 @@ type captured struct {
 	reqs    []capturedReq
 	respID  string
 	respErr string // 非空则回 400 + {"error":...}
+
+	// 各接口的响应正文，留空用默认值（都在建服务之前设好，不与处理协程并发写）。
+	respPeers string
+	respState string
+	respInbox string
+}
+
+func (c *captured) peersResp() string {
+	if c.respPeers != "" {
+		return c.respPeers
+	}
+	return `{"peers":{"ubuntu:b":"busy","mac:a":"idle","ubuntu:c":"idle"}}`
+}
+
+func (c *captured) stateResp() string {
+	if c.respState != "" {
+		return c.respState
+	}
+	return `{"ok":true}`
+}
+
+func (c *captured) inboxResp() string {
+	if c.respInbox != "" {
+		return c.respInbox
+	}
+	return `{"messages":[],"unanswered":[]}`
 }
 
 type capturedReq struct {
@@ -30,6 +57,7 @@ type capturedReq struct {
 	auth   string
 	query  string
 	body   sendBody
+	raw    []byte // /msg/send 的原始正文，用来断言字段有没有出现在 JSON 里
 }
 
 func (c *captured) add(r capturedReq) {
@@ -54,7 +82,18 @@ func (c *captured) count() int {
 	return len(c.reqs)
 }
 
-// handler 统一处理 /msg/send、/msg/state、/msg/who、/msg。
+// queries 按顺序返回收到的请求的查询串。
+func (c *captured) queries() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make([]string, 0, len(c.reqs))
+	for _, r := range c.reqs {
+		out = append(out, r.path+"?"+r.query)
+	}
+	return out
+}
+
+// handler 统一处理 /msg/send（reply 也走它）、/msg/state、/msg/inbox、/msg/who、/msg。
 func (c *captured) handler() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		rec := capturedReq{
@@ -64,6 +103,7 @@ func (c *captured) handler() http.HandlerFunc {
 		}
 		if r.Method == http.MethodPost && r.URL.Path == "/msg/send" {
 			b, _ := io.ReadAll(r.Body)
+			rec.raw = b
 			_ = json.Unmarshal(b, &rec.body)
 		}
 		c.add(rec)
@@ -72,6 +112,7 @@ func (c *captured) handler() http.HandlerFunc {
 			fmt.Fprintf(w, `{"error":%q}`, c.respErr)
 			return
 		}
+		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
 		case "/msg/send":
 			id := c.respID
@@ -80,9 +121,11 @@ func (c *captured) handler() http.HandlerFunc {
 			}
 			fmt.Fprintf(w, `{"id":%q}`, id)
 		case "/msg/state":
-			fmt.Fprint(w, `{"ok":true}`)
+			fmt.Fprint(w, c.stateResp())
+		case "/msg/inbox":
+			fmt.Fprint(w, c.inboxResp())
 		case "/msg/who", "/msg":
-			fmt.Fprint(w, `{"peers":{"ubuntu:b":"busy","mac:a":"idle","ubuntu:c":"idle"}}`)
+			fmt.Fprint(w, c.peersResp())
 		default:
 			w.WriteHeader(http.StatusNotFound)
 			fmt.Fprint(w, `{"error":"没有这个路径"}`)
@@ -475,5 +518,390 @@ func TestSendArgValidation(t *testing.T) {
 	}
 	if cap.count() != n {
 		t.Errorf("附件超限不该发请求，已发 %d", cap.count()-n)
+	}
+}
+
+// watchReader 记录自己有没有被读过：state 不带 --check 时绝不该碰标准输入。
+type watchReader struct {
+	r      io.Reader
+	called atomic.Bool
+}
+
+func (w *watchReader) Read(p []byte) (int, error) {
+	w.called.Store(true)
+	return w.r.Read(p)
+}
+
+func (w *watchReader) wasRead() bool { return w.called.Load() }
+
+func TestSendKindAndAskUser(t *testing.T) {
+	var cap captured
+	srv := httptest.NewServer(cap.handler())
+	defer srv.Close()
+	useEndpoint(t, srv.URL)
+	t.Setenv("XXYI_ADDR", "ubuntu:cw")
+
+	out := &bytes.Buffer{}
+	if code := run([]string{"send", "mac:boss", "帮我改", "--kind", "request", "--ask-user"}, strings.NewReader(""), out, io.Discard); code != exitOK {
+		t.Fatalf("退出码 %d，stdout %q", code, out.String())
+	}
+	got := cap.last(t)
+	if got.body.Kind != "request" || !got.body.AskUser {
+		t.Errorf("正文 %+v", got.body)
+	}
+	if got.body.To != "mac:boss" || got.body.ReplyTo != "" {
+		t.Errorf("正文 %+v", got.body)
+	}
+	if !strings.Contains(string(got.raw), `"ask_user":true`) {
+		t.Errorf("原始正文 %s", got.raw)
+	}
+
+	// 不带 --kind 默认 notice
+	out.Reset()
+	if code := run([]string{"send", "mac:boss", "只是说一声"}, strings.NewReader(""), out, io.Discard); code != exitOK {
+		t.Fatalf("退出码 %d", code)
+	}
+	got = cap.last(t)
+	if got.body.Kind != "notice" {
+		t.Errorf("默认 kind %q", got.body.Kind)
+	}
+	if got.body.AskUser {
+		t.Error("不带 --ask-user 不该是 true")
+	}
+
+	// kind=code 缺 repo/branch：本地就拦下，不发请求
+	n := cap.count()
+	errOut := &bytes.Buffer{}
+	if code := run([]string{"send", "mac:boss", "代码好了", "--kind", "code"}, strings.NewReader(""), io.Discard, errOut); code != exitErr {
+		t.Fatalf("退出码 %d", code)
+	}
+	if !strings.Contains(errOut.String(), "交代码（--kind code）必须带 --repo 和 --branch") {
+		t.Errorf("stderr %q", errOut.String())
+	}
+	if cap.count() != n {
+		t.Errorf("本地拦下后不该发请求，已发 %d", cap.count()-n)
+	}
+
+	// kind=code 带齐 repo/branch 能发
+	out.Reset()
+	if code := run([]string{"send", "mac:boss", "代码好了", "--kind", "code", "--repo", "base", "--branch", "feat"}, strings.NewReader(""), out, io.Discard); code != exitOK {
+		t.Fatalf("退出码 %d，stdout %q", code, out.String())
+	}
+	got = cap.last(t)
+	if got.body.Kind != "code" || got.body.Repo != "base" || got.body.Branch != "feat" {
+		t.Errorf("正文 %+v", got.body)
+	}
+
+	// reply 不许走 send
+	errOut.Reset()
+	if code := run([]string{"send", "mac:boss", "hi", "--kind", "reply"}, strings.NewReader(""), io.Discard, errOut); code != exitErr {
+		t.Fatalf("退出码 %d", code)
+	}
+	if !strings.Contains(errOut.String(), "xxyi-msg reply") {
+		t.Errorf("stderr %q", errOut.String())
+	}
+
+	// --kind 值不认识
+	errOut.Reset()
+	if code := run([]string{"send", "mac:boss", "hi", "--kind", "urgent"}, strings.NewReader(""), io.Discard, errOut); code != exitErr {
+		t.Fatalf("退出码 %d", code)
+	}
+	if !strings.Contains(errOut.String(), "--kind") {
+		t.Errorf("stderr %q", errOut.String())
+	}
+}
+
+func TestReplyCommand(t *testing.T) {
+	var cap captured
+	srv := httptest.NewServer(cap.handler())
+	defer srv.Close()
+	useEndpoint(t, srv.URL)
+	t.Setenv("XXYI_ADDR", "ubuntu:cw")
+
+	out := &bytes.Buffer{}
+	if code := run([]string{"reply", "ab12", "已改好，测试跑过了"}, strings.NewReader(""), out, io.Discard); code != exitOK {
+		t.Fatalf("退出码 %d，stdout %q", code, out.String())
+	}
+	if out.String() != "已排队 ab12\n" {
+		t.Errorf("输出 %q", out.String())
+	}
+	got := cap.last(t)
+	if got.path != "/msg/send" || got.method != http.MethodPost {
+		t.Errorf("%s %s", got.method, got.path)
+	}
+	if got.body.Kind != "reply" || got.body.ReplyTo != "ab12" {
+		t.Errorf("正文 %+v", got.body)
+	}
+	if got.body.To != "" || !strings.Contains(string(got.raw), `"to":""`) {
+		t.Errorf("回复不该带收件人，正文 %s", got.raw)
+	}
+	if got.body.From != "ubuntu:cw" || got.body.Text != "已改好，测试跑过了" {
+		t.Errorf("正文 %+v", got.body)
+	}
+
+	// 标准输入 + 附件
+	dir := t.TempDir()
+	file := filepath.Join(dir, "patch.txt")
+	if err := os.WriteFile(file, []byte("附件"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	out.Reset()
+	if code := run([]string{"reply", "ab12", "-", "--file", file}, strings.NewReader("管道正文\n"), out, io.Discard); code != exitOK {
+		t.Fatalf("退出码 %d", code)
+	}
+	got = cap.last(t)
+	if got.body.Text != "管道正文\n" || got.body.FileName != "patch.txt" || string(got.body.File) != "附件" {
+		t.Errorf("正文 %+v", got.body)
+	}
+	if got.body.Kind != "reply" || got.body.ReplyTo != "ab12" {
+		t.Errorf("正文 %+v", got.body)
+	}
+
+	// 缺 id / 空文字 / 未知选项
+	for _, args := range [][]string{
+		{"reply"},
+		{"reply", "ab12"},
+		{"reply", "ab12", "hi", "--nope", "x"},
+	} {
+		errOut := &bytes.Buffer{}
+		if code := run(args, strings.NewReader(""), io.Discard, errOut); code != exitErr {
+			t.Errorf("%v 退出码 %d", args, code)
+		}
+		if errOut.Len() == 0 {
+			t.Errorf("%v 没有报错", args)
+		}
+	}
+}
+
+func TestInboxCommand(t *testing.T) {
+	var cap captured
+	cap.respInbox = `{"messages":[` +
+		`{"id":"m2","from":"mac:boss","to":"ubuntu:cw","text":"收到\n别的","state":"queued","kind":"reply","reply_to":"m1"},` +
+		`{"id":"m1","from":"ubuntu:cw","to":"mac:boss","text":"帮我改\n细节","state":"delivered","kind":"request","ask_user":true}` +
+		`],"unanswered":[{"id":"m1","from":"ubuntu:cw","to":"mac:boss","text":"帮我改\n细节","state":"delivered","kind":"request"}]}`
+	srv := httptest.NewServer(cap.handler())
+	defer srv.Close()
+	useEndpoint(t, srv.URL)
+	t.Setenv("XXYI_ADDR", "ubuntu:cw")
+
+	out := &bytes.Buffer{}
+	if code := run([]string{"inbox"}, nil, out, io.Discard); code != exitOK {
+		t.Fatalf("退出码 %d，stderr %q", code, out.String())
+	}
+	want := "未回复 #m1 来自 ubuntu:cw：帮我改\n" +
+		"#m2 reply mac:boss → ubuntu:cw queued：收到\n" +
+		"#m1 request ubuntu:cw → mac:boss delivered：帮我改\n"
+	if out.String() != want {
+		t.Errorf("inbox 输出 %q，期望 %q", out.String(), want)
+	}
+	got := cap.last(t)
+	if got.path != "/msg/inbox" || !strings.Contains(got.query, "addr=ubuntu%3Acw") || !strings.Contains(got.query, "n=20") {
+		t.Errorf("inbox 请求 %s?%s", got.path, got.query)
+	}
+
+	// 指定条数
+	if code := run([]string{"inbox", "3"}, nil, io.Discard, io.Discard); code != exitOK {
+		t.Fatalf("退出码 %d", code)
+	}
+	if got := cap.last(t); !strings.Contains(got.query, "n=3") {
+		t.Errorf("查询 %s", got.query)
+	}
+
+	// 条数不合法：本地拦下
+	for _, bad := range []string{"0", "101", "abc"} {
+		errOut := &bytes.Buffer{}
+		if code := run([]string{"inbox", bad}, nil, io.Discard, errOut); code != exitErr {
+			t.Errorf("inbox %s 退出码 %d", bad, code)
+		}
+		if errOut.Len() == 0 {
+			t.Errorf("inbox %s 没有报错", bad)
+		}
+	}
+}
+
+func TestInboxEmptyAndWhoGone(t *testing.T) {
+	var cap captured
+	cap.respInbox = `{"messages":[],"unanswered":[]}`
+	cap.respPeers = `{"peers":{"ubuntu:b":"busy","mac:a":"gone","mac:c":"idle"}}`
+	srv := httptest.NewServer(cap.handler())
+	defer srv.Close()
+	useEndpoint(t, srv.URL)
+	t.Setenv("XXYI_ADDR", "ubuntu:cw")
+
+	out := &bytes.Buffer{}
+	if code := run([]string{"inbox"}, nil, out, io.Discard); code != exitOK {
+		t.Fatalf("退出码 %d", code)
+	}
+	if out.String() != "收件箱是空的\n" {
+		t.Errorf("空收件箱输出 %q", out.String())
+	}
+
+	out.Reset()
+	if code := run([]string{"who"}, nil, out, io.Discard); code != exitOK {
+		t.Fatalf("退出码 %d", code)
+	}
+	// gone 原样打印，不再把非 busy 的补成 idle
+	if want := "mac:a gone\nmac:c idle\nubuntu:b busy\n"; out.String() != want {
+		t.Errorf("who 输出 %q，期望 %q", out.String(), want)
+	}
+}
+
+// --check + stop_hook_active=false：服务端列出欠回复时，标准输出一行 block JSON。
+func TestStateCheckBlocksOnUnanswered(t *testing.T) {
+	var cap captured
+	cap.respState = `{"ok":true,"unanswered":[` +
+		`{"id":"aa11","from":"mac:boss","text":"把分支推上去"},` +
+		`{"id":"bb22","from":"mac:boss","text":"另一件事\n第二行不该出现"}` +
+		`]}`
+	srv := httptest.NewServer(cap.handler())
+	defer srv.Close()
+	useEndpoint(t, srv.URL)
+	t.Setenv("XXYI_ADDR", "ubuntu:cw")
+
+	out := &bytes.Buffer{}
+	if code := run([]string{"state", "idle", "--check"}, strings.NewReader(`{"stop_hook_active":false}`), out, io.Discard); code != exitOK {
+		t.Fatalf("退出码 %d", code)
+	}
+	line := strings.TrimSuffix(out.String(), "\n")
+	if strings.Contains(line, "\n") {
+		t.Fatalf("block 响应必须是一行 JSON：%q", out.String())
+	}
+	var block struct {
+		Decision string `json:"decision"`
+		Reason   string `json:"reason"`
+	}
+	if err := json.Unmarshal([]byte(line), &block); err != nil {
+		t.Fatalf("标准输出不是合法 JSON %q：%v", line, err)
+	}
+	if block.Decision != "block" {
+		t.Errorf("decision %q", block.Decision)
+	}
+	for _, want := range []string{"aa11", "bb22", "mac:boss", "xxyi_reply", "把分支推上去", "另一件事"} {
+		if !strings.Contains(block.Reason, want) {
+			t.Errorf("reason %q 里没有 %q", block.Reason, want)
+		}
+	}
+	if strings.Contains(block.Reason, "第二行不该出现") {
+		t.Errorf("reason 该只带第一行：%q", block.Reason)
+	}
+	if !strings.Contains(block.Reason, "；") {
+		t.Errorf("多条要用「；」连接：%q", block.Reason)
+	}
+	if got := cap.last(t); !strings.Contains(got.query, "check=1") || !strings.Contains(got.query, "state=idle") {
+		t.Errorf("state 请求 %s?%s", got.path, got.query)
+	}
+}
+
+// stop_hook_active=true：请求不带 check，标准输出干净。
+func TestStateCheckSkippedWhenHookActive(t *testing.T) {
+	var cap captured
+	cap.respState = `{"ok":true,"unanswered":[{"id":"aa11","from":"mac:boss","text":"欠着的"}]}`
+	srv := httptest.NewServer(cap.handler())
+	defer srv.Close()
+	useEndpoint(t, srv.URL)
+	t.Setenv("XXYI_ADDR", "ubuntu:cw")
+
+	out := &bytes.Buffer{}
+	if code := run([]string{"state", "idle", "--check"}, strings.NewReader(`{"stop_hook_active":true}`), out, io.Discard); code != exitOK {
+		t.Fatalf("退出码 %d", code)
+	}
+	if out.Len() != 0 {
+		t.Errorf("钩子已在跑时不该有输出：%q", out.String())
+	}
+	if got := cap.last(t); strings.Contains(got.query, "check=") {
+		t.Errorf("stop_hook_active=true 时不该带 check：%s", got.query)
+	}
+}
+
+// 服务端没有欠回复：不带 block，静默退出。
+func TestStateCheckQuietWhenNothingUnanswered(t *testing.T) {
+	var cap captured
+	cap.respState = `{"ok":true,"unanswered":[]}`
+	srv := httptest.NewServer(cap.handler())
+	defer srv.Close()
+	useEndpoint(t, srv.URL)
+	t.Setenv("XXYI_ADDR", "ubuntu:cw")
+
+	out := &bytes.Buffer{}
+	if code := run([]string{"state", "idle", "--check"}, strings.NewReader(`{"stop_hook_active":false}`), out, io.Discard); code != exitOK {
+		t.Fatalf("退出码 %d", code)
+	}
+	if out.Len() != 0 {
+		t.Errorf("没有欠回复不该有输出：%q", out.String())
+	}
+	if got := cap.last(t); !strings.Contains(got.query, "check=1") {
+		t.Errorf("该带 check=1：%s", got.query)
+	}
+}
+
+// 不带 --check：不读标准输入，也不带 check。
+func TestStateWithoutCheckDoesNotReadStdin(t *testing.T) {
+	var cap captured
+	cap.respState = `{"ok":true,"unanswered":[{"id":"aa11","from":"mac:boss","text":"欠着的"}]}`
+	srv := httptest.NewServer(cap.handler())
+	defer srv.Close()
+	useEndpoint(t, srv.URL)
+	t.Setenv("XXYI_ADDR", "ubuntu:cw")
+
+	stdin := &watchReader{r: strings.NewReader(`{"stop_hook_active":false}`)}
+	out := &bytes.Buffer{}
+	if code := run([]string{"state", "idle"}, stdin, out, io.Discard); code != exitOK {
+		t.Fatalf("退出码 %d", code)
+	}
+	if stdin.wasRead() {
+		t.Error("不带 --check 不该读标准输入")
+	}
+	if out.Len() != 0 {
+		t.Errorf("不该有输出：%q", out.String())
+	}
+	if got := cap.last(t); strings.Contains(got.query, "check=") {
+		t.Errorf("不该带 check：%s", got.query)
+	}
+}
+
+// 标准输入一直不关闭：仍在 stateDeadline 内返回（goroutine 读 + select）。
+func TestStateCheckStdinNeverClosesReturnsFast(t *testing.T) {
+	var cap captured
+	srv := httptest.NewServer(cap.handler())
+	defer srv.Close()
+	useEndpoint(t, srv.URL)
+	t.Setenv("XXYI_ADDR", "ubuntu:cw")
+
+	oldDeadline := stateDeadline
+	t.Cleanup(func() { stateDeadline = oldDeadline })
+	stateDeadline = 300 * time.Millisecond
+
+	pr, _ := io.Pipe() // 没人写也没人关
+	start := time.Now()
+	out := &bytes.Buffer{}
+	if code := run([]string{"state", "idle", "--check"}, pr, out, io.Discard); code != exitOK {
+		t.Fatalf("退出码 %d", code)
+	}
+	if d := time.Since(start); d > 1200*time.Millisecond {
+		t.Fatalf("耗时 %v，标准输入不关闭时也没及时返回", d)
+	}
+	if out.Len() != 0 {
+		t.Errorf("读不到钩子 JSON 时不该有输出：%q", out.String())
+	}
+}
+
+// state 接受 gone；参数不合法仍静默退出 0。
+func TestStateGoneAndBadArgs(t *testing.T) {
+	var cap captured
+	srv := httptest.NewServer(cap.handler())
+	defer srv.Close()
+	useEndpoint(t, srv.URL)
+	t.Setenv("XXYI_ADDR", "ubuntu:cw")
+
+	if code := run([]string{"state", "gone"}, nil, io.Discard, io.Discard); code != exitOK {
+		t.Fatalf("退出码 %d", code)
+	}
+	if got := cap.last(t); !strings.Contains(got.query, "state=gone") {
+		t.Errorf("state 请求 %s?%s", got.path, got.query)
+	}
+	for _, args := range [][]string{{"state"}, {"state", "asleep"}, {"state", "busy", "idle"}, {"state", "--check"}} {
+		if code := run(args, strings.NewReader(`{"stop_hook_active":false}`), io.Discard, io.Discard); code != exitOK {
+			t.Errorf("%v 退出码 %d", args, code)
+		}
 	}
 }

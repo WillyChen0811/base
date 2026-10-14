@@ -1046,3 +1046,12 @@ func TestPathUnderRejectsHidden(t *testing.T) {
 		}
 	}
 }
+
+func TestTmuxSessionArgsOrder(t *testing.T) {
+	if got := strings.Join(tmuxSessionArgs("%3"), " "); got != "display-message -p -t %3 #S" {
+		t.Errorf("参数 %q：-t 要在格式串前面", got)
+	}
+	if got := strings.Join(tmuxSessionArgs(""), " "); got != "display-message -p #S" {
+		t.Errorf("参数 %q", got)
+	}
+}

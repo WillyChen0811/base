@@ -65,15 +65,19 @@ var (
 var tmuxSession = func() (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), tmuxTimeout)
 	defer cancel()
-	args := []string{"display-message", "-p", "#S"}
-	if pane := os.Getenv("TMUX_PANE"); pane != "" {
-		args = append(args, "-t", pane)
-	}
-	out, err := exec.CommandContext(ctx, "tmux", args...).Output()
+	out, err := exec.CommandContext(ctx, "tmux", tmuxSessionArgs(os.Getenv("TMUX_PANE"))...).Output()
 	if err != nil {
 		return "", err
 	}
 	return strings.TrimSpace(string(out)), nil
+}
+
+// tmuxSessionArgs 是取会话名的 tmux 参数。-t 必须在格式串之前：tmux 把格式串之后的参数都当多余参数报错。
+func tmuxSessionArgs(pane string) []string {
+	if pane == "" {
+		return []string{"display-message", "-p", "#S"}
+	}
+	return []string{"display-message", "-p", "-t", pane, "#S"}
 }
 
 const usage = "用法：xxyi-msg send <收件人> [文字|-] [--file 路径] [--repo 名 --branch 名] [--kind request|notice|code] [--ask-user]" +

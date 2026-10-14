@@ -42,6 +42,8 @@ type Config struct {
 	// MsgSync / MsgDeliver 透传给消息 Hub：nil 时 Hub 的同步/送达报"未配置"。
 	MsgSync    func(ctx context.Context, m Message) error
 	MsgDeliver func(ctx context.Context, m Message) error
+	// MsgStorePath 透传给消息 Hub 的落盘路径（重启不丢消息）；空 = Hub 保持纯内存。
+	MsgStorePath string
 }
 
 // Status 是协助服务的状态快照。
@@ -101,7 +103,7 @@ type Service struct {
 	remote    Remote
 	queue     *Queue
 	runner    *Runner
-	hub       *Hub          // 消息中转队列（纯内存）
+	hub       *Hub          // 消息中转队列（配了 MsgStorePath 则落盘）
 	msgKick   chan struct{} // 容量 1 的"踢一下"：Send/Decide/SetState/SetAuto 后叫醒 Pump
 	hookToken string        // NewService 时随机生成，不变
 	repos     []string
@@ -144,7 +146,7 @@ func NewService(cfg Config, remote Remote) *Service {
 		msgKick:   make(chan struct{}, 1),
 	}
 	// hub 依赖 s.logEvent，必须等 s 建好再接上
-	s.hub = NewHub(HubConfig{Sync: cfg.MsgSync, Deliver: cfg.MsgDeliver, Log: s.logEvent})
+	s.hub = NewHub(HubConfig{Sync: cfg.MsgSync, Deliver: cfg.MsgDeliver, Log: s.logEvent, StorePath: cfg.MsgStorePath})
 	return s
 }
 

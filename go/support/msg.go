@@ -168,9 +168,13 @@ type HubConfig struct {
 	Deliver func(ctx context.Context, m Message) error
 	Log     func(kind string, detail map[string]string) // 可为 nil
 	Now     func() time.Time                            // 可为 nil，用 time.Now
+	// StorePath 是落盘文件路径：消息（含附件）、对端状态、自动模式、欠回复计数写进这个文件，
+	// NewHub 时读回来，wgtund 重启不丢消息；空 = 不落盘（保持纯内存行为）。
+	StorePath string
 }
 
-// Hub 是消息中转队列，纯内存、并发安全；网络与 git 由 cfg 注入。
+// Hub 是消息中转队列，并发安全；网络与 git 由 cfg 注入。
+// cfg.StorePath 非空时把消息/对端状态等落盘（见 msgstore.go），空则纯内存。
 type Hub struct {
 	mu        sync.Mutex
 	cfg       HubConfig
@@ -187,11 +191,20 @@ type Hub struct {
 	nagged    map[string]int       // 单条欠回复请求已提醒过的次数（NagUnanswered 用）
 	autoUntil time.Time            // 零值表示自动模式关闭
 	wakeup    chan struct{}        // outbox 有变化或 SetState 时翻转，唤醒长轮询的 TakeOutbox
+
+	// 落盘（见 msgstore.go）：持锁时 saveLocked 拍快照（snap/snapSeq），
+	// 解锁后 flush 拿 saveMu 原子写，只有序号比上次写盘的大才真写，锁外并发不乱序。
+	storePath  string     // cfg.StorePath；空 = 不落盘
+	saveMu     sync.Mutex // 串行化磁盘写
+	snapSeq    uint64     // 快照序号：内容每变一次 +1
+	snap       []byte     // 最近一次持锁拍下的快照 JSON（内容不可变，锁外引用安全）
+	writtenSeq uint64     // 最近成功写盘的快照序号；只在 flush 持 saveMu 时读写
 }
 
-// NewHub 新建一个空的 Hub。
+// NewHub 新建 Hub。cfg.StorePath 非空时读回上次落盘的快照（消息含附件、对端状态、
+// 自动模式、欠回复计数；takenAt/outbox/inflight 等瞬时状态一律从空开始，见 msgstore.go）。
 func NewHub(cfg HubConfig) *Hub {
-	return &Hub{
+	h := &Hub{
 		cfg:       cfg,
 		outbox:    nil,
 		outPlaced: make(map[string]bool),
@@ -204,7 +217,12 @@ func NewHub(cfg HubConfig) *Hub {
 		peerSeq:   make(map[string]uint64),
 		nagged:    make(map[string]int),
 		wakeup:    make(chan struct{}),
+		storePath: cfg.StorePath,
 	}
+	if h.storePath != "" {
+		h.loadStore()
+	}
+	return h
 }
 
 func (h *Hub) now() time.Time {
@@ -480,6 +498,7 @@ func (h *Hub) Send(m Message) (string, error) {
 		close(wake) // 淘汰顺带清了 outbox 条目，叫醒等待中的 TakeOutbox
 	}
 	h.logMsg(m)
+	h.persist() // 新消息入库（含附件）连同 trim 淘汰一起落盘
 	return m.ID, nil
 }
 
@@ -498,6 +517,7 @@ func (h *Hub) SetState(addr string, st PeerState) error {
 	wake := h.flipWakeupLocked()
 	h.mu.Unlock()
 	close(wake)
+	h.persist() // 对端状态和 peerAt 落盘
 	return nil
 }
 
@@ -595,7 +615,6 @@ func (h *Hub) Unanswered(addr string) []Message {
 func (h *Hub) NagUnanswered(addr string) []Message {
 	un := h.Unanswered(addr)
 	h.mu.Lock()
-	defer h.mu.Unlock()
 	now := h.now()
 	var out []Message
 	for _, m := range un {
@@ -604,6 +623,10 @@ func (h *Hub) NagUnanswered(addr string) []Message {
 		}
 		h.nagged[m.ID]++
 		out = append(out, m)
+	}
+	h.mu.Unlock()
+	if len(out) > 0 {
+		h.persist() // nagged 计数涨了，落盘
 	}
 	return out
 }
@@ -703,6 +726,7 @@ func (h *Hub) Decide(id, action string) error {
 		close(wake)
 	}
 	h.logMsg(out)
+	h.persist() // 决定后的状态/Now/Synced/附件清理落盘
 	return nil
 }
 
@@ -718,6 +742,7 @@ func (h *Hub) SetAuto(minutes int) error {
 		h.autoUntil = h.now().Add(time.Duration(minutes) * time.Minute)
 	}
 	h.mu.Unlock()
+	h.persist() // 自动模式开关落盘
 	return nil
 }
 
@@ -760,6 +785,7 @@ func (h *Hub) TakeOutbox(ctx context.Context, to string) (Message, bool) {
 			h.takenAt[id] = h.now()       // 记取走时间，超时未确认由 pumpOne 重新排队
 			h.setPeerLocked(to, PeerBusy) // 取走即算送出，置忙避免连发
 			h.mu.Unlock()
+			h.persist() // 对端置 busy 落盘（takenAt 不存，重启后由重放/确认收敛）
 			return out, true
 		}
 		wake := h.wakeup
@@ -799,6 +825,7 @@ func (h *Hub) MarkDelivered(id string) error {
 	h.mu.Unlock()
 
 	h.logMsg(out)
+	h.persist() // delivered 状态（和原请求 Answered）落盘
 	return nil
 }
 
@@ -858,6 +885,7 @@ func (h *Hub) pumpOne(ctx context.Context, id string) {
 		if reclaimed != nil {
 			h.logMsg(*reclaimed)
 		}
+		h.persist() // 内容没变时不写盘；有 reclaim 的 Reason 改动则落盘
 		return
 	}
 	if next, ok := h.nextTry[id]; ok && h.now().Before(next) {
@@ -865,6 +893,7 @@ func (h *Hub) pumpOne(ctx context.Context, id string) {
 		if reclaimed != nil {
 			h.logMsg(*reclaimed)
 		}
+		h.persist()
 		return
 	}
 	needSync := m.Repo != "" && !m.Synced
@@ -874,6 +903,7 @@ func (h *Hub) pumpOne(ctx context.Context, id string) {
 		if reclaimed != nil {
 			h.logMsg(*reclaimed)
 		}
+		h.persist()
 		return
 	}
 	h.inflight[id] = true
@@ -916,7 +946,8 @@ func (h *Hub) pumpOne(ctx context.Context, id string) {
 			h.logMsg(*out)
 		}
 		if !continueSend {
-			return // 同步失败、被取消，或同步期间被 reject/淘汰
+			h.persist() // sync_failed 的 State/Reason 落盘；取消/被拒时内容没变则不写
+			return      // 同步失败、被取消，或同步期间被 reject/淘汰
 		}
 	}
 
@@ -930,6 +961,7 @@ func (h *Hub) pumpOne(ctx context.Context, id string) {
 			if reclaimed != nil {
 				h.logMsg(*reclaimed)
 			}
+			h.persist()
 			return
 		}
 		var wake chan struct{}
@@ -946,6 +978,7 @@ func (h *Hub) pumpOne(ctx context.Context, id string) {
 			close(wake)
 		}
 		// 进 outbox 不算状态变化，也不置忙（被取走时才置），不写日志。
+		h.persist() // outbox/outPlaced 不进快照：内容没变时 saveLocked 不会递增序号
 		return
 	}
 
@@ -1012,4 +1045,5 @@ func (h *Hub) pumpOne(ctx context.Context, id string) {
 	if out != nil {
 		h.logMsg(*out)
 	}
+	h.persist() // delivered/gone/退避 Reason 等送达结果落盘
 }

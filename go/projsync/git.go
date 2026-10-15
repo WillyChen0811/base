@@ -202,7 +202,8 @@ func runGit(ctx context.Context, dir string, env []string, args ...string) ([]by
 // 返回退出码；非 git 退出类错误（ctx 取消、找不到 git 等）退出码为 -1。
 func runGitCode(ctx context.Context, dir string, env []string, args ...string) ([]byte, int, error) {
 	cmd := exec.CommandContext(ctx, "git", append([]string{"-C", dir}, args...)...)
-	cmd.Env = append(append(cleanEnv(os.Environ()), env...), "GIT_TERMINAL_PROMPT=0")
+	// GIT_NO_REPLACE_OBJECTS=1 放在最后、调用方不能覆盖：refs/replace 会让 Git 看到被替换后的历史/对象，必须关掉。
+	cmd.Env = append(append(cleanEnv(os.Environ()), env...), "GIT_TERMINAL_PROMPT=0", "GIT_NO_REPLACE_OBJECTS=1")
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 	if err := cmd.Run(); err != nil {

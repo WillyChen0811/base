@@ -231,6 +231,9 @@ func CheckScope(ctx context.Context, repoDir string, env []string, branches []st
 	// g) 布局 + f) 逐工作区
 	wts := checkLayout(ctx, repoDir, env, add)
 
+	// i) 会改变 Git 看到的历史/对象的功能
+	checkHistoryAltering(ctx, repoDir, env, add)
+
 	// b) 分支名
 	for _, b := range branches {
 		checkBranchName(ctx, repoDir, env, b, add)
@@ -530,4 +533,47 @@ func (p ApplyPlan) checkScope(ctx context.Context, oids ...string) error {
 		return fmt.Errorf("%s：%w", p.tag(), err)
 	}
 	return err
+}
+
+// checkHistoryAltering：refs/replace、grafts、浅克隆、部分克隆都会改变 Git 看到的历史或对象
+// （祖先检测、试合并的结果可能与真实历史不同），未专门处理，按 PLAN 第十一节识别就停。读取失败也判超出。
+func checkHistoryAltering(ctx context.Context, repoDir string, env []string, add func(string, ...any)) {
+	if out, err := runGit(ctx, repoDir, env, "for-each-ref", "--count=1", "--format=%(refname)", "refs/replace/"); err != nil {
+		add("读取 refs/replace 失败: %v", err)
+	} else if len(out) > 0 {
+		add("仓库有替换对象引用（refs/replace/*），会改变 Git 看到的历史")
+	}
+	cd, err := runGit(ctx, repoDir, env, "rev-parse", "--path-format=absolute", "--git-common-dir")
+	if err != nil {
+		add("定位 git 公共目录失败: %v", err)
+	} else {
+		common := strings.TrimSuffix(string(cd), "\n")
+		for _, f := range []struct{ rel, why string }{
+			{"info/grafts", "仓库有 grafts 文件（info/grafts），会改变 Git 看到的历史"},
+			{"shallow", "仓库是浅克隆（存在 shallow 文件）"},
+		} {
+			if _, err := os.Lstat(filepath.Join(common, f.rel)); err == nil {
+				add("%s", f.why)
+			} else if !os.IsNotExist(err) {
+				add("检查 %s 失败: %v", f.rel, err)
+			}
+		}
+	}
+	if out, err := runGit(ctx, repoDir, env, "rev-parse", "--is-shallow-repository"); err != nil {
+		add("读取是否浅克隆失败: %v", err)
+	} else if strings.TrimSuffix(string(out), "\n") != "false" {
+		add("仓库是浅克隆")
+	}
+	if out, code, err := runGitCode(ctx, repoDir, env, "config", "--get-regexp", `^remote\..*\.promisor$`); err != nil {
+		if code != 1 {
+			add("读取 promisor 配置失败: %v", err)
+		}
+	} else if strings.Contains(string(out), "true") {
+		add("仓库是部分克隆（remote.*.promisor）")
+	}
+	if _, code, err := runGitCode(ctx, repoDir, env, "config", "--get", "extensions.partialclone"); err == nil {
+		add("仓库是部分克隆（extensions.partialclone）")
+	} else if code != 1 {
+		add("读取 extensions.partialclone 失败: %v", err)
+	}
 }

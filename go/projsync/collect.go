@@ -236,7 +236,7 @@ func tryMerge(ctx context.Context, repoDir string, env []string, mac, ubuntu str
 
 	e := append(append([]string{}, env...), "GIT_OBJECT_DIRECTORY="+tmp, "GIT_ALTERNATE_OBJECT_DIRECTORIES="+realObjs)
 	cmd := exec.CommandContext(ctx, "git", "-C", repoDir, "merge-tree", "--write-tree", "--name-only", "-z", mac, ubuntu)
-	cmd.Env = append(append(cleanEnv(os.Environ()), e...), "GIT_TERMINAL_PROMPT=0")
+	cmd.Env = append(append(cleanEnv(os.Environ()), e...), "GIT_TERMINAL_PROMPT=0", "GIT_NO_REPLACE_OBJECTS=1") // 同 runGitCode，调用方不可覆盖
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 	runErr := cmd.Run()

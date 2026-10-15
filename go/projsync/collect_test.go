@@ -470,3 +470,75 @@ func TestRepoDirMustBeWorktreeRoot(t *testing.T) {
 		}
 	}
 }
+
+// refs/replace、grafts、浅克隆、部分克隆：CheckScope 判超出，执行器不写。
+func TestHistoryAlteringOutOfScope(t *testing.T) {
+	ctx := context.Background()
+	wantOOS := func(dir, key string) {
+		t.Helper()
+		err := CheckScope(ctx, dir, nil, []string{"main"})
+		var oos *ErrOutOfScope
+		if !errors.As(err, &oos) || !strings.Contains(err.Error(), key) {
+			t.Fatalf("应判超出（%s）: %v", key, err)
+		}
+	}
+	refuses := func(dir string) {
+		t.Helper()
+		before := ag(t, dir, "for-each-ref")
+		head := rev(t, dir, "HEAD")
+		err := CreateBranch(ctx, ApplyPlan{RepoDir: dir, Branch: "nb", NewOID: head, Kind: KindCreateOnOther})
+		if err == nil || ag(t, dir, "for-each-ref") != before {
+			t.Fatalf("执行器应拒绝且不写: %v", err)
+		}
+	}
+
+	// refs/replace：B（与 A 无关）被替换成以 A 为父
+	dir := newRepo(t)
+	a := rev(t, dir, "HEAD")
+	ag(t, dir, "checkout", "-q", "--orphan", "bb")
+	ag(t, dir, "rm", "-rfq", ".")
+	b := commitFile(t, dir, "b.txt", "b\n")
+	ag(t, dir, "checkout", "-q", "main")
+	ag(t, dir, "branch", "-D", "bb")
+	if ok, err := isAncestor(ctx, dir, nil, a, b); err != nil || ok {
+		t.Fatalf("无替换时 a 不是 b 的祖先: %v %v", ok, err)
+	}
+	// 用替换对象让 b 看起来以 a 为父
+	fake := ag(t, dir, "commit-tree", ag(t, dir, "rev-parse", b+"^{tree}"), "-p", a, "-m", "fake")
+	ag(t, dir, "replace", b, fake)
+	if ok, err := isAncestor(ctx, dir, nil, a, b); err != nil || ok {
+		t.Fatalf("有 refs/replace 时 isAncestor 应返回真实结果 false: %v %v", ok, err)
+	}
+	// 调用方 env 也不能覆盖
+	if ok, err := isAncestor(ctx, dir, []string{"GIT_NO_REPLACE_OBJECTS=0"}, a, b); err != nil || ok {
+		t.Fatalf("调用方不能覆盖 GIT_NO_REPLACE_OBJECTS: %v %v", ok, err)
+	}
+	wantOOS(dir, "refs/replace")
+	refuses(dir)
+
+	// grafts
+	g := newRepo(t)
+	os.WriteFile(filepath.Join(g, ".git", "info", "grafts"), nil, 0o644)
+	wantOOS(g, "grafts")
+	refuses(g)
+
+	// 浅克隆 / 部分克隆
+	src := newRepo(t)
+	commitFile(t, src, "s2.txt", "2\n")
+	shallow := filepath.Join(t.TempDir(), "shallow")
+	ag(t, src, "clone", "-q", "--depth", "1", "file://"+src, shallow)
+	wantOOS(shallow, "浅克隆")
+	refuses(shallow)
+
+	partial := filepath.Join(t.TempDir(), "partial")
+	ag(t, src, "config", "uploadpack.allowFilter", "true")
+	ag(t, src, "config", "uploadpack.allowAnySHA1InWant", "true")
+	ag(t, src, "clone", "-q", "--filter=blob:none", "file://"+src, partial)
+	wantOOS(partial, "部分克隆")
+	refuses(partial)
+
+	// 普通仓库不受影响
+	if err := CheckScope(ctx, newRepo(t), nil, []string{"main"}); err != nil {
+		t.Fatalf("普通仓库不应超出: %v", err)
+	}
+}

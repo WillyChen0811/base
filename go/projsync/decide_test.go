@@ -408,3 +408,11 @@ func TestWorktreeSameSideMultipleNoCrosstalk(t *testing.T) {
 		t.Fatalf("%+v", r)
 	}
 }
+
+func TestDecideCleanButConflictFilesInvalid(t *testing.T) {
+	a := one(t, RepoFacts{}, BranchFacts{Name: "d", Mac: "m", Ubuntu: "u", MergeClean: true, ConflictFiles: []string{"a.go"}})
+	wantKind(t, a, KindInvalidFacts)
+	if a.Target != "" || len(a.Sides) != 0 || !strings.Contains(a.Reason, "试合并标为干净却列出冲突文件") {
+		t.Fatalf("%+v", a)
+	}
+}

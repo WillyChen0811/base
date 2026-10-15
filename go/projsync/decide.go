@@ -75,8 +75,8 @@ type BranchAction struct {
 	Kind ActionKind
 	// Target 是要更新到的提交哈希；AutoMerge 时为空，由执行器生成合并提交后填。
 	Target string
-	// Sides 是要更新的一边（AutoMerge 为两边）；WaitDirty/NeedCommit 时是
-	// 「被 dirty 阻塞的那些边」（NeedCommit 时即需要 agent 提交的设备）。
+	// Sides 是要更新的一边（AutoMerge 为两边）；WaitDirty/BlockedDirty 时表示
+	// 被未提交改动挡住的设备。分支侧不负责派提交（由 DecideWorktrees 负责）。
 	Sides  []Side
 	Reason string
 }
@@ -148,6 +148,9 @@ func decideOne(repo RepoFacts, b BranchFacts) BranchAction {
 	case b.UbuntuIsAncestorOfMac:
 		return gateDirty(act, KindFastForward, b.Mac, []Side{SideUbuntu}, b,
 			"Mac 领先，Ubuntu 快进到 Mac 的提交")
+	case b.MergeClean && len(b.ConflictFiles) > 0:
+		act.Kind = KindInvalidFacts
+		act.Reason = "事实矛盾（试合并标为干净却列出冲突文件），需重新采集，不更新任何一边"
 	case b.MergeClean:
 		return gateDirty(act, KindAutoMerge, "", []Side{SideMac, SideUbuntu}, b,
 			"两边分叉但可干净合并，生成合并提交后两边都更新")

@@ -432,3 +432,41 @@ func TestCommitTreeSubmoduleOutOfScope(t *testing.T) {
 		t.Fatalf("普通快进应成功: %v", err)
 	}
 }
+
+// RepoDir 必须是工作区根；ls-tree 用 --full-tree，子目录调用不会只查子树。
+func TestRepoDirMustBeWorktreeRoot(t *testing.T) {
+	ctx := context.Background()
+	dir, c1, c2 := ffRepo(t)
+	sub := filepath.Join(dir, "d")
+	os.MkdirAll(sub, 0o755)
+	refs := ag(t, dir, "for-each-ref")
+
+	err := CheckScope(ctx, sub, nil, []string{"main"})
+	if err == nil || !strings.Contains(err.Error(), "仓库路径不是工作区根目录") {
+		t.Fatalf("子目录应判超出: %v", err)
+	}
+	if err := FastForwardBranch(ctx, ffPlan(sub, "feat", c1, c2)); err == nil || ag(t, dir, "for-each-ref") != refs {
+		t.Fatalf("子目录调用执行器应拒绝且不写: %v", err)
+	}
+
+	// 符号链接指向仓库根：解析后相等，视为根，正常通过
+	link := filepath.Join(t.TempDir(), "link")
+	if err := os.Symlink(dir, link); err != nil {
+		t.Fatal(err)
+	}
+	if err := CheckScope(ctx, link, nil, []string{"main"}); err != nil {
+		t.Fatalf("指向仓库根的符号链接应通过: %v", err)
+	}
+
+	// gitlink 在子目录之外，从仓库内子目录调用 CheckCommitsScope 也要查整棵树（--full-tree）
+	ag(t, dir, "checkout", "-q", "-b", "g", c1)
+	ag(t, dir, "update-index", "--add", "--cacheinfo", "160000,"+c1+",outside")
+	ag(t, dir, "commit", "-m", "gitlink")
+	g := rev(t, dir, "HEAD")
+	ag(t, dir, "checkout", "-q", "main")
+	for _, d := range []string{dir, sub} {
+		if err := CheckCommitsScope(ctx, d, nil, g); err == nil || !strings.Contains(err.Error(), "包含子模块") {
+			t.Fatalf("%s 调用应判超出: %v", d, err)
+		}
+	}
+}

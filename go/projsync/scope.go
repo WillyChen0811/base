@@ -458,6 +458,11 @@ func checkLayout(ctx context.Context, repoDir string, env []string, add func(str
 		add("无法确认 %s 的工作区根: %v", repoDir, err)
 	} else {
 		tp, e := real(strings.TrimSuffix(string(top), "\n"))
+		// RepoDir 必须正是工作区根：两边都解析符号链接并 Clean 后逐字节比较。
+		// 指向仓库根的符号链接解析后相等，视为根、正常通过；子目录则判超出。
+		if rd, e3 := real(repoDir); e3 != nil || e != nil || filepath.Clean(rd) != filepath.Clean(tp) {
+			add("仓库路径不是工作区根目录：%s", repoDir)
+		}
 		found := false
 		for _, w := range wts {
 			if wp, e2 := real(w.Path); e == nil && e2 == nil && wp == tp {
@@ -491,7 +496,7 @@ func CheckCommitsScope(ctx context.Context, repoDir string, env []string, oids .
 			reasons = append(reasons, fmt.Sprintf("提交 %q 的 OID 不合法，无法检查子模块", o))
 			continue
 		}
-		out, err := runGit(ctx, repoDir, env, "ls-tree", "-r", "-z", o)
+		out, err := runGit(ctx, repoDir, env, "ls-tree", "--full-tree", "-r", "-z", o)
 		if err != nil {
 			reasons = append(reasons, fmt.Sprintf("读取提交 %s 的树失败: %v", short, err))
 			continue

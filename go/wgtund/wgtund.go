@@ -291,6 +291,7 @@ func Run(ctx context.Context, dir string, stdin io.Reader, stdout io.Writer) (er
 	// 协助服务（可选）：本机 HTTP 地址和钩子令牌都要在写合并设置文件前拿到
 	// （projSvc 必须在这之前建好：协助的 ProjSync 要直接用它）
 	var supportLocal, supportHook http.Handler
+	var autostart *autostarter // 未启用自动开时为 nil（markManual 对 nil 安全）
 	if prep != nil {
 		svc, fwd, err := startSupport(prep, dir, expand(conf.KnownHosts), ln.Addr().String(), socksAddrs, pool, projSvc)
 		if err != nil {
@@ -301,6 +302,10 @@ func Run(ctx context.Context, dir string, stdin io.Reader, stdout io.Writer) (er
 			closers = append(closers, fwd)
 		}
 		supportLocal, supportHook = svc.LocalHandler(), svc.HookHandler()
+		if prep.conf.autostartOn() {
+			autostart = startAutostart(svc, autostartRetry)
+			closers = append(closers, autostart) // 在 svc.Close 之前关（closers 逆序执行）
+		}
 	}
 
 	mux := http.NewServeMux()
@@ -316,6 +321,9 @@ func Run(ctx context.Context, dir string, stdin io.Reader, stdout io.Writer) (er
 				if o := r.Header.Get("Origin"); o == "" || !originAllowed(o, conf.AllowedOrigins) {
 					errJSON(w, http.StatusForbidden, "需要从 xxyi 页面操作")
 					return
+				}
+				if r.URL.Path == "/support/start" || r.URL.Path == "/support/stop" {
+					autostart.markManual() // 用户手动开/关过，本次运行不再自动开
 				}
 			}
 		}

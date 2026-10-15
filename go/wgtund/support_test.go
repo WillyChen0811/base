@@ -115,6 +115,7 @@ func supportFixture(t *testing.T, tweak func(sup map[string]any, settings map[st
 		"host": "ubuntu", "claude_bin": bin, "workdir": workdir,
 		"claude_args": []string{"--model", "sonnet"},
 		"repos":       map[string]any{"xxyi": map[string]any{"dir": workdir, "remote": "ssh://x@h/r"}},
+		"autostart":   false, // 默认关：老测试都是手动开；自动开有专门的用例
 	}
 	if tweak != nil {
 		tweak(sup, settings)

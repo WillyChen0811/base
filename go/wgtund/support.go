@@ -29,6 +29,7 @@ type supportConf struct {
 	ClaudeArgs     []string               `json:"claude_args"`
 	Repos          map[string]supportRepo `json:"repos"`
 	GitTunnel      string                 `json:"git_tunnel"`
+	Autostart      *bool                  `json:"autostart"` // 启动后自动开协助（不限时）；缺省/null 视为 true，false 关闭
 }
 
 type supportRepo struct {
@@ -36,6 +37,9 @@ type supportRepo struct {
 	Remote    string `json:"remote"`
 	RemoteDir string `json:"remote_dir"` // Ubuntu 上的仓库目录；不写时从 remote 推导（见 remoteDirOf）
 }
+
+// autostartOn 报告是否启动后自动开协助：缺省视为开。
+func (c *supportConf) autostartOn() bool { return c.Autostart == nil || *c.Autostart }
 
 // supportPrep 是校验通过后的 support 配置。
 type supportPrep struct {

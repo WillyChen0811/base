@@ -87,6 +87,9 @@ var layoutEnvKeys = []string{"GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_
 
 // 保守的「无组合形式差异」区块（未引入 golang.org/x/text，见 isSafeRune）。
 func isSafeRune(r rune) bool {
+	if unicode.IsSpace(r) || unicode.IsControl(r) { // 含 U+3000 表意空格：易被 TrimSpace 类处理改写，一律不放行
+		return false
+	}
 	switch {
 	case r < 0x80:
 		return true

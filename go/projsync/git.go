@@ -158,8 +158,7 @@ func listLocalBranches(ctx context.Context, dir string, env []string) ([]string,
 		return nil, err
 	}
 	var branches []string
-	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
-		line = strings.TrimSpace(line)
+	for _, line := range nameLines(out) {
 		if line != "" {
 			branches = append(branches, line)
 		}
@@ -182,8 +181,7 @@ func listRemoteRefs(ctx context.Context, dir string, env []string, nsName string
 		return nil, err
 	}
 	var refs []string
-	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
-		line = strings.TrimSpace(line)
+	for _, line := range nameLines(out) {
 		if line != "" {
 			refs = append(refs, line)
 		}
@@ -220,4 +218,14 @@ func runGitCode(ctx context.Context, dir string, env []string, args ...string) (
 		return nil, code, fmt.Errorf("git %s 失败: %w, stderr: %s", strings.Join(args, " "), err, msg)
 	}
 	return stdout.Bytes(), 0, nil
+}
+
+// nameLines 把 git 输出按行拆开，只去掉记录分隔的 "\n"：名字/路径必须保留原始字节，
+// 绝不能 TrimSpace（Go 的 TrimSpace 会裁掉 U+00A0、U+3000 等，把真实名字变成另一个名字）。OID 才可以 TrimSpace。
+func nameLines(out []byte) []string {
+	s := strings.TrimSuffix(string(out), "\n")
+	if s == "" {
+		return nil
+	}
+	return strings.Split(s, "\n")
 }

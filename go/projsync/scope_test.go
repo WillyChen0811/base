@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -321,5 +322,20 @@ func TestAutoMergeBlockedByMergeInProgress(t *testing.T) {
 	}
 	if after := ag(t, dir, "count-objects", "-v"); after != before {
 		t.Fatalf("创建了新对象:\n%s\n%s", before, after)
+	}
+}
+
+func TestScopeBranchNameWhitespaceNotTrimmed(t *testing.T) {
+	for _, name := range []string{"\u00a0lead", "trail\u3000"} {
+		dir, c1, c2 := ffRepo(t)
+		if _, err := exec.Command("git", "-C", dir, "check-ref-format", "--branch", name).Output(); err != nil {
+			t.Skipf("git 不接受 %q", name)
+		}
+		ag(t, dir, "branch", name, c1)
+		wantOOS(t, dir, ffPlan(dir, "main", c1, c2), "无法确认规范化的分支名")
+		// readRef 对带尾部空白字符的名字也必须精确匹配
+		if oid, ex, err := readRef(context.Background(), dir, nil, "refs/heads/"+name); err != nil || !ex || oid != c1 {
+			t.Fatalf("readRef %q: %v %v %v", name, oid, ex, err)
+		}
 	}
 }

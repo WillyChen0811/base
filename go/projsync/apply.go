@@ -168,7 +168,7 @@ func readRef(ctx context.Context, dir string, env []string, ref string) (oid str
 	if err != nil {
 		return "", false, fmt.Errorf("读取引用 %s 失败: %w", ref, err)
 	}
-	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+	for _, line := range nameLines(out) {
 		f := strings.SplitN(line, " ", 2)
 		if len(f) == 2 && f[1] == ref {
 			if !oidRe.MatchString(f[0]) {

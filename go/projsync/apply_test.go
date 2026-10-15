@@ -731,3 +731,63 @@ func TestWorktreePathDecoding(t *testing.T) {
 		t.Fatal("没快进")
 	}
 }
+
+func TestMergeConfigDoesNotChangeSemantics(t *testing.T) {
+	ctx := context.Background()
+	for name, cfg := range map[string][][]string{
+		"mergeOptions=--squash": {{"branch.main.mergeOptions", "--squash"}},
+		"merge.ff=false":        {{"merge.ff", "false"}},
+		"squash加ff=false":       {{"branch.main.mergeOptions", "--squash --no-ff"}, {"merge.ff", "false"}},
+	} {
+		cfg := cfg
+		t.Run(name, func(t *testing.T) {
+			dir, c1, c2 := ffRepo(t)
+			for _, kv := range cfg {
+				ag(t, dir, "config", kv[0], kv[1])
+			}
+			if err := FastForwardBranch(ctx, ffPlan(dir, "main", c1, c2)); err != nil {
+				t.Fatal(err)
+			}
+			if rev(t, dir, "HEAD") != c2 || rev(t, dir, "refs/heads/main") != c2 {
+				t.Fatal("HEAD/引用没前进")
+			}
+			if ag(t, dir, "status", "--porcelain", "-uall") != "" {
+				t.Fatal("索引与工作区没跟上 HEAD")
+			}
+			if b, err := os.ReadFile(filepath.Join(dir, "new.txt")); err != nil || string(b) != "new\n" {
+				t.Fatal("文件没更新")
+			}
+			if len(strings.Fields(ag(t, dir, "rev-list", "--parents", "-n1", "HEAD"))) != 2 {
+				t.Fatal("不应产生合并提交")
+			}
+		})
+	}
+}
+
+func TestGitDirTrailingSpace(t *testing.T) {
+	ctx := context.Background()
+	base := t.TempDir()
+	dir := filepath.Join(base, "repo")
+	gdir := filepath.Join(base, "gd ") // 独立 git 目录，名字以空格结尾
+	os.MkdirAll(dir, 0o755)
+	ag(t, dir, "init", "-q", "-b", "main", "--separate-git-dir", gdir)
+	ag(t, dir, "config", "user.name", "test")
+	ag(t, dir, "config", "user.email", "t@t")
+	c1 := commitFile(t, dir, "README.md", "base\n")
+	ag(t, dir, "branch", "feat")
+	ag(t, dir, "checkout", "-q", "feat")
+	c2 := commitFile(t, dir, "new.txt", "new\n")
+	ag(t, dir, "checkout", "-q", "--detach", "main")
+	got := ag(t, dir, "rev-parse", "--absolute-git-dir")
+	_ = got // ag 会 TrimSpace，这里只确认目录存在
+	if _, err := os.Stat(gdir); err != nil {
+		t.Fatal(err)
+	}
+	os.WriteFile(filepath.Join(gdir, "MERGE_HEAD"), []byte(c2+"\n"), 0o644)
+	before := snapshot(t, dir)
+	wantRefuse(t, FastForwardBranch(ctx, ffPlan(dir, "main", c1, c2)))
+	wantRefuse(t, CreateBranch(ctx, ApplyPlan{RepoDir: dir, Branch: "nb", NewOID: c2, Kind: KindCreateOnOther}))
+	if snapshot(t, dir) != before {
+		t.Fatal("现场变了")
+	}
+}

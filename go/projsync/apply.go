@@ -175,7 +175,7 @@ func (p ApplyPlan) requireAllIdle(ctx context.Context, wts []WorktreeInfo) error
 		if err != nil {
 			return fmt.Errorf("%s：检查工作区 %s 失败，停止: %w", p.tag(), w.Path, err)
 		}
-		gitDir := strings.TrimSpace(string(gd))
+		gitDir := strings.TrimSuffix(string(gd), "\n") // 只去掉输出末尾一个换行，路径自身的空白必须保留
 		for _, m := range busyMarkers {
 			_, err := os.Lstat(filepath.Join(gitDir, m))
 			if err == nil {
@@ -396,8 +396,8 @@ func (p ApplyPlan) checkWorktreeHead(ctx context.Context, wt, ref string) error 
 	if err != nil {
 		return fmt.Errorf("工作区 %s 的 HEAD 已不是分支（或读取失败）: %w", wt, err)
 	}
-	if strings.TrimSpace(string(sym)) != ref {
-		return fmt.Errorf("工作区 %s 已切换到 %s", wt, strings.TrimSpace(string(sym)))
+	if strings.TrimSuffix(string(sym), "\n") != ref {
+		return fmt.Errorf("工作区 %s 已切换到 %s", wt, strings.TrimSuffix(string(sym), "\n"))
 	}
 	head, err := runGit(ctx, wt, p.Env, "rev-parse", "--verify", "HEAD")
 	if err != nil {
@@ -520,7 +520,10 @@ func (p ApplyPlan) fastForwardCheckedOut(ctx context.Context, wt, ref string) er
 	if err := p.checkClean(ctx, wt); err != nil {
 		return fail(err)
 	}
-	if _, err := runGit(ctx, wt, p.Env, "merge", "--ff-only", "--no-autostash", "--no-overwrite-ignore", p.NewOID); err != nil {
+	if _, err := runGit(ctx, wt, p.Env,
+		// -c 清空该分支继承的 mergeOptions（如 --squash 会让内容进索引/工作区而 HEAD 不动）；
+		// 显式 --no-squash。--ff-only 在命令行上优先于 merge.ff 等配置，不会被全局配置改变语义。
+		"-c", "branch."+p.Branch+".mergeOptions=", "merge", "--ff-only", "--no-squash", "--no-autostash", "--no-overwrite-ignore", p.NewOID); err != nil {
 		return fmt.Errorf("%s：merge --ff-only 失败，需重新判定: %w", p.tag(), err)
 	}
 	head, err := runGit(ctx, wt, p.Env, "rev-parse", "--verify", "HEAD")

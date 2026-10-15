@@ -1,3 +1,7 @@
+// 分工：DecideWorktrees 按工作区判定「要不要派 agent 提交未提交改动」，与分支要不要更新无关；
+// DecideBranches 判定每个分支的更新动作。执行器每轮先用 DecideWorktrees 派提交任务，
+// 再用 DecideBranches 决定分支动作。同一个 dirty 工作区可能在两个函数里都出现
+// （分支被挡住 + 需要提交），执行器应按工作区（Side+Path）去重派活。
 package projsync
 
 import (
@@ -179,13 +183,13 @@ func gateDirty(act BranchAction, kind ActionKind, target string, update []Side, 
 	act.Sides = blocked
 	if !allQuiet {
 		act.Kind = KindWaitDirty
-		act.Reason = fmt.Sprintf("%s工作区有未提交改动且静止不足 %d 分钟，本轮不更新（两边都不动），还需等待约 %d 分钟",
-			sideNames(blocked), QuietMinutesForAutoCommit, maxWait)
+		act.Reason = fmt.Sprintf("%s工作区有未提交改动且静止不足 %d 分钟，%s，还需等待约 %d 分钟",
+			sideNames(blocked), QuietMinutesForAutoCommit, notUpdatedText(kind), maxWait)
 		return act
 	}
 	act.Kind = KindNeedCommit
-	act.Reason = fmt.Sprintf("%s工作区有未提交改动且已静止 ≥%d 分钟，本轮不更新（两边都不动），请该设备上指定的 agent 在仓库中提交",
-		sideNames(blocked), QuietMinutesForAutoCommit)
+	act.Reason = fmt.Sprintf("%s工作区有未提交改动且已静止 ≥%d 分钟，%s，请该设备上指定的 agent 在仓库中提交",
+		sideNames(blocked), QuietMinutesForAutoCommit, notUpdatedText(kind))
 	return act
 }
 
@@ -199,4 +203,65 @@ func sideNames(ss []Side) string {
 		}
 	}
 	return strings.Join(names, "、")
+}
+
+func notUpdatedText(kind ActionKind) string {
+	if kind == KindAutoMerge {
+		return "本轮不更新（两边都不动）"
+	}
+	return "本轮不更新该分支"
+}
+
+// WorktreeFacts 是某台设备上一个工作区的事实（一个仓库在一台设备上可有多个工作区）。
+type WorktreeFacts struct {
+	Side         Side
+	Path         string
+	Branch       string
+	Dirty        bool
+	QuietMinutes int // 未提交改动连续多少分钟没变化；不 dirty 时忽略
+}
+
+// WorktreeAction 是对一个工作区的判定。Kind 只会是
+// KindNothing / KindWaitDirty / KindNeedCommit / KindSkipRepoBusy。
+type WorktreeAction struct {
+	Side   Side
+	Path   string
+	Branch string
+	Kind   ActionKind
+	Reason string
+}
+
+// DecideWorktrees 是纯函数：busy 则全部跳过；不 dirty 无事；dirty 且静止不足
+// QuietMinutesForAutoCommit 则等待；否则交该设备的 agent 提交。输出按 Side、Path 排序。
+func DecideWorktrees(repo RepoFacts, wts []WorktreeFacts) []WorktreeAction {
+	sorted := make([]WorktreeFacts, len(wts))
+	copy(sorted, wts)
+	sort.SliceStable(sorted, func(i, j int) bool {
+		if sorted[i].Side != sorted[j].Side {
+			return sorted[i].Side < sorted[j].Side
+		}
+		return sorted[i].Path < sorted[j].Path
+	})
+	out := make([]WorktreeAction, 0, len(sorted))
+	for _, w := range sorted {
+		a := WorktreeAction{Side: w.Side, Path: w.Path, Branch: w.Branch}
+		switch {
+		case repo.MacBusy || repo.UbuntuBusy:
+			a.Kind = KindSkipRepoBusy
+			a.Reason = "仓库正在 rebase/merge/cherry-pick 中，本轮跳过：" + busyReason(repo)
+		case !w.Dirty:
+			a.Kind = KindNothing
+			a.Reason = "工作区没有未提交改动"
+		case w.QuietMinutes < QuietMinutesForAutoCommit:
+			a.Kind = KindWaitDirty
+			a.Reason = fmt.Sprintf("%s工作区 %s（分支 %s）有未提交改动，静止不足 %d 分钟，还需等待约 %d 分钟",
+				sideNames([]Side{w.Side}), w.Path, w.Branch, QuietMinutesForAutoCommit, QuietMinutesForAutoCommit-w.QuietMinutes)
+		default:
+			a.Kind = KindNeedCommit
+			a.Reason = fmt.Sprintf("%s工作区 %s（分支 %s）有未提交改动且已静止 ≥%d 分钟，请该设备上指定的 agent 提交",
+				sideNames([]Side{w.Side}), w.Path, w.Branch, QuietMinutesForAutoCommit)
+		}
+		out = append(out, a)
+	}
+	return out
 }

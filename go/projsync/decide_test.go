@@ -210,3 +210,72 @@ func TestDecideSortedDeterministic(t *testing.T) {
 		t.Fatal("non-deterministic")
 	}
 }
+
+func oneWT(t *testing.T, repo RepoFacts, w WorktreeFacts) WorktreeAction {
+	t.Helper()
+	r := DecideWorktrees(repo, []WorktreeFacts{w})
+	if len(r) != 1 {
+		t.Fatalf("want 1, got %d", len(r))
+	}
+	return r[0]
+}
+
+func TestWorktreeDirtyWhileBranchesSame(t *testing.T) {
+	// 分支两边相同（DecideBranches 返回 Nothing），但 Mac 工作区 dirty 静止 30 分钟
+	wantKind(t, one(t, RepoFacts{}, BranchFacts{Name: "main", Mac: "a", Ubuntu: "a", MacCheckedOut: true, MacDirty: true, MacQuietMinutes: 30}), KindNothing)
+	a := oneWT(t, RepoFacts{}, WorktreeFacts{Side: SideMac, Path: "/w/x", Branch: "main", Dirty: true, QuietMinutes: 30})
+	if a.Kind != KindNeedCommit {
+		t.Fatalf("%+v", a)
+	}
+	for _, s := range []string{"Mac", "/w/x", "main"} {
+		if !strings.Contains(a.Reason, s) {
+			t.Fatalf("reason missing %q: %s", s, a.Reason)
+		}
+	}
+}
+
+func TestWorktreeBoundary(t *testing.T) {
+	w := WorktreeFacts{Side: SideUbuntu, Path: "/p", Branch: "b", Dirty: true, QuietMinutes: 19}
+	a := oneWT(t, RepoFacts{}, w)
+	if a.Kind != KindWaitDirty || !strings.Contains(a.Reason, "1 分钟") {
+		t.Fatalf("%+v", a)
+	}
+	w.QuietMinutes = 20
+	if a := oneWT(t, RepoFacts{}, w); a.Kind != KindNeedCommit {
+		t.Fatalf("%+v", a)
+	}
+}
+
+func TestWorktreeCleanAndBusy(t *testing.T) {
+	if a := oneWT(t, RepoFacts{}, WorktreeFacts{Side: SideMac, Path: "/p", QuietMinutes: 99}); a.Kind != KindNothing {
+		t.Fatalf("%+v", a)
+	}
+	a := oneWT(t, RepoFacts{MacBusy: true, MacBusyReason: "merge 中"}, WorktreeFacts{Side: SideMac, Path: "/p", Dirty: true, QuietMinutes: 99})
+	if a.Kind != KindSkipRepoBusy || !strings.Contains(a.Reason, "merge 中") {
+		t.Fatalf("%+v", a)
+	}
+}
+
+func TestWorktreeSorted(t *testing.T) {
+	in := []WorktreeFacts{
+		{Side: SideUbuntu, Path: "/a"},
+		{Side: SideMac, Path: "/z"},
+		{Side: SideMac, Path: "/b"},
+	}
+	r := DecideWorktrees(RepoFacts{}, in)
+	got := []string{string(r[0].Side) + r[0].Path, string(r[1].Side) + r[1].Path, string(r[2].Side) + r[2].Path}
+	if !reflect.DeepEqual(got, []string{"mac/b", "mac/z", "ubuntu/a"}) {
+		t.Fatalf("%v", got)
+	}
+	if in[0].Path != "/a" {
+		t.Fatal("input mutated")
+	}
+}
+
+func TestGateDirtyReasonByKind(t *testing.T) {
+	b := macAhead()
+	b.UbuntuCheckedOut, b.UbuntuDirty, b.UbuntuQuietMinutes = true, true, 5
+	if a := one(t, RepoFacts{}, b); strings.Contains(a.Reason, "两边都不动") {
+		t.Fatalf("FastForward reason wrong: %s", a.Reason)
+	}
+}

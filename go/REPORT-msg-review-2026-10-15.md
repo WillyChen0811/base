@@ -31,3 +31,6 @@
 5. S8 在 mac: 收件方是否出现：读 Mac msg-store.json 的 stage=ack 尝试。
 6. 今天 feat/native-wip 上那几条 code 消息是真同步还是被直接送出：查 support-log.jsonl 的「sync_failed→queued→delivered」序列。
 7. 引用源码为 base-msg 的 feat/msg；Mac 实际运行的 wgtund 版本未直接核对，但 S1、S2 行为与日志、对话记录一致。
+
+## 补充证据（报告之后，指挥观察）
+- #39eeb4abdf8d8378（mac:omlx2 → ubuntu:xxyi，kind=code，H1 c5529e4）：注入终端的文字末尾是「（注意：代码没有同步，仓库 xxyi 分支 main）」，但 Ubuntu 的 main 当时已快进到 c5529e4、refs/xxyi 已清空、消息状态 delivered——**实际同步成功却标「没有同步」**。这推翻了 S1 里「『没有同步』分支执行不到」的结论：同步标记两个方向都会错。修 S1 时要查清注入文字是在同步前还是同步后生成（例如消息在同步完成前就被取走/注入，或 Display 读的是旧快照）。

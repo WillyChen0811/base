@@ -339,3 +339,16 @@ func TestScopeBranchNameWhitespaceNotTrimmed(t *testing.T) {
 		}
 	}
 }
+
+func TestScopeNarrowWhitelist(t *testing.T) {
+	for _, name := range []string{"x\u302a\u302b", "x\u302f", "ＡＢ", "功能、测试", "功能，测试", "a\u3000", "q\u3001"} {
+		dir, p := branchPlan(t, name) // ag 建分支，git 不接受会直接失败
+		wantOOS(t, dir, p, "NFC")
+	}
+	for _, name := range []string{"功能/测试", "修复-界面", "扩展\u3400"} {
+		_, p := branchPlan(t, name)
+		if err := FastForwardBranch(context.Background(), p); err != nil {
+			t.Fatalf("%q 应在范围内: %v", name, err)
+		}
+	}
+}

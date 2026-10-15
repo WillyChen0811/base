@@ -85,18 +85,18 @@ func parseGitVersion(s string) (major, minor int, err error) {
 var layoutEnvKeys = []string{"GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY",
 	"GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_NAMESPACE", "GIT_REPLACE_REF_BASE", "GIT_NO_REPLACE_OBJECTS", "GIT_GRAFT_FILE", "GIT_CEILING_DIRECTORIES"}
 
-// 保守的「无组合形式差异」区块（未引入 golang.org/x/text，见 isSafeRune）。
+// 白名单只剩「ASCII 安全字符 + 汉字」：汉字（CJK 统一表意文字 U+4E00–9FFF、扩展 A U+3400–4DBF）没有组合形式差异；
+// 标点（含 U+3000–303F，其中 U+302A–302F 是组合声调符号）、全角、组合符号、空白与控制字符一律超出范围。
+// 额外保险：unicode.Mn/Mc/Me（组合附加符号）永远判超出，即使将来有人放宽区块也拦得住。
 func isSafeRune(r rune) bool {
-	if unicode.IsSpace(r) || unicode.IsControl(r) { // 含 U+3000 表意空格：易被 TrimSpace 类处理改写，一律不放行
+	if unicode.IsSpace(r) || unicode.IsControl(r) || unicode.In(r, unicode.Mn, unicode.Mc, unicode.Me) {
 		return false
 	}
 	switch {
 	case r < 0x80:
 		return true
 	case r >= 0x4E00 && r <= 0x9FFF, // CJK 统一表意文字
-		r >= 0x3400 && r <= 0x4DBF, // CJK 扩展 A
-		r >= 0x3000 && r <= 0x303F, // 中日韩符号标点
-		r >= 0xFF00 && r <= 0xFFEF: // 全角
+		r >= 0x3400 && r <= 0x4DBF: // CJK 扩展 A
 		return true
 	}
 	return false
@@ -104,7 +104,7 @@ func isSafeRune(r rune) bool {
 
 // nameNFCProblem 返回分支名在 UTF-8/NFC 方面的问题（空串=无）。
 // go.mod 没有 golang.org/x/text、go.sum 与模块缓存里也没有，故不引入新依赖，
-// 用保守白名单：非 ASCII 字符只允许落在 isSafeRune 的区块内（这些区块无 NFC/NFD 差异），其余一律判超出。
+// 用保守白名单：非 ASCII 字符只允许汉字区块（见 isSafeRune），其余一律判超出。
 func nameNFCProblem(name string) string {
 	if !utf8.ValidString(name) {
 		return "不是合法 UTF-8"

@@ -238,6 +238,12 @@ func CheckScope(ctx context.Context, repoDir string, env []string, branches []st
 	if err != nil {
 		add("列出本地分支失败: %v", err)
 	} else {
+		// 仓库里任何一个本地分支名含白名单外字符 => 无法确认规范化，整个仓库超出（NormalizationClashes 只是辅助）
+		for _, n := range local {
+			if nameNFCProblem(n) != "" {
+				add("仓库里有无法确认规范化的分支名：%s", n)
+			}
+		}
 		for _, pr := range NormalizationClashes(MergeBranchNames(local, branches)) {
 			add("分支名 %q 与 %q 规范化后相同但字节不同", pr[0], pr[1])
 		}

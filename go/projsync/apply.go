@@ -614,6 +614,13 @@ func AutoMergeCommit(ctx context.Context, p ApplyPlan) (string, error) {
 			return "", fmt.Errorf("%s：父提交不可用，停止: %w", p.tag(), err)
 		}
 	}
+	wts, err := listWorktrees(ctx, p.RepoDir, p.Env)
+	if err != nil {
+		return "", fmt.Errorf("%s：%w，停止", p.tag(), err)
+	}
+	if err := p.requireAllIdle(ctx, wts); err != nil {
+		return "", err
+	}
 	out, code, err := p.writeGitCode(ctx, p.RepoDir, false, nil, "merge-tree", "--write-tree", p1, p2)
 	if err != nil {
 		if code == 1 {

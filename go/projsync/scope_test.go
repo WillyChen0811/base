@@ -295,3 +295,31 @@ func TestNormalizationClashesAndMerge(t *testing.T) {
 		t.Fatal("相同字节不算冲突")
 	}
 }
+
+func TestScopeAnyUnsafeLocalBranchStopsRepo(t *testing.T) {
+	dir, c1, c2 := ffRepo(t)
+	ag(t, dir, "branch", "\u0100", c1)
+	ag(t, dir, "branch", "A\u0304", c1)
+	wantOOS(t, dir, ffPlan(dir, "main", c1, c2), "仓库里有无法确认规范化的分支名")
+
+	dir, c1, c2 = ffRepo(t)
+	ag(t, dir, "branch", "功能/测试", c1)
+	if err := FastForwardBranch(context.Background(), ffPlan(dir, "main", c1, c2)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestAutoMergeBlockedByMergeInProgress(t *testing.T) {
+	dir, c1, c2 := ffRepo(t)
+	if err := os.WriteFile(filepath.Join(dir, ".git", "MERGE_HEAD"), []byte(c2+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	before := ag(t, dir, "count-objects", "-v")
+	_, err := AutoMergeCommit(context.Background(), ApplyPlan{RepoDir: dir, Branch: "main", Kind: KindAutoMerge, Parents: [2]string{c1, c2}})
+	if err == nil {
+		t.Fatal("合并进行中应拒绝")
+	}
+	if after := ag(t, dir, "count-objects", "-v"); after != before {
+		t.Fatalf("创建了新对象:\n%s\n%s", before, after)
+	}
+}

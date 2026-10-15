@@ -108,7 +108,34 @@ func (p ApplyPlan) writeEnv(extra ...[2]string) []string {
 		env = append(env, fmt.Sprintf("GIT_CONFIG_KEY_%d=%s", n, kv[0]), fmt.Sprintf("GIT_CONFIG_VALUE_%d=%s", n, kv[1]))
 		n++
 	}
-	return append(env, fmt.Sprintf("GIT_CONFIG_COUNT=%d", n))
+	// GIT_CONFIG_PARAMETERS（继承的 -c 配置）优先级高于 GIT_CONFIG_COUNT 系列，会覆盖我们注入的值，
+	// 因此对写命令一律置空（置空覆盖进程环境里的同名变量）。选择「宁可少继承、不可被覆盖」：
+	// 其中与安全无关的配置也一并丢弃，写命令用不到它们。
+	return append(env, fmt.Sprintf("GIT_CONFIG_COUNT=%d", n), "GIT_CONFIG_PARAMETERS=")
+}
+
+// writeGitCode 是所有写命令（merge、update-ref、commit-tree，以及写对象的 merge-tree）的唯一入口：
+// 命令行 -c core.hooksPath=/dev/null（命令行 -c 优先级最高）；分支名不含 = 时 mergeOptions 清空也走命令行 -c；
+// 含 = 的名字命令行无法表达，改走 writeEnv 的 KEY_n/VALUE_n（此时 GIT_CONFIG_PARAMETERS 已被置空，不会覆盖）。
+// extraEnv 追加在最后（如作者身份）。
+func (p ApplyPlan) writeGitCode(ctx context.Context, dir string, clearMergeOptions bool, extraEnv []string, args ...string) ([]byte, int, error) {
+	cli := []string{"-c", "core.hooksPath=/dev/null"}
+	var envCfg [][2]string
+	if clearMergeOptions {
+		key := "branch." + p.Branch + ".mergeOptions"
+		if strings.Contains(p.Branch, "=") {
+			envCfg = append(envCfg, [2]string{key, ""})
+		} else {
+			cli = append(cli, "-c", key+"=")
+		}
+	}
+	env := append(p.writeEnv(envCfg...), extraEnv...)
+	return runGitCode(ctx, dir, env, append(cli, args...)...)
+}
+
+func (p ApplyPlan) writeGit(ctx context.Context, dir string, clearMergeOptions bool, extraEnv []string, args ...string) ([]byte, error) {
+	out, _, err := p.writeGitCode(ctx, dir, clearMergeOptions, extraEnv, args...)
+	return out, err
 }
 
 func zeroOID(like string) string { return strings.Repeat("0", len(like)) }
@@ -348,7 +375,7 @@ func CreateBranch(ctx context.Context, p ApplyPlan) error {
 	// 旧值全零 = 必须不存在的比较交换。
 	// 竞态：上面的检查与此处写入之间不是原子的，写后只能事后复查发现（见 postCheckNotCheckedOut），
 	// 调度层必须对同一仓库串行。
-	if _, err := runGit(ctx, p.RepoDir, p.writeEnv(), "update-ref", "--no-deref", ref, p.NewOID, zeroOID(p.NewOID)); err != nil {
+	if _, err := p.writeGit(ctx, p.RepoDir, false, nil, "update-ref", "--no-deref", ref, p.NewOID, zeroOID(p.NewOID)); err != nil {
 		return fmt.Errorf("%s：创建引用失败（可能被抢先建立），需重新判定: %w", p.tag(), err)
 	}
 	return p.postCheckNotCheckedOut(ctx)
@@ -401,7 +428,7 @@ func FastForwardBranch(ctx context.Context, p ApplyPlan) error {
 		}
 		// 未检出路径：listWorktrees 与 update-ref 之间不是原子的，写后复查只能发现、不能消除竞态，
 		// 调度层必须对同一仓库串行执行同步与工作区操作。
-		if _, err := runGit(ctx, p.RepoDir, p.writeEnv(), "update-ref", "--no-deref", ref, p.NewOID, p.OldOID); err != nil {
+		if _, err := p.writeGit(ctx, p.RepoDir, false, nil, "update-ref", "--no-deref", ref, p.NewOID, p.OldOID); err != nil {
 			return fmt.Errorf("%s：更新引用失败（引用可能已变化），需重新判定: %w", p.tag(), err)
 		}
 		if got, ex, err := readRef(ctx, p.RepoDir, p.Env, ref); err != nil || !ex || got != p.NewOID {
@@ -549,7 +576,7 @@ func (p ApplyPlan) fastForwardCheckedOut(ctx context.Context, wt, ref string) er
 	}
 	// 通过环境变量清空该分支继承的 mergeOptions（如 --squash 会让内容进索引/工作区而 HEAD 不动；
 	// 键值分离，分支名含 = 也安全）；显式 --no-squash。--ff-only 在命令行上优先于 merge.ff 等配置。
-	if _, err := runGit(ctx, wt, p.writeEnv([2]string{"branch." + p.Branch + ".mergeOptions", ""}),
+	if _, err := p.writeGit(ctx, wt, true, nil,
 		"merge", "--ff-only", "--no-squash", "--no-autostash", "--no-overwrite-ignore", p.NewOID); err != nil {
 		return fmt.Errorf("%s：merge --ff-only 失败，需重新判定: %w", p.tag(), err)
 	}
@@ -578,7 +605,7 @@ func AutoMergeCommit(ctx context.Context, p ApplyPlan) (string, error) {
 			return "", fmt.Errorf("%s：父提交不可用，停止: %w", p.tag(), err)
 		}
 	}
-	out, code, err := runGitCode(ctx, p.RepoDir, p.Env, "merge-tree", "--write-tree", p1, p2)
+	out, code, err := p.writeGitCode(ctx, p.RepoDir, false, nil, "merge-tree", "--write-tree", p1, p2)
 	if err != nil {
 		if code == 1 {
 			return "", fmt.Errorf("%s：试合并有冲突，不自动合并", p.tag())
@@ -589,11 +616,10 @@ func AutoMergeCommit(ctx context.Context, p ApplyPlan) (string, error) {
 	if !oidRe.MatchString(tree) {
 		return "", fmt.Errorf("%s：试合并输出无法解析: %q", p.tag(), tree)
 	}
-	env := append(p.writeEnv(),
-		"GIT_AUTHOR_NAME=XXYI", "GIT_AUTHOR_EMAIL=xxyi@localhost",
-		"GIT_COMMITTER_NAME=XXYI", "GIT_COMMITTER_EMAIL=xxyi@localhost")
+	env := []string{"GIT_AUTHOR_NAME=XXYI", "GIT_AUTHOR_EMAIL=xxyi@localhost",
+		"GIT_COMMITTER_NAME=XXYI", "GIT_COMMITTER_EMAIL=xxyi@localhost"}
 	msg := fmt.Sprintf("XXYI 自动合并 %s：mac %s + ubuntu %s", p.Branch, p1, p2)
-	co, err := runGit(ctx, p.RepoDir, env, "commit-tree", tree, "-p", p1, "-p", p2, "-m", msg)
+	co, err := p.writeGit(ctx, p.RepoDir, false, env, "commit-tree", tree, "-p", p1, "-p", p2, "-m", msg)
 	if err != nil {
 		return "", fmt.Errorf("%s：生成合并提交失败，停止: %w", p.tag(), err)
 	}

@@ -874,3 +874,57 @@ func TestWriteEnvNumbering(t *testing.T) {
 		t.Fatalf("带已有 GIT_CONFIG_COUNT 的快进失败: %v", err)
 	}
 }
+
+func TestInheritedConfigParametersCannotOverride(t *testing.T) {
+	ctx := context.Background()
+	for _, viaProc := range []bool{false, true} {
+		name := "p.Env"
+		if viaProc {
+			name = "进程环境"
+		}
+		for _, b := range []string{"main", "ft/a=b"} {
+			b := b
+			t.Run(name+"/"+b, func(t *testing.T) {
+				dir, c1, c2 := ffRepo(t)
+				if b != "main" {
+					ag(t, dir, "branch", b, c1)
+					ag(t, dir, "checkout", "-q", b)
+				}
+				hooks := t.TempDir()
+				marker := filepath.Join(t.TempDir(), "ran")
+				script := "#!/bin/sh\nrm -f README.md\necho tampered > new.txt\ntouch " + marker + "\n"
+				for _, h := range []string{"post-merge", "reference-transaction"} {
+					os.WriteFile(filepath.Join(hooks, h), []byte(script), 0o755)
+				}
+				params := "'core.hooksPath=" + hooks + "'"
+				if strings.Contains(b, "=") {
+					// 含 = 的 key 无法放进 GIT_CONFIG_PARAMETERS（读命令也会解析失败），改在仓库配置里放 squash
+					ag(t, dir, "config", "--add", "branch."+b+".mergeOptions", "--squash")
+				} else {
+					params += " 'branch." + b + ".mergeOptions=--squash'"
+				}
+				pl := ffPlan(dir, b, c1, c2)
+				if viaProc {
+					t.Setenv("GIT_CONFIG_PARAMETERS", params)
+				} else {
+					pl.Env = []string{"GIT_CONFIG_PARAMETERS=" + params}
+				}
+				if err := FastForwardBranch(ctx, pl); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := os.Stat(marker); err == nil {
+					t.Fatal("钩子被执行了")
+				}
+				if bb, _ := os.ReadFile(filepath.Join(dir, "new.txt")); string(bb) != "new\n" {
+					t.Fatal("new.txt 与 NewOID 不一致")
+				}
+				if bb, _ := os.ReadFile(filepath.Join(dir, "README.md")); string(bb) != "base\n" {
+					t.Fatal("README.md 被改")
+				}
+				if rev(t, dir, "HEAD") != c2 || ag(t, dir, "status", "--porcelain", "-uall") != "" {
+					t.Fatal("HEAD/索引/工作区没一起前进")
+				}
+			})
+		}
+	}
+}

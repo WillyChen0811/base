@@ -318,7 +318,7 @@ func xxyiPort() (string, error) {
 // addrNameIllegal 与服务端 support.ValidAddr 同一套字符集：名字只许 ASCII 字母数字和 . _ -。
 var addrNameIllegal = regexp.MustCompile(`[^A-Za-z0-9._-]`)
 
-// selfAddr 定自己的地址：XXYI_ADDR 优先，其次 TMUX 里的会话名（ubuntu: 一侧）；
+// selfAddr 定自己的地址：XXYI_ADDR 优先，其次 TMUX 里的会话名（前缀按选侧规则 ubuntuSide，与 connect 共用）；
 // 两个都没有（Codex 跑钩子时环境变量全不带）再沿进程树往上找自己住在哪个 tmux 会话里（见 selfaddr.go）。
 // 会话名先按服务端规则校验：不合法现在就说清，别让 send 到服务端才碰一脑袋 400。
 func selfAddr() (string, error) {
@@ -333,7 +333,10 @@ func selfAddr() (string, error) {
 		if err := checkSessionName(name); err != nil {
 			return "", err
 		}
-		return "ubuntu:" + name, nil
+		if ubuntuSide() {
+			return "ubuntu:" + name, nil
+		}
+		return "mac:" + name, nil
 	}
 	return selfAddrFromProcTree()
 }

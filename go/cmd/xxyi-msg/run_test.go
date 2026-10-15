@@ -502,8 +502,16 @@ func TestSelfAddr(t *testing.T) {
 		t.Error("XXYI_ADDR 有值时不该碰 tmux")
 	}
 
-	// 只有 TMUX：用注入的会话名
+	// 只有 TMUX：用注入的会话名；前缀按选侧规则，这里让 HOME 里有 endpoint.json 判成 ubuntu 侧
 	t.Setenv("XXYI_ADDR", "")
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	if err := os.MkdirAll(filepath.Join(home, ".xxyi-support"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, ".xxyi-support", "endpoint.json"), []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	if code := run([]string{"send", "mac:boss", "hi"}, strings.NewReader(""), io.Discard, io.Discard); code != exitOK {
 		t.Fatalf("退出码 %d", code)
 	}
@@ -1227,5 +1235,23 @@ func TestUbuntuSupportOffMessage(t *testing.T) {
 	}
 	if !strings.Contains(errOut.String(), "没有协助端点") || strings.Contains(errOut.String(), "8765") {
 		t.Errorf("stderr %q", errOut.String())
+	}
+}
+
+// 设了 TMUX、没有 XXYI_ADDR，选侧规则判成 mac 时地址前缀必须是 mac:（与 connect 共用同一规则）。
+func TestSelfAddrTmuxMacSide(t *testing.T) {
+	home := t.TempDir() // 空家目录：选侧规则判 mac
+	t.Setenv("HOME", home)
+	t.Setenv("XXYI_ADDR", "")
+	t.Setenv("TMUX", "/tmp/tmux-1000/default,123,0")
+	oldTmux := tmuxSession
+	t.Cleanup(func() { tmuxSession = oldTmux })
+	tmuxSession = func() (string, error) { return "sess1", nil }
+	if ubuntuSide() {
+		t.Fatal("前置条件：空家目录应判 mac 侧")
+	}
+	addr, err := selfAddr()
+	if err != nil || addr != "mac:sess1" {
+		t.Errorf("selfAddr = %q, %v，期望 mac:sess1", addr, err)
 	}
 }

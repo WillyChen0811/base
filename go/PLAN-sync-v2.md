@@ -54,7 +54,7 @@
 5. **消息代码同步并入项目同步，并把状态反馈给 agent**：kind=code 消息不再自己做单向同步；发送前触发该项目一轮同步并等它完成，把同步结果（成功、哪些分支快进/合并、冲突待用户处理、未提交改动等待中）原样反馈给发送消息的 agent。
 6. **两边都用 ~/Documents/codes/ 下的仓库**。注意：Mac 上 xxyi 现在在 ~/xxyi-work/xxyi（omlx 会话的工作目录、build.sh、XXYI.app 路径、hosts.json 的 support.repos/projsync 都指向这里），base 在 Mac 有两份（~/xxyi-work/base 与 ~/Documents/codes/base）——需要一次迁移：把 Mac 的 xxyi、base 统一到 ~/Documents/codes/ 下，并改所有引用。迁移步骤另写，执行前给用户过目。
 
-## 七、实现拆分（用户 10/15 定：不交给本地模型；在 Ubuntu 上由指挥派 Sonnet 代理实现，指挥先审、再交 Codex 审（涉及数据安全）；一次一项，每项带测试）
+## 七、实现拆分（用户 10/15 定：不交给本地模型；在 Ubuntu 上由指挥派 Sonnet 代理实现，指挥先审、按指挥意见改完、再交 Codex 审（涉及数据安全）；一次一项，每项带测试）
 1. 分支判定纯函数：输入两边分支→提交、祖先关系、merge-tree 结果、检出与工作区状态；输出每分支动作。全用本地临时仓库测试。
 2. 更新分支的执行器（update-ref / ff-only / 拒绝），含「只允许更新到后代」的校验。
 3. 自动干净合并（merge-tree + commit-tree）。

@@ -56,6 +56,30 @@ type ApplyPlan struct {
 // applyTestHook 仅测试使用：在 FastForwardBranch 通过检查、真正写入之前被调用。
 var applyTestHook func(stage string)
 
+// ErrCheckedOutDuringUpdate 表示更新引用期间该分支被某工作区检出：引用已改、工作区文件未随之更新。
+// 只报告，不做任何回退或补救写；需人工处理。用 errors.As 取出详情。
+type ErrCheckedOutDuringUpdate struct {
+	Branch, Worktree, OldOID, NewOID string
+}
+
+func (e *ErrCheckedOutDuringUpdate) Error() string {
+	return fmt.Sprintf("分支 %s：更新引用期间该分支被工作区 %s 检出，工作区文件未随之更新（旧 %s，新 %s），需人工处理；未做任何回退",
+		e.Branch, e.Worktree, e.OldOID, e.NewOID)
+}
+
+// postCheckNotCheckedOut 在引用写入成功后复查：若此时有工作区检出该分支则报告（只能发现、不能消除竞态，
+// 调度层必须对同一仓库串行执行同步与工作区操作）。
+func (p ApplyPlan) postCheckNotCheckedOut(ctx context.Context) error {
+	wts, err := listWorktrees(ctx, p.RepoDir, p.Env)
+	if err != nil {
+		return fmt.Errorf("%s：引用已更新，但事后复查工作区失败，需人工确认: %w", p.tag(), err)
+	}
+	if hs := checkedOutBy(wts, p.Branch); len(hs) > 0 {
+		return &ErrCheckedOutDuringUpdate{Branch: p.Branch, Worktree: hs[0].Path, OldOID: p.OldOID, NewOID: p.NewOID}
+	}
+	return nil
+}
+
 var oidRe = regexp.MustCompile(`^([0-9a-f]{40}|[0-9a-f]{64})$`)
 
 func zeroOID(like string) string { return strings.Repeat("0", len(like)) }
@@ -234,11 +258,16 @@ func CreateBranch(ctx context.Context, p ApplyPlan) error {
 	if hs := checkedOutBy(wts, p.Branch); len(hs) > 0 {
 		return fmt.Errorf("%s：工作区 %s 的 HEAD 已指向该分支名，拒绝创建", p.tag(), hs[0].Path)
 	}
+	if applyTestHook != nil {
+		applyTestHook("beforeUpdateRef")
+	}
 	// 旧值全零 = 必须不存在的比较交换。
+	// 竞态：上面的检查与此处写入之间不是原子的，写后只能事后复查发现（见 postCheckNotCheckedOut），
+	// 调度层必须对同一仓库串行。
 	if _, err := runGit(ctx, p.RepoDir, p.Env, "update-ref", ref, p.NewOID, zeroOID(p.NewOID)); err != nil {
 		return fmt.Errorf("%s：创建引用失败（可能被抢先建立），需重新判定: %w", p.tag(), err)
 	}
-	return nil
+	return p.postCheckNotCheckedOut(ctx)
 }
 
 // FastForwardBranch 把分支从 OldOID 快进到 NewOID。
@@ -277,10 +306,15 @@ func FastForwardBranch(ctx context.Context, p ApplyPlan) error {
 	holders := checkedOutBy(wts, p.Branch)
 	switch len(holders) {
 	case 0:
+		if applyTestHook != nil {
+			applyTestHook("beforeUpdateRef")
+		}
+		// 未检出路径：listWorktrees 与 update-ref 之间不是原子的，写后复查只能发现、不能消除竞态，
+		// 调度层必须对同一仓库串行执行同步与工作区操作。
 		if _, err := runGit(ctx, p.RepoDir, p.Env, "update-ref", ref, p.NewOID, p.OldOID); err != nil {
 			return fmt.Errorf("%s：更新引用失败（引用可能已变化），需重新判定: %w", p.tag(), err)
 		}
-		return nil
+		return p.postCheckNotCheckedOut(ctx)
 	case 1:
 		return p.fastForwardCheckedOut(ctx, holders[0].Path, ref)
 	default:
@@ -289,7 +323,7 @@ func FastForwardBranch(ctx context.Context, p ApplyPlan) error {
 }
 
 // busyMarkers 是 git 目录下表示操作进行中的文件/目录。
-var busyMarkers = []string{"MERGE_HEAD", "REBASE_HEAD", "rebase-merge", "rebase-apply", "CHERRY_PICK_HEAD", "REVERT_HEAD"}
+var busyMarkers = []string{"MERGE_HEAD", "REBASE_HEAD", "rebase-merge", "rebase-apply", "CHERRY_PICK_HEAD", "REVERT_HEAD", "sequencer", "BISECT_LOG"}
 
 func (p ApplyPlan) checkWorktreeHead(ctx context.Context, wt, ref string) error {
 	sym, err := runGit(ctx, wt, p.Env, "symbolic-ref", "-q", "HEAD")

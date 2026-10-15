@@ -2,6 +2,7 @@ package projsync
 
 import (
 	"context"
+	"errors"
 	"io/fs"
 	"os"
 	"os/exec"
@@ -261,6 +262,23 @@ func TestFastForwardRefusals(t *testing.T) {
 			t.Fatal("现场变了")
 		}
 	})
+	for _, m := range []string{"sequencer", "BISECT_LOG"} {
+		m := m
+		t.Run("进行中标记"+m, func(t *testing.T) {
+			dir, c1, c2 := ffRepo(t)
+			gd := ag(t, dir, "rev-parse", "--absolute-git-dir")
+			if m == "sequencer" {
+				os.MkdirAll(filepath.Join(gd, m), 0o755)
+			} else {
+				os.WriteFile(filepath.Join(gd, m), []byte("x\n"), 0o644)
+			}
+			before := snapshot(t, dir)
+			wantRefuse(t, FastForwardBranch(ctx, ffPlan(dir, "main", c1, c2)))
+			if snapshot(t, dir) != before {
+				t.Fatal("现场变了")
+			}
+		})
+	}
 	t.Run("两个工作区检出同一分支", func(t *testing.T) {
 		dir, c1, c2 := ffRepo(t)
 		wt := filepath.Join(t.TempDir(), "wt2")
@@ -475,4 +493,47 @@ func TestListWorktreesDetachedAndMismatchedKind(t *testing.T) {
 	p := ffPlan(dir, "main", c1, c2)
 	p.Kind = KindCreateOnOther
 	wantRefuse(t, FastForwardBranch(ctx, p))
+}
+
+func TestCheckedOutDuringUpdate(t *testing.T) {
+	ctx := context.Background()
+	t.Run("快进", func(t *testing.T) {
+		dir, c1, c2 := ffRepo(t)
+		ag(t, dir, "checkout", "-q", "--detach")
+		wt := filepath.Join(t.TempDir(), "wt")
+		applyTestHook = func(stage string) {
+			if stage == "beforeUpdateRef" {
+				ag(t, dir, "worktree", "add", "-q", wt, "main")
+			}
+		}
+		defer func() { applyTestHook = nil }()
+		err := FastForwardBranch(ctx, ffPlan(dir, "main", c1, c2))
+		var e *ErrCheckedOutDuringUpdate
+		if !errors.As(err, &e) || e.OldOID != c1 || e.NewOID != c2 || e.Worktree == "" {
+			t.Fatalf("应返回专门错误: %v", err)
+		}
+		if rev(t, dir, "refs/heads/main") != c2 {
+			t.Fatal("引用应保持已更新（不回退）")
+		}
+		if _, e := os.Stat(filepath.Join(wt, "new.txt")); e == nil {
+			t.Fatal("不应补写工作区文件")
+		}
+	})
+	t.Run("创建", func(t *testing.T) {
+		dir, _, c2 := ffRepo(t)
+		applyTestHook = func(stage string) {
+			if stage == "beforeUpdateRef" {
+				ag(t, dir, "symbolic-ref", "HEAD", "refs/heads/newb")
+			}
+		}
+		defer func() { applyTestHook = nil }()
+		err := CreateBranch(ctx, ApplyPlan{RepoDir: dir, Branch: "newb", NewOID: c2, Kind: KindCreateOnOther})
+		var e *ErrCheckedOutDuringUpdate
+		if !errors.As(err, &e) {
+			t.Fatalf("应返回专门错误: %v", err)
+		}
+		if rev(t, dir, "refs/heads/newb") != c2 {
+			t.Fatal("不回退")
+		}
+	})
 }

@@ -142,7 +142,9 @@ func (f *forwardSvc) acceptLoop(ln net.Listener) {
 	}
 }
 
-// serve 把进来的连接拨到当前线路的 addr 再双向拷贝，任一方向结束就两边都关（照 routeForwarder）。
+// serve 把进来的连接拨到当前线路的 addr 再双向拷贝。某方向读到 EOF 时只对另一侧 CloseWrite（TCP 半关闭），
+// 让反向的响应继续拷完；两个方向都结束才关两条连接。不支持 CloseWrite 或拷贝出错则退回完全关闭。
+// 切换线路/退出时 switchRoute/Close 强制关已登记的连接，两个拷贝随之结束。
 func (f *forwardSvc) serve(c net.Conn) {
 	up, gen, err := f.dial()
 	if err != nil {
@@ -154,16 +156,25 @@ func (f *forwardSvc) serve(c net.Conn) {
 	}
 	done := make(chan struct{}, 2)
 	cp := func(dst, src net.Conn) {
-		io.Copy(dst, src)
+		_, err := io.Copy(dst, src)
+		if cw, ok := dst.(interface{ CloseWrite() error }); ok && err == nil {
+			if cw.CloseWrite() != nil {
+				dst.Close()
+				src.Close()
+			}
+		} else {
+			dst.Close()
+			src.Close()
+		}
 		done <- struct{}{}
 	}
 	go cp(up, c)
 	go cp(c, up)
-	<-done // 任一方向结束就两边都关
+	<-done
+	<-done
 	f.untrack(c, up)
 	c.Close()
 	up.Close()
-	<-done
 }
 
 // track 登记一对 gen 线路上建立的转发连接；「查状态」和「登记」在同一把锁里：

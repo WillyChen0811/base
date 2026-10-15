@@ -260,6 +260,43 @@ func TestForwardReachesUpstream(t *testing.T) {
 	}
 }
 
+// 半关闭：客户端写完请求后 CloseWrite，上游读到 EOF 才回复，客户端必须收到完整响应
+func TestForwardHalfClose(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer c.Close()
+				req, _ := io.ReadAll(c) // 读到 EOF（客户端半关闭）后才回复
+				time.Sleep(100 * time.Millisecond)
+				io.WriteString(c, "resp:"+string(req))
+			}()
+		}
+	}()
+	f := newFixture(t, func(cfg map[string]any) {
+		addFwd(cfg, fwdConf("omlx", "127.0.0.1:0", fwdRoute("内网", "", ln.Addr().String())))
+	})
+	st, _, _ := run(t, f.dir)
+	fs := forwardsOf(t, st)
+	c := dialFwd(t, fs[0].Listen)
+	io.WriteString(c, "request-body")
+	if err := c.(*net.TCPConn).CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
+	got, err := io.ReadAll(c)
+	if err != nil || string(got) != "resp:request-body" {
+		t.Errorf("响应 = %q, %v，期望 resp:request-body", got, err)
+	}
+}
+
 // (b) /forwards 的字段名与 /hosts 的一项一致（外加 listen）
 func TestForwardFieldsMatchHosts(t *testing.T) {
 	u := startFwdUpstream(t, "A")

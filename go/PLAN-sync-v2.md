@@ -56,7 +56,7 @@
 5. 与消息代码同步（kind=code 消息，单向 ff-only）的关系：建议 v2 上线后，kind=code 消息不再自己同步，只在发送前触发一轮项目同步并等它完成；同步失败的原因原样告诉发送者（顺带解决 REPORT 里的 S1/S3/S4）。
 6. Mac 侧仓库路径：xxyi 现在在 ~/xxyi-work/xxyi（omlx 会话、build.sh、XXYI.app 都指向这里）；base 在 Mac 有两份（~/xxyi-work/base 与 ~/Documents/codes/base）。用户说「Mac 用 ~/Documents/codes 下的」——xxyi 是否也迁移？base 以哪份为准？
 
-## 七、实现拆分（等 Mac 界面几批做完，派 Ubuntu 本地模型，一次一项，每项测试 + Codex 审）
+## 七、实现拆分（用户 10/15 定：不交给本地模型；在 Ubuntu 上由指挥派 Sonnet 代理实现，指挥自己审查；一次一项，每项带测试）
 1. 分支判定纯函数：输入两边分支→提交、祖先关系、merge-tree 结果、检出与工作区状态；输出每分支动作。全用本地临时仓库测试。
 2. 更新分支的执行器（update-ref / ff-only / 拒绝），含「只允许更新到后代」的校验。
 3. 自动干净合并（merge-tree + commit-tree）。

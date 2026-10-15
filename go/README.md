@@ -35,6 +35,16 @@
   首选连不上（拨号 15 秒超时仍失败）时**不会自动切换**，只在状态里标出 `preferred_down`，由用户在页面上同意后才切到备用；
   走备用期间，wgtund 每 30 秒在后台探测一次首选的 TCP 端口，通了只标出 `preferred_back`，是否切回同样由用户决定。
   不写 `routes` 的旧配置等于只有一条线路，行为不变。
+- 端口转发（可选）：`forwards` 把本机端口上的访问转到远端地址（比如 omlx 访问 Studio 上的 omlx HTTP 服务）：
+  ```json
+  "forwards": [{"name": "omlx", "listen": "127.0.0.1:18192",
+               "routes": [{"label": "内网", "tunnel": "", "addr": "192.168.147.196:8192"},
+                          {"label": "家里（程序）", "tunnel": "home", "addr": "192.168.65.4:8192"}]}]
+  ```
+  `listen` 必须是 127.0.0.1 或 localhost 的 主机:端口（不许监听别的地址）；`name` 不能为空、不能互相重复、不能与主机重名；
+  `routes` 写法与主机多线路相同（第一条是首选，`tunnel` 空为直连）。每个进来的连接拨到当前线路的 `addr`（超时 15 秒）再双向拷贝；
+  线路规则和主机一样：启动从首选开始、连不通只标 `preferred_down` 不自动切换，走备用期间探测首选标 `preferred_back`。
+  监听失败启动失败。
 
 就绪后往 stdout 写一行 `{"http":"127.0.0.1:端口","token":"…","socks":{…}}`；stdin 关闭即退出。
 HTTP 接口都要带 `token` 参数；每台主机共用一条 SSH 连接（第一次用到才拨，断了自动重拨）：
@@ -45,6 +55,11 @@ HTTP 接口都要带 `token` 参数；每台主机共用一条 SSH 连接（第�
 - `POST /hosts/route?host=&route=下标`：切换线路，成功返回该主机在 `/hosts` 里的那一项（切换后的状态）。
   会关掉旧连接（终端会话随之结束），下次使用时经新线路重连。除主令牌外，还要求请求头 `Origin` 存在且在
   `allowed_origins` 里，否则 403「需要从 xxyi 页面操作」；`route` 不是整数或越界 400、主机不存在 404、非 POST 405。
+- `GET /forwards`：端口转发状态，每项字段名与 `/hosts` 的一项一致（外加 `listen`，网页按同一种线路条渲染）；
+  没配置 `forwards` 时返回空数组 `[]`。
+- `POST /forwards/route?name=&route=下标`：切换转发的线路，成功返回该转发在 `/forwards` 里的那一项；
+  会关掉当前所有已转发的连接（之后的新连接走新线路）。鉴权与 `/hosts/route` 一致（`Origin` 必需否则 403、
+  非 POST 405、`route` 不是整数或越界 400、转发名不存在 404）。
 - `GET /status`：隧道握手与流量统计。
 - `GET /sessions?host=`：列 tmux 会话 `{"sessions":[{"name","attached","windows","created","activity"}]}`
   （时间是 Unix 秒；远端没有 tmux 服务时返回空数组）。

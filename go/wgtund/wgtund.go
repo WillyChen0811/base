@@ -74,6 +74,7 @@ type fileConf struct {
 	Hosts          []hostConf        `json:"hosts"`
 	Support        *supportConf      `json:"support"`
 	Projsync       *projsyncConf     `json:"projsync"`
+	Forwards       []forwardConf     `json:"forwards"`
 }
 
 func expand(p string) string {
@@ -169,6 +170,16 @@ func Run(ctx context.Context, dir string, stdin io.Reader, stdout io.Writer) (er
 			return fmt.Errorf("hosts.json: socks 地址 %q 必须是回环地址", addr)
 		}
 	}
+	fwdSeen := map[string]bool{}
+	for _, fw := range conf.Forwards {
+		if fwdSeen[fw.Name] {
+			return fmt.Errorf("hosts.json: 转发名 %q 重复", fw.Name)
+		}
+		fwdSeen[fw.Name] = true
+		if err := fw.validate(cfgs, seen); err != nil {
+			return err
+		}
+	}
 	prep, err := prepareSupport(conf, dir)
 	if err != nil {
 		return err
@@ -200,6 +211,19 @@ func Run(ctx context.Context, dir string, stdin io.Reader, stdout io.Writer) (er
 		}
 		closers = append(closers, s)
 		socksAddrs[name] = s.Addr().String()
+	}
+
+	// 端口转发（可选）：本机固定端口，进来的拨到当前线路的远端地址；监听失败算启动失败
+	forwardMap := map[string]*forwardSvc{}
+	forwardOrder := []string{}
+	for _, fw := range conf.Forwards {
+		fwd := newForward(fw, tunnels)
+		if err := fwd.start(); err != nil {
+			return fmt.Errorf("转发 %q 开监听失败: %w", fw.Name, err)
+		}
+		closers = append(closers, fwd)
+		forwardMap[fw.Name] = fwd
+		forwardOrder = append(forwardOrder, fw.Name)
 	}
 
 	tok := make([]byte, 24)
@@ -356,6 +380,40 @@ func Run(ctx context.Context, dir string, stdin io.Reader, stdout io.Writer) (er
 			return
 		}
 		writeJSON(w, itemOf(h))
+	})
+
+	// 端口转发：每项字段与 /hosts 一致（外加 listen），网页按同一种线路条渲染；切换同样只许从 xxyi 页面发起
+	mux.HandleFunc("/forwards", func(w http.ResponseWriter, r *http.Request) {
+		list := []forwardItem{}
+		for _, n := range forwardOrder {
+			list = append(list, forwardMap[n].item())
+		}
+		writeJSON(w, list)
+	})
+	mux.HandleFunc("/forwards/route", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			errJSON(w, http.StatusMethodNotAllowed, "请用 POST")
+			return
+		}
+		if o := r.Header.Get("Origin"); o == "" || !originAllowed(o, conf.AllowedOrigins) {
+			errJSON(w, http.StatusForbidden, "需要从 xxyi 页面操作")
+			return
+		}
+		fwd, ok := forwardMap[r.URL.Query().Get("name")]
+		if !ok {
+			errJSON(w, http.StatusNotFound, "未知转发")
+			return
+		}
+		idx, err := strconv.Atoi(r.URL.Query().Get("route"))
+		if err != nil {
+			errJSON(w, http.StatusBadRequest, "route 要是整数")
+			return
+		}
+		if err := fwd.switchRoute(idx); err != nil {
+			errJSON(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		writeJSON(w, fwd.item())
 	})
 
 	// 项目同步（可选）：GET 列状态、POST /projsync/run 发起；没配置一律 404

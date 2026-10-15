@@ -352,6 +352,23 @@ func checkWorktreeIndexState(ctx context.Context, wt string, env []string, add f
 			add("工作区 %s：检查 sparse-checkout 文件失败: %v", wt, err)
 		}
 	}
+	// 子模块：子模块场景未专门处理和测试（status 对子模块的可见性还受 ignore 配置影响），
+	// 按 PLAN 第十一节「识别边界、超出就停」：工作区根有 .gitmodules，或索引里有 gitlink（模式 160000）即超出范围。
+	if _, err := os.Lstat(filepath.Join(wt, ".gitmodules")); err == nil {
+		add("工作区 %s：仓库包含子模块，超出自动同步范围", wt)
+	} else if !os.IsNotExist(err) {
+		add("工作区 %s：检查 .gitmodules 失败: %v", wt, err)
+	}
+	if st, err := runGit(ctx, wt, env, "ls-files", "-s", "-z"); err != nil {
+		add("工作区 %s：读取索引条目失败: %v", wt, err)
+	} else {
+		for _, rec := range strings.Split(string(st), "\x00") {
+			if strings.HasPrefix(rec, "160000 ") {
+				add("工作区 %s：仓库包含子模块，超出自动同步范围", wt)
+				break
+			}
+		}
+	}
 	lv, err := runGit(ctx, wt, env, "ls-files", "-v", "-z")
 	if err != nil {
 		add("工作区 %s：读取索引标记失败: %v", wt, err)

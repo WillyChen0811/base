@@ -183,7 +183,7 @@ func CollectLocalWorktrees(ctx context.Context, repoDir string, env []string, si
 // GIT_OPTIONAL_LOCKS=0 避免 status 为刷新索引而写 index.lock。输出按原始字节判空，不 TrimSpace。
 func worktreeDirty(ctx context.Context, wt string, env []string) (bool, error) {
 	e := append(append([]string{}, env...), "GIT_OPTIONAL_LOCKS=0")
-	out, err := runGit(ctx, wt, e, "status", "--porcelain", "--untracked-files=all")
+	out, err := runGit(ctx, wt, e, "status", "--porcelain", "--untracked-files=all", "--ignore-submodules=none")
 	if err != nil {
 		return false, fmt.Errorf("读取工作区 %s 状态失败: %w", wt, err)
 	}

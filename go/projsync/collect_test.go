@@ -2,6 +2,7 @@ package projsync
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -321,5 +322,62 @@ func TestCollectIsReadOnly(t *testing.T) {
 	}
 	if !strings.Contains(ag(t, dir, "status", "--porcelain"), "untracked.txt") {
 		t.Fatal("未跟踪文件应仍在")
+	}
+}
+
+// 带子模块的仓库：即使配了 diff.ignoreSubmodules=all / submodule.<name>.ignore=all，
+// 子模块里的改动也必须算 dirty；CheckScope 判超出，执行器不写。
+func TestSubmoduleDirtyAndOutOfScope(t *testing.T) {
+	sub := newRepo(t)
+	dir := newRepo(t)
+	ag(t, dir, "-c", "protocol.file.allow=always", "submodule", "add", sub, "sm")
+	ag(t, dir, "commit", "-m", "add sm")
+	ag(t, dir, "config", "diff.ignoreSubmodules", "all")
+	ag(t, dir, "config", "submodule.sm.ignore", "all")
+	ctx := context.Background()
+
+	if d, err := worktreeDirty(ctx, dir, nil); err != nil || d {
+		t.Fatalf("干净子模块不应 dirty: %v %v", d, err)
+	}
+	os.WriteFile(filepath.Join(dir, "sm", "README.md"), []byte("changed\n"), 0o644)
+	if out := ag(t, dir, "status", "--porcelain", "-uall"); strings.Contains(out, "sm") {
+		t.Skip("此 git 版本下 ignore 配置未隐藏子模块改动，无法复现")
+	}
+	if d, err := worktreeDirty(ctx, dir, nil); err != nil || !d {
+		t.Fatalf("子模块内改动应判 dirty: %v %v", d, err)
+	}
+	wf, err := CollectLocalWorktrees(ctx, dir, nil, SideMac, nil)
+	if err != nil || len(wf) != 1 || !wf[0].Dirty {
+		t.Fatalf("CollectLocalWorktrees: %+v %v", wf, err)
+	}
+	// 执行器写前的 checkClean 同样看得见
+	if err := (ApplyPlan{RepoDir: dir}).checkClean(ctx, dir); err == nil {
+		t.Fatal("checkClean 应拒绝子模块内有改动的工作区")
+	}
+
+	// CheckScope 判超出
+	err = CheckScope(ctx, dir, nil, []string{"main"})
+	var oos *ErrOutOfScope
+	if !errors.As(err, &oos) || !strings.Contains(err.Error(), "仓库包含子模块，超出自动同步范围") {
+		t.Fatalf("应判超出范围: %v", err)
+	}
+	// 执行器不写（开启范围检查）：创建分支被拒，引用不变
+	refs := ag(t, dir, "for-each-ref")
+	head := rev(t, dir, "HEAD")
+	cerr := CreateBranch(ctx, ApplyPlan{RepoDir: dir, Branch: "newb", NewOID: head, Kind: KindCreateOnOther})
+	if cerr == nil || ag(t, dir, "for-each-ref") != refs {
+		t.Fatalf("执行器应拒绝且不写: %v", cerr)
+	}
+
+	// 仅有 gitlink、没有 .gitmodules 也判超出
+	os.Remove(filepath.Join(dir, ".gitmodules"))
+	if err := CheckScope(ctx, dir, nil, []string{"main"}); err == nil || !strings.Contains(err.Error(), "子模块") {
+		t.Fatalf("gitlink 应判超出: %v", err)
+	}
+
+	// 普通仓库不受影响
+	plain := newRepo(t)
+	if err := CheckScope(ctx, plain, nil, []string{"main"}); err != nil {
+		t.Fatalf("普通仓库不应超出: %v", err)
 	}
 }

@@ -479,7 +479,7 @@ func (p ApplyPlan) checkWorktreeHead(ctx context.Context, wt, ref string) error 
 // checkClean：含未跟踪文件（-uall，按 .gitignore 过滤）；GIT_OPTIONAL_LOCKS=0 避免 status 回写索引。
 func (p ApplyPlan) checkClean(ctx context.Context, wt string) error {
 	st, err := runGit(ctx, wt, append(append([]string{}, p.Env...), "GIT_OPTIONAL_LOCKS=0"),
-		"status", "--porcelain", "--untracked-files=all")
+		"status", "--porcelain", "--untracked-files=all", "--ignore-submodules=none")
 	if err != nil {
 		return err
 	}

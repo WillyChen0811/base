@@ -92,7 +92,7 @@ var oidRe = regexp.MustCompile(`^([0-9a-f]{40}|[0-9a-f]{64})$`)
 // 已有 GIT_CONFIG_COUNT=N（调用方 Env，或进程环境）时从第 N 个开始编号。
 func (p ApplyPlan) writeEnv(extra ...[2]string) []string {
 	n := 0
-	cnt := os.Getenv("GIT_CONFIG_COUNT")
+	cnt := "" // 继承的 GIT_* 已被 runGitCode 清掉，只认调用方 Env
 	for _, e := range p.Env {
 		if v, ok := strings.CutPrefix(e, "GIT_CONFIG_COUNT="); ok {
 			cnt = v
@@ -342,6 +342,9 @@ func CreateBranch(ctx context.Context, p ApplyPlan) error {
 	if err := p.validateCommon(ctx, KindCreateOnOther); err != nil {
 		return err
 	}
+	if err := p.checkScope(ctx); err != nil {
+		return err
+	}
 	if p.OldOID != "" {
 		return fmt.Errorf("%s：创建分支要求旧值为空，停止", p.tag())
 	}
@@ -384,6 +387,9 @@ func CreateBranch(ctx context.Context, p ApplyPlan) error {
 // FastForwardBranch 把分支从 OldOID 快进到 NewOID。
 func FastForwardBranch(ctx context.Context, p ApplyPlan) error {
 	if err := p.validateCommon(ctx, KindFastForward); err != nil {
+		return err
+	}
+	if err := p.checkScope(ctx); err != nil {
 		return err
 	}
 	if !oidRe.MatchString(p.OldOID) {
@@ -594,6 +600,9 @@ func (p ApplyPlan) fastForwardCheckedOut(ctx context.Context, wt, ref string) er
 // 不更新任何分支：调用方对两边分别调用 FastForwardBranch（旧值各自是自己的父提交）。
 func AutoMergeCommit(ctx context.Context, p ApplyPlan) (string, error) {
 	if err := p.validateCommon(ctx, KindAutoMerge); err != nil {
+		return "", err
+	}
+	if err := p.checkScope(ctx); err != nil {
 		return "", err
 	}
 	p1, p2 := p.Parents[0], p.Parents[1]

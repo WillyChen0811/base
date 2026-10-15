@@ -732,7 +732,14 @@ func TestWorktreePathDecoding(t *testing.T) {
 	}
 }
 
+// withoutScope 关闭范围检查，仅用于测试执行器自身的第二层防护（这些场景在真实入口已被范围检查拦下）。
+func withoutScope(t *testing.T) {
+	scopeCheckDisabledForTest = true
+	t.Cleanup(func() { scopeCheckDisabledForTest = false })
+}
+
 func TestMergeConfigDoesNotChangeSemantics(t *testing.T) {
+	withoutScope(t)
 	ctx := context.Background()
 	for name, cfg := range map[string][][]string{
 		"mergeOptions=--squash": {{"branch.main.mergeOptions", "--squash"}},
@@ -833,6 +840,7 @@ func TestHooksDisabledOnWrite(t *testing.T) {
 }
 
 func TestBranchNamesWithSpecialChars(t *testing.T) {
+	withoutScope(t)
 	ctx := context.Background()
 	for _, b := range []string{"ft/a=b", "a=b", "x.y/z", "q\"uote", "r=s=t.u"} {
 		b := b
@@ -876,6 +884,7 @@ func TestWriteEnvNumbering(t *testing.T) {
 }
 
 func TestInheritedConfigParametersCannotOverride(t *testing.T) {
+	withoutScope(t)
 	ctx := context.Background()
 	for _, viaProc := range []bool{false, true} {
 		name := "p.Env"

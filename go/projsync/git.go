@@ -49,7 +49,7 @@ func validateNamespace(name string) error {
 //  4. 找出对方有但本机没有的分支（RemoteOnly）
 //
 // 绝不修改本机或对方的 HEAD/refs/heads/工作区。
-// env 追加在 os.Environ() 之后， caller 可用它注入 git config 等。
+// 继承的 os.Environ() 先经 cleanEnv 清掉全部 GIT_*（读写命令统一），env（执行器/调用方注入）追加其后， caller 可用它注入 git config 等。
 func SyncGit(ctx context.Context, dir, remoteURL string, env []string, localName, remoteName string) (GitResult, error) {
 	// 校验参数
 	if err := validateNamespace(localName); err != nil {
@@ -199,12 +199,12 @@ func runGit(ctx context.Context, dir string, env []string, args ...string) ([]by
 }
 
 // runGitCode 执行 git -C Dir ...，不经 shell。
-// env 追加在 os.Environ() 之后，末尾固定 GIT_TERMINAL_PROMPT=0。
+// 继承的 os.Environ() 先经 cleanEnv 清掉全部 GIT_*（读写命令统一），env（执行器/调用方注入）追加其后，末尾固定 GIT_TERMINAL_PROMPT=0。
 // stdout 与 stderr 分开收集，失败时错误带 stderr（截前 2KB）。
 // 返回退出码；非 git 退出类错误（ctx 取消、找不到 git 等）退出码为 -1。
 func runGitCode(ctx context.Context, dir string, env []string, args ...string) ([]byte, int, error) {
 	cmd := exec.CommandContext(ctx, "git", append([]string{"-C", dir}, args...)...)
-	cmd.Env = append(append(os.Environ(), env...), "GIT_TERMINAL_PROMPT=0")
+	cmd.Env = append(append(cleanEnv(os.Environ()), env...), "GIT_TERMINAL_PROMPT=0")
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 	if err := cmd.Run(); err != nil {

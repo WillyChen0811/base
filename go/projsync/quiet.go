@@ -3,6 +3,7 @@ package projsync
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/json"
@@ -25,8 +26,10 @@ const (
 	cleanFingerprint = "clean"
 	// DefaultDetectInterval 是同步服务两次检测之间的预期间隔。
 	DefaultDetectInterval = 10 * time.Minute
-	// smallFileHashLimit 以内的文件额外哈希内容，见 WorktreeFingerprint 的取舍说明。
-	smallFileHashLimit = 1 << 20
+	// fileHashLimit 以内的普通文件都哈希内容；超过则无法确认，见 WorktreeFingerprint 的取舍说明。
+	fileHashLimit = 64 << 20
+	// unverifiablePrefix 开头的指纹表示「无法确认是否在变」：每次都不同，Observe 恒返回 0。
+	unverifiablePrefix = "unverifiable:"
 )
 
 // WorktreeFingerprint 返回工作区指纹与是否 dirty。干净返回 ("clean", false, nil)。
@@ -34,12 +37,13 @@ const (
 // 指纹 = sha256( status 原始输出 + 按路径排序后每个列出路径的 lstat(size, mtime 纳秒, mode, 符号链接目标) )。
 // 目录（如子模块）跳过。已修改文件继续被编辑时 status 输出不变，但 mtime/size 会变，所以指纹也变。
 //
-// 取舍（重要，方向与直觉相反，如实写明）：「漏检」= 实际变了而指纹没变 = 静止被判得【更长】，
-// 这是不安全的方向（可能过早提交）。stat 指纹的漏检只发生在「同一纳秒/同一内核时间片内同尺寸改写」
-// 或「工具把 mtime 还原」（touch -r、rsync -t）两种情形。前者误差上界是文件系统时间戳粒度
-// （毫秒级，对 20 分钟门槛可忽略；之后任何新写入都会改变 mtime 而被检出）；后者 stat 无法防住。
-// 因此对 ≤1MiB 的文件额外哈希内容（开销很小），同时覆盖这两种情形；
-// >1MiB 的大文件不读内容，仅靠 stat，残余风险仅为「mtime 被人为还原的大文件」。
+// 取舍（重要，方向与直觉相反）：「漏检」= 实际变了而指纹没变 = 静止被判得【更长】，
+// 这是不安全的方向（可能过早提交）。只靠 stat 防不住「工具把 mtime 还原」（touch -r、rsync -t）
+// 与同一时间戳粒度内的同尺寸改写，所以所有 ≤64MiB 的普通文件都哈希内容。
+// >64MiB 的文件读不起、又无法靠 stat 确认，按 PLAN 第十一节「识别边界、超出就停」处理：
+// 指纹返回以 "unverifiable:" 为前缀、且每次都不同（含 time.Now().UnixNano() 与随机数）的值，
+// Observe 对该前缀恒重置并返回 0，因此含超大未提交文件的工作区永不自动提交，交用户手动处理。
+// （选用前缀而非多一个返回值，是为了不改变签名，且标记随指纹一起流入 QuietFunc 的 fps。）
 // 读取失败一律 error；文件在 status 与 lstat/读取之间被删除记为 "gone"（视为变动，指纹因而变化）。
 func WorktreeFingerprint(ctx context.Context, wtDir string, env []string) (fp string, dirty bool, err error) {
 	e := append(append([]string{}, env...), "GIT_OPTIONAL_LOCKS=0")
@@ -58,6 +62,7 @@ func WorktreeFingerprint(ctx context.Context, wtDir string, env []string) (fp st
 	h := sha256.New()
 	writeFP(h, out)
 	last := "\x00"
+	unverifiable := false
 	for _, p := range paths {
 		if p == last {
 			continue
@@ -68,7 +73,17 @@ func WorktreeFingerprint(ctx context.Context, wtDir string, env []string) (fp st
 		if err != nil {
 			return "", false, fmt.Errorf("读取 %s 失败: %w", filepath.Join(wtDir, p), err)
 		}
+		if desc == "unverifiable" {
+			unverifiable = true
+		}
 		writeFP(h, []byte(desc))
+	}
+	if unverifiable {
+		var r [16]byte
+		if _, err := rand.Read(r[:]); err != nil {
+			return "", false, err
+		}
+		return fmt.Sprintf("%s%d-%x", unverifiablePrefix, time.Now().UnixNano(), r), true, nil
 	}
 	return fmt.Sprintf("%x", h.Sum(nil)), true, nil
 }
@@ -104,7 +119,10 @@ func statDesc(p string) (string, error) {
 		return fmt.Sprintf("link %d %d %o -> %s", fi.Size(), fi.ModTime().UnixNano(), fi.Mode(), t), nil
 	}
 	desc := fmt.Sprintf("file %d %d %o", fi.Size(), fi.ModTime().UnixNano(), fi.Mode())
-	if fi.Mode().IsRegular() && fi.Size() <= smallFileHashLimit {
+	if fi.Mode().IsRegular() && fi.Size() > fileHashLimit {
+		return "unverifiable", nil
+	}
+	if fi.Mode().IsRegular() {
 		f, err := os.Open(p)
 		if err != nil {
 			if errors.Is(err, fs.ErrNotExist) {
@@ -169,6 +187,10 @@ type QuietEntry struct {
 	Fingerprint string    `json:"fingerprint"`
 	Since       time.Time `json:"since"`    // 该指纹首次出现的时间
 	LastSeen    time.Time `json:"lastSeen"` // 最近一次观察
+
+	// loaded 表示条目来自磁盘（上次进程）。磁盘值只经墙钟往返、没有单调时钟，
+	// 墙钟被校准（NTP 向前跳）可能提前凑满 20 分钟，所以对它的第一次 Observe 一律重新计时。
+	loaded bool
 }
 
 // QuietTracker 把各工作区的指纹持久化到一个 JSON 文件。非并发安全。
@@ -193,6 +215,10 @@ func LoadQuietTracker(path string) (*QuietTracker, error) {
 	if err := json.Unmarshal(b, &m); err != nil || m == nil {
 		return nil, fmt.Errorf("静止记录 %s 已损坏: %v", path, err)
 	}
+	for k, e := range m {
+		e.loaded = true
+		m[k] = e
+	}
 	t.Entries = m
 	return t, nil
 }
@@ -205,6 +231,11 @@ func canonWorktree(p string) string {
 	return filepath.Clean(p)
 }
 
+// 加载自磁盘的条目仅用于诊断与显示，不参与静止判断：对它们的第一次 Observe 一律 since=now、返回 0。
+// 代价：同步服务重启后要再等 20 分钟才会自动提交，属保守方向。进程内的 since/lastSeen 直接保存
+// 调用方传入的 now（time.Now() 得到的值带单调时钟读数），间隔用 now.Sub(since) 计算（Go 优先用单调时钟），
+// 不经 Unix 时间往返。
+//
 // Observe 记录一次观察并返回已静止的整分钟数。
 //   - 首次、指纹变化、fp=="clean"：since=now，返回 0。
 //   - 时钟回拨（now 早于 since 或 lastSeen）：视为指纹刚变，返回 0。宁可判得更短，不能更长。
@@ -221,7 +252,7 @@ func (t *QuietTracker) Observe(wt string, fp string, now time.Time) int {
 	}
 	key := canonWorktree(wt)
 	e, ok := t.Entries[key]
-	reset := !ok || fp == cleanFingerprint || e.Fingerprint != fp ||
+	reset := !ok || e.loaded || fp == cleanFingerprint || strings.HasPrefix(fp, unverifiablePrefix) || e.Fingerprint != fp ||
 		now.Before(e.Since) || now.Before(e.LastSeen) || now.Sub(e.LastSeen) > 2*iv
 	if reset {
 		t.Entries[key] = QuietEntry{Fingerprint: fp, Since: now, LastSeen: now}

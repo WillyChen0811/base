@@ -267,12 +267,82 @@ func TestTrackerSaveLoad(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if m := tr2.Observe(wt, "A", t0.Add(10*time.Minute)); m != 10 {
-		t.Fatalf("往返后继续计时: %d", m)
-	}
 	e1, e2 := tr.Entries[canonWorktree(wt)], tr2.Entries[canonWorktree(wt)]
 	if e1.Fingerprint != e2.Fingerprint || !e1.Since.Equal(e2.Since) {
 		t.Fatalf("%v %v", e1, e2)
+	}
+	// 磁盘条目不参与静止判断：第一次 Observe 重新计时
+	if m := tr2.Observe(wt, "A", t0.Add(10*time.Minute)); m != 0 {
+		t.Fatalf("加载后第一次应归 0: %d", m)
+	}
+	if m := tr2.Observe(wt, "A", t0.Add(15*time.Minute)); m != 5 {
+		t.Fatalf("之后正常计时: %d", m)
+	}
+}
+
+func TestTrackerLoadedIgnoresOldSince(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "q.json")
+	wt := t.TempDir()
+	tr, _ := LoadQuietTracker(p)
+	tr.Observe(wt, "A", t0)
+	tr.Save()
+	b, _ := os.ReadFile(p)
+	b = []byte(strings.ReplaceAll(string(b), "2026-01-01T12:00:00Z", "2000-01-01T00:00:00Z"))
+	os.WriteFile(p, b, 0o600)
+	tr2, err := LoadQuietTracker(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if e := tr2.Entries[canonWorktree(wt)]; e.Since.Year() != 2000 {
+		t.Fatalf("改写未生效: %v", e)
+	}
+	if m := tr2.Observe(wt, "A", t0.Add(time.Hour)); m != 0 {
+		t.Fatalf("很早的 since 不应沿用: %d", m)
+	}
+}
+
+// 注入带单调读数的 now（time.Now() 为基准再 Add，Add 保留单调读数），验证进程内 25 分钟返回 25。
+func TestTrackerMonotonicInProcess(t *testing.T) {
+	tr, _ := LoadQuietTracker(filepath.Join(t.TempDir(), "q.json"))
+	wt := t.TempDir()
+	base := time.Now()
+	tr.Observe(wt, "A", base)
+	for i := 1; i <= 5; i++ {
+		tr.Observe(wt, "A", base.Add(time.Duration(5*i)*time.Minute))
+	}
+	if m := tr.Observe(wt, "A", base.Add(25*time.Minute)); m != 25 {
+		t.Fatalf("got %d", m)
+	}
+}
+
+func TestFingerprintHugeFileUnverifiable(t *testing.T) {
+	d := newQuietRepo(t)
+	f, err := os.Create(filepath.Join(d, "huge.bin"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Truncate(fileHashLimit + 1); err != nil {
+		t.Skip("无法造稀疏文件:", err)
+	}
+	f.Close()
+	a, dirty := fpOf(t, d)
+	b, _ := fpOf(t, d)
+	if !dirty || a == b || !strings.HasPrefix(a, unverifiablePrefix) {
+		t.Fatalf("超大文件指纹应每次不同: %q %q", a, b)
+	}
+	tr, _ := LoadQuietTracker(filepath.Join(t.TempDir(), "q.json"))
+	base := time.Now()
+	for i := 0; i < 5; i++ {
+		fp, _ := fpOf(t, d)
+		if m := tr.Observe(d, fp, base.Add(time.Duration(10*i)*time.Minute)); m != 0 {
+			t.Fatalf("无法确认应恒为 0: %d", m)
+		}
+	}
+	// 恰好等于上限的稀疏文件仍可哈希
+	os.Truncate(filepath.Join(d, "huge.bin"), 1<<20)
+	c, _ := fpOf(t, d)
+	if strings.HasPrefix(c, unverifiablePrefix) {
+		t.Fatal("小文件不应无法确认")
 	}
 }
 

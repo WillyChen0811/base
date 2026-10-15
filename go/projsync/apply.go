@@ -35,6 +35,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 )
 
@@ -83,6 +84,32 @@ func (p ApplyPlan) postCheckNotCheckedOut(ctx context.Context) error {
 }
 
 var oidRe = regexp.MustCompile(`^([0-9a-f]{40}|[0-9a-f]{64})$`)
+
+// writeEnv 返回所有「会写」的 git 命令（merge、update-ref、commit-tree）统一使用的环境：
+// 在调用方 Env 之上用 GIT_CONFIG_COUNT/KEY_n/VALUE_n 注入命令级配置覆盖——
+// core.hooksPath=/dev/null（禁用 post-merge、reference-transaction 等钩子，防止钩子改写工作区/索引），
+// 外加调用方给的 extra。只影响自动同步执行的这条命令，不改仓库配置，用户手动操作时钩子照常。
+// 已有 GIT_CONFIG_COUNT=N（调用方 Env，或进程环境）时从第 N 个开始编号。
+func (p ApplyPlan) writeEnv(extra ...[2]string) []string {
+	n := 0
+	cnt := os.Getenv("GIT_CONFIG_COUNT")
+	for _, e := range p.Env {
+		if v, ok := strings.CutPrefix(e, "GIT_CONFIG_COUNT="); ok {
+			cnt = v
+		}
+	}
+	if cnt != "" {
+		if v, err := strconv.Atoi(cnt); err == nil && v > 0 {
+			n = v
+		}
+	}
+	env := append([]string{}, p.Env...)
+	for _, kv := range append([][2]string{{"core.hooksPath", "/dev/null"}}, extra...) {
+		env = append(env, fmt.Sprintf("GIT_CONFIG_KEY_%d=%s", n, kv[0]), fmt.Sprintf("GIT_CONFIG_VALUE_%d=%s", n, kv[1]))
+		n++
+	}
+	return append(env, fmt.Sprintf("GIT_CONFIG_COUNT=%d", n))
+}
 
 func zeroOID(like string) string { return strings.Repeat("0", len(like)) }
 
@@ -321,7 +348,7 @@ func CreateBranch(ctx context.Context, p ApplyPlan) error {
 	// 旧值全零 = 必须不存在的比较交换。
 	// 竞态：上面的检查与此处写入之间不是原子的，写后只能事后复查发现（见 postCheckNotCheckedOut），
 	// 调度层必须对同一仓库串行。
-	if _, err := runGit(ctx, p.RepoDir, p.Env, "update-ref", "--no-deref", ref, p.NewOID, zeroOID(p.NewOID)); err != nil {
+	if _, err := runGit(ctx, p.RepoDir, p.writeEnv(), "update-ref", "--no-deref", ref, p.NewOID, zeroOID(p.NewOID)); err != nil {
 		return fmt.Errorf("%s：创建引用失败（可能被抢先建立），需重新判定: %w", p.tag(), err)
 	}
 	return p.postCheckNotCheckedOut(ctx)
@@ -374,7 +401,7 @@ func FastForwardBranch(ctx context.Context, p ApplyPlan) error {
 		}
 		// 未检出路径：listWorktrees 与 update-ref 之间不是原子的，写后复查只能发现、不能消除竞态，
 		// 调度层必须对同一仓库串行执行同步与工作区操作。
-		if _, err := runGit(ctx, p.RepoDir, p.Env, "update-ref", "--no-deref", ref, p.NewOID, p.OldOID); err != nil {
+		if _, err := runGit(ctx, p.RepoDir, p.writeEnv(), "update-ref", "--no-deref", ref, p.NewOID, p.OldOID); err != nil {
 			return fmt.Errorf("%s：更新引用失败（引用可能已变化），需重新判定: %w", p.tag(), err)
 		}
 		if got, ex, err := readRef(ctx, p.RepoDir, p.Env, ref); err != nil || !ex || got != p.NewOID {
@@ -520,10 +547,10 @@ func (p ApplyPlan) fastForwardCheckedOut(ctx context.Context, wt, ref string) er
 	if err := p.checkClean(ctx, wt); err != nil {
 		return fail(err)
 	}
-	if _, err := runGit(ctx, wt, p.Env,
-		// -c 清空该分支继承的 mergeOptions（如 --squash 会让内容进索引/工作区而 HEAD 不动）；
-		// 显式 --no-squash。--ff-only 在命令行上优先于 merge.ff 等配置，不会被全局配置改变语义。
-		"-c", "branch."+p.Branch+".mergeOptions=", "merge", "--ff-only", "--no-squash", "--no-autostash", "--no-overwrite-ignore", p.NewOID); err != nil {
+	// 通过环境变量清空该分支继承的 mergeOptions（如 --squash 会让内容进索引/工作区而 HEAD 不动；
+	// 键值分离，分支名含 = 也安全）；显式 --no-squash。--ff-only 在命令行上优先于 merge.ff 等配置。
+	if _, err := runGit(ctx, wt, p.writeEnv([2]string{"branch." + p.Branch + ".mergeOptions", ""}),
+		"merge", "--ff-only", "--no-squash", "--no-autostash", "--no-overwrite-ignore", p.NewOID); err != nil {
 		return fmt.Errorf("%s：merge --ff-only 失败，需重新判定: %w", p.tag(), err)
 	}
 	head, err := runGit(ctx, wt, p.Env, "rev-parse", "--verify", "HEAD")
@@ -562,7 +589,7 @@ func AutoMergeCommit(ctx context.Context, p ApplyPlan) (string, error) {
 	if !oidRe.MatchString(tree) {
 		return "", fmt.Errorf("%s：试合并输出无法解析: %q", p.tag(), tree)
 	}
-	env := append(append([]string{}, p.Env...),
+	env := append(p.writeEnv(),
 		"GIT_AUTHOR_NAME=XXYI", "GIT_AUTHOR_EMAIL=xxyi@localhost",
 		"GIT_COMMITTER_NAME=XXYI", "GIT_COMMITTER_EMAIL=xxyi@localhost")
 	msg := fmt.Sprintf("XXYI 自动合并 %s：mac %s + ubuntu %s", p.Branch, p1, p2)

@@ -791,3 +791,86 @@ func TestGitDirTrailingSpace(t *testing.T) {
 		t.Fatal("现场变了")
 	}
 }
+
+func TestHooksDisabledOnWrite(t *testing.T) {
+	ctx := context.Background()
+	for _, custom := range []bool{false, true} {
+		name := "默认hooks目录"
+		if custom {
+			name = "自定义hooksPath"
+		}
+		t.Run(name, func(t *testing.T) {
+			dir, c1, c2 := ffRepo(t)
+			marker := filepath.Join(t.TempDir(), "ran")
+			script := "#!/bin/sh\nrm -f README.md\necho tampered > new.txt\ntouch " + marker + "\n"
+			hooks := filepath.Join(ag(t, dir, "rev-parse", "--absolute-git-dir"), "hooks")
+			if custom {
+				hooks = t.TempDir()
+				ag(t, dir, "config", "core.hooksPath", hooks)
+			}
+			for _, h := range []string{"post-merge", "reference-transaction"} {
+				if err := os.WriteFile(filepath.Join(hooks, h), []byte(script), 0o755); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := FastForwardBranch(ctx, ffPlan(dir, "main", c1, c2)); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := os.Stat(marker); err == nil {
+				t.Fatal("钩子被执行了")
+			}
+			if b, _ := os.ReadFile(filepath.Join(dir, "new.txt")); string(b) != "new\n" {
+				t.Fatal("new.txt 与 NewOID 不一致")
+			}
+			if b, _ := os.ReadFile(filepath.Join(dir, "README.md")); string(b) != "base\n" {
+				t.Fatal("README.md 被删或改")
+			}
+			if ag(t, dir, "status", "--porcelain", "-uall") != "" {
+				t.Fatal("现场与 NewOID 不一致")
+			}
+		})
+	}
+}
+
+func TestBranchNamesWithSpecialChars(t *testing.T) {
+	ctx := context.Background()
+	for _, b := range []string{"ft/a=b", "a=b", "x.y/z", "q\"uote", "r=s=t.u"} {
+		b := b
+		t.Run(b, func(t *testing.T) {
+			dir, c1, c2 := ffRepo(t)
+			if _, err := exec.Command("git", "-C", dir, "check-ref-format", "--branch", b).Output(); err != nil {
+				t.Skipf("分支名不合法: %s", b)
+			}
+			ag(t, dir, "branch", b, c1)
+			ag(t, dir, "checkout", "-q", b)
+			// 用环境变量写入含 = 的 key：配置里直接写 mergeOptions=--squash
+			ag(t, dir, "config", "--add", "branch."+b+".mergeOptions", "--squash")
+			if err := FastForwardBranch(ctx, ffPlan(dir, b, c1, c2)); err != nil {
+				t.Fatal(err)
+			}
+			if rev(t, dir, "HEAD") != c2 || ag(t, dir, "status", "--porcelain", "-uall") != "" {
+				t.Fatal("HEAD/索引/工作区没一起前进")
+			}
+		})
+	}
+}
+
+func TestWriteEnvNumbering(t *testing.T) {
+	p := ApplyPlan{Env: []string{"GIT_CONFIG_COUNT=1", "GIT_CONFIG_KEY_0=user.name", "GIT_CONFIG_VALUE_0=zz"}}
+	env := p.writeEnv([2]string{"branch.a=b.mergeOptions", ""})
+	joined := strings.Join(env, "\n")
+	for _, w := range []string{"GIT_CONFIG_KEY_1=core.hooksPath", "GIT_CONFIG_VALUE_1=/dev/null",
+		"GIT_CONFIG_KEY_2=branch.a=b.mergeOptions", "GIT_CONFIG_VALUE_2=", "GIT_CONFIG_COUNT=3", "GIT_CONFIG_KEY_0=user.name"} {
+		if !strings.Contains(joined, w) {
+			t.Fatalf("缺少 %q: %v", w, env)
+		}
+	}
+	// 实际生效：调用方已有的第 0 项仍然有效，且写路径正常
+	ctx := context.Background()
+	dir, c1, c2 := ffRepo(t)
+	pl := ffPlan(dir, "main", c1, c2)
+	pl.Env = []string{"GIT_CONFIG_COUNT=1", "GIT_CONFIG_KEY_0=merge.ff", "GIT_CONFIG_VALUE_0=false"}
+	if err := FastForwardBranch(ctx, pl); err != nil || rev(t, dir, "HEAD") != c2 {
+		t.Fatalf("带已有 GIT_CONFIG_COUNT 的快进失败: %v", err)
+	}
+}

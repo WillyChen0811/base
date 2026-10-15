@@ -342,7 +342,7 @@ func CreateBranch(ctx context.Context, p ApplyPlan) error {
 	if err := p.validateCommon(ctx, KindCreateOnOther); err != nil {
 		return err
 	}
-	if err := p.checkScope(ctx); err != nil {
+	if err := p.checkScope(ctx, p.NewOID); err != nil {
 		return err
 	}
 	if p.OldOID != "" {
@@ -389,7 +389,7 @@ func FastForwardBranch(ctx context.Context, p ApplyPlan) error {
 	if err := p.validateCommon(ctx, KindFastForward); err != nil {
 		return err
 	}
-	if err := p.checkScope(ctx); err != nil {
+	if err := p.checkScope(ctx, p.OldOID, p.NewOID); err != nil {
 		return err
 	}
 	if !oidRe.MatchString(p.OldOID) {
@@ -602,7 +602,7 @@ func AutoMergeCommit(ctx context.Context, p ApplyPlan) (string, error) {
 	if err := p.validateCommon(ctx, KindAutoMerge); err != nil {
 		return "", err
 	}
-	if err := p.checkScope(ctx); err != nil {
+	if err := p.checkScope(ctx, p.Parents[0], p.Parents[1]); err != nil {
 		return "", err
 	}
 	p1, p2 := p.Parents[0], p.Parents[1]

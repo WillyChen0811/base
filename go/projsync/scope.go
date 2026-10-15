@@ -474,12 +474,52 @@ func checkLayout(ctx context.Context, repoDir string, env []string, add func(str
 // scopeCheckDisabledForTest 仅测试使用：让执行器自身的第二层防护（mergeOptions 清空等）仍可被单独测试。
 var scopeCheckDisabledForTest bool
 
-// checkScope 是 ApplyPlan 在写原语开头调用的统一入口。
-func (p ApplyPlan) checkScope(ctx context.Context) error {
+// CheckCommitsScope 检查本次写动作涉及的提交树：任一提交的树里有 gitlink（模式 160000）或根目录有 .gitmodules，
+// 或读取失败，都判超出范围。子模块场景未专门处理和测试，按 PLAN 第十一节识别就停；
+// 这补上「工作区都不含子模块、但要写入的目标提交含子模块」的缺口。空串 OID 跳过。
+func CheckCommitsScope(ctx context.Context, repoDir string, env []string, oids ...string) error {
+	var reasons []string
+	for _, o := range oids {
+		if o == "" {
+			continue
+		}
+		short := o
+		if len(short) > 12 {
+			short = short[:12]
+		}
+		if !oidRe.MatchString(o) {
+			reasons = append(reasons, fmt.Sprintf("提交 %q 的 OID 不合法，无法检查子模块", o))
+			continue
+		}
+		out, err := runGit(ctx, repoDir, env, "ls-tree", "-r", "-z", o)
+		if err != nil {
+			reasons = append(reasons, fmt.Sprintf("读取提交 %s 的树失败: %v", short, err))
+			continue
+		}
+		// 记录格式：<mode> SP <type> SP <oid> TAB <path>
+		for _, rec := range strings.Split(string(out), "\x00") {
+			meta, path, _ := strings.Cut(rec, "\t")
+			if strings.HasPrefix(meta, "160000 ") || path == ".gitmodules" {
+				reasons = append(reasons, fmt.Sprintf("提交 %s 包含子模块，超出自动同步范围", short))
+				break
+			}
+		}
+	}
+	if len(reasons) == 0 {
+		return nil
+	}
+	return &ErrOutOfScope{Repo: repoDir, Reasons: reasons}
+}
+
+// checkScope 是 ApplyPlan 在写原语开头调用的统一入口：仓库/分支范围 + 本次涉及的提交树。
+func (p ApplyPlan) checkScope(ctx context.Context, oids ...string) error {
 	if scopeCheckDisabledForTest {
 		return nil
 	}
 	err := CheckScope(ctx, p.RepoDir, p.Env, []string{p.Branch})
+	if err == nil {
+		err = CheckCommitsScope(ctx, p.RepoDir, p.Env, oids...)
+	}
 	var oos *ErrOutOfScope
 	if errors.As(err, &oos) {
 		return fmt.Errorf("%s：%w", p.tag(), err)

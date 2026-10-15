@@ -381,3 +381,54 @@ func TestSubmoduleDirtyAndOutOfScope(t *testing.T) {
 		t.Fatalf("普通仓库不应超出: %v", err)
 	}
 }
+
+// 目标提交树含子模块（工作区都不含）：写前提交树检查判超出，引用/对象不变。
+func TestCommitTreeSubmoduleOutOfScope(t *testing.T) {
+	ctx := context.Background()
+	dir := newRepo(t)
+	a := rev(t, dir, "HEAD")
+	ag(t, dir, "branch", "other", a) // 未检出分支
+	// B：A 的后代，新增 gitlink（不必真有子模块）
+	ag(t, dir, "checkout", "-q", "-b", "withsub", a)
+	ag(t, dir, "update-index", "--add", "--cacheinfo", "160000,"+a+",sub")
+	ag(t, dir, "commit", "-m", "add gitlink")
+	b := rev(t, dir, "HEAD")
+	// C：A 的后代，只新增 .gitmodules
+	ag(t, dir, "checkout", "-q", "-b", "withmods", a)
+	c := commitFile(t, dir, ".gitmodules", "[submodule \"x\"]\n")
+	// D：A 的后代，普通提交
+	ag(t, dir, "checkout", "-q", "-b", "plain", a)
+	d := commitFile(t, dir, "p.txt", "p\n")
+	ag(t, dir, "checkout", "-q", "main")
+	ag(t, dir, "branch", "-D", "withsub", "withmods", "plain")
+
+	expect := func(err error, what string) {
+		t.Helper()
+		var oos *ErrOutOfScope
+		if !errors.As(err, &oos) || !strings.Contains(err.Error(), "包含子模块，超出自动同步范围") {
+			t.Fatalf("%s 应判超出范围: %v", what, err)
+		}
+	}
+	refs := ag(t, dir, "for-each-ref")
+	objs := ag(t, dir, "count-objects", "-v")
+	same := func(what string) {
+		t.Helper()
+		if ag(t, dir, "for-each-ref") != refs || ag(t, dir, "count-objects", "-v") != objs {
+			t.Fatalf("%s 后引用或对象库变了", what)
+		}
+	}
+	expect(FastForwardBranch(ctx, ffPlan(dir, "other", a, b)), "快进到含 gitlink 的提交")
+	expect(FastForwardBranch(ctx, ffPlan(dir, "other", a, c)), "快进到含 .gitmodules 的提交")
+	same("快进")
+	expect(CreateBranch(ctx, ApplyPlan{RepoDir: dir, Branch: "nb", NewOID: b, Kind: KindCreateOnOther}), "创建")
+	same("创建")
+	_, err := AutoMergeCommit(ctx, ApplyPlan{RepoDir: dir, Branch: "other", Kind: KindAutoMerge, Parents: [2]string{b, d}})
+	expect(err, "自动合并")
+	same("自动合并")
+	// 旧值含子模块也拒绝
+	expect(FastForwardBranch(ctx, ffPlan(dir, "other", b, d)), "旧值含子模块")
+	// 普通提交不受影响
+	if err := FastForwardBranch(ctx, ffPlan(dir, "other", a, d)); err != nil || rev(t, dir, "other") != d {
+		t.Fatalf("普通快进应成功: %v", err)
+	}
+}

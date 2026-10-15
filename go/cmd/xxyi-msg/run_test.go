@@ -34,6 +34,8 @@ type captured struct {
 	respPeers string
 	respState string
 	respInbox string
+	// 审批接口（/approval/ask）的响应正文，留空回「没拿到决定」。
+	respApproval string
 }
 
 func (c *captured) peersResp() string {
@@ -55,6 +57,14 @@ func (c *captured) inboxResp() string {
 		return c.respInbox
 	}
 	return `{"messages":[],"unanswered":[]}`
+}
+
+// approvalResp 是 /approval/ask 的响应正文：没设就回「没拿到决定」（钩子据此退回终端确认）。
+func (c *captured) approvalResp() string {
+	if c.respApproval != "" {
+		return c.respApproval
+	}
+	return `{"decided":false}`
 }
 
 type capturedReq struct {
@@ -109,10 +119,12 @@ func (c *captured) handler() http.HandlerFunc {
 			xxauth: r.Header.Get("X-XXYI-Auth"),
 			query:  r.URL.RawQuery,
 		}
-		if r.Method == http.MethodPost && r.URL.Path == "/msg/send" {
+		if r.Method == http.MethodPost && (r.URL.Path == "/msg/send" || r.URL.Path == "/approval/ask") {
 			b, _ := io.ReadAll(r.Body)
 			rec.raw = b
-			_ = json.Unmarshal(b, &rec.body)
+			if r.URL.Path == "/msg/send" {
+				_ = json.Unmarshal(b, &rec.body)
+			}
 		}
 		c.add(rec)
 		if c.respErr != "" {
@@ -139,6 +151,8 @@ func (c *captured) handler() http.HandlerFunc {
 			fmt.Fprint(w, c.inboxResp())
 		case "/msg/who", "/msg":
 			fmt.Fprint(w, c.peersResp())
+		case "/approval/ask":
+			fmt.Fprint(w, c.approvalResp())
 		default:
 			w.WriteHeader(http.StatusNotFound)
 			fmt.Fprint(w, `{"error":"没有这个路径"}`)

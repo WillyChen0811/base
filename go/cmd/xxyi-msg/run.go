@@ -206,15 +206,31 @@ func defaultXxyiConfigPath() string {
 	return filepath.Join(home, ".xxyi", "config.json")
 }
 
+// isUbuntuSideFiles 是选侧的唯一规则：有 endpoint.json 就是 Ubuntu 一侧；
+// 没有端点文件时，装了 Ubuntu 证书且没有 Mac 才有的 xxyi config.json 才算 Ubuntu
+// （只是协助没开）；其余走 Mac 的 xxyi 本机接口。
+// connect 与 selfaddr 的 ubuntuSide 都调它，侧别才不会打架
+// （侧判成 Ubuntu 却去连 Mac 的接口会被 403 拒）。
+// 路径由调用方传入：connect 传包级变量（测试指到临时目录），ubuntuSide 按当时的 HOME 现算。
+func isUbuntuSideFiles(endpoint, ubuntuBundle, xxyiConfig string) bool {
+	if _, err := os.Stat(endpoint); err == nil {
+		return true
+	}
+	if _, err := os.Stat(ubuntuBundle); err != nil {
+		return false
+	}
+	_, cerr := os.Stat(xxyiConfig) // 只有 Mac 上有 XXYI 配置
+	return errors.Is(cerr, fs.ErrNotExist)
+}
+
 // connect 按配置文件选侧：Ubuntu 一侧有 endpoint.json 就用它；否则走 Mac 的 xxyi 本机接口拿端口和令牌。
 func connect(ctx context.Context, timeout time.Duration) (*client, error) {
 	raw, err := os.ReadFile(endpointPath)
 	if errors.Is(err, fs.ErrNotExist) {
-		// 有 Ubuntu 侧证书却没有端点文件：这台就是 Ubuntu，只是协助没开，别去连 Mac 的本机接口。
+		// 没有端点文件：按共用规则判侧（见 isUbuntuSideFiles）——有 Ubuntu 侧证书却没有
+		// Mac 才有的 XXYI 配置，这台就是 Ubuntu，只是协助没开，别去连 Mac 的本机接口。
 		// 仍按连不上处理（send 会暂存，协助打开后补发）。
-		_, berr := os.Stat(clientBundlePathUbuntu)
-		_, cerr := os.Stat(xxyiConfigPath) // 只有 Mac 上有 XXYI 配置
-		if berr == nil && errors.Is(cerr, fs.ErrNotExist) {
+		if isUbuntuSideFiles(endpointPath, clientBundlePathUbuntu, xxyiConfigPath) {
 			return nil, &connError{err: errors.New("Ubuntu 这边没有协助端点")}
 		}
 		return connectMac(ctx, timeout)
@@ -1187,6 +1203,10 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		}
 	case "state":
 		return cmdState(args[1:], stdin, stdout)
+	case "approve-hook":
+		// 审批钩子：cmdApproveHook 自己带超时与上下文，任何失败都空输出退出 0（退回终端确认），
+		// 所以这里原样把它的退出码透出去，不套「错误：」前缀、不补发暂存。
+		return cmdApproveHook(args[1:], stdin, stdout)
 	case "mcp":
 		err = serveMCP(stdin, stdout)
 	default:

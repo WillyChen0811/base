@@ -170,22 +170,15 @@ func selfAddrFromProcTree() (string, error) {
 	return "mac:" + name, nil
 }
 
-// ubuntuSide 判当前是不是 Ubuntu 一侧：~/.xxyi-support 下有端点或客户端证书（与 connect 的标志一致）。
-// 按调用时的 HOME 现算，跟 selfAddr/日志的目录规则同源。
+// ubuntuSide 判当前是不是 Ubuntu 一侧：规则与 connect 共用一个函数（见 run.go 的 isUbuntuSideFiles），
+// 路径按调用时的 HOME 现算（default*Path 就是家目录拼出来的），
+// 这样 connect 走 Mac 的时候地址前缀也一定是 mac:——侧别不一致会被本机接口 403 拒。
 func ubuntuSide() bool {
 	home, err := os.UserHomeDir()
 	if err != nil || home == "" {
 		return false
 	}
-	for _, p := range []string{
-		filepath.Join(home, ".xxyi-support", "endpoint.json"),
-		filepath.Join(home, ".xxyi-support", "client.json"),
-	} {
-		if _, err := os.Stat(p); err == nil {
-			return true
-		}
-	}
-	return false
+	return isUbuntuSideFiles(defaultEndpointPath(), defaultClientBundlePathUbuntu(), defaultXxyiConfigPath())
 }
 
 // hookLog 给 state 钩子追加一行排查日志："时间 参数 结果"。

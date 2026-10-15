@@ -4,13 +4,18 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"errors"
+	"fmt"
 	"io"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/WillyChen0811/base/go/xxyica"
 )
 
 // TestMain 把 HOME 统一指到临时目录：钩子日志不许写进真实家目录。
@@ -364,6 +369,139 @@ func TestHookLogRotation(t *testing.T) {
 	}
 	if len(rotated) != len(old) {
 		t.Errorf(".1 长 %d，want %d", len(rotated), len(old))
+	}
+}
+
+// 选侧规则的四种文件布局（connect 与 selfAddr 共用 isUbuntuSideFiles，结论必须一致）：
+// 只有 endpoint.json → ubuntu；只有 Ubuntu 证书（没有 Mac 的 config.json）→ ubuntu；
+// 证书加 config.json 但没有 endpoint.json → mac；什么都没有 → mac。
+func TestUbuntuSideRule(t *testing.T) {
+	cases := []struct {
+		name                  string
+		endpoint, bundle, cfg bool
+		wantUbuntu            bool
+	}{
+		{"只有 endpoint.json", true, false, false, true},
+		{"只有 Ubuntu 证书没有 config.json", false, true, false, true},
+		{"证书加 config.json 没有 endpoint.json", false, true, true, false},
+		{"什么都没有", false, false, false, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			sup := filepath.Join(home, ".xxyi-support")
+			mac := filepath.Join(home, ".xxyi")
+			for _, dir := range []string{sup, mac} {
+				if err := os.MkdirAll(dir, 0o700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			// 包级路径与家目录下的默认路径重合：connect 与 ubuntuSide 看的是同一组文件
+			setPaths(t, filepath.Join(sup, "endpoint.json"), filepath.Join(mac, "config.json"))
+			clientBundlePathUbuntu = filepath.Join(sup, "client.json") // setPaths 已登记还原
+			for _, p := range []string{endpointPath, clientBundlePathUbuntu, xxyiConfigPath} {
+				_ = os.Remove(p)
+			}
+			touch := func(p string) {
+				if err := os.WriteFile(p, []byte("{}"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if c.endpoint {
+				touch(endpointPath)
+			}
+			if c.bundle {
+				touch(clientBundlePathUbuntu)
+			}
+			if c.cfg {
+				touch(xxyiConfigPath)
+			}
+
+			if got := isUbuntuSideFiles(endpointPath, clientBundlePathUbuntu, xxyiConfigPath); got != c.wantUbuntu {
+				t.Errorf("isUbuntuSideFiles = %v，want %v", got, c.wantUbuntu)
+			}
+			if got := ubuntuSide(); got != c.wantUbuntu {
+				t.Errorf("ubuntuSide() = %v，want %v", got, c.wantUbuntu)
+			}
+			// 进程树兜底的地址前缀跟着侧别走
+			t.Setenv("XXYI_ADDR", "")
+			t.Setenv("TMUX", "")
+			useFakeTree(t, map[int]int{os.Getpid(): 80, 80: 1}, "80 codex1\n")
+			want := "mac:codex1"
+			if c.wantUbuntu {
+				want = "ubuntu:codex1"
+			}
+			addr, err := selfAddr()
+			if err != nil || addr != want {
+				t.Errorf("selfAddr = %q,%v，want %q", addr, err, want)
+			}
+		})
+	}
+}
+
+// P2 的触发场景：有 ~/.xxyi-support/client.json 和 ~/.xxyi/config.json、没有 endpoint.json。
+// connect 走 Mac 本机接口，selfAddr 的兜底前缀也必须是 mac:（判成 ubuntu 会被本机接口 403 拒）。
+func TestSideConnectAndSelfAddrAgree(t *testing.T) {
+	var msgCap captured
+	msgSrv := httptest.NewServer(msgCap.handler())
+	defer msgSrv.Close()
+	api := http.NewServeMux()
+	api.HandleFunc("/api/terminal", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, `{"http":%q,"token":"mtk"}`, authority(msgSrv.URL))
+	})
+	apiSrv := httptest.NewServer(api)
+	defer apiSrv.Close()
+
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	sup := filepath.Join(home, ".xxyi-support")
+	if err := os.MkdirAll(sup, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	cfg := filepath.Join(home, ".xxyi", "config.json")
+	if err := os.MkdirAll(filepath.Dir(cfg), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(cfg, []byte(fmt.Sprintf(`{"http_port":%q}`, portOf(t, apiSrv.URL))), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ca, err := xxyica.NewCA()
+	if err != nil {
+		t.Fatal(err)
+	}
+	bundle := filepath.Join(sup, "client.json")
+	writeTestBundle(t, ca, bundle, "ubuntu")
+
+	setPaths(t, filepath.Join(sup, "endpoint.json"), cfg) // endpoint.json 故意不写
+	clientBundlePathUbuntu = bundle
+	t.Setenv("XXYI_ADDR", "")
+	t.Setenv("TMUX", "")
+	useFakeTree(t, map[int]int{os.Getpid(): 80, 80: 1}, "80 codex1\n")
+
+	if ubuntuSide() {
+		t.Error("装了 Mac 配置又没有端点：该判成 Mac")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), httpTimeout)
+	defer cancel()
+	c, err := connect(ctx, httpTimeout)
+	if err != nil {
+		t.Fatalf("connect 失败：%v", err)
+	}
+	if !c.query || c.token != "mtk" {
+		t.Errorf("connect 该走 Mac 侧（令牌在查询参数里）：query=%v token=%q", c.query, c.token)
+	}
+	if addr, err := selfAddr(); err != nil || addr != "mac:codex1" {
+		t.Fatalf("selfAddr = %q,%v", addr, err)
+	}
+
+	out := &bytes.Buffer{}
+	if code := run([]string{"send", "ubuntu:boss", "hi"}, strings.NewReader(""), out, io.Discard); code != exitOK {
+		t.Fatalf("退出码 %d，输出 %q", code, out.String())
+	}
+	got := msgCap.last(t)
+	if got.body.From != "mac:codex1" || got.query != "token=mtk" {
+		t.Errorf("from=%q query=%q，前缀该跟 connect 的侧别一致", got.body.From, got.query)
 	}
 }
 

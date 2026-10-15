@@ -24,7 +24,9 @@ package projsync
 //  8. 提交任务派发 / 9. 冲突只交控制中心：调度层与展示层，本项不做。
 //  10. 集成测试：apply_test.go。
 //
-// 禁用：reset、checkout/switch、branch -d/-D、update-ref -d、--force、--autostash、stash。
+// 禁用：reset、checkout/switch、branch -d/-D、update-ref -d、--force、--autostash（merge 显式 --no-autostash、--no-overwrite-ignore）、stash。
+// 所有待写分支必须是直接引用（符号引用/悬空符号引用一律拒绝），update-ref 带 --no-deref。
+// 任何写动作前检查仓库全部非 bare 工作区的进行中标记（merge/rebase/cherry-pick/revert/sequencer/bisect）。
 
 import (
 	"context"
@@ -44,7 +46,7 @@ type ApplyPlan struct {
 	OldOID string
 	NewOID string
 	Kind   ActionKind
-	// Parents 是 AutoMerge 的两个父提交。
+	// Parents 是 AutoMerge 的两个父提交，顺序固定：Parents[0] 是 mac 侧、Parents[1] 是 ubuntu 侧。
 	Parents [2]string
 	// FactsVersion 是采集事实的版本号，仅用于错误信息；是否过期由调用方（调度层）判断，
 	// 本层以现场重读的 OID/HEAD 为准。
@@ -139,6 +141,54 @@ func isAncestor(ctx context.Context, dir string, env []string, a, b string) (boo
 	return false, fmt.Errorf("祖先检测失败: %w", err)
 }
 
+// isSymbolicRef 判断 ref 是否是符号引用（含悬空）。exit 1=不是；其它失败是 error。
+func isSymbolicRef(ctx context.Context, dir string, env []string, ref string) (bool, error) {
+	_, code, err := runGitCode(ctx, dir, env, "symbolic-ref", "-q", ref)
+	if err == nil {
+		return true, nil
+	}
+	if code == 1 {
+		return false, nil
+	}
+	return false, fmt.Errorf("检查 %s 是否符号引用失败: %w", ref, err)
+}
+
+// requireDirectRef 拒绝符号引用（update-ref 即使加 --no-deref 也不应去改别名）。
+func (p ApplyPlan) requireDirectRef(ctx context.Context, ref string) error {
+	sym, err := isSymbolicRef(ctx, p.RepoDir, p.Env, ref)
+	if err != nil {
+		return fmt.Errorf("%s：%w，停止", p.tag(), err)
+	}
+	if sym {
+		return fmt.Errorf("%s：%s 是符号引用，拒绝更新", p.tag(), ref)
+	}
+	return nil
+}
+
+// requireAllIdle 逐个检查全部非 bare 工作区的进行中标记（各自的 git 目录）；任一 busy 或失败都停止。
+func (p ApplyPlan) requireAllIdle(ctx context.Context, wts []WorktreeInfo) error {
+	for _, w := range wts {
+		if w.Bare {
+			continue
+		}
+		gd, err := runGit(ctx, w.Path, p.Env, "rev-parse", "--absolute-git-dir")
+		if err != nil {
+			return fmt.Errorf("%s：检查工作区 %s 失败，停止: %w", p.tag(), w.Path, err)
+		}
+		gitDir := strings.TrimSpace(string(gd))
+		for _, m := range busyMarkers {
+			_, err := os.Lstat(filepath.Join(gitDir, m))
+			if err == nil {
+				return fmt.Errorf("%s：工作区 %s 正在进行 %s 对应的操作（merge/rebase/cherry-pick/revert/bisect），停止", p.tag(), w.Path, m)
+			}
+			if !os.IsNotExist(err) {
+				return fmt.Errorf("%s：检查 %s 的 %s 失败，停止: %w", p.tag(), w.Path, m, err)
+			}
+		}
+	}
+	return nil
+}
+
 // requireCommit 确认 oid 在仓库里存在且是提交。
 func requireCommit(ctx context.Context, dir string, env []string, oid string) error {
 	if !oidRe.MatchString(oid) {
@@ -164,7 +214,7 @@ type WorktreeInfo struct {
 
 // listWorktrees 列出仓库全部工作区（含 linked worktree）。
 func listWorktrees(ctx context.Context, dir string, env []string) ([]WorktreeInfo, error) {
-	out, err := runGit(ctx, dir, env, "worktree", "list", "--porcelain")
+	out, err := runGit(ctx, dir, env, "worktree", "list", "--porcelain", "-z")
 	if err != nil {
 		return nil, fmt.Errorf("列出工作区失败: %w", err)
 	}
@@ -185,7 +235,8 @@ func listWorktrees(ctx context.Context, dir string, env []string) ([]WorktreeInf
 		cur = nil
 		return nil
 	}
-	for _, line := range strings.Split(string(out), "\n") {
+	// -z：每个属性以 NUL 结尾，工作区之间多一个空记录；路径保持原始字节，不做 C 风格转义。
+	for _, line := range strings.Split(string(out), "\x00") {
 		switch {
 		case line == "":
 			if err := flush(); err != nil {
@@ -244,6 +295,9 @@ func CreateBranch(ctx context.Context, p ApplyPlan) error {
 		return fmt.Errorf("%s：目标提交不可用，停止: %w", p.tag(), err)
 	}
 	ref := "refs/heads/" + p.Branch
+	if err := p.requireDirectRef(ctx, ref); err != nil { // 悬空符号引用也在此拒绝
+		return err
+	}
 	_, ex, err := readRef(ctx, p.RepoDir, p.Env, ref)
 	if err != nil {
 		return fmt.Errorf("%s：读取失败，停止: %w", p.tag(), err)
@@ -258,13 +312,16 @@ func CreateBranch(ctx context.Context, p ApplyPlan) error {
 	if hs := checkedOutBy(wts, p.Branch); len(hs) > 0 {
 		return fmt.Errorf("%s：工作区 %s 的 HEAD 已指向该分支名，拒绝创建", p.tag(), hs[0].Path)
 	}
+	if err := p.requireAllIdle(ctx, wts); err != nil {
+		return err
+	}
 	if applyTestHook != nil {
 		applyTestHook("beforeUpdateRef")
 	}
 	// 旧值全零 = 必须不存在的比较交换。
 	// 竞态：上面的检查与此处写入之间不是原子的，写后只能事后复查发现（见 postCheckNotCheckedOut），
 	// 调度层必须对同一仓库串行。
-	if _, err := runGit(ctx, p.RepoDir, p.Env, "update-ref", ref, p.NewOID, zeroOID(p.NewOID)); err != nil {
+	if _, err := runGit(ctx, p.RepoDir, p.Env, "update-ref", "--no-deref", ref, p.NewOID, zeroOID(p.NewOID)); err != nil {
 		return fmt.Errorf("%s：创建引用失败（可能被抢先建立），需重新判定: %w", p.tag(), err)
 	}
 	return p.postCheckNotCheckedOut(ctx)
@@ -282,6 +339,9 @@ func FastForwardBranch(ctx context.Context, p ApplyPlan) error {
 		return fmt.Errorf("%s：目标提交不可用，停止: %w", p.tag(), err)
 	}
 	ref := "refs/heads/" + p.Branch
+	if err := p.requireDirectRef(ctx, ref); err != nil {
+		return err
+	}
 	cur, ex, err := readRef(ctx, p.RepoDir, p.Env, ref)
 	if err != nil {
 		return fmt.Errorf("%s：读取失败，停止: %w", p.tag(), err)
@@ -303,6 +363,9 @@ func FastForwardBranch(ctx context.Context, p ApplyPlan) error {
 	if err != nil {
 		return fmt.Errorf("%s：%w，停止", p.tag(), err)
 	}
+	if err := p.requireAllIdle(ctx, wts); err != nil {
+		return err
+	}
 	holders := checkedOutBy(wts, p.Branch)
 	switch len(holders) {
 	case 0:
@@ -311,8 +374,11 @@ func FastForwardBranch(ctx context.Context, p ApplyPlan) error {
 		}
 		// 未检出路径：listWorktrees 与 update-ref 之间不是原子的，写后复查只能发现、不能消除竞态，
 		// 调度层必须对同一仓库串行执行同步与工作区操作。
-		if _, err := runGit(ctx, p.RepoDir, p.Env, "update-ref", ref, p.NewOID, p.OldOID); err != nil {
+		if _, err := runGit(ctx, p.RepoDir, p.Env, "update-ref", "--no-deref", ref, p.NewOID, p.OldOID); err != nil {
 			return fmt.Errorf("%s：更新引用失败（引用可能已变化），需重新判定: %w", p.tag(), err)
+		}
+		if got, ex, err := readRef(ctx, p.RepoDir, p.Env, ref); err != nil || !ex || got != p.NewOID {
+			return fmt.Errorf("%s：更新后复读引用不符（%q，%v），需人工确认", p.tag(), got, err)
 		}
 		return p.postCheckNotCheckedOut(ctx)
 	case 1:
@@ -350,49 +416,98 @@ func (p ApplyPlan) checkWorktreeHead(ctx context.Context, wt, ref string) error 
 	return nil
 }
 
+// checkClean：含未跟踪文件（-uall，按 .gitignore 过滤）；GIT_OPTIONAL_LOCKS=0 避免 status 回写索引。
+func (p ApplyPlan) checkClean(ctx context.Context, wt string) error {
+	st, err := runGit(ctx, wt, append(append([]string{}, p.Env...), "GIT_OPTIONAL_LOCKS=0"),
+		"status", "--porcelain", "--untracked-files=all")
+	if err != nil {
+		return err
+	}
+	if len(strings.TrimSpace(string(st))) > 0 {
+		return fmt.Errorf("工作区 %s 有未提交改动或未跟踪文件", wt)
+	}
+	return nil
+}
+
+// checkNoOverwrite：被 .gitignore 忽略的未跟踪文件 status 看不见，但 merge 可能覆盖。
+// 以 --no-renames 把重命名拆成删除+新增，检查新提交里所有将被写入的路径（新增/修改/类型变化）：
+// 路径本身及其各级父路径在工作区若存在「Old 未跟踪」的同名文件则拒绝；
+// 路径本身是目录时（文件/目录互换），目录内必须全是 Old 已跟踪文件。
+func (p ApplyPlan) checkNoOverwrite(ctx context.Context, wt string) error {
+	tr, err := runGit(ctx, wt, p.Env, "ls-tree", "-r", "-z", "--name-only", p.OldOID)
+	if err != nil {
+		return err
+	}
+	tracked := map[string]bool{}
+	for _, f := range strings.Split(string(tr), "\x00") {
+		if f != "" {
+			tracked[f] = true
+		}
+	}
+	out, err := runGit(ctx, wt, p.Env, "diff", "--name-only", "-z", "--no-renames", "--diff-filter=AMT", p.OldOID, p.NewOID)
+	if err != nil {
+		return err
+	}
+	for _, path := range strings.Split(string(out), "\x00") {
+		if path == "" {
+			continue
+		}
+		parts := strings.Split(path, "/")
+		for k := range parts {
+			q := strings.Join(parts[:k+1], "/")
+			fi, err := os.Lstat(filepath.Join(wt, q))
+			if os.IsNotExist(err) {
+				break // 更深的层级也不会存在
+			}
+			if err != nil {
+				return fmt.Errorf("检查路径 %s 失败: %w", q, err)
+			}
+			final := k == len(parts)-1
+			if !fi.IsDir() {
+				if !tracked[q] {
+					return fmt.Errorf("路径 %s 在工作区已存在且未被跟踪（被忽略的文件），会被覆盖", q)
+				}
+				break // 已跟踪文件将由 git 替换，其下不会有内容
+			}
+			if !final {
+				continue
+			}
+			// 最终路径在工作区是目录（新提交里它是文件）：目录内必须全是已跟踪文件。
+			werr := filepath.WalkDir(filepath.Join(wt, q), func(fp string, d os.DirEntry, e error) error {
+				if e != nil {
+					return e
+				}
+				if d.IsDir() {
+					return nil
+				}
+				rel, e := filepath.Rel(wt, fp)
+				if e != nil {
+					return e
+				}
+				if !tracked[filepath.ToSlash(rel)] {
+					return fmt.Errorf("目录 %s 内有未跟踪文件 %s，会被覆盖", q, rel)
+				}
+				return nil
+			})
+			if werr != nil {
+				return werr
+			}
+		}
+	}
+	return nil
+}
+
 func (p ApplyPlan) fastForwardCheckedOut(ctx context.Context, wt, ref string) error {
 	fail := func(err error) error { return fmt.Errorf("%s：%w，停止，未写入", p.tag(), err) }
 	if err := p.checkWorktreeHead(ctx, wt, ref); err != nil {
 		return fail(err)
 	}
-	gd, err := runGit(ctx, wt, p.Env, "rev-parse", "--absolute-git-dir")
-	if err != nil {
+	// 进行中标记已由 requireAllIdle 对全部工作区检查过。
+	if err := p.checkClean(ctx, wt); err != nil {
 		return fail(err)
 	}
-	gitDir := strings.TrimSpace(string(gd))
-	for _, m := range busyMarkers {
-		_, err := os.Lstat(filepath.Join(gitDir, m))
-		if err == nil {
-			return fail(fmt.Errorf("工作区 %s 正在进行 %s 对应的操作（merge/rebase/cherry-pick/revert）", wt, m))
-		}
-		if !os.IsNotExist(err) {
-			return fail(fmt.Errorf("检查 %s 失败: %w", m, err))
-		}
-	}
-	// 含未跟踪文件（-uall，按 .gitignore 过滤）；GIT_OPTIONAL_LOCKS=0 避免 status 回写索引。
-	st, err := runGit(ctx, wt, append(append([]string{}, p.Env...), "GIT_OPTIONAL_LOCKS=0"),
-		"status", "--porcelain", "--untracked-files=all")
-	if err != nil {
+	if err := p.checkNoOverwrite(ctx, wt); err != nil {
 		return fail(err)
-	}
-	if len(strings.TrimSpace(string(st))) > 0 {
-		return fail(fmt.Errorf("工作区 %s 有未提交改动或未跟踪文件", wt))
-	}
-	// 被 .gitignore 忽略的未跟踪文件 status 看不见，但 merge 会覆盖它们：
-	// 凡新提交里新增的路径，若工作区已有同名文件/目录项则拒绝。
-	added, err := runGit(ctx, wt, p.Env, "diff", "--name-only", "-z", "--diff-filter=A", p.OldOID, p.NewOID)
-	if err != nil {
-		return fail(err)
-	}
-	for _, path := range strings.Split(string(added), "\x00") {
-		if path == "" {
-			continue
-		}
-		if _, err := os.Lstat(filepath.Join(wt, path)); err == nil {
-			return fail(fmt.Errorf("新增路径 %s 在工作区已存在（被忽略的未跟踪文件），会被覆盖", path))
-		} else if !os.IsNotExist(err) {
-			return fail(fmt.Errorf("检查路径 %s 失败: %w", path, err))
-		}
 	}
 
 	if applyTestHook != nil {
@@ -402,7 +517,10 @@ func (p ApplyPlan) fastForwardCheckedOut(ctx context.Context, wt, ref string) er
 	if err := p.checkWorktreeHead(ctx, wt, ref); err != nil {
 		return fail(err)
 	}
-	if _, err := runGit(ctx, wt, p.Env, "merge", "--ff-only", p.NewOID); err != nil {
+	if err := p.checkClean(ctx, wt); err != nil {
+		return fail(err)
+	}
+	if _, err := runGit(ctx, wt, p.Env, "merge", "--ff-only", "--no-autostash", "--no-overwrite-ignore", p.NewOID); err != nil {
 		return fmt.Errorf("%s：merge --ff-only 失败，需重新判定: %w", p.tag(), err)
 	}
 	head, err := runGit(ctx, wt, p.Env, "rev-parse", "--verify", "HEAD")
@@ -444,7 +562,7 @@ func AutoMergeCommit(ctx context.Context, p ApplyPlan) (string, error) {
 	env := append(append([]string{}, p.Env...),
 		"GIT_AUTHOR_NAME=XXYI", "GIT_AUTHOR_EMAIL=xxyi@localhost",
 		"GIT_COMMITTER_NAME=XXYI", "GIT_COMMITTER_EMAIL=xxyi@localhost")
-	msg := fmt.Sprintf("XXYI 自动合并 %s：%s 与 %s", p.Branch, p1[:8], p2[:8])
+	msg := fmt.Sprintf("XXYI 自动合并 %s：mac %s + ubuntu %s", p.Branch, p1, p2)
 	co, err := runGit(ctx, p.RepoDir, env, "commit-tree", tree, "-p", p1, "-p", p2, "-m", msg)
 	if err != nil {
 		return "", fmt.Errorf("%s：生成合并提交失败，停止: %w", p.tag(), err)

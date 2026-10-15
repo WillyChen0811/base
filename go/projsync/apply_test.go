@@ -62,19 +62,39 @@ func snapshot(t *testing.T, dir string) string {
 	sb.WriteString(string(headOut))
 	sb.WriteString("\nINDEX:" + ag(t, dir, "ls-files", "-s"))
 	sb.WriteString("\nSTATUS:" + ag(t, dir, "status", "--porcelain", "-uall", "--ignored"))
-	filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
+	sb.WriteString("\nSTASH:" + ag(t, dir, "stash", "list"))
+	err := filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
-			return nil
+			return err
 		}
 		if d.IsDir() && d.Name() == ".git" {
 			return filepath.SkipDir
 		}
-		if !d.IsDir() {
-			b, _ := os.ReadFile(p)
-			sb.WriteString("\nF:" + p + "=" + string(b))
+		fi, err := os.Lstat(p)
+		if err != nil {
+			return err
+		}
+		switch {
+		case fi.Mode()&os.ModeSymlink != 0:
+			tgt, err := os.Readlink(p)
+			if err != nil {
+				return err
+			}
+			sb.WriteString("\nL:" + p + " -> " + tgt)
+		case fi.IsDir():
+			sb.WriteString("\nD:" + p + " " + fi.Mode().String())
+		default:
+			b, err := os.ReadFile(p)
+			if err != nil {
+				return err
+			}
+			sb.WriteString("\nF:" + p + " " + fi.Mode().String() + "=" + string(b))
 		}
 		return nil
 	})
+	if err != nil {
+		t.Fatalf("快照遍历失败: %v", err)
+	}
 	return sb.String()
 }
 
@@ -292,9 +312,11 @@ func TestFastForwardRefusals(t *testing.T) {
 	t.Run("校验后写入前切了分支", func(t *testing.T) {
 		dir, c1, c2 := ffRepo(t)
 		ag(t, dir, "branch", "other", c1)
+		var after string
 		applyTestHook = func(stage string) {
 			if stage == "beforeMerge" {
 				ag(t, dir, "checkout", "-q", "other")
+				after = snapshot(t, dir)
 			}
 		}
 		defer func() { applyTestHook = nil }()
@@ -306,12 +328,19 @@ func TestFastForwardRefusals(t *testing.T) {
 		if _, e := os.Stat(filepath.Join(dir, "new.txt")); e == nil {
 			t.Fatal("文件被写入")
 		}
+		if snapshot(t, dir) != after {
+			t.Fatal("以外部变动后的现场为基准，现场又变了")
+		}
 	})
 	t.Run("校验后写入前HEAD前进", func(t *testing.T) {
 		dir, c1, c2 := ffRepo(t)
-		applyTestHook = func(string) { commitFile(t, dir, "late.txt", "late\n") }
+		var after string
+		applyTestHook = func(string) { commitFile(t, dir, "late.txt", "late\n"); after = snapshot(t, dir) }
 		defer func() { applyTestHook = nil }()
 		wantRefuse(t, FastForwardBranch(ctx, ffPlan(dir, "main", c1, c2)))
+		if snapshot(t, dir) != after {
+			t.Fatal("现场又变了")
+		}
 		if _, e := os.Stat(filepath.Join(dir, "new.txt")); e == nil {
 			t.Fatal("文件被写入")
 		}
@@ -350,13 +379,21 @@ func TestFastForwardLinkedWorktree(t *testing.T) {
 
 	// 从主工作区路径调用，linked 里 merge；先验证脏文件会拒绝
 	os.WriteFile(filepath.Join(wt, "junk.txt"), []byte("j"), 0o644)
+	sw, sd := snapshot(t, wt), snapshot(t, dir)
 	wantRefuse(t, FastForwardBranch(ctx, ffPlan(dir, "lw", c1, c2)))
+	if snapshot(t, wt) != sw || snapshot(t, dir) != sd {
+		t.Fatal("linked 拒绝后现场变了")
+	}
 	os.Remove(filepath.Join(wt, "junk.txt"))
 
 	// linked worktree 里 merge 中也要识别（git-dir 在 .git/worktrees/ 下）
 	gd := ag(t, wt, "rev-parse", "--absolute-git-dir")
 	os.WriteFile(filepath.Join(gd, "MERGE_HEAD"), []byte(c2+"\n"), 0o644)
+	sw, sd = snapshot(t, wt), snapshot(t, dir)
 	wantRefuse(t, FastForwardBranch(ctx, ffPlan(dir, "lw", c1, c2)))
+	if snapshot(t, wt) != sw || snapshot(t, dir) != sd {
+		t.Fatal("linked 拒绝后现场变了")
+	}
 	os.Remove(filepath.Join(gd, "MERGE_HEAD"))
 
 	if err := FastForwardBranch(ctx, ffPlan(dir, "lw", c1, c2)); err != nil {
@@ -402,7 +439,7 @@ func TestAutoMergeCommit(t *testing.T) {
 			t.Fatal("父不是祖先")
 		}
 	}
-	if !strings.Contains(ag(t, dir, "log", "-1", "--format=%s", m), "XXYI 自动合并") {
+	if ag(t, dir, "log", "-1", "--format=%s", m) != "XXYI 自动合并 main：mac "+a+" + ubuntu "+b {
 		t.Fatal("提交信息不对")
 	}
 	// 两边分别快进到合并提交
@@ -536,4 +573,161 @@ func TestCheckedOutDuringUpdate(t *testing.T) {
 			t.Fatal("不回退")
 		}
 	})
+}
+
+// 在被检出分支 main 的工作区里，让新提交 c2 写入的路径被未跟踪/忽略项挡住，必须拒绝且原样保留。
+func ignoreRepo(t *testing.T) string {
+	dir := newRepo(t)
+	os.WriteFile(filepath.Join(dir, ".gitignore"), []byte("*.log\n"), 0o644)
+	ag(t, dir, "add", ".gitignore")
+	ag(t, dir, "commit", "-q", "-m", "ignore")
+	return dir
+}
+
+func TestFastForwardOverwriteGuards(t *testing.T) {
+	ctx := context.Background()
+	t.Run("重命名目标是被忽略的本地文件", func(t *testing.T) {
+		dir := ignoreRepo(t)
+		c1 := commitFile(t, dir, "old.txt", "tracked\n")
+		ag(t, dir, "checkout", "-q", "-b", "feat")
+		ag(t, dir, "mv", "old.txt", "new.log")
+		ag(t, dir, "commit", "-q", "-m", "rename")
+		c2 := rev(t, dir, "HEAD")
+		ag(t, dir, "checkout", "-q", "main")
+		os.WriteFile(filepath.Join(dir, "new.log"), []byte("local only\n"), 0o644)
+		before := snapshot(t, dir)
+		wantRefuse(t, FastForwardBranch(ctx, ffPlan(dir, "main", c1, c2)))
+		if snapshot(t, dir) != before {
+			t.Fatal("现场变了")
+		}
+	})
+	t.Run("目录变文件且目录里有被忽略文件", func(t *testing.T) {
+		dir := ignoreRepo(t)
+		c1 := commitFile(t, dir, "a/x.txt", "x\n")
+		ag(t, dir, "checkout", "-q", "-b", "feat")
+		ag(t, dir, "rm", "-q", "-r", "a")
+		os.WriteFile(filepath.Join(dir, "a"), []byte("now file\n"), 0o644)
+		ag(t, dir, "add", "a")
+		ag(t, dir, "commit", "-q", "-m", "dir->file")
+		c2 := rev(t, dir, "HEAD")
+		ag(t, dir, "checkout", "-q", "main")
+		os.WriteFile(filepath.Join(dir, "a", "junk.log"), []byte("keep me\n"), 0o644)
+		before := snapshot(t, dir)
+		wantRefuse(t, FastForwardBranch(ctx, ffPlan(dir, "main", c1, c2)))
+		if snapshot(t, dir) != before {
+			t.Fatal("现场变了")
+		}
+	})
+	t.Run("父级路径被被忽略文件挡住", func(t *testing.T) {
+		dir := ignoreRepo(t)
+		c1 := rev(t, dir, "HEAD")
+		ag(t, dir, "checkout", "-q", "-b", "feat")
+		commitFile(t, dir, "d.log.dir/e.txt", "e\n")
+		ag(t, dir, "mv", "d.log.dir", "d.log")
+		ag(t, dir, "commit", "-q", "-m", "mv")
+		c2 := rev(t, dir, "HEAD")
+		ag(t, dir, "checkout", "-q", "main")
+		os.WriteFile(filepath.Join(dir, "d.log"), []byte("local file\n"), 0o644)
+		before := snapshot(t, dir)
+		wantRefuse(t, FastForwardBranch(ctx, ffPlan(dir, "main", c1, c2)))
+		if snapshot(t, dir) != before {
+			t.Fatal("现场变了")
+		}
+	})
+	t.Run("文件变目录是合法的", func(t *testing.T) {
+		dir := ignoreRepo(t)
+		c1 := commitFile(t, dir, "a", "file\n")
+		ag(t, dir, "checkout", "-q", "-b", "feat")
+		ag(t, dir, "rm", "-q", "a")
+		c2 := commitFile(t, dir, "a/x.txt", "x\n")
+		ag(t, dir, "checkout", "-q", "main")
+		if err := FastForwardBranch(ctx, ffPlan(dir, "main", c1, c2)); err != nil {
+			t.Fatal(err)
+		}
+		if b, err := os.ReadFile(filepath.Join(dir, "a", "x.txt")); err != nil || string(b) != "x\n" {
+			t.Fatal("文件变目录没生效")
+		}
+	})
+}
+
+func TestSymbolicRefRefused(t *testing.T) {
+	ctx := context.Background()
+	dir, c1, c2 := ffRepo(t)
+	ag(t, dir, "symbolic-ref", "refs/heads/alias", "refs/heads/main")
+	before := snapshot(t, dir)
+	wantRefuse(t, FastForwardBranch(ctx, ffPlan(dir, "alias", c1, c2)))
+	if snapshot(t, dir) != before || rev(t, dir, "refs/heads/main") != c1 {
+		t.Fatal("main 或工作区被改")
+	}
+	// 悬空符号引用不能被创建覆盖
+	ag(t, dir, "symbolic-ref", "refs/heads/dang", "refs/heads/nowhere")
+	before = snapshot(t, dir)
+	wantRefuse(t, CreateBranch(ctx, ApplyPlan{RepoDir: dir, Branch: "dang", NewOID: c2, Kind: KindCreateOnOther}))
+	if snapshot(t, dir) != before {
+		t.Fatal("现场变了")
+	}
+	if _, ex, _ := readRef(ctx, dir, nil, "refs/heads/nowhere"); ex {
+		t.Fatal("符号引用被解引用创建")
+	}
+}
+
+func TestNoAutostash(t *testing.T) {
+	ctx := context.Background()
+	dir, c1, c2 := ffRepo(t)
+	ag(t, dir, "config", "merge.autostash", "true")
+	var after string
+	applyTestHook = func(stage string) {
+		if stage == "beforeMerge" {
+			os.WriteFile(filepath.Join(dir, "README.md"), []byte("edited in race\n"), 0o644)
+			after = snapshot(t, dir)
+		}
+	}
+	defer func() { applyTestHook = nil }()
+	wantRefuse(t, FastForwardBranch(ctx, ffPlan(dir, "main", c1, c2)))
+	if snapshot(t, dir) != after || ag(t, dir, "stash", "list") != "" {
+		t.Fatal("现场变了或出现 stash")
+	}
+}
+
+func TestBusyOtherWorktreeBlocksWrites(t *testing.T) {
+	ctx := context.Background()
+	dir, c1, c2 := ffRepo(t)
+	ag(t, dir, "checkout", "-q", "--detach")
+	wt := filepath.Join(t.TempDir(), "wtA")
+	ag(t, dir, "worktree", "add", "-q", "--detach", wt)
+	gd := ag(t, wt, "rev-parse", "--absolute-git-dir")
+	os.WriteFile(filepath.Join(gd, "MERGE_HEAD"), []byte(c2+"\n"), 0o644)
+	sd, sw := snapshot(t, dir), snapshot(t, wt)
+	wantRefuse(t, FastForwardBranch(ctx, ffPlan(dir, "main", c1, c2)))
+	wantRefuse(t, CreateBranch(ctx, ApplyPlan{RepoDir: dir, Branch: "nb", NewOID: c2, Kind: KindCreateOnOther}))
+	if snapshot(t, dir) != sd || snapshot(t, wt) != sw {
+		t.Fatal("现场变了")
+	}
+}
+
+func TestWorktreePathDecoding(t *testing.T) {
+	ctx := context.Background()
+	dir, c1, c2 := ffRepo(t)
+	ag(t, dir, "branch", "lw", c1)
+	wt := filepath.Join(t.TempDir(), "工作 区 \"q\" 'x'")
+	ag(t, dir, "worktree", "add", "-q", wt, "lw")
+	wts, err := listWorktrees(ctx, dir, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := checkedOutBy(wts, "lw")
+	if len(h) != 1 {
+		t.Fatalf("未识别: %+v", wts)
+	}
+	want, _ := filepath.EvalSymlinks(wt)
+	got, _ := filepath.EvalSymlinks(h[0].Path)
+	if got != want {
+		t.Fatalf("路径被改写: %q != %q", got, want)
+	}
+	if err := FastForwardBranch(ctx, ffPlan(dir, "lw", c1, c2)); err != nil {
+		t.Fatal(err)
+	}
+	if rev(t, wt, "HEAD") != c2 {
+		t.Fatal("没快进")
+	}
 }

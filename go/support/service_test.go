@@ -219,7 +219,7 @@ const hookBody = `{"session_id":"sess-9","hook_event_name":"PermissionRequest","
 func TestStartValidationAndPublish(t *testing.T) {
 	s, fr := newTestService(t, Config{})
 
-	for _, bad := range []int{0, MaxMinutes + 1, -1} {
+	for _, bad := range []int{MaxMinutes + 1, -1} {
 		if err := s.Start(bad); err == nil {
 			t.Fatalf("Start(%d) 应报错", bad)
 		}
@@ -753,8 +753,8 @@ func TestLocalSupportStatusAndLogFile(t *testing.T) {
 	if code, _ := remoteDo(t, http.MethodPost, lsrv.URL+"/support/start", "", nil); code != 400 {
 		t.Fatalf("缺 minutes 应 400，得 %d", code)
 	}
-	if code, _ := remoteDo(t, http.MethodPost, lsrv.URL+"/support/start?minutes=0", "", nil); code != 400 {
-		t.Fatalf("minutes=0 应 400，得 %d", code)
+	if code, _ := remoteDo(t, http.MethodPost, lsrv.URL+"/support/start?minutes=-1", "", nil); code != 400 {
+		t.Fatalf("minutes=-1 应 400，得 %d", code)
 	}
 
 	code, body := remoteDo(t, http.MethodPost, lsrv.URL+"/support/start?minutes=5", "", nil)
@@ -1533,5 +1533,87 @@ func TestStartPrepare(t *testing.T) {
 	}
 	if calls != 3 {
 		t.Fatalf("停止后再开启应再调用 Prepare，实际 %d 次", calls)
+	}
+}
+
+// ---------- 不限时（minutes==0） ----------
+
+func TestStartUnlimited(t *testing.T) {
+	s, fr := newTestService(t, Config{})
+	if err := s.Start(0); err != nil {
+		t.Fatalf("Start(0): %v", err)
+	}
+	st := s.Status()
+	if !st.Active || st.Until != 0 {
+		t.Fatalf("不限时应 Active 且 Until==0: %+v", st)
+	}
+	s.mu.Lock()
+	timer, until := s.timer, s.until
+	s.mu.Unlock()
+	if timer != nil || !until.IsZero() {
+		t.Fatalf("不限时不应有计时器/截止时间: timer=%v until=%v", timer, until)
+	}
+	if got := fr.publishRec(0).until; got != 0 {
+		t.Fatalf("Publish 的 until 应为 0，得 %d", got)
+	}
+}
+
+func TestStartLimitedToUnlimitedAndBack(t *testing.T) {
+	s, fr := newTestService(t, Config{})
+	if err := s.Start(30); err != nil {
+		t.Fatal(err)
+	}
+	s.mu.Lock()
+	hadTimer := s.timer != nil
+	s.mu.Unlock()
+	if !hadTimer {
+		t.Fatal("限时应有计时器")
+	}
+	if err := s.Start(0); err != nil {
+		t.Fatal(err)
+	}
+	s.mu.Lock()
+	timer := s.timer
+	s.mu.Unlock()
+	if timer != nil || s.Status().Until != 0 || !s.Status().Active {
+		t.Fatalf("改不限时后应无计时器、Until==0: %+v", s.Status())
+	}
+	if got := fr.lastPublish().until; got != 0 {
+		t.Fatalf("改不限时后 Publish until 应为 0，得 %d", got)
+	}
+	if err := s.Start(10); err != nil {
+		t.Fatal(err)
+	}
+	s.mu.Lock()
+	timer = s.timer
+	s.mu.Unlock()
+	st := s.Status()
+	if timer == nil || st.Until < time.Now().Unix()+9*60 {
+		t.Fatalf("从不限时改回限时应重建计时器并设 Until: %+v", st)
+	}
+	if fr.lastPublish().until != st.Until {
+		t.Fatalf("Publish until=%d 应等于 Status.Until=%d", fr.lastPublish().until, st.Until)
+	}
+}
+
+func TestReconnectUnlimitedPublishesZero(t *testing.T) {
+	old := reconnectDelay
+	reconnectDelay = 20 * time.Millisecond
+	t.Cleanup(func() { reconnectDelay = old })
+
+	s, fr := newTestService(t, Config{})
+	if err := s.Start(0); err != nil {
+		t.Fatal(err)
+	}
+	fr.closeLast()
+	deadline := time.Now().Add(5 * time.Second)
+	for fr.publishCount() < 2 {
+		if time.Now().After(deadline) {
+			t.Fatal("没有重连")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := fr.lastPublish().until; got != 0 {
+		t.Fatalf("重连 Publish 的 until 应为 0，得 %d", got)
 	}
 }

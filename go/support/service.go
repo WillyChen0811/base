@@ -58,7 +58,7 @@ type Config struct {
 // Status 是协助服务的状态快照。
 type Status struct {
 	Active     bool        `json:"active"`
-	Until      int64       `json:"until"`       // Unix 秒，未开为 0
+	Until      int64       `json:"until"`       // Unix 秒，未开或不限时为 0
 	RemoteAddr string      `json:"remote_addr"` // 远端监听地址，未开或暂时断开为空
 	Claude     RunnerState `json:"claude"`
 	Pending    []Request   `json:"pending"`  // 永远不是 null
@@ -265,14 +265,24 @@ func bindSession(parent context.Context, sess *session) (context.Context, contex
 	return ctx, func() { stop(); cancel() }
 }
 
-// MaxMinutes 是一次协助的最长时长（分钟）。
+// MaxMinutes 是一次限时协助的最长时长（分钟）。0 表示不限时，不受此上限约束。
 const MaxMinutes = 600
 
-// Start 开启协助。minutes 限 1..MaxMinutes；已在协助中则把截止时间改成「现在+minutes」，
-// 保持原远端令牌。Open 或 Publish 失败时关掉已开的东西并保持未开启。
+// untilUnix 把截止时间换成发给远端的 Unix 秒；零值（不限时）必须是 0，
+// 因为零值 time 的 Unix() 是一个很大的负数，不是 0。
+func untilUnix(t time.Time) int64 {
+	if t.IsZero() {
+		return 0
+	}
+	return t.Unix()
+}
+
+// Start 开启协助。minutes 取 0..MaxMinutes，0 表示不限时（不建到期计时器，until 为零值，
+// 发给远端的截止时间为 0）。已在协助中则改截止时间：minutes>0 改成「现在+minutes」（可从不限时改回限时），
+// minutes==0 改成不限时；都保持原远端令牌。Open 或 Publish 失败时关掉已开的东西并保持未开启。
 func (s *Service) Start(minutes int) error {
-	if minutes < 1 || minutes > MaxMinutes {
-		return fmt.Errorf("support: 时长必须 1..%d 分钟，实际 %d", MaxMinutes, minutes)
+	if minutes < 0 || minutes > MaxMinutes {
+		return fmt.Errorf("support: 时长必须 0..%d 分钟（0=不限时），实际 %d", MaxMinutes, minutes)
 	}
 	s.opMu.Lock()
 	defer s.opMu.Unlock()
@@ -280,17 +290,28 @@ func (s *Service) Start(minutes int) error {
 
 	s.mu.Lock()
 	if s.active {
-		s.until = time.Now().Add(dur)
-		if s.timer != nil {
-			s.timer.Reset(time.Until(s.until))
+		sess := s.sess
+		if minutes == 0 {
+			s.until = time.Time{}
+			if s.timer != nil {
+				s.timer.Stop()
+				s.timer = nil
+			}
+		} else {
+			s.until = time.Now().Add(dur)
+			if s.timer != nil {
+				s.timer.Reset(time.Until(s.until))
+			} else {
+				s.timer = time.AfterFunc(time.Until(s.until), func() { s.stop("到时自动结束", sess) })
+			}
 		}
-		addr, sess, until := s.remoteAddr, s.sess, s.until
+		addr, until := s.remoteAddr, s.until
 		s.mu.Unlock()
-		s.logEvent("start", map[string]string{"minutes": strconv.Itoa(minutes), "reason": "延长时长", "addr": addr})
+		s.logEvent("start", map[string]string{"minutes": strconv.Itoa(minutes), "reason": "改时长", "addr": addr})
 		// 把新的截止时间写到远端；失败只记日志（远端文件里的旧时间只会让 macsup 更早提示过期）
 		if addr != "" && sess != nil {
 			ctx, cancel := sess.opCtx(remoteOpWait)
-			err := s.remote.Publish(ctx, addr, sess.token, until.Unix())
+			err := s.remote.Publish(ctx, addr, sess.token, untilUnix(until))
 			cancel()
 			if err != nil {
 				s.logEvent("remote", map[string]string{"event": "republish_failed", "error": err.Error()})
@@ -317,9 +338,12 @@ func (s *Service) Start(minutes int) error {
 		return fmt.Errorf("support: 开远端监听失败: %w", err)
 	}
 	addr := ln.Addr().String()
-	until := time.Now().Add(dur)
+	var until time.Time // 零值 = 不限时
+	if minutes > 0 {
+		until = time.Now().Add(dur)
+	}
 	ctx2, cancel2 := sess.opCtx(remoteOpWait)
-	err = s.remote.Publish(ctx2, addr, sess.token, until.Unix())
+	err = s.remote.Publish(ctx2, addr, sess.token, untilUnix(until))
 	cancel2()
 	if err != nil {
 		_ = ln.Close()
@@ -339,7 +363,9 @@ func (s *Service) Start(minutes int) error {
 	s.remoteAddr = addr
 	s.srv = srv
 	s.ln = ln
-	s.timer = time.AfterFunc(time.Until(s.until), func() { s.stop("到时自动结束", sess) })
+	if minutes > 0 {
+		s.timer = time.AfterFunc(time.Until(s.until), func() { s.stop("到时自动结束", sess) })
+	}
 	sess.wg.Add(3) // serveLoop + msgPumpLoop + msgTimersLoop；在 opMu 内、Stop 不可能同时进行，Add 安全
 	s.mu.Unlock()
 
@@ -368,7 +394,7 @@ func (s *Service) stop(reason string, expired *session) {
 		s.mu.Unlock()
 		return
 	}
-	if expired != nil && (s.sess != expired || time.Now().Before(s.until)) {
+	if expired != nil && (s.sess != expired || s.until.IsZero() || time.Now().Before(s.until)) {
 		s.mu.Unlock()
 		return
 	}
@@ -444,7 +470,7 @@ func (s *Service) Status() Status {
 		Projects:   sortedStrings(s.cfg.ProjSyncNames),
 	}
 	if active {
-		st.Until = until.Unix()
+		st.Until = untilUnix(until)
 	}
 	return st
 }
@@ -511,7 +537,7 @@ func (s *Service) reconnectLoop(sess *session) (net.Listener, *http.Server) {
 		until := s.until
 		s.mu.Unlock()
 		ctx2, cancel2 := sess.opCtx(remoteOpWait)
-		err = s.remote.Publish(ctx2, addr, sess.token, until.Unix())
+		err = s.remote.Publish(ctx2, addr, sess.token, untilUnix(until))
 		cancel2()
 		if err != nil {
 			_ = ln.Close()
@@ -854,8 +880,8 @@ func (s *Service) LocalHandler() http.Handler {
 	}))
 	mux.HandleFunc("/support/start", only(http.MethodPost, func(w http.ResponseWriter, r *http.Request) {
 		minutes, err := strconv.Atoi(r.URL.Query().Get("minutes"))
-		if err != nil || minutes < 1 || minutes > MaxMinutes {
-			errJSON(w, http.StatusBadRequest, fmt.Sprintf("minutes 必须是 1..%d 的整数", MaxMinutes))
+		if err != nil || minutes < 0 || minutes > MaxMinutes {
+			errJSON(w, http.StatusBadRequest, fmt.Sprintf("minutes 必须是 0..%d 的整数（0=不限时）", MaxMinutes))
 			return
 		}
 		if err := s.Start(minutes); err != nil {

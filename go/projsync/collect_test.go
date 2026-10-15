@@ -542,3 +542,34 @@ func TestHistoryAlteringOutOfScope(t *testing.T) {
 		t.Fatalf("普通仓库不应超出: %v", err)
 	}
 }
+
+// 布尔配置由 Git 规范化：yes/1/TRUE/on 都算真；无法解析判超出；假值不因此超出。
+func TestBoolConfigNormalized(t *testing.T) {
+	ctx := context.Background()
+	check := func(key, val string) error {
+		dir := newRepo(t)
+		ag(t, dir, "config", key, val)
+		return CheckScope(ctx, dir, nil, []string{"main"})
+	}
+	for _, v := range []string{"yes", "1", "TRUE", "on"} {
+		if err := check("remote.origin.promisor", v); err == nil || !strings.Contains(err.Error(), "部分克隆") {
+			t.Fatalf("promisor=%s 应判超出: %v", v, err)
+		}
+	}
+	if err := check("core.sparseCheckout", "yes"); err == nil || !strings.Contains(err.Error(), "sparse-checkout") {
+		t.Fatalf("sparseCheckout=yes 应判超出: %v", err)
+	}
+	for _, v := range []string{"false", "0", "no"} {
+		if err := check("core.sparseCheckout", v); err != nil {
+			t.Fatalf("sparseCheckout=%s 不应超出: %v", v, err)
+		}
+		if err := check("remote.origin.promisor", v); err != nil {
+			t.Fatalf("promisor=%s 不应超出: %v", v, err)
+		}
+	}
+	for _, k := range []string{"core.sparseCheckout", "remote.origin.promisor"} {
+		if err := check(k, "maybe"); err == nil {
+			t.Fatalf("%s=maybe 无法解析应判超出", k)
+		}
+	}
+}

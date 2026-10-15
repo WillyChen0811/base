@@ -564,12 +564,22 @@ func checkHistoryAltering(ctx context.Context, repoDir string, env []string, add
 	} else if strings.TrimSuffix(string(out), "\n") != "false" {
 		add("仓库是浅克隆")
 	}
-	if out, code, err := runGitCode(ctx, repoDir, env, "config", "--get-regexp", `^remote\..*\.promisor$`); err != nil {
+	// 布尔配置一律 --type=bool 读，由 Git 规范化 yes/1/on/TRUE 等为 true/false；
+	// 值无法解析时 git 报错（非 1 退出码）=> 判超出；键不存在（退出码 1）视为 false。--null：记录 "键\n值\0"。
+	if out, code, err := runGitCode(ctx, repoDir, env, "config", "--type=bool", "--null", "--get-regexp", `^remote\..*\.promisor$`); err != nil {
 		if code != 1 {
-			add("读取 promisor 配置失败: %v", err)
+			add("读取 promisor 配置失败（值可能无法解析）: %v", err)
 		}
-	} else if strings.Contains(string(out), "true") {
-		add("仓库是部分克隆（remote.*.promisor）")
+	} else {
+		for _, rec := range strings.Split(string(out), "\x00") {
+			if rec == "" {
+				continue
+			}
+			k, v, _ := strings.Cut(rec, "\n")
+			if v == "true" {
+				add("仓库是部分克隆（%s）", k)
+			}
+		}
 	}
 	if _, code, err := runGitCode(ctx, repoDir, env, "config", "--get", "extensions.partialclone"); err == nil {
 		add("仓库是部分克隆（extensions.partialclone）")

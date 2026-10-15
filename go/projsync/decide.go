@@ -1,7 +1,11 @@
 // 分工：DecideWorktrees 按工作区判定「要不要派 agent 提交未提交改动」，与分支要不要更新无关；
-// DecideBranches 判定每个分支的更新动作。执行器每轮先用 DecideWorktrees 派提交任务，
-// 再用 DecideBranches 决定分支动作。同一个 dirty 工作区可能在两个函数里都出现
-// （分支被挡住 + 需要提交），执行器应按工作区（Side+Path）去重派活。
+// DecideBranches 判定每个分支的更新动作，但不负责派提交：被 dirty 挡住时只返回
+// KindWaitDirty（静止不足）或 KindBlockedDirty（已静止够，等工作区判定派活）；
+// KindNeedCommit 只由 DecideWorktrees 产生。
+//
+// 提交派活统一以 WorktreeAction 为入口（执行器按 设备+仓库+规范化路径 去重，并跟踪在途任务）。
+// 派活后相关事实全部失效，执行器必须重新采集后再执行分支动作。
+// BranchAction 不是完整执行凭据：执行上下文要另外带两边旧 OID、目标 OID、工作区映射、事实版本。
 package projsync
 
 import (
@@ -33,7 +37,9 @@ const (
 	KindAutoMerge     ActionKind = "auto_merge"      // 分叉且可干净合并，生成合并提交后两边都更新
 	KindConflict      ActionKind = "conflict"        // 分叉且有冲突，交用户手动处理，不更新任何一边
 	KindWaitDirty     ActionKind = "wait_dirty"      // 需更新的一边工作区 dirty 且静止不足，本轮不更新
-	KindNeedCommit    ActionKind = "need_commit"     // 同上但已静止足够，交该设备的 agent 提交
+	KindBlockedDirty  ActionKind = "blocked_dirty"   // 同上但已静止足够：等工作区判定派提交，本轮分支不更新
+	KindNeedCommit    ActionKind = "need_commit"     // 仅由 DecideWorktrees 产生：交该设备的 agent 提交
+	KindInvalidFacts  ActionKind = "invalid_facts"   // 事实矛盾或不安全，不更新任何一边，需重新采集
 	KindSkipRepoBusy  ActionKind = "skip_repo_busy"  // 仓库正在 rebase/merge 等，整个项目本轮跳过
 )
 
@@ -42,7 +48,8 @@ type BranchFacts struct {
 	Name string
 	// 两边该分支的提交哈希；空串表示这一边没有该分支。
 	Mac, Ubuntu string
-	// 两边都存在且不同时才有意义。
+	// 仅当两边都存在且哈希不同时才有意义；两边相同或有一边为空时被忽略。
+	// 两个标志同时为 true 且哈希不同是矛盾输入，判 KindInvalidFacts。
 	MacIsAncestorOfUbuntu bool
 	UbuntuIsAncestorOfMac bool
 	// 分叉时 git merge-tree --write-tree 试合并是否无冲突；ConflictFiles 为冲突文件。
@@ -128,11 +135,12 @@ func decideOne(repo RepoFacts, b BranchFacts) BranchAction {
 		act.Kind = KindNothing
 		act.Reason = "两边相同"
 	case b.Ubuntu == "":
-		act.Kind, act.Target, act.Sides = KindCreateOnOther, b.Mac, []Side{SideUbuntu}
-		act.Reason = "只有 Mac 有该分支，在 Ubuntu 建同名分支"
+		return createOnOther(act, b.Mac, SideUbuntu, b.UbuntuCheckedOut)
 	case b.Mac == "":
-		act.Kind, act.Target, act.Sides = KindCreateOnOther, b.Ubuntu, []Side{SideMac}
-		act.Reason = "只有 Ubuntu 有该分支，在 Mac 建同名分支"
+		return createOnOther(act, b.Ubuntu, SideMac, b.MacCheckedOut)
+	case b.MacIsAncestorOfUbuntu && b.UbuntuIsAncestorOfMac:
+		act.Kind = KindInvalidFacts
+		act.Reason = "事实矛盾（两边提交不同却互为祖先），需重新采集，不更新任何一边"
 	case b.MacIsAncestorOfUbuntu:
 		// Mac 落后，更新 Mac。
 		return gateDirty(act, KindFastForward, b.Ubuntu, []Side{SideMac}, b,
@@ -155,25 +163,42 @@ func decideOne(repo RepoFacts, b BranchFacts) BranchAction {
 	return act
 }
 
+// createOnOther 在 target 侧建同名分支。只允许创建「未被任何工作区 HEAD 指向」的引用：
+// 目标侧若有工作区检出该名字（HEAD 指向不存在的分支，如 unborn 或引用被外部删除），
+// 创建引用会悄悄改变那个工作区的状态，因此拒绝。执行器只建引用，不碰文件/索引/HEAD。
+func createOnOther(act BranchAction, commit string, target Side, targetCheckedOut bool) BranchAction {
+	if targetCheckedOut {
+		act.Kind = KindInvalidFacts
+		act.Reason = fmt.Sprintf("%s侧有工作区指向不存在的分支，需重新采集并人工确认，不创建", sideNames([]Side{target}))
+		return act
+	}
+	act.Kind, act.Target, act.Sides = KindCreateOnOther, commit, []Side{target}
+	act.Reason = fmt.Sprintf("只有%s有该分支，在%s建同名分支", sideNames([]Side{otherSide(target)}), sideNames([]Side{target}))
+	return act
+}
+
+func otherSide(s Side) Side {
+	if s == SideMac {
+		return SideUbuntu
+	}
+	return SideMac
+}
+
 // gateDirty 检查要更新的各边是否因被检出且 dirty 而不能更新。
 func gateDirty(act BranchAction, kind ActionKind, target string, update []Side, b BranchFacts, okReason string) BranchAction {
 	var blocked []Side
-	maxWait := 0
-	allQuiet := true
-	for _, s := range update {
+	var waits []string
+	for _, side := range update {
 		dirty, quiet, co := b.MacDirty, b.MacQuietMinutes, b.MacCheckedOut
-		if s == SideUbuntu {
+		if side == SideUbuntu {
 			dirty, quiet, co = b.UbuntuDirty, b.UbuntuQuietMinutes, b.UbuntuCheckedOut
 		}
 		if !co || !dirty {
 			continue
 		}
-		blocked = append(blocked, s)
+		blocked = append(blocked, side)
 		if quiet < QuietMinutesForAutoCommit {
-			allQuiet = false
-			if w := QuietMinutesForAutoCommit - quiet; w > maxWait {
-				maxWait = w
-			}
+			waits = append(waits, fmt.Sprintf("%s尚需等待约 %d 分钟", sideNames([]Side{side}), QuietMinutesForAutoCommit-quiet))
 		}
 	}
 	if len(blocked) == 0 {
@@ -181,14 +206,13 @@ func gateDirty(act BranchAction, kind ActionKind, target string, update []Side, 
 		return act
 	}
 	act.Sides = blocked
-	if !allQuiet {
+	if len(waits) > 0 {
 		act.Kind = KindWaitDirty
-		act.Reason = fmt.Sprintf("%s工作区有未提交改动且静止不足 %d 分钟，%s，还需等待约 %d 分钟",
-			sideNames(blocked), QuietMinutesForAutoCommit, notUpdatedText(kind), maxWait)
+		act.Reason = fmt.Sprintf("%s有未提交改动；%s，%s", sideNames(blocked), strings.Join(waits, "；"), notUpdatedText(kind))
 		return act
 	}
-	act.Kind = KindNeedCommit
-	act.Reason = fmt.Sprintf("%s工作区有未提交改动且已静止 ≥%d 分钟，%s，请该设备上指定的 agent 在仓库中提交",
+	act.Kind = KindBlockedDirty
+	act.Reason = fmt.Sprintf("%s有未提交改动且已静止 ≥%d 分钟；等待该设备提交未提交改动（由工作区判定派活），%s",
 		sideNames(blocked), QuietMinutesForAutoCommit, notUpdatedText(kind))
 	return act
 }
@@ -207,9 +231,9 @@ func sideNames(ss []Side) string {
 
 func notUpdatedText(kind ActionKind) string {
 	if kind == KindAutoMerge {
-		return "本轮不更新（两边都不动）"
+		return "本分支两边暂不更新"
 	}
-	return "本轮不更新该分支"
+	return "本分支暂不更新"
 }
 
 // WorktreeFacts 是某台设备上一个工作区的事实（一个仓库在一台设备上可有多个工作区）。

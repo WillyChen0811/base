@@ -31,7 +31,7 @@ func TestDecideSame(t *testing.T) {
 }
 
 func TestDecideOnlyMac(t *testing.T) {
-	a := one(t, RepoFacts{}, BranchFacts{Name: "x", Mac: "aaa", UbuntuCheckedOut: true, UbuntuDirty: true})
+	a := one(t, RepoFacts{}, BranchFacts{Name: "x", Mac: "aaa", MacCheckedOut: true, MacDirty: true})
 	wantKind(t, a, KindCreateOnOther)
 	if a.Target != "aaa" || !reflect.DeepEqual(a.Sides, []Side{SideUbuntu}) {
 		t.Fatalf("%+v", a)
@@ -83,12 +83,12 @@ func TestDecideWaitDirty(t *testing.T) {
 	}
 }
 
-func TestDecideNeedCommit(t *testing.T) {
+func TestDecideBlockedDirty(t *testing.T) {
 	b := macAhead()
 	b.UbuntuCheckedOut, b.UbuntuDirty, b.UbuntuQuietMinutes = true, true, 25
 	a := one(t, RepoFacts{}, b)
-	wantKind(t, a, KindNeedCommit)
-	if !strings.Contains(a.Reason, "Ubuntu") {
+	wantKind(t, a, KindBlockedDirty)
+	if !strings.Contains(a.Reason, "Ubuntu") || !strings.Contains(a.Reason, "工作区判定派活") {
 		t.Fatalf("reason=%s", a.Reason)
 	}
 }
@@ -97,7 +97,7 @@ func TestDecideQuietBoundary(t *testing.T) {
 	b := macAhead()
 	b.UbuntuCheckedOut, b.UbuntuDirty = true, true
 	b.UbuntuQuietMinutes = QuietMinutesForAutoCommit
-	wantKind(t, one(t, RepoFacts{}, b), KindNeedCommit)
+	wantKind(t, one(t, RepoFacts{}, b), KindBlockedDirty)
 	b.UbuntuQuietMinutes = QuietMinutesForAutoCommit - 1
 	a := one(t, RepoFacts{}, b)
 	wantKind(t, a, KindWaitDirty)
@@ -142,11 +142,11 @@ func TestDecideAutoMergeMacDirty(t *testing.T) {
 	if a.Target != "" || !reflect.DeepEqual(a.Sides, []Side{SideMac}) {
 		t.Fatalf("%+v", a)
 	}
-	if !strings.Contains(a.Reason, "17 分钟") || !strings.Contains(a.Reason, "两边都不动") {
+	if !strings.Contains(a.Reason, "17 分钟") || !strings.Contains(a.Reason, "两边暂不更新") {
 		t.Fatalf("reason=%s", a.Reason)
 	}
 	b.MacQuietMinutes = 30
-	wantKind(t, one(t, RepoFacts{}, b), KindNeedCommit)
+	wantKind(t, one(t, RepoFacts{}, b), KindBlockedDirty)
 }
 
 func TestDecideAutoMergeBothDirtyMixed(t *testing.T) {
@@ -275,7 +275,136 @@ func TestWorktreeSorted(t *testing.T) {
 func TestGateDirtyReasonByKind(t *testing.T) {
 	b := macAhead()
 	b.UbuntuCheckedOut, b.UbuntuDirty, b.UbuntuQuietMinutes = true, true, 5
-	if a := one(t, RepoFacts{}, b); strings.Contains(a.Reason, "两边都不动") {
+	if a := one(t, RepoFacts{}, b); strings.Contains(a.Reason, "两边暂不更新") {
 		t.Fatalf("FastForward reason wrong: %s", a.Reason)
+	}
+}
+
+func TestDecideBothEmpty(t *testing.T) {
+	wantKind(t, one(t, RepoFacts{}, BranchFacts{Name: "x"}), KindNothing)
+}
+
+func TestDecideCreateTargetCheckedOut(t *testing.T) {
+	for _, dirty := range []bool{false, true} {
+		a := one(t, RepoFacts{}, BranchFacts{Name: "x", Mac: "a", UbuntuCheckedOut: true, UbuntuDirty: dirty, UbuntuQuietMinutes: 99})
+		wantKind(t, a, KindInvalidFacts)
+		if a.Target != "" || len(a.Sides) != 0 || !strings.Contains(a.Reason, "工作区指向不存在的分支") {
+			t.Fatalf("%+v", a)
+		}
+		a = one(t, RepoFacts{}, BranchFacts{Name: "x", Ubuntu: "a", MacCheckedOut: true, MacDirty: dirty})
+		wantKind(t, a, KindInvalidFacts)
+	}
+	// 来源侧被检出不影响
+	wantKind(t, one(t, RepoFacts{}, BranchFacts{Name: "x", Mac: "a", MacCheckedOut: true, MacDirty: true}), KindCreateOnOther)
+}
+
+func TestDecideContradictoryAncestors(t *testing.T) {
+	a := one(t, RepoFacts{}, BranchFacts{Name: "x", Mac: "a", Ubuntu: "b", MacIsAncestorOfUbuntu: true, UbuntuIsAncestorOfMac: true, MergeClean: true})
+	wantKind(t, a, KindInvalidFacts)
+	if len(a.Sides) != 0 || a.Target != "" || !strings.Contains(a.Reason, "事实矛盾") {
+		t.Fatalf("%+v", a)
+	}
+}
+
+func TestDecideAncestorFlagsIgnored(t *testing.T) {
+	wantKind(t, one(t, RepoFacts{}, BranchFacts{Name: "x", Mac: "a", Ubuntu: "a", MacIsAncestorOfUbuntu: true, UbuntuIsAncestorOfMac: true}), KindNothing)
+	a := one(t, RepoFacts{}, BranchFacts{Name: "x", Mac: "a", MacIsAncestorOfUbuntu: true, UbuntuIsAncestorOfMac: true})
+	wantKind(t, a, KindCreateOnOther)
+	a = one(t, RepoFacts{}, BranchFacts{Name: "x", Ubuntu: "a", MacIsAncestorOfUbuntu: true, UbuntuIsAncestorOfMac: true})
+	wantKind(t, a, KindCreateOnOther)
+}
+
+func TestDecideAutoMergeBothDirtyMatrix(t *testing.T) {
+	cases := []struct {
+		mac, ub  int
+		kind     ActionKind
+		contains []string
+	}{
+		{3, 10, KindWaitDirty, []string{"Mac、Ubuntu有未提交改动", "Mac尚需等待约 17 分钟", "Ubuntu尚需等待约 10 分钟"}},
+		{20, 30, KindBlockedDirty, []string{"工作区判定派活"}},
+		{30, 10, KindWaitDirty, []string{"Ubuntu尚需等待约 10 分钟", "两边暂不更新"}},
+	}
+	for _, c := range cases {
+		b := diverged()
+		b.MacCheckedOut, b.MacDirty, b.MacQuietMinutes = true, true, c.mac
+		b.UbuntuCheckedOut, b.UbuntuDirty, b.UbuntuQuietMinutes = true, true, c.ub
+		a := one(t, RepoFacts{}, b)
+		wantKind(t, a, c.kind)
+		if a.Target != "" || !reflect.DeepEqual(a.Sides, []Side{SideMac, SideUbuntu}) {
+			t.Fatalf("%+v", a)
+		}
+		for _, s := range c.contains {
+			if !strings.Contains(a.Reason, s) {
+				t.Fatalf("reason missing %q: %s", s, a.Reason)
+			}
+		}
+	}
+	// 30/10 时 Mac 已满，不应出现在等待里
+	b := diverged()
+	b.MacCheckedOut, b.MacDirty, b.MacQuietMinutes = true, true, 30
+	b.UbuntuCheckedOut, b.UbuntuDirty, b.UbuntuQuietMinutes = true, true, 10
+	if strings.Contains(one(t, RepoFacts{}, b).Reason, "Mac尚需") {
+		t.Fatal("Mac should not wait")
+	}
+}
+
+func TestDecideAutoMergeOnlyUbuntuDirty(t *testing.T) {
+	b := diverged()
+	b.UbuntuCheckedOut, b.UbuntuDirty, b.UbuntuQuietMinutes = true, true, 5
+	a := one(t, RepoFacts{}, b)
+	wantKind(t, a, KindWaitDirty)
+	if !reflect.DeepEqual(a.Sides, []Side{SideUbuntu}) || a.Target != "" {
+		t.Fatalf("%+v", a)
+	}
+}
+
+func TestDecideAutoMergeOneSideCheckedOutClean(t *testing.T) {
+	b := diverged()
+	b.MacCheckedOut = true
+	wantKind(t, one(t, RepoFacts{}, b), KindAutoMerge)
+}
+
+func TestDecideConflictNoFileList(t *testing.T) {
+	a := one(t, RepoFacts{}, BranchFacts{Name: "d", Mac: "m", Ubuntu: "u"})
+	wantKind(t, a, KindConflict)
+	if !strings.Contains(a.Reason, "未取得冲突文件列表") {
+		t.Fatal(a.Reason)
+	}
+}
+
+func TestDecideBothBusyNoReason(t *testing.T) {
+	a := one(t, RepoFacts{MacBusy: true, UbuntuBusy: true}, macAhead())
+	wantKind(t, a, KindSkipRepoBusy)
+	if strings.Count(a.Reason, "原因未知") != 2 {
+		t.Fatal(a.Reason)
+	}
+}
+
+func TestDecideEmptyInputs(t *testing.T) {
+	if r := DecideBranches(RepoFacts{}, nil); r == nil || len(r) != 0 {
+		t.Fatalf("%#v", r)
+	}
+	if r := DecideBranches(RepoFacts{}, []BranchFacts{}); len(r) != 0 {
+		t.Fatal(r)
+	}
+	if r := DecideWorktrees(RepoFacts{}, nil); r == nil || len(r) != 0 {
+		t.Fatalf("%#v", r)
+	}
+}
+
+func TestWorktreeSameSideMultipleNoCrosstalk(t *testing.T) {
+	r := DecideWorktrees(RepoFacts{}, []WorktreeFacts{
+		{Side: SideMac, Path: "/w2", Branch: "b2", Dirty: true, QuietMinutes: 30},
+		{Side: SideMac, Path: "/w1", Branch: "b1", Dirty: true, QuietMinutes: 5},
+		{Side: SideMac, Path: "/w3", Branch: "b3"},
+	})
+	want := []ActionKind{KindWaitDirty, KindNeedCommit, KindNothing}
+	for i, a := range r {
+		if a.Kind != want[i] {
+			t.Fatalf("%d: %+v", i, a)
+		}
+	}
+	if r[0].Path != "/w1" || r[1].Branch != "b2" {
+		t.Fatalf("%+v", r)
 	}
 }

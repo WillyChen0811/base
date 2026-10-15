@@ -55,7 +55,7 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 
 func TestAutostartSuccess(t *testing.T) {
 	f := &fakeStarter{}
-	a := startAutostart(f, time.Hour)
+	a := startAutostart(f, time.Hour, 0)
 	a.Close() // 等 goroutine 退出（成功路径本就会自行退出）
 	if f.nCalls() != 1 || f.calls[0] != 0 {
 		t.Fatalf("应只调一次 Start(0): %v", f.calls)
@@ -64,7 +64,7 @@ func TestAutostartSuccess(t *testing.T) {
 
 func TestAutostartRetryThenSuccess(t *testing.T) {
 	f := &fakeStarter{failN: 2}
-	a := startAutostart(f, 10*time.Millisecond)
+	a := startAutostart(f, 10*time.Millisecond, 0)
 	waitFor(t, "重试后成功", func() bool { return f.Status().Active })
 	a.Close()
 	if n := f.nCalls(); n != 3 {
@@ -74,7 +74,7 @@ func TestAutostartRetryThenSuccess(t *testing.T) {
 
 func TestAutostartManualStopPreventsRetry(t *testing.T) {
 	f := &fakeStarter{failN: 1 << 30}
-	a := startAutostart(f, 20*time.Millisecond)
+	a := startAutostart(f, 20*time.Millisecond, 0)
 	waitFor(t, "至少失败一次", func() bool { return f.nCalls() >= 1 })
 	a.markManual()
 	<-a.done // 下一轮检查到 manual 后自行退出
@@ -88,7 +88,7 @@ func TestAutostartManualStopPreventsRetry(t *testing.T) {
 
 func TestAutostartAlreadyActive(t *testing.T) {
 	f := &fakeStarter{active: true}
-	a := startAutostart(f, 10*time.Millisecond)
+	a := startAutostart(f, 10*time.Millisecond, 0)
 	a.Close()
 	if f.nCalls() != 0 {
 		t.Fatalf("已在协助中不应再 Start: %v", f.calls)
@@ -97,7 +97,7 @@ func TestAutostartAlreadyActive(t *testing.T) {
 
 func TestAutostartCloseStopsGoroutine(t *testing.T) {
 	f := &fakeStarter{failN: 1 << 30}
-	a := startAutostart(f, time.Hour) // 重试间隔很长：只有 Close 能让它退出
+	a := startAutostart(f, time.Hour, 0) // 重试间隔很长：只有 Close 能让它退出
 	waitFor(t, "首次失败", func() bool { return f.nCalls() >= 1 })
 	done := make(chan struct{})
 	go func() { a.Close(); close(done) }()
@@ -161,5 +161,49 @@ func TestAutostartDisabled(t *testing.T) {
 	_, b := get(t, st, "/support", true)
 	if strings.Contains(string(b), `"active":true`) {
 		t.Fatalf("autostart=false 不应自动开: %s", b)
+	}
+}
+
+// autostart_minutes=600：自动开启后 until 约为现在+600 分钟。
+func TestAutostartMinutes(t *testing.T) {
+	old := autostartRetry
+	autostartRetry = 20 * time.Millisecond
+	t.Cleanup(func() { autostartRetry = old })
+	f, _, _ := supportFixture(t, func(s, _ map[string]any) { s["autostart"] = true; s["autostart_minutes"] = 600 })
+	before := time.Now()
+	st, _, _ := run(t, f.dir)
+	var ss struct {
+		Active bool  `json:"active"`
+		Until  int64 `json:"until"`
+	}
+	waitFor(t, "自动开启", func() bool {
+		_, b := get(t, st, "/support", true)
+		return json.Unmarshal(b, &ss) == nil && ss.Active
+	})
+	want := before.Add(600 * time.Minute).Unix()
+	if d := ss.Until - want; d < -5 || d > 30 {
+		t.Fatalf("until=%d，期望约 %d（现在+600 分钟）", ss.Until, want)
+	}
+}
+
+// startAutostart 把 minutes 原样交给 Start。
+func TestAutostartPassesMinutes(t *testing.T) {
+	f := &fakeStarter{}
+	a := startAutostart(f, time.Hour, 600)
+	defer a.Close()
+	waitFor(t, "Start 被调用", func() bool { return f.nCalls() == 1 })
+	if f.calls[0] != 600 {
+		t.Fatalf("Start(%d)，期望 600", f.calls[0])
+	}
+}
+
+// autostart_minutes 超出 0..600 时配置校验失败。
+func TestAutostartMinutesInvalid(t *testing.T) {
+	for _, m := range []int{601, -1} {
+		f, _, _ := supportFixture(t, func(s, _ map[string]any) { s["autostart_minutes"] = m })
+		err := runErr(t, f.dir)
+		if err == nil || !strings.HasPrefix(err.Error(), "hosts.json: support") || !strings.Contains(err.Error(), "autostart_minutes") {
+			t.Errorf("minutes=%d: 应返回 autostart_minutes 配置错误，得到 %v", m, err)
+		}
 	}
 }

@@ -303,7 +303,7 @@ func Run(ctx context.Context, dir string, stdin io.Reader, stdout io.Writer) (er
 		}
 		supportLocal, supportHook = svc.LocalHandler(), svc.HookHandler()
 		if prep.conf.autostartOn() {
-			autostart = startAutostart(svc, autostartRetry)
+			autostart = startAutostart(svc, autostartRetry, prep.conf.AutostartMinutes)
 			closers = append(closers, autostart) // 在 svc.Close 之前关（closers 逆序执行）
 		}
 	}

@@ -18,7 +18,7 @@ type supportStarter interface {
 	Status() support.Status
 }
 
-// autostarter 在后台把协助开成「不限时」：失败（如 Ubuntu 暂时连不上）按间隔重试，
+// autostarter 在后台把协助开成 minutes 分钟（0 不限时）：失败（如 Ubuntu 暂时连不上）按间隔重试，
 // 直到成功、用户手动开/关过、或被 Close。手动操作之后本次运行内不再自动开。
 type autostarter struct {
 	cancel context.CancelFunc
@@ -27,8 +27,8 @@ type autostarter struct {
 	manual atomic.Bool
 }
 
-// startAutostart 起后台 goroutine。retry<=0 时用 autostartRetry。
-func startAutostart(svc supportStarter, retry time.Duration) *autostarter {
+// startAutostart 起后台 goroutine，开启时长 minutes 分钟（0 不限时）。retry<=0 时用 autostartRetry。
+func startAutostart(svc supportStarter, retry time.Duration, minutes int) *autostarter {
 	if retry <= 0 {
 		retry = autostartRetry
 	}
@@ -40,7 +40,7 @@ func startAutostart(svc supportStarter, retry time.Duration) *autostarter {
 			if a.manual.Load() || svc.Status().Active {
 				return
 			}
-			if err := svc.Start(0); err == nil {
+			if err := svc.Start(minutes); err == nil {
 				return
 			}
 			select {

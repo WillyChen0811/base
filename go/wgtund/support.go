@@ -29,7 +29,9 @@ type supportConf struct {
 	ClaudeArgs     []string               `json:"claude_args"`
 	Repos          map[string]supportRepo `json:"repos"`
 	GitTunnel      string                 `json:"git_tunnel"`
-	Autostart      *bool                  `json:"autostart"` // 启动后自动开协助（不限时）；缺省/null 视为 true，false 关闭
+	Autostart      *bool                  `json:"autostart"` // 启动后自动开协助；缺省/null 视为 true，false 关闭
+	// AutostartMinutes 是自动开启的时长（分钟）：0 不限时，1..600 到时自动结束（到时不再重开）
+	AutostartMinutes int `json:"autostart_minutes"`
 }
 
 type supportRepo struct {
@@ -125,6 +127,9 @@ func prepareSupport(c *fileConf, dir string) (*supportPrep, error) {
 	workdir := expand(sc.Workdir)
 	if fi, err := os.Stat(workdir); err != nil || !fi.IsDir() {
 		return nil, bad("的 workdir %q 不存在或不是目录", sc.Workdir)
+	}
+	if sc.AutostartMinutes < 0 || sc.AutostartMinutes > 600 {
+		return nil, bad("的 autostart_minutes %d 不合法（0 不限时，或 1..600 分钟）", sc.AutostartMinutes)
 	}
 	for name, r := range sc.Repos {
 		if r.Dir == "" || r.Remote == "" {

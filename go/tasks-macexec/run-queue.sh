@@ -14,12 +14,14 @@ studio_free(){
   pgrep -f '/\.omlx-agent/omlx-agent ' >/dev/null && return 1
   return 0
 }
-review(){ # $1=id $2=base $3=commit
-  local wt=/tmp/claude-1000/macexec-rev-$1
-  git -C "$REPO" worktree add -q --detach "$wt" "$3" 2>/dev/null || return
-  ( cd "$wt" && env -u TMUX -u TMUX_PANE timeout 1800 codex exec --dangerously-bypass-approvals-and-sandbox \
-      -o "$ST/$1.review.md" "只读评审，不要修改任何文件。评审 git diff $2 $3 这次改动，需求见 go/tasks-macexec/$1.md 与 go/tasks-macexec/CONTRACT.md、go/PLAN-macexec.md。重点：与约定是否一致、安全边界（不得任意命令/写文件、路径逃逸）、并发与超时、资源泄漏、错误处理。按严重程度列出问题（P1/P2/P3），每条给文件:行号、触发场景、建议修法；没有问题就写「无问题」。用中文。" >/dev/null 2>&1 )
-  git -C "$REPO" worktree remove --force "$wt" 2>/dev/null
+review(){ # $1=id $2=base $3=commit；导出到临时目录评审，不建 git 工作区（工作区数量计入同步上限）
+  local d=/tmp/claude-1000/macexec-rev-$1
+  rm -rf "$d"; mkdir -p "$d"
+  git -C "$REPO" archive "$3" | tar -x -C "$d" || { log "$1 导出失败，跳过评审"; return; }
+  git -C "$REPO" diff "$2" "$3" > "$d/REVIEW.diff"
+  ( cd "$d" && env -u TMUX -u TMUX_PANE timeout 1800 codex exec --dangerously-bypass-approvals-and-sandbox \
+      -o "$ST/$1.review.md" "只读评审，不要修改任何文件。当前目录是改动后的代码快照，本次改动的 diff 在 REVIEW.diff。需求见 go/tasks-macexec/$1.md 与 go/tasks-macexec/CONTRACT.md、go/PLAN-macexec.md。重点：与约定是否一致、安全边界（不得任意命令/写文件、路径逃逸）、并发与超时、资源泄漏、错误处理。按严重程度列出问题（P1/P2/P3），每条给文件:行号、触发场景、建议修法；没有问题就写「无问题」。用中文。" >/dev/null 2>&1 )
+  rm -rf "$d"
   log "$1 评审完成：$ST/$1.review.md"
 }
 next_id(){ local i; for i in $(cat "$Q/QUEUE"); do [ -f "$ST/$i.done" ] || { echo "$i"; return 0; }; done; return 1; }
@@ -29,6 +31,14 @@ while id=$(next_id); do
   log "$id 开始（base $base）"
   ~/.omlx-agent/omlx-agent "$REPO" "按 go/tasks-macexec/$id.md 做（先读它，再读 go/tasks-macexec/CONTRACT.md）。不要 git commit。" > "$ST/$id.out" 2>&1
   rc=$?
+  for k in 1 2; do  # 用尽轮数就接着同一会话做，最多两次
+    grep -q 'subtype=error_max_turns' "$ST/$id.out" || break
+    sid=$(grep -o 'session_id=[0-9a-f-]*' "$ST/$id.out" | tail -1 | cut -d= -f2)
+    [ -n "$sid" ] || break
+    log "$id 用尽轮数，第 $k 次接着做"
+    ~/.omlx-agent/omlx-agent --resume "$sid" "$REPO" "接着把 go/tasks-macexec/$id.md 做完。已改的保留；先编译看还差什么。不要 git commit。" > "$ST/$id.out" 2>&1
+    rc=$?
+  done
   if grep -q 'is_error=True' "$ST/$id.out" || [ $rc -ne 0 ]; then log "$id 模型没做完（rc=$rc），停下"; exit 1; fi
   if grep -q "^# .*只读" "$Q/$id.md"; then touch "$ST/$id.done"; log "$id 调研完成：$ST/$id.out"; continue; fi
   ( cd "$REPO/go" && env -u TMUX -u TMUX_PANE go build ./... && env -u TMUX -u TMUX_PANE go vet ./macexec/ ./support/ ./cmd/xxyi-msg/ \

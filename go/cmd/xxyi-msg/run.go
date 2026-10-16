@@ -193,7 +193,11 @@ func (c *client) doLimited(ctx context.Context, method, path string, body []byte
 	if maxBytes > 0 {
 		respRdr = io.LimitReader(resp.Body, maxBytes+1)
 	}
-	b, _ := io.ReadAll(respRdr)
+	b, err := io.ReadAll(respRdr)
+	if err != nil {
+		// 正文读一半断了必须报错返回：吞掉它调用方会拿到半截内容当完整响应（截图尤其致命）。
+		return nil, fmt.Errorf("读响应失败：%w", err)
+	}
 	if maxBytes > 0 && int64(len(b)) > maxBytes {
 		return nil, fmt.Errorf("响应超过 %d 字节上限", maxBytes)
 	}

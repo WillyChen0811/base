@@ -53,7 +53,7 @@ var mcpMacTools = []map[string]any{
 		"inputSchema": map[string]any{"type": "object", "properties": map[string]any{"name": map[string]any{"type": "string", "description": "测试文件名（不带 .test.js 后缀）"}}, "required": []string{"name"}}},
 	{"name": "mac_build_app", "description": "在 Mac 上跑 mac/build.sh 打包 app（xxyi 仓库），同步等到跑完（上限 20 分钟）；返回退出码、用时与输出末尾。",
 		"inputSchema": macNoArgs},
-	{"name": "mac_install_app", "description": "让 Mac 安装刚打包的 XXYI.app 并重启：起安装脚本后立即返回，不等装完（脚本会重启 XXYI 与 wgtund，协助随之断开重开）。看结果请用 mac_screenshot 与 mac_logs。",
+	{"name": "mac_install_app", "description": "让 Mac 退出正在运行的 XXYI，改为打开打包目录里刚打好的新版（不覆盖桌面上的 App）：起脚本后立即返回，不等装完（脚本会重启 XXYI 与 wgtund，协助随之断开重开）。看结果请用 mac_screenshot 与 mac_logs。",
 		"inputSchema": macNoArgs},
 	{"name": "mac_screenshot", "description": "截 Mac 的整屏（PNG 图片）。", "inputSchema": macNoArgs},
 	{"name": "mac_logs", "description": "看 Mac 上日志的末尾若干行：name 取 service（协助服务）/ wgtund（隧道守护）。",

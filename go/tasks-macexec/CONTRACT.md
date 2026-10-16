@@ -24,7 +24,7 @@
 - `GET /exec/logs?name=service|wgtund&lines=N` → `{text}`（N ≤ 500；路径照现有代码查清楚）。
 - `GET /exec/screenshot` → image/png（screencapture -x 整屏，sips -Z 1600 缩小，临时文件用完删；非 darwin 501）。
 - `POST /exec/install` → `{started: true}`：把一段 Go 里写死的脚本写到临时文件，Setpgid 起 /bin/sh 执行后立即返回；
-  脚本：校验 build/XXYI.app 签名 → 退出 XXYI → pkill 残留服务与 wgtund → ditto 到 ~/Desktop/XXYI.app → 校验 → open。不另存日志文件（调用方用截图和 /exec/logs 看结果）。
+  脚本：校验 build/XXYI.app 签名 → 退出 XXYI → pkill 残留服务与 wgtund → 直接打开打包目录里的新版（不覆盖桌面 App）。不另存日志文件（调用方用截图和 /exec/logs 看结果）。
 - 每次调用单独记一行到 `~/.xxyi/macexec.log`（时间、接口/动作、仓库、结果：退出码/超时/忙/参数错，**不记输出内容**）；**不写进协助日志**（不调 logEvent）。文件超过 1MB 时改名为 macexec.log.1 再新建（只留这一份旧的）。
 
 ## MCP（Ubuntu 端，cmd/xxyi-msg/macexec.go，重写替换现有内容）

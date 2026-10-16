@@ -248,24 +248,20 @@ func (s *Service) execScreenshot(w http.ResponseWriter, r *http.Request) {
 }
 
 // macexecInstallScript 是装 app 脚本的全文（写死，不接受任何外部参数，见 CONTRACT.md）：
-// 校验 build/XXYI.app 签名 → 退出 XXYI → pkill 残留的 XXYI 与 wgtund →
-// ditto 到 ~/Desktop/XXYI.app → 再校验 → open。
+// 校验 build/XXYI.app 签名 → 退出 XXYI → pkill 残留的 XXYI 与 wgtund → 直接打开打包目录里的新版。
+// **不覆盖用户桌面上的 XXYI.app**（用户 10/16：新版只留在打包目录，替换由用户自己决定）。
 // 第一行 rm -f "$0" 删掉自己的脚本文件（sh 已打开该文件，删除后照常读完）。
 // 不另存日志：输出全部丢弃，调用方用截图和 /exec/logs 看结果。
 const macexecInstallScript = `#!/bin/sh
 set -e
 SRC="$HOME/xxyi-work/xxyi/mac/build/XXYI.app"
-DST="$HOME/Desktop/XXYI.app"
 rm -f "$0"
 codesign --verify --deep --strict "$SRC"
 osascript -e 'quit app "XXYI"' || true
 sleep 2
 pkill -x XXYI || true
 pkill -f wgtund || true
-rm -rf "$DST"
-ditto "$SRC" "$DST"
-codesign --verify --deep --strict "$DST"
-open "$DST"
+open "$SRC"
 `
 
 // execInstall 是 POST /exec/install：把脚本写到临时文件，独立进程组起 /bin/sh 后立即返回

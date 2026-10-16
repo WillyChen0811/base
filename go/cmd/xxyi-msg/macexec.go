@@ -3,12 +3,14 @@ package main
 // mac_* 工具：从这边经协助远端（wgtund 的 remoteMux）操作 Mac 上的执行接口 /exec/*。
 // 地址与令牌走现有 connect()，与 xxyi_send 等工具同一套通道；约定见 tasks-macexec/CONTRACT.md。
 // 短调用（状态/读文件/日志/查任务/截图）一次往返；长任务（构建/自测/节点测试/打包/装 app）
-// 先 POST /exec/start 拿 job，再按固定 5 秒节拍查 /exec/job，最多等 9 分钟——
+// 先 POST /exec/start 拿 job，再按固定 5 秒节拍查 /exec/job。9 分钟预算从进入工具那一刻起算：
+// /exec/start（含重试）、每次查询、节拍等待都压在同一个总截止之内——
 // 没跑完不报错，返回 job id 让调用方用 mac_job 接着查。
 // wgtund 重启后协助会按 autostart 自动新开，令牌与地址都会变（D1 调研），入口发布在
 // ~/.xxyi-support/endpoint.json：所以每次调用都现读入口（connect 每次重读该文件），
-// 连不上或 401 时再读一次、重试一次；轮询期间同样每次现读，单次查询失败（连不上/401/5xx）
-// 容忍重试，连续 3 次或累计 60 秒才报错（install_app 会重启 wgtund，必须靠这个撑过去）。
+// 连不上或 401 时再读一次、重试一次；正文读一半断了（unexpected EOF、连接重置）同样重读重试；
+// 轮询期间同样每次现读，单次查询失败（连不上/401/5xx/正文中断）容忍重试，
+// 连续 3 次或累计 60 秒才报错（install_app 会重启 wgtund，必须靠这个撑过去）。
 
 import (
 	"bytes"
@@ -32,7 +34,7 @@ var (
 	macQuickWait               = 30 * time.Second       // 快任务（git status）从启动到结束的等待上限
 	macPollInterval            = 5 * time.Second        // 长任务轮询节拍（约定：5 秒，从上次查询开始算）
 	macQuickPollInterval       = 500 * time.Millisecond // 快任务轮询节拍
-	macMaxWait                 = 9 * time.Minute        // 长任务在工具内部最多等 9 分钟（从启动独立计）
+	macMaxWait                 = 9 * time.Minute        // 长任务总预算 9 分钟：进入工具起算，/exec/start 也算在内
 	macFailMax                 = 3                      // 轮询连续失败次数上限，超过才报错
 	macFailBudget              = 60 * time.Second       // 轮询失败累计上限（期间反复重读入口等 Mac 回来）
 	screenshotMax        int64 = 8 << 20                // 截图响应上限 8MB（服务端本就限宽 1600，防异常响应撑爆内存）
@@ -291,10 +293,23 @@ func macStaleEntry(err error) bool {
 	return errors.As(err, &se) && se.status == http.StatusUnauthorized
 }
 
-// macPollRetryable 判轮询中单次 /exec/job 查询失败可否容忍：连不上/401/5xx——
+// macBodyInterrupt 判错误是不是正文读一半断了（unexpected EOF、连接重置等；
+// doLimited 用 bodyError 把已拿到的状态码带出来）。断在半路多半是 wgtund 刚重启
+// （install_app 必经）或链路掉线，跟连不上同源：要重读入口、重试、按节拍容忍。
+// 但断之前服务端已回了明确状态码的按状态码分类，不能全当可重试：
+// 401 走重读入口、5xx 可容忍；其它 4xx（404/409 等）结论已经给出，重试没意义。
+func macBodyInterrupt(err error) bool {
+	var be *bodyError
+	if !errors.As(err, &be) {
+		return false
+	}
+	return be.status == http.StatusOK || be.status == http.StatusUnauthorized || be.status >= 500
+}
+
+// macPollRetryable 判轮询中单次 /exec/job 查询失败可否容忍：连不上/401/5xx/正文中断——
 // install_app 会重启 wgtund，Mac 回来前这段窗口里的查询注定是这个样子（404/400 重试没意义）。
 func macPollRetryable(err error) bool {
-	if macStaleEntry(err) {
+	if macStaleEntry(err) || macBodyInterrupt(err) {
 		return true
 	}
 	var se *statusError
@@ -311,50 +326,79 @@ func macCallOnce(ctx context.Context, fn func(c *client) ([]byte, error)) ([]byt
 }
 
 // macCall 是 mac_* 所有请求的统一入口：每次现读入口做一次请求；
-// 入口旧了（连不上/401）就再读一次、重试一次，第二次仍失败则拿第二次的错误。
+// 入口旧了（连不上/401）或正文读一半断了（通道断在 wgtund 重启这类事情上，
+// 断前拿到 401/5xx/200 的才算；404/409 结论已给出不重试）就再读一次、重试一次，
+// 第二次仍失败则拿第二次的错误。
 func macCall(ctx context.Context, fn func(c *client) ([]byte, error)) ([]byte, error) {
 	b, err := macCallOnce(ctx, fn)
-	if err == nil || !macStaleEntry(err) {
+	if err == nil || !(macStaleEntry(err) || macBodyInterrupt(err)) {
 		return b, err
 	}
 	return macCallOnce(ctx, fn)
 }
 
 // macRunJob 启动一个动作并轮询到状态不再是 running（或预算用完）。
-// 长任务：截止时间从启动独立计算（macMaxWait 是预算不是叠加出来的墙），
-// 按固定节拍轮询（节拍从上次查询开始算，请求耗时不往后叠），每次查询的 ctx 限在剩余预算内；
-// 单次查询失败（连不上/401/5xx）不立即报错，下一个节拍重读入口再查，
-// 连续 macFailMax 次或失败累计 macFailBudget 才报错并附 job id。
+// 长任务：总截止 deadline 在进入本函数那一刻定下（macMaxWait 是预算不是叠加出来的墙），
+// /exec/start（含 macCall 里那次重试）、每次查询、节拍等待都压在 deadline 之内；
+// 按固定节拍轮询（节拍从上次查询开始算，请求耗时不往后叠；等待不早于 deadline 停），
+// 每次查询的 ctx 限在剩余预算内；单次查询失败（连不上/401/5xx/正文中断）不立即报错，
+// 下一个节拍重读入口再查，连续 macFailMax 次或失败累计 macFailBudget 才报错并附 job id。
+// 每次查询返回后先看总预算：用完就正常交回 job id，错误与失败计数排在预算之后——
+// 预算耗尽不是失败，调用方拿 id 用 mac_job 接着查。
 // quick=true 用快任务的节奏与预算（macQuickWait），到点还没完直接报错——
 // 那是异常，不该让调用方拿着 id 干等；预算用完同样如此。
 func macRunJob(ctx context.Context, action, repo, name string, quick bool) (string, error) {
-	job, err := macStartJob(ctx, action, repo, name)
-	if err != nil {
-		return "", err
-	}
 	interval, budget := macPollInterval, macMaxWait
 	if quick {
 		interval, budget = macQuickPollInterval, macQuickWait
 	}
-	deadline := time.Now().Add(budget)
+	deadline := time.Now().Add(budget) // 总截止从这里起算，start 也在预算内
+	// 启动同样受总截止约束（macCall 的重试也在 sctx 里跑完）。
+	sctx, cancel := context.WithTimeout(ctx, min(macCallTimeout, time.Until(deadline)))
+	job, err := macStartJob(sctx, action, repo, name)
+	cancel()
+	if err != nil {
+		return "", err
+	}
 	next := time.Now().Add(interval) // 节拍锚点：上次查询开始 + interval
 	fails := 0
 	failSince := time.Time{}
+	// 预算用完后对外的交代：长任务正常交回 job id，快任务报超时。
+	waitOver := func() (string, error) {
+		if quick {
+			return "", fmt.Errorf("任务 %s（%s）超过 %v 还没跑完，用 mac_job id=%s 接着查", job.ID, job.Action, budget, job.ID)
+		}
+		return fmt.Sprintf("任务 %s（%s）还在跑，已等 %v；用 mac_job id=%s 接着查", job.ID, job.Action, budget, job.ID), nil
+	}
 	for {
+		wait := next
+		if deadline.Before(wait) {
+			wait = deadline // 节拍等待用「下一节拍」与「总截止」中较早者
+		}
 		select {
 		case <-ctx.Done():
-			return "", fmt.Errorf("查任务 %s 超时：%w（可用 mac_job id=%s 接着查）", job.ID, ctx.Err(), job.ID)
-		case <-time.After(time.Until(next)):
+			return waitOver() // 外层兜底 ctx 到点 ⇒ 预算必已用完，按预算用完收尾
+		case <-time.After(time.Until(wait)):
 		}
-		remain := time.Until(deadline)
-		if remain <= 0 {
-			break // 预算用完：统一在循环外收尾（长任务正常交回 job id）
+		if !time.Now().Before(deadline) {
+			break // 等到总截止还没等到头：预算用完，统一收尾
 		}
 		pollAt := time.Now()
-		qctx, cancel := context.WithTimeout(ctx, min(macCallTimeout, remain))
+		qctx, cancel := context.WithTimeout(ctx, min(macCallTimeout, time.Until(deadline)))
 		job2, tail, err := macGetJob(qctx, job.ID)
 		cancel()
 		next = pollAt.Add(interval)
+		if err == nil && job2.State != macexec.StateRunning {
+			// 查询成功且已收尾：结果优先于预算——哪怕正好压线，也是干完了，不是没等到。
+			text := macJobText(job2, tail)
+			if job2.State != macexec.StateDone {
+				return "", errors.New(text)
+			}
+			return text, nil
+		}
+		if !time.Now().Before(deadline) {
+			break // 预算用完：正常交回 job id；查询失败也不算失败，排在预算之后
+		}
 		if err != nil {
 			if !macPollRetryable(err) {
 				return "", fmt.Errorf("查任务 %s 失败：%w（可用 mac_job id=%s 接着查）", job.ID, err, job.ID)
@@ -371,21 +415,8 @@ func macRunJob(ctx context.Context, action, repo, name string, quick bool) (stri
 		}
 		fails = 0
 		job = job2
-		if job.State != macexec.StateRunning {
-			text := macJobText(job, tail)
-			if job.State != macexec.StateDone {
-				return "", errors.New(text)
-			}
-			return text, nil
-		}
-		if !time.Now().Before(deadline) {
-			break // 最后一次查询也没等到头
-		}
 	}
-	if quick {
-		return "", fmt.Errorf("任务 %s（%s）超过 %v 还没跑完，用 mac_job id=%s 接着查", job.ID, job.Action, budget, job.ID)
-	}
-	return fmt.Sprintf("任务 %s（%s）还在跑，已等 %v；用 mac_job id=%s 接着查", job.ID, job.Action, budget, job.ID), nil
+	return waitOver()
 }
 
 // macStartJob 启动任务（经 macCall：每次现读入口，入口旧了重读再试一次）；

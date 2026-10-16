@@ -100,6 +100,21 @@ func (e *connError) Error() string {
 
 func (e *connError) Unwrap() error { return e.err }
 
+// bodyError 是拿到了响应状态码、但正文读一半断了（unexpected EOF、连接重置等）。
+// 状态码留着：断线前服务端已给出的结论不能丢（404/409 不该被当成断线重试）。
+// 故意的不套 connError/statusError 的壳：消息工具的暂存按 connError、归档按 statusError，
+// 补发行为不能因正文中断而变；mac_* 自行按残留状态码分类（见 macexec.go 的 macBodyInterrupt）。
+type bodyError struct {
+	status int
+	err    error
+}
+
+func (e *bodyError) Error() string {
+	return fmt.Sprintf("读响应失败：%v（HTTP %d）", e.err, e.status)
+}
+
+func (e *bodyError) Unwrap() error { return e.err }
+
 type endpoint struct {
 	Addr  string `json:"addr"`
 	Token string `json:"token"`
@@ -196,7 +211,8 @@ func (c *client) doLimited(ctx context.Context, method, path string, body []byte
 	b, err := io.ReadAll(respRdr)
 	if err != nil {
 		// 正文读一半断了必须报错返回：吞掉它调用方会拿到半截内容当完整响应（截图尤其致命）。
-		return nil, fmt.Errorf("读响应失败：%w", err)
+		// 用 bodyError 把已拿到的状态码带出去，让 mac_* 按状态码分类（401/5xx 照旧，其它 4xx 不重试）。
+		return nil, &bodyError{status: resp.StatusCode, err: err}
 	}
 	if maxBytes > 0 && int64(len(b)) > maxBytes {
 		return nil, fmt.Errorf("响应超过 %d 字节上限", maxBytes)

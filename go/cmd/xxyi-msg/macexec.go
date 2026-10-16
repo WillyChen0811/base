@@ -1,16 +1,11 @@
 package main
 
 // mac_* 工具：从这边经协助远端（wgtund 的 remoteMux）操作 Mac 上的执行接口 /exec/*。
-// 地址与令牌走现有 connect()，与 xxyi_send 等工具同一套通道；约定见 tasks-macexec/CONTRACT.md。
-// 短调用（状态/读文件/日志/查任务/截图）一次往返；长任务（构建/自测/节点测试/打包/装 app）
-// 先 POST /exec/start 拿 job，再按固定 5 秒节拍查 /exec/job。9 分钟预算从进入工具那一刻起算：
-// /exec/start（含重试）、每次查询、节拍等待都压在同一个总截止之内——
-// 没跑完不报错，返回 job id 让调用方用 mac_job 接着查。
-// wgtund 重启后协助会按 autostart 自动新开，令牌与地址都会变（D1 调研），入口发布在
-// ~/.xxyi-support/endpoint.json：所以每次调用都现读入口（connect 每次重读该文件），
-// 连不上或 401 时再读一次、重试一次；正文读一半断了（unexpected EOF、连接重置）同样重读重试；
-// 轮询期间同样每次现读，单次查询失败（连不上/401/5xx/正文中断）容忍重试，
-// 连续 3 次或累计 60 秒才报错（install_app 会重启 wgtund，必须靠这个撑过去）。
+// 地址与令牌走现有 connect()（每次现读 endpoint.json）、发一次请求就返回：不轮询、不重试；
+// 唯一例外是 401（wgtund 重启后新令牌就在 endpoint.json 里，重读入口再试一次是免费的，
+// 而对跑着的命令不能重试——服务端可能已经起了动作）。
+// 动作跑完（含非零退出与超时被杀）都是数据：文字返回退出码/用时/输出尾部；
+// 报错只发生在没跑成：忙（409）、参数/路径错（400）、令牌不对（401）、连不上（connError）。
 
 import (
 	"bytes"
@@ -22,257 +17,93 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 
 	"github.com/WillyChen0811/base/go/macexec"
 )
 
-// 超时、轮询节奏与失败容忍，测试里可调小。
 var (
-	macCallTimeout             = 30 * time.Second       // 单次 /exec/* 请求的 HTTP 超时
-	macQuickWait               = 30 * time.Second       // 快任务（git status）从启动到结束的等待上限
-	macPollInterval            = 5 * time.Second        // 长任务轮询节拍（约定：5 秒，从上次查询开始算）
-	macQuickPollInterval       = 500 * time.Millisecond // 快任务轮询节拍
-	macMaxWait                 = 9 * time.Minute        // 长任务总预算 9 分钟：进入工具起算，/exec/start 也算在内
-	macFailMax                 = 3                      // 轮询连续失败次数上限，超过才报错
-	macFailBudget              = 60 * time.Second       // 轮询失败累计上限（期间反复重读入口等 Mac 回来）
-	screenshotMax        int64 = 8 << 20                // 截图响应上限 8MB（服务端本就限宽 1600，防异常响应撑爆内存）
+	// macRunTimeout：动作超时 + 一分钟收尾（超时秒数以 go/macexec 为准，取够用的最大一档 build_app 20 分钟）。
+	macRunTimeout = 21 * time.Minute
+	// macQuickTimeout 是截图/日志/装 app 起手的 HTTP 超时（约定：60s）。
+	macQuickTimeout = 60 * time.Second
+	// screenshotMax 是截图响应读取上限（服务端已限宽 1600，防异常响应撑爆内存）。
+	screenshotMax int64 = 8 << 20
 )
 
-// pngSignature 是 PNG 的完整 8 字节签名（RFC 2083）；只比 "\x89PNG" 4 字节太松，半截响应也可能撞上。
-var pngSignature = []byte{0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'}
-
-// macJob 是 Mac 端旧 /exec/start、/exec/job 响应 JSON 结构的本地镜像。
-// go/macexec 的执行器已按 v2 约定改成同步 Run、不再提供 Job 类型；
-// 本文件将在后续任务（tasks-macexec/S4）里整体替换为同步调用，这里类型先就地保留维持编译。
-type macJob struct {
-	ID       string    `json:"id"`
-	Action   string    `json:"action"`
-	State    string    `json:"state"`
-	ExitCode int       `json:"exitCode"`
-	Started  time.Time `json:"started"`
-	Ended    time.Time `json:"ended"`
-	Note     string    `json:"note"`
-}
-
-// 旧 /exec/job 协议里的任务状态取值。
-const (
-	macStateRunning = "running"
-	macStateDone    = "done"
-)
-
-// macRepoXxyi 是长任务动作所在的仓库（swift_build/selftest/node_test/build_app 都在 xxyi 里）。
-const macRepoXxyi = "xxyi"
+var pngSignature = []byte{0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'} // PNG 完整 8 字节签名（RFC 2083），只比前 4 字节太松
 
 // macNodeTestName 与服务端 actions 同一套规则：测试名只许小写字母数字下划线。
 var macNodeTestName = regexp.MustCompile(`^[a-z0-9_]+$`)
 
-// mcpMacTools 是加进 tools/list 的十个 mac_* 工具。
+// macNoArgs 是无参数工具的公共 inputSchema。
+var macNoArgs = map[string]any{"type": "object", "properties": map[string]any{}, "required": []string{}}
+
+// mcpMacTools 是加进 tools/list 的八个 mac_* 工具。
 var mcpMacTools = []map[string]any{
-	{
-		"name":        "mac_git_status",
-		"description": "看 Mac 上某个仓库的 git status（porcelain 格式，含分支行）。",
-		"inputSchema": map[string]any{
-			"type": "object",
-			"properties": map[string]any{
-				"repo": map[string]any{"type": "string", "enum": macexec.DefaultRepos, "description": "仓库名"},
-			},
-			"required": []string{"repo"},
-		},
-	},
-	{
-		"name":        "mac_read_file",
-		"description": "读 Mac 上仓库里的一个文本文件（按行，offset 从 0 起；单次上限 256KB，非 UTF-8 会报错）。",
-		"inputSchema": map[string]any{
-			"type": "object",
-			"properties": map[string]any{
-				"repo":   map[string]any{"type": "string", "enum": macexec.DefaultRepos, "description": "仓库名"},
-				"path":   map[string]any{"type": "string", "description": "仓库内相对路径（不许绝对路径、.. 或 .git 段）"},
-				"offset": map[string]any{"type": "integer", "description": "起始行（0 起），默认 0"},
-				"limit":  map[string]any{"type": "integer", "description": "读取行数，默认由服务端定（读满 256KB 为止）"},
-			},
-			"required": []string{"repo", "path"},
-		},
-	},
-	{
-		"name":        "mac_logs",
-		"description": "看 Mac 上的日志末尾若干行：name 取 service（协助服务）/ wgtund（隧道守护）/ ui（界面）。",
-		"inputSchema": map[string]any{
-			"type": "object",
-			"properties": map[string]any{
-				"name":  map[string]any{"type": "string", "enum": []string{"service", "wgtund", "ui"}, "description": "日志名"},
-				"lines": map[string]any{"type": "integer", "description": "末尾行数，1..500，默认 200"},
-			},
-			"required": []string{"name"},
-		},
-	},
-	{
-		"name":        "mac_job",
-		"description": "按 id 查 Mac 上任务的状态与输出末尾（长任务超时没跑完时接着查用）。",
-		"inputSchema": map[string]any{
-			"type": "object",
-			"properties": map[string]any{
-				"id": map[string]any{"type": "string", "description": "任务 id（长任务工具返回的）"},
-			},
-			"required": []string{"id"},
-		},
-	},
-	{
-		"name":        "mac_build",
-		"description": "在 Mac 上跑 swift build（xxyi/mac）。内部每 5 秒查一次、最多等 9 分钟；没跑完返回 job id，用 mac_job 接着查。",
-		"inputSchema": map[string]any{
-			"type":       "object",
-			"properties": map[string]any{},
-			"required":   []string{},
-		},
-	},
-	{
-		"name":        "mac_selftest",
-		"description": "在 Mac 上跑 swift run xxyi-selftest（xxyi/mac）。内部每 5 秒查一次、最多等 9 分钟；没跑完返回 job id，用 mac_job 接着查。",
-		"inputSchema": map[string]any{
-			"type":       "object",
-			"properties": map[string]any{},
-			"required":   []string{},
-		},
-	},
-	{
-		"name":        "mac_node_test",
-		"description": "在 Mac 上跑 node tests/js/<name>.test.js（xxyi 仓库）。name 只许小写字母数字下划线。内部每 5 秒查一次、最多等 9 分钟；没跑完返回 job id，用 mac_job 接着查。",
-		"inputSchema": map[string]any{
-			"type": "object",
-			"properties": map[string]any{
-				"name": map[string]any{"type": "string", "description": "测试文件名（不带 .test.js 后缀）"},
-			},
-			"required": []string{"name"},
-		},
-	},
-	{
-		"name":        "mac_build_app",
-		"description": "在 Mac 上跑 ./build.sh 打包 app（xxyi/mac）。内部每 5 秒查一次、最多等 9 分钟；没跑完返回 job id，用 mac_job 接着查。",
-		"inputSchema": map[string]any{
-			"type":       "object",
-			"properties": map[string]any{},
-			"required":   []string{},
-		},
-	},
-	{
-		"name":        "mac_install_app",
-		"description": "在 Mac 上安装刚打包的 XXYI.app 并重启（装 ~/xxyi-work/xxyi/mac/build/XXYI.app）。安装会重启 wgtund，地址与令牌随之变化，工具会自动重读入口接着查。内部每 5 秒查一次、最多等 9 分钟；没跑完返回 job id，用 mac_job 接着查。",
-		"inputSchema": map[string]any{
-			"type":       "object",
-			"properties": map[string]any{},
-			"required":   []string{},
-		},
-	},
-	{
-		"name":        "mac_screenshot",
-		"description": "截 Mac 的屏：target=screen 整屏、target=xxyi XXYI 界面窗口，返回 PNG 图片。",
-		"inputSchema": map[string]any{
-			"type": "object",
-			"properties": map[string]any{
-				"target": map[string]any{"type": "string", "enum": []string{"screen", "xxyi"}, "description": "截图对象，默认 screen"},
-			},
-			"required": []string{},
-		},
-	},
+	{"name": "mac_git_status", "description": "看 Mac 上某个仓库的 git status（porcelain 格式，含分支行）。",
+		"inputSchema": map[string]any{"type": "object", "properties": map[string]any{"repo": map[string]any{"type": "string", "enum": macexec.DefaultRepos, "description": "仓库名"}}, "required": []string{"repo"}}},
+	{"name": "mac_build", "description": "在 Mac 上跑 swift build（xxyi/mac），同步等到跑完（上限 15 分钟）；返回退出码、用时与输出末尾，构建失败也是文字（含错误尾部）。",
+		"inputSchema": macNoArgs},
+	{"name": "mac_selftest", "description": "在 Mac 上跑 swift run xxyi-selftest（xxyi/mac），同步等到跑完（上限 15 分钟）；返回退出码、用时与输出末尾。",
+		"inputSchema": macNoArgs},
+	{"name": "mac_node_test", "description": "在 Mac 上跑 node tests/js/<name>.test.js（xxyi 仓库），同步等到跑完（上限 5 分钟）；name 只许小写字母数字下划线。返回退出码、用时与输出末尾。",
+		"inputSchema": map[string]any{"type": "object", "properties": map[string]any{"name": map[string]any{"type": "string", "description": "测试文件名（不带 .test.js 后缀）"}}, "required": []string{"name"}}},
+	{"name": "mac_build_app", "description": "在 Mac 上跑 mac/build.sh 打包 app（xxyi 仓库），同步等到跑完（上限 20 分钟）；返回退出码、用时与输出末尾。",
+		"inputSchema": macNoArgs},
+	{"name": "mac_install_app", "description": "让 Mac 安装刚打包的 XXYI.app 并重启：起安装脚本后立即返回，不等装完（脚本会重启 XXYI 与 wgtund，协助随之断开重开）。看结果请用 mac_screenshot 与 mac_logs。",
+		"inputSchema": macNoArgs},
+	{"name": "mac_screenshot", "description": "截 Mac 的整屏（PNG 图片）。", "inputSchema": macNoArgs},
+	{"name": "mac_logs", "description": "看 Mac 上日志的末尾若干行：name 取 service（协助服务）/ wgtund（隧道守护）。",
+		"inputSchema": map[string]any{"type": "object", "properties": map[string]any{
+			"name":  map[string]any{"type": "string", "enum": []string{"service", "wgtund"}, "description": "日志名"},
+			"lines": map[string]any{"type": "integer", "description": "末尾行数，1..500，默认 200"},
+		}, "required": []string{"name"}}},
 }
 
-// allMcpTools 是 tools/list 的完整名单：五个消息工具 + 十个 mac 工具。
+// allMcpTools 是 tools/list 的完整名单：五个消息工具 + 八个 mac 工具。
 func allMcpTools() []map[string]any {
 	return append(append([]map[string]any{}, mcpTools...), mcpMacTools...)
 }
 
-// runMacTool 是 mac_* 文字类工具的实现（mac_screenshot 在 callTool 里走图片通道，不经过这里）。
-// 每个工具自带总预算：长任务 = macMaxWait（截止时间在里面独立计）+ 一次调用的收尾余量，
-// 其余 = macQuickWait + 余量。
+// macRunActions 是"经 /exec/run 同步跑动作"的工具名 → 动作名映射；
+// 其余两个 mac 工具（install/screenshot、logs）各有专门的接口，不在这张表里。
+var macRunActions = map[string]string{
+	"mac_git_status": "git_status",
+	"mac_build":      "swift_build",
+	"mac_selftest":   "selftest",
+	"mac_build_app":  "build_app",
+	"mac_node_test":  "node_test",
+}
+
+// runMacTool 是 mac_* 文字类工具的实现（mac_screenshot 在 callTool 里走图片通道，不经过这里）；
+// HTTP 截止在 macCall 里按 path 定，这里只管参数校验；名单与服务端 actions 同一套。
 func runMacTool(ctx context.Context, name string, args map[string]any) (string, error) {
-	switch name {
-	case "mac_git_status":
-		repo, err := macRepoArg(args)
-		if err != nil {
-			return "", err
-		}
-		ctx, cancel := context.WithTimeout(ctx, macQuickWait+macCallTimeout)
-		defer cancel()
-		return macRunJob(ctx, "git_status", repo, "", true)
-	case "mac_read_file":
-		repo, err := macRepoArg(args)
-		if err != nil {
-			return "", err
-		}
-		path, err := argString(args, "path", true)
-		if err != nil {
-			return "", err
-		}
-		if strings.TrimSpace(path) == "" {
-			return "", errors.New("path 不能为空")
-		}
-		offset, err := argInt(args, "offset", 0)
-		if err != nil {
-			return "", err
-		}
-		limit, err := argInt(args, "limit", 0)
-		if err != nil {
-			return "", err
-		}
-		if offset < 0 || limit < 0 {
-			return "", fmt.Errorf("offset/limit 不能为负：offset=%d limit=%d", offset, limit)
-		}
-		ctx, cancel := context.WithTimeout(ctx, macQuickWait+macCallTimeout)
-		defer cancel()
-		return macReadFile(ctx, repo, path, offset, limit)
-	case "mac_logs":
-		name, err := argString(args, "name", true)
-		if err != nil {
-			return "", err
-		}
+	var repo, testName string
+	var err error
+	if action, ok := macRunActions[name]; ok {
 		switch name {
-		case "service", "wgtund", "ui":
-		default:
-			return "", fmt.Errorf("name 只能是 service/wgtund/ui，实际是 %q", name)
+		case "mac_git_status":
+			if repo, err = macRepoArg(args); err != nil {
+				return "", err
+			}
+		case "mac_node_test":
+			if testName, err = argString(args, "name", true); err != nil {
+				return "", err
+			}
+			if !macNodeTestName.MatchString(testName) {
+				return "", fmt.Errorf("测试名 %q 不合法：只许小写字母、数字、下划线", testName)
+			}
 		}
-		lines, err := argInt(args, "lines", 200)
-		if err != nil {
-			return "", err
-		}
-		if lines < 1 || lines > 500 {
-			return "", fmt.Errorf("lines 必须 1..500，实际 %d", lines)
-		}
-		ctx, cancel := context.WithTimeout(ctx, macQuickWait+macCallTimeout)
-		defer cancel()
-		return macLogs(ctx, name, lines)
-	case "mac_job":
-		id, err := argString(args, "id", true)
-		if err != nil {
-			return "", err
-		}
-		ctx, cancel := context.WithTimeout(ctx, macQuickWait+macCallTimeout)
-		defer cancel()
-		// mac_job 本身也每次现读入口：装完 app 拿到的旧 id，重启后照样能查到。
-		job, tail, err := macGetJob(ctx, id)
-		if err != nil {
-			return "", err
-		}
-		return macJobText(job, tail), nil
-	case "mac_build":
-		return macRunLong(ctx, "swift_build", macRepoXxyi, "")
-	case "mac_selftest":
-		return macRunLong(ctx, "selftest", macRepoXxyi, "")
-	case "mac_build_app":
-		return macRunLong(ctx, "build_app", macRepoXxyi, "")
+		return macExecRun(ctx, action, repo, testName)
+	}
+	switch name {
 	case "mac_install_app":
-		// 装 app 会重启 wgtund（协助自动重开、地址令牌变）：靠 macRunJob 每次现读入口 + 失败容忍撑过去。
-		return macRunLong(ctx, "install_app", macRepoXxyi, "")
-	case "mac_node_test":
-		testName, err := argString(args, "name", true)
-		if err != nil {
-			return "", err
-		}
-		if !macNodeTestName.MatchString(testName) {
-			return "", fmt.Errorf("测试名 %q 不合法：只许小写字母、数字、下划线", testName)
-		}
-		return macRunLong(ctx, "node_test", macRepoXxyi, testName)
+		return macInstall(ctx)
+	case "mac_logs":
+		return macLogs(ctx, args)
 	default:
 		return "", fmt.Errorf("没有这个工具 %q", name)
 	}
@@ -284,236 +115,106 @@ func macRepoArg(args map[string]any) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	for _, r := range macexec.DefaultRepos {
-		if repo == r {
-			return repo, nil
-		}
+	if !slices.Contains(macexec.DefaultRepos, repo) {
+		return "", fmt.Errorf("仓库 %q 不在允许名单里（可用：%s）", repo, strings.Join(macexec.DefaultRepos, "/"))
 	}
-	return "", fmt.Errorf("仓库 %q 不在允许名单里（可用：%s）", repo, strings.Join(macexec.DefaultRepos, "/"))
+	return repo, nil
 }
 
-// macRunLong 启动长任务并轮询到结束：done 返回文字；failed/timeout 报错（带退出码与输出末尾）；
-// 从启动独立计的 macMaxWait 预算用完还没跑完则正常返回 job id，让调用方用 mac_job 接着查。
-// 外层 ctx 只多留一次调用的余量兜底，真正的 9 分钟截止在 macRunJob 里按 deadline 算。
-func macRunLong(ctx context.Context, action, repo, name string) (string, error) {
-	ctx, cancel := context.WithTimeout(ctx, macMaxWait+macCallTimeout)
+// macCall 是所有 mac 请求的统一入口：按 path 定 HTTP 截止（/exec/run 长、其余 60s），
+// 现读入口发一次请求；只有令牌不对（401）才重读入口再试一次（见文件头说明），其余都不重试。
+func macCall(ctx context.Context, path string, fn func(c *client) ([]byte, error)) ([]byte, error) {
+	timeout := macQuickTimeout
+	if path == "/exec/run" {
+		timeout = macRunTimeout
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	return macRunJob(ctx, action, repo, name, false)
-}
-
-// macStaleEntry 判错误是不是"入口旧了"：连不上或 401——wgtund 重启后协助自动重开，
-// 地址与令牌都换到了新的 endpoint.json（D1 调研），必须重读入口再试。
-func macStaleEntry(err error) bool {
-	var ce *connError
-	if errors.As(err, &ce) {
-		return true
-	}
+	b, err := macOnce(ctx, timeout, fn)
 	var se *statusError
-	return errors.As(err, &se) && se.status == http.StatusUnauthorized
-}
-
-// macBodyInterrupt 判错误是不是正文读一半断了（unexpected EOF、连接重置等；
-// doLimited 用 bodyError 把已拿到的状态码带出来）。断在半路多半是 wgtund 刚重启
-// （install_app 必经）或链路掉线，跟连不上同源：要重读入口、重试、按节拍容忍。
-// 但断之前服务端已回了明确状态码的按状态码分类，不能全当可重试：
-// 401 走重读入口、5xx 可容忍；其它 4xx（404/409 等）结论已经给出，重试没意义。
-func macBodyInterrupt(err error) bool {
-	var be *bodyError
-	if !errors.As(err, &be) {
-		return false
+	if err != nil && errors.As(err, &se) && se.status == http.StatusUnauthorized {
+		return macOnce(ctx, timeout, fn)
 	}
-	return be.status == http.StatusOK || be.status == http.StatusUnauthorized || be.status >= 500
+	return b, err
 }
 
-// macPollRetryable 判轮询中单次 /exec/job 查询失败可否容忍：连不上/401/5xx/正文中断——
-// install_app 会重启 wgtund，Mac 回来前这段窗口里的查询注定是这个样子（404/400 重试没意义）。
-func macPollRetryable(err error) bool {
-	if macStaleEntry(err) || macBodyInterrupt(err) {
-		return true
-	}
-	var se *statusError
-	return errors.As(err, &se) && se.status >= 500
-}
-
-// macCallOnce 现读入口（connect 每次都重读 endpoint.json）做一次请求。
-func macCallOnce(ctx context.Context, fn func(c *client) ([]byte, error)) ([]byte, error) {
-	c, err := connect(ctx, macCallTimeout)
+// macOnce 用现读的入口发一次请求；客户端超时与 ctx 截止一致（长动作不能被短超时掐掉）。
+func macOnce(ctx context.Context, timeout time.Duration, fn func(c *client) ([]byte, error)) ([]byte, error) {
+	c, err := connect(ctx, timeout)
 	if err != nil {
 		return nil, err
 	}
 	return fn(c)
 }
 
-// macCall 是 mac_* 所有请求的统一入口：每次现读入口做一次请求；
-// 入口旧了（连不上/401）或正文读一半断了（通道断在 wgtund 重启这类事情上，
-// 断前拿到 401/5xx/200 的才算；404/409 结论已给出不重试）就再读一次、重试一次，
-// 第二次仍失败则拿第二次的错误。
-func macCall(ctx context.Context, fn func(c *client) ([]byte, error)) ([]byte, error) {
-	b, err := macCallOnce(ctx, fn)
-	if err == nil || !(macStaleEntry(err) || macBodyInterrupt(err)) {
-		return b, err
-	}
-	return macCallOnce(ctx, fn)
-}
-
-// macRunJob 启动一个动作并轮询到状态不再是 running（或预算用完）。
-// 长任务：总截止 deadline 在进入本函数那一刻定下（macMaxWait 是预算不是叠加出来的墙），
-// /exec/start（含 macCall 里那次重试）、每次查询、节拍等待都压在 deadline 之内；
-// 按固定节拍轮询（节拍从上次查询开始算，请求耗时不往后叠；等待不早于 deadline 停），
-// 每次查询的 ctx 限在剩余预算内；单次查询失败（连不上/401/5xx/正文中断）不立即报错，
-// 下一个节拍重读入口再查，连续 macFailMax 次或失败累计 macFailBudget 才报错并附 job id。
-// 每次查询返回后先看总预算：用完就正常交回 job id，错误与失败计数排在预算之后——
-// 预算耗尽不是失败，调用方拿 id 用 mac_job 接着查。
-// quick=true 用快任务的节奏与预算（macQuickWait），到点还没完直接报错——
-// 那是异常，不该让调用方拿着 id 干等；预算用完同样如此。
-func macRunJob(ctx context.Context, action, repo, name string, quick bool) (string, error) {
-	interval, budget := macPollInterval, macMaxWait
-	if quick {
-		interval, budget = macQuickPollInterval, macQuickWait
-	}
-	deadline := time.Now().Add(budget) // 总截止从这里起算，start 也在预算内
-	// 启动同样受总截止约束（macCall 的重试也在 sctx 里跑完）。
-	sctx, cancel := context.WithTimeout(ctx, min(macCallTimeout, time.Until(deadline)))
-	job, err := macStartJob(sctx, action, repo, name)
-	cancel()
-	if err != nil {
-		return "", err
-	}
-	next := time.Now().Add(interval) // 节拍锚点：上次查询开始 + interval
-	fails := 0
-	failSince := time.Time{}
-	// 预算用完后对外的交代：长任务正常交回 job id，快任务报超时。
-	waitOver := func() (string, error) {
-		if quick {
-			return "", fmt.Errorf("任务 %s（%s）超过 %v 还没跑完，用 mac_job id=%s 接着查", job.ID, job.Action, budget, job.ID)
-		}
-		return fmt.Sprintf("任务 %s（%s）还在跑，已等 %v；用 mac_job id=%s 接着查", job.ID, job.Action, budget, job.ID), nil
-	}
-	for {
-		wait := next
-		if deadline.Before(wait) {
-			wait = deadline // 节拍等待用「下一节拍」与「总截止」中较早者
-		}
-		select {
-		case <-ctx.Done():
-			return waitOver() // 外层兜底 ctx 到点 ⇒ 预算必已用完，按预算用完收尾
-		case <-time.After(time.Until(wait)):
-		}
-		if !time.Now().Before(deadline) {
-			break // 等到总截止还没等到头：预算用完，统一收尾
-		}
-		pollAt := time.Now()
-		qctx, cancel := context.WithTimeout(ctx, min(macCallTimeout, time.Until(deadline)))
-		job2, tail, err := macGetJob(qctx, job.ID)
-		cancel()
-		next = pollAt.Add(interval)
-		if err == nil && job2.State != macStateRunning {
-			// 查询成功且已收尾：结果优先于预算——哪怕正好压线，也是干完了，不是没等到。
-			text := macJobText(job2, tail)
-			if job2.State != macStateDone {
-				return "", errors.New(text)
-			}
-			return text, nil
-		}
-		if !time.Now().Before(deadline) {
-			break // 预算用完：正常交回 job id；查询失败也不算失败，排在预算之后
-		}
-		if err != nil {
-			if !macPollRetryable(err) {
-				return "", fmt.Errorf("查任务 %s 失败：%w（可用 mac_job id=%s 接着查）", job.ID, err, job.ID)
-			}
-			if fails == 0 {
-				failSince = pollAt
-			}
-			fails++
-			if fails < macFailMax && time.Since(failSince) < macFailBudget {
-				continue // 容忍这一次（多半是 wgtund 正在重启），下个节拍重读入口再查
-			}
-			return "", fmt.Errorf("查任务 %s 连续 %d 次失败（自 %s 起）：%w（可用 mac_job id=%s 接着查）",
-				job.ID, fails, failSince.Format("15:04:05"), err, job.ID)
-		}
-		fails = 0
-		job = job2
-	}
-	return waitOver()
-}
-
-// macStartJob 启动任务（经 macCall：每次现读入口，入口旧了重读再试一次）；
-// 忙（409）等错误由 client.do 原样带出服务端原因，不重试。
-func macStartJob(ctx context.Context, action, repo, name string) (macJob, error) {
+// macExecRun 跑一次动作并渲染结果：非零退出码与超时都是数据（文字），
+// 忙/参数错/连不上这些"没跑成"才走错误通道（Error() 已带服务端原因与状态码）。
+func macExecRun(ctx context.Context, action, repo, name string) (string, error) {
 	body, err := json.Marshal(map[string]any{"action": action, "repo": repo, "name": name})
 	if err != nil {
-		return macJob{}, err
-	}
-	b, err := macCall(ctx, func(c *client) ([]byte, error) {
-		return c.do(ctx, http.MethodPost, c.path("/exec/start", nil), body)
-	})
-	if err != nil {
-		return macJob{}, err
-	}
-	var r struct {
-		Job macJob `json:"job"`
-	}
-	if json.Unmarshal(b, &r) != nil || r.Job.ID == "" {
-		return macJob{}, errors.New("Mac 端响应里没有 job id")
-	}
-	return r.Job, nil
-}
-
-// macGetJob 查任务状态与输出末尾（服务端已截到 200 行 / 64KB）；同样每次现读入口。
-func macGetJob(ctx context.Context, id string) (macJob, string, error) {
-	b, err := macCall(ctx, func(c *client) ([]byte, error) {
-		return c.do(ctx, http.MethodGet, c.path("/exec/job", url.Values{"id": {id}}), nil)
-	})
-	if err != nil {
-		return macJob{}, "", err
-	}
-	var r struct {
-		Job  macJob `json:"job"`
-		Tail string `json:"tail"`
-	}
-	if json.Unmarshal(b, &r) != nil || r.Job.ID == "" {
-		return macJob{}, "", errors.New("Mac 端 job 响应格式不对")
-	}
-	return r.Job, r.Tail, nil
-}
-
-// macReadFile 按行读远端仓库文件，返回正文（含行数说明，让调用方知道有没有读全）。
-func macReadFile(ctx context.Context, repo, path string, offset, limit int) (string, error) {
-	body, err := json.Marshal(map[string]any{"repo": repo, "path": path, "offset": offset, "limit": limit})
-	if err != nil {
 		return "", err
 	}
-	b, err := macCall(ctx, func(c *client) ([]byte, error) {
-		return c.do(ctx, http.MethodPost, c.path("/exec/read", nil), body)
+	b, err := macCall(ctx, "/exec/run", func(c *client) ([]byte, error) {
+		return c.do(ctx, http.MethodPost, c.path("/exec/run", nil), body)
 	})
 	if err != nil {
 		return "", err
 	}
 	var r struct {
-		Text       string `json:"text"`
-		LinesTotal int    `json:"lines_total"`
+		ExitCode int     `json:"exit_code"`
+		TimedOut bool    `json:"timed_out"`
+		Seconds  float64 `json:"seconds"`
+		Tail     string  `json:"tail"`
 	}
-	if json.Unmarshal(b, &r) != nil {
-		return "", errors.New("Mac 端 read 响应格式不对")
+	if err := json.Unmarshal(b, &r); err != nil {
+		return "", fmt.Errorf("Mac 端 run 响应格式不对：%w", err)
 	}
-	// 本段行数按正文数：末尾换行只是行尾，不额外算一行（数 "\n"+1 会把整段多算一行）。
-	got := 0
-	if r.Text != "" {
-		got = strings.Count(strings.TrimSuffix(r.Text, "\n"), "\n") + 1
+	head := fmt.Sprintf("退出码 %d，用时 %.1fs", r.ExitCode, r.Seconds)
+	if r.TimedOut {
+		head += "（超时被终止）"
 	}
-	head := fmt.Sprintf("%s:%s（全文 %d 行，本段自第 %d 行起 %d 行）", repo, path, r.LinesTotal, offset+1, got)
-	if offset+got < r.LinesTotal {
-		head += "，后面还有，加大 limit 或推进 offset"
+	if r.Tail == "" {
+		return head, nil
 	}
-	return head + "\n" + r.Text, nil
+	return head + "\n输出（末尾）：\n" + r.Tail, nil
 }
 
-// macLogs 取远端日志末尾。
-func macLogs(ctx context.Context, name string, lines int) (string, error) {
+// macInstall 起装 app 脚本：服务端脱开本进程跑脚本并立即返回，这里只确认已起手。
+func macInstall(ctx context.Context) (string, error) {
+	b, err := macCall(ctx, "/exec/install", func(c *client) ([]byte, error) {
+		return c.do(ctx, http.MethodPost, c.path("/exec/install", nil), nil)
+	})
+	if err != nil {
+		return "", err
+	}
+	var r struct {
+		Started bool `json:"started"`
+	}
+	if err := json.Unmarshal(b, &r); err != nil || !r.Started {
+		return "", errors.New("Mac 端 install 响应格式不对")
+	}
+	return "已让 Mac 起安装脚本（会重启 XXYI 与 wgtund）；用 mac_screenshot 和 mac_logs 看结果", nil
+}
+
+// macLogs 取远端日志末尾（名单与行数先在本地拒，合法才发 GET）。
+func macLogs(ctx context.Context, args map[string]any) (string, error) {
+	name, err := argString(args, "name", true)
+	if err != nil {
+		return "", err
+	}
+	if name != "service" && name != "wgtund" {
+		return "", fmt.Errorf("name 只能是 service/wgtund，实际是 %q", name)
+	}
+	lines, err := argInt(args, "lines", 200)
+	if err != nil {
+		return "", err
+	}
+	if lines < 1 || lines > 500 {
+		return "", fmt.Errorf("lines 必须 1..500，实际 %d", lines)
+	}
 	q := url.Values{"name": {name}, "lines": {fmt.Sprint(lines)}}
-	b, err := macCall(ctx, func(c *client) ([]byte, error) {
-		return c.do(ctx, http.MethodGet, c.path("/exec/logs", q), nil)
+	b, err := macCall(ctx, "/exec/logs", func(c *client) ([]byte, error) {
+		return c.doLimited(ctx, http.MethodGet, c.path("/exec/logs", q), nil, 0)
 	})
 	if err != nil {
 		return "", err
@@ -521,8 +222,8 @@ func macLogs(ctx context.Context, name string, lines int) (string, error) {
 	var r struct {
 		Text string `json:"text"`
 	}
-	if json.Unmarshal(b, &r) != nil {
-		return "", errors.New("Mac 端 logs 响应格式不对")
+	if err := json.Unmarshal(b, &r); err != nil {
+		return "", fmt.Errorf("Mac 端 logs 响应格式不对：%w", err)
 	}
 	if strings.TrimSpace(r.Text) == "" {
 		return fmt.Sprintf("%s 日志最近 %d 行是空的", name, lines), nil
@@ -530,58 +231,20 @@ func macLogs(ctx context.Context, name string, lines int) (string, error) {
 	return r.Text, nil
 }
 
-// macScreenshot 取 PNG 截图原始字节；超限、不是 PNG 或正文断在半路都当场报错：
-// 签名查完整 8 字节，再整图解码一次验完整性（截断/坏块在解码时就会报，
-// 只查前缀会把中断当成功交出去）。
+// macScreenshot 取整屏 PNG 原始字节：查完整 8 字节签名，再整图解码一次验完整性
+// （截断/坏块在解码时就会报，只查前缀会把中断当成功交出去）。
 func macScreenshot(ctx context.Context, args map[string]any) ([]byte, error) {
-	target, err := argString(args, "target", false)
-	if err != nil {
-		return nil, err
-	}
-	if target == "" {
-		target = "screen"
-	}
-	if target != "screen" && target != "xxyi" {
-		return nil, fmt.Errorf("target 只能是 screen/xxyi，实际是 %q", target)
-	}
-	ctx, cancel := context.WithTimeout(ctx, macQuickWait+macCallTimeout)
-	defer cancel()
-	b, err := macCall(ctx, func(c *client) ([]byte, error) {
-		return c.doLimited(ctx, http.MethodGet, c.path("/exec/screenshot", url.Values{"target": {target}}), nil, screenshotMax)
+	b, err := macCall(ctx, "/exec/screenshot", func(c *client) ([]byte, error) {
+		return c.doLimited(ctx, http.MethodGet, c.path("/exec/screenshot", nil), nil, screenshotMax)
 	})
 	if err != nil {
 		return nil, err
 	}
-	if err := macCheckPNG(b); err != nil {
-		return nil, fmt.Errorf("Mac 端截图不可用：%w", err)
-	}
-	return b, nil
-}
-
-// macCheckPNG 校验完整 8 字节 PNG 签名，并用 image/png 整图解码一次确认内容完整。
-func macCheckPNG(b []byte) error {
 	if !bytes.HasPrefix(b, pngSignature) {
-		return fmt.Errorf("响应不是 PNG（%d 字节）", len(b))
+		return nil, fmt.Errorf("Mac 端截图不可用：响应不是 PNG（%d 字节）", len(b))
 	}
 	if _, err := png.Decode(bytes.NewReader(b)); err != nil {
-		return fmt.Errorf("PNG 不完整（%d 字节）：%w", len(b), err)
+		return nil, fmt.Errorf("Mac 端截图不可用：PNG 不完整（%d 字节）：%w", len(b), err)
 	}
-	return nil
-}
-
-// macJobText 渲染任务状态：一行摘要 + 输出末尾。
-func macJobText(job macJob, tail string) string {
-	var sb strings.Builder
-	fmt.Fprintf(&sb, "任务 %s（%s）：%s", job.ID, job.Action, job.State)
-	if job.State != macStateRunning {
-		fmt.Fprintf(&sb, "，退出码 %d", job.ExitCode)
-	}
-	if job.Note != "" {
-		fmt.Fprintf(&sb, "，说明：%s", job.Note)
-	}
-	if tail != "" {
-		sb.WriteString("\n输出（末尾）：\n")
-		sb.WriteString(tail)
-	}
-	return sb.String()
+	return b, nil
 }

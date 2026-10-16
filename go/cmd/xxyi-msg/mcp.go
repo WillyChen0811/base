@@ -1,7 +1,7 @@
 package main
 
 // MCP 服务：标准输入/输出上的 JSON-RPC 2.0，一行一个 JSON（newline-delimited），只用标准库。
-// 给另一侧的 Claude 用：五个消息工具碰消息通道，十个 mac_* 工具经协助远端碰 Mac（见 macexec.go），
+// 给另一侧的 Claude 用：五个消息工具碰消息通道，八个 mac_* 工具经协助远端碰 Mac（见 macexec.go），
 // 名单之外的事一律不暴露。
 
 import (
@@ -113,7 +113,7 @@ func initializeResult(params json.RawMessage) map[string]any {
 	}
 }
 
-// mcpTools 是消息通道的五个工具（mac_* 十个见 macexec.go 的 mcpMacTools），参数用 JSON Schema 描述。
+// mcpTools 是消息通道的五个工具（mac_* 八个见 macexec.go 的 mcpMacTools），参数用 JSON Schema 描述。
 var mcpTools = []map[string]any{
 	{
 		"name":        "xxyi_send",

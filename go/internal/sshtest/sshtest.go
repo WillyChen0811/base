@@ -22,6 +22,8 @@ type Options struct {
 	// Exec 不为 nil 时，没有申请 PTY 的 exec 请求交给它处理：返回标准输出、标准错误和退出码。
 	// 申请了 PTY 的 exec/shell 仍走回显（现有行为）。
 	Exec func(cmd string) (stdout, stderr string, code int)
+	// ExecStdin 不为 nil 时优先于 Exec：读完客户端的标准输入（直到 EOF）再交给它处理。
+	ExecStdin func(cmd string, stdin []byte) (stdout, stderr string, code int)
 	// Forward 为 true 时支持远端端口转发（tcpip-forward）；默认拒绝。
 	Forward bool
 	// SFTPRoot 非空时，session 通道上的 "subsystem" 请求且名字是 "sftp" 时回 true，
@@ -285,7 +287,13 @@ func (s *Server) serve(c net.Conn, cfg *ssh.ServerConfig) {
 						continue
 					}
 					started = true
-					if req.Type == "exec" && !pty && s.opts.Exec != nil {
+					if req.Type == "exec" && !pty && s.opts.ExecStdin != nil {
+						cmd, fn := e.Command, s.opts.ExecStdin
+						go func() {
+							in, _ := io.ReadAll(ch)
+							exec(ch, func(string) (string, string, int) { return fn(cmd, in) }, cmd)
+						}()
+					} else if req.Type == "exec" && !pty && s.opts.Exec != nil {
 						go exec(ch, s.opts.Exec, e.Command)
 					} else {
 						go echo(ch)

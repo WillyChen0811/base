@@ -25,6 +25,9 @@ const (
 	maxRunStderr = 4 << 10 // 报错时带出的标准错误前 4KB
 )
 
+// RunInput 的输出上限（stdout、stderr 各自）。
+const maxRunInputOut = 8 << 20
+
 // ErrOutputTooLarge 表示 Run 的标准输出超过 1MB 上限。
 var ErrOutputTooLarge = errors.New("sshterm: 标准输出超过 1MB")
 
@@ -190,6 +193,83 @@ func (c *Client) Run(ctx context.Context, command string) ([]byte, error) {
 		return nil, fmt.Errorf("sshterm: 远端命令失败: %w", werr)
 	}
 	return stdout, nil
+}
+
+// RunInput 同 Run，但把 stdin 写给远端命令（写完关闭输入），并同时返回标准输出、标准错误和退出码。
+// 退出码非 0 不算错误（exit 里给出）；连接/会话/超时/输出超限才返回 err。
+// 输出上限：stdout 与 stderr 各 maxRunInputOut。命令串由调用方负责安全，需要传的数据请走 stdin。
+func (c *Client) RunInput(ctx context.Context, command string, stdin []byte) (stdout, stderr []byte, exit int, err error) {
+	if err := c.live(); err != nil {
+		return nil, nil, -1, err
+	}
+	sess, err := c.client.NewSession()
+	if err != nil {
+		return nil, nil, -1, fmt.Errorf("sshterm: 开会话失败: %w", err)
+	}
+	defer sess.Close()
+	stop := context.AfterFunc(ctx, func() { sess.Close() })
+	defer stop()
+
+	in, err := sess.StdinPipe()
+	if err != nil {
+		return nil, nil, -1, fmt.Errorf("sshterm: 取 stdin 失败: %w", err)
+	}
+	out, err := sess.StdoutPipe()
+	if err != nil {
+		return nil, nil, -1, fmt.Errorf("sshterm: 取 stdout 失败: %w", err)
+	}
+	errPipe, err := sess.StderrPipe()
+	if err != nil {
+		return nil, nil, -1, fmt.Errorf("sshterm: 取 stderr 失败: %w", err)
+	}
+	if err := sess.Start(command); err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, nil, -1, ctxErr
+		}
+		return nil, nil, -1, fmt.Errorf("sshterm: 启动远端命令失败: %w", err)
+	}
+	go func() { // 输入写完就关；远端提前退出时写失败无所谓
+		in.Write(stdin)
+		in.Close()
+	}()
+	type res struct {
+		b   []byte
+		err error
+	}
+	ec := make(chan res, 1)
+	go func() {
+		b, e := io.ReadAll(io.LimitReader(errPipe, maxRunInputOut+1))
+		io.Copy(io.Discard, errPipe)
+		ec <- res{b, e}
+	}()
+	stdout, err = io.ReadAll(io.LimitReader(out, maxRunInputOut+1))
+	if err == nil && len(stdout) > maxRunInputOut {
+		err = ErrOutputTooLarge
+	}
+	if err != nil {
+		sess.Close()
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, nil, -1, ctxErr
+		}
+		return nil, nil, -1, fmt.Errorf("sshterm: 读远端输出失败: %w", err)
+	}
+	io.Copy(io.Discard, out)
+	er := <-ec
+	werr := sess.Wait()
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return nil, nil, -1, ctxErr
+	}
+	if len(er.b) > maxRunInputOut {
+		return nil, nil, -1, ErrOutputTooLarge
+	}
+	if werr != nil {
+		var ee *ssh.ExitError
+		if errors.As(werr, &ee) {
+			return stdout, er.b, ee.ExitStatus(), nil
+		}
+		return nil, nil, -1, fmt.Errorf("sshterm: 远端命令失败: %w", werr)
+	}
+	return stdout, er.b, 0, nil
 }
 
 // Listen 让远端在 addr（形如 "127.0.0.1:0"）上监听，连进来的连接经这条 SSH 连接转回本地。

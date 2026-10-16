@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"io"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"strings"
 	"unicode/utf8"
@@ -40,7 +41,17 @@ const (
 	ErrKindCheckedOut = "checked_out_during_update"
 	ErrKindRefs       = "refs_changed"
 	ErrKindOther      = "other"
+	// 自动提交（Kind=auto_commit）新增的分类。
+	ErrKindNotFinished     = "not_finished"
+	ErrKindNothingToCommit = "nothing_to_commit"
+	ErrKindCommitFailed    = "commit_failed"
 )
+
+// RequestAutoCommit 是 ApplyRequest.Kind 的取值：自动提交一个工作区的未提交改动。
+// Kind 为空 = 原有的分支更新动作（Plan）。协议版本仍是 1：新增的 Kind/Commit 字段用 omitempty，
+// 旧动作的请求字节不变；旧服务端（不认识这两个字段）收到 auto_commit 请求会因「未知字段」整体拒绝（协议层失败、
+// 未执行），所以两端需先同步升级再启用自动提交。
+const RequestAutoCommit = "auto_commit"
 
 // FactsRequest 请求采集对方仓库的事实。
 type FactsRequest struct {
@@ -70,17 +81,21 @@ type FactsResponse struct {
 }
 
 // ApplyRequest 请求执行一步更新。Plan.RepoDir 可空（或等于 Repo）；Plan.Env 必须为空。
+//
+// Kind 为空：执行 Plan（分支更新）；Kind=RequestAutoCommit：执行 Commit（Plan 必须是零值，Commit 必填）。
 type ApplyRequest struct {
 	Version int
 	Repo    string
 	Plan    ApplyPlan
+	Kind    string      `json:",omitempty"`
+	Commit  *CommitPlan `json:",omitempty"`
 }
 
 // ApplyResponse 是执行结果。业务失败 OK=false 并带 ErrKind/Error；协议层错误不走这里。
 type ApplyResponse struct {
 	Version int
 	OK      bool
-	NewOID  string // AutoMerge 成功时的合并提交
+	NewOID  string // AutoMerge 成功时的合并提交；自动提交成功时的新提交
 	ErrKind string
 	Error   string
 }
@@ -212,6 +227,16 @@ func validateApplyRequest(req *ApplyRequest) error {
 	if err := checkRepoPath(req.Repo); err != nil {
 		return err
 	}
+	switch req.Kind {
+	case "":
+		if req.Commit != nil {
+			return errors.New("Kind 为空时不允许带 Commit")
+		}
+	case RequestAutoCommit:
+		return validateCommitRequest(req)
+	default:
+		return fmt.Errorf("不认识的请求类型 Kind=%q", req.Kind)
+	}
 	p := &req.Plan
 	if p.RepoDir != "" && p.RepoDir != req.Repo {
 		return errors.New("Plan.RepoDir 与 Repo 不一致")
@@ -242,8 +267,29 @@ func validateApplyRequest(req *ApplyRequest) error {
 	return nil
 }
 
-// ServeApply 处理一个 ApplyRequest（原始 JSON），返回响应 JSON。err 非 nil 表示协议层失败（未写任何东西）。
-func ServeApply(ctx context.Context, in []byte) (out []byte, err error) {
+// validateCommitRequest 校验 auto_commit 请求：Plan 必须是零值（尤其 Env 禁止），Commit 字段合法。
+func validateCommitRequest(req *ApplyRequest) error {
+	if !reflect.DeepEqual(req.Plan, ApplyPlan{}) {
+		return errors.New("auto_commit 请求的 Plan 必须为空（不接受 Plan.Env 等）")
+	}
+	c := req.Commit
+	if c == nil {
+		return errors.New("auto_commit 请求缺少 Commit")
+	}
+	if c.RepoDir != "" && c.RepoDir != req.Repo {
+		return errors.New("Commit.RepoDir 与 Repo 不一致")
+	}
+	c.RepoDir = req.Repo
+	return ValidateCommitPlan(*c)
+}
+
+// ServeApply 等同 ServeApplyWith(ctx, in, nil)：没有 judge，auto_commit 只有 Force=true 才能执行。
+func ServeApply(ctx context.Context, in []byte) ([]byte, error) { return ServeApplyWith(ctx, in, nil) }
+
+// ServeApplyWith 处理一个 ApplyRequest（原始 JSON），返回响应 JSON；judge 用于 auto_commit（Force=false 时判定 agent 是否做完）。err 非 nil 表示协议层失败：
+// 请求校验阶段的失败确实未写任何东西，但内部 panic 可能发生在写动作之后，所以调用方对「协议层失败」
+// 一律不得假定未写入——必须停下并重新确认现场。
+func ServeApplyWith(ctx context.Context, in []byte, judge CommitJudge) (out []byte, err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			out, err = nil, fmt.Errorf("内部错误: %v", r)
@@ -258,12 +304,14 @@ func ServeApply(ctx context.Context, in []byte) (out []byte, err error) {
 	}
 	resp := ApplyResponse{Version: RemoteVersion}
 	var aerr error
-	switch req.Plan.Kind {
-	case KindCreateOnOther:
+	switch {
+	case req.Kind == RequestAutoCommit:
+		resp.NewOID, aerr = AutoCommit(ctx, *req.Commit, judge)
+	case req.Plan.Kind == KindCreateOnOther:
 		aerr = CreateBranch(ctx, req.Plan)
-	case KindFastForward:
+	case req.Plan.Kind == KindFastForward:
 		aerr = FastForwardBranch(ctx, req.Plan)
-	case KindAutoMerge:
+	case req.Plan.Kind == KindAutoMerge:
 		resp.NewOID, aerr = AutoMergeCommit(ctx, req.Plan)
 	}
 	if aerr != nil {
@@ -278,17 +326,56 @@ func ServeApply(ctx context.Context, in []byte) (out []byte, err error) {
 func classifyApplyErr(err error) string {
 	var oos *ErrOutOfScope
 	var co *ErrCheckedOutDuringUpdate
+	var cf *ErrCommitFailed
 	switch {
+	case errors.Is(err, ErrNotFinished):
+		return ErrKindNotFinished
+	case errors.Is(err, ErrNothingToCommit):
+		return ErrKindNothingToCommit
+	case errors.As(err, &cf):
+		return ErrKindCommitFailed
 	case errors.As(err, &oos):
 		return ErrKindOutOfScope
 	case errors.As(err, &co):
 		return ErrKindCheckedOut
-	// apply.go 没有给「引用已变化 / 已被抢先建立」专门的错误类型，按固定中文措辞识别。
-	case strings.Contains(err.Error(), "引用已变化"), strings.Contains(err.Error(), "目标分支已存在"),
-		strings.Contains(err.Error(), "可能被抢先建立"):
+	case errors.Is(err, ErrRefsChanged):
 		return ErrKindRefs
 	}
 	return ErrKindOther
+}
+
+var knownErrKinds = map[string]bool{
+	ErrKindOutOfScope: true, ErrKindCheckedOut: true, ErrKindRefs: true, ErrKindOther: true,
+	ErrKindNotFinished: true, ErrKindNothingToCommit: true, ErrKindCommitFailed: true,
+}
+
+// validateApplyResponse 校验响应的必需字段与字段组合：
+// OK=true 时 ErrKind、Error 必须为空，且 NewOID 恰在 AutoMerge / AutoCommit 成功时出现并合法；
+// OK=false 时 ErrKind 必须是已知分类、Error 非空、NewOID 为空。
+func validateApplyResponse(req ApplyRequest, resp ApplyResponse) error {
+	if resp.OK {
+		if resp.ErrKind != "" || resp.Error != "" {
+			return fmt.Errorf("OK=true 却带有 ErrKind=%q / Error=%q", resp.ErrKind, resp.Error)
+		}
+		wantOID := req.Plan.Kind == KindAutoMerge || req.Kind == RequestAutoCommit
+		if wantOID && !oidRe.MatchString(resp.NewOID) {
+			return fmt.Errorf("成功响应缺少合法的 NewOID: %q", resp.NewOID)
+		}
+		if !wantOID && resp.NewOID != "" {
+			return fmt.Errorf("该动作成功时不应带 NewOID: %q", resp.NewOID)
+		}
+		return nil
+	}
+	if !knownErrKinds[resp.ErrKind] {
+		return fmt.Errorf("失败响应的 ErrKind 缺失或未知: %q", resp.ErrKind)
+	}
+	if resp.Error == "" {
+		return errors.New("失败响应缺少 Error")
+	}
+	if resp.NewOID != "" {
+		return fmt.Errorf("失败响应不应带 NewOID: %q", resp.NewOID)
+	}
+	return nil
 }
 
 // ── Mac 侧客户端 ──────────────────────────────────────
@@ -347,10 +434,18 @@ func RemoteFacts(ctx context.Context, r RemoteRunner, xxyiMsgPath string, req Fa
 	if resp.Error != "" {
 		return FactsResponse{}, errors.New("对方采集失败: " + resp.Error)
 	}
+	if len(resp.Worktrees) == 0 || resp.Branches == nil || resp.Agents == nil {
+		return FactsResponse{}, errors.New("远程采集响应缺少必需字段（Worktrees / Branches / Agents）")
+	}
+	if (resp.ScopeError == "") != (len(resp.ScopeReasons) == 0) {
+		return FactsResponse{}, errors.New("远程采集响应的 ScopeError 与 ScopeReasons 不一致")
+	}
 	return resp, nil
 }
 
 // RemoteApply 经 r 在对方机器上执行一步更新。业务失败（OK=false）不是 error，看 ErrKind/Error。
+// 返回 error（通信失败、退出码非 0、响应不合法）时远端可能已经写入，结果不确定：
+// 调用方必须停下并重新确认现场（重新采集），不得假定未写入，更不得盲目重试。
 func RemoteApply(ctx context.Context, r RemoteRunner, xxyiMsgPath string, req ApplyRequest) (ApplyResponse, error) {
 	req.Version = RemoteVersion
 	var resp ApplyResponse
@@ -359,6 +454,9 @@ func RemoteApply(ctx context.Context, r RemoteRunner, xxyiMsgPath string, req Ap
 	}
 	if resp.Version != RemoteVersion {
 		return ApplyResponse{}, fmt.Errorf("响应协议版本不符：%d", resp.Version)
+	}
+	if err := validateApplyResponse(req, resp); err != nil {
+		return ApplyResponse{}, fmt.Errorf("远程响应不合法（远端结果不确定，需重新确认现场）: %w", err)
 	}
 	return resp, nil
 }

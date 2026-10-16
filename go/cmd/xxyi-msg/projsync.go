@@ -9,6 +9,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"strings"
 
 	"github.com/WillyChen0811/base/go/agentstate"
 	"github.com/WillyChen0811/base/go/projsync"
@@ -25,6 +26,15 @@ func judgeAgent(ctx context.Context, worktree string) projsync.AgentVerdict {
 	return av
 }
 
+// judgeFinished 供自动提交用：agentstate 判定为 Finished 才算做完；判定失败按未做完。why 带判定依据。
+func judgeFinished(ctx context.Context, worktree string) (bool, string) {
+	r, err := agentstate.JudgeDetail(ctx, worktree, agentstate.Options{})
+	if err != nil {
+		return false, "判定失败: " + err.Error()
+	}
+	return r.Verdict == agentstate.VerdictFinished, fmt.Sprintf("agent 状态 %s；%s", r.Verdict, strings.Join(r.Notes, "；"))
+}
+
 func cmdProjsync(sub string, stdin io.Reader, stdout io.Writer) error {
 	in, err := io.ReadAll(io.LimitReader(stdin, projsync.MaxRemoteInput+1))
 	if err != nil {
@@ -37,7 +47,7 @@ func cmdProjsync(sub string, stdin io.Reader, stdout io.Writer) error {
 	if sub == projsync.SubcmdFacts {
 		out, err = projsync.ServeFacts(context.Background(), in, judgeAgent)
 	} else {
-		out, err = projsync.ServeApply(context.Background(), in)
+		out, err = projsync.ServeApplyWith(context.Background(), in, judgeFinished)
 	}
 	if err != nil {
 		return err

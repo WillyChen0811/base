@@ -38,8 +38,10 @@ func RepoRoot(home, name string, allowed []string) (string, error) {
 	return root, nil
 }
 
-// ResolveInRepo 把仓库内相对路径解析成绝对路径：拒绝空、绝对路径、含 ".." 段、含 ".git" 段；
-// filepath.EvalSymlinks 之后仍须在 root（同样 EvalSymlinks 过）之内，防符号链接逃逸。
+// ResolveInRepo 把仓库内相对路径解析成绝对路径：拒绝空、绝对路径、含 ".." 段、含 ".git" 段
+// （".git" 按大小写不敏感比较，macOS 大小写不敏感卷上 ".GIT" 同样命中）；
+// filepath.EvalSymlinks 之后仍须在 root（同样 EvalSymlinks 过）之内，防符号链接逃逸；
+// 解析后再对相对路径逐段查 ".git"，防仓库内符号链接指向 .git（如 alias -> .git）。
 func ResolveInRepo(root, rel string) (string, error) {
 	if rel == "" {
 		return "", fmt.Errorf("路径不能为空")
@@ -51,7 +53,8 @@ func ResolveInRepo(root, rel string) (string, error) {
 		if seg == ".." {
 			return "", fmt.Errorf("路径不允许包含 \"..\" 段: %q", rel)
 		}
-		if seg == ".git" {
+		// 大小写不敏感比较：macOS 常见卷不区分大小写，".GIT" 同样落在 .git 上。
+		if strings.EqualFold(seg, ".git") {
 			return "", fmt.Errorf("路径不允许访问 .git: %q", rel)
 		}
 	}
@@ -69,6 +72,16 @@ func ResolveInRepo(root, rel string) (string, error) {
 	}
 	if resolved != realRoot && !strings.HasPrefix(resolved, realRoot+string(filepath.Separator)) {
 		return "", fmt.Errorf("路径越出仓库: %q", rel)
+	}
+	// 符号链接可能指向 .git 目录（如 alias -> .git），解析后的相对路径也要逐段查 .git。
+	relResolved, err := filepath.Rel(realRoot, resolved)
+	if err != nil {
+		return "", fmt.Errorf("路径无法转成仓库内相对路径 %q: %w", rel, err)
+	}
+	for _, seg := range strings.Split(relResolved, string(filepath.Separator)) {
+		if strings.EqualFold(seg, ".git") {
+			return "", fmt.Errorf("路径不允许访问 .git: %q", rel)
+		}
 	}
 	return resolved, nil
 }

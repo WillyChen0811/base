@@ -295,10 +295,10 @@ func mergedSettings(base map[string]any, hookCmd string) map[string]any {
 
 // startSupport 建协助服务。httpAddr 是本机 HTTP 监听地址；socksAddrs 是各 SOCKS 口的实际地址。
 // proj 是项目同步服务（没配置 projsync 时为 nil）：配置了就把它的项目名和同步入口交给协助服务，
-// 远端 Claude 发起的同步经用户批准后同步调用 proj.Run 执行。
+// 远端 Claude 发起的同步经用户批准后同步调用 proj.RunOnce 执行（走 v2，返回 RoundResult）。
 // 主机有多条线路时还会起线路转发口，作为第二个返回值交给调用方在退出时关闭（否则为 nil）。
 // 合并设置文件在 NewService 之后（拿到钩子令牌）才写，Claude 要等用户点开始才会启动。
-func startSupport(p *supportPrep, dir, knownHosts, httpAddr string, socksAddrs map[string]string, pool *sshPool, proj *projsyncSvc) (*support.Service, io.Closer, error) {
+func startSupport(p *supportPrep, dir, knownHosts, httpAddr string, socksAddrs map[string]string, pool *sshPool, proj *projsyncV2Svc) (*support.Service, io.Closer, error) {
 	sc := p.conf
 	merged := filepath.Join(dir, "support-claude.merged.json")
 	bin := expand(sc.ClaudeBin) // 由 xxyi 拉起时 PATH 可能不含 ~/.local/bin，允许写 ~/ 开头的路径
@@ -372,9 +372,9 @@ func startSupport(p *supportPrep, dir, knownHosts, httpAddr string, socksAddrs m
 		cfg.MsgSign = ca.Sign
 	}
 	if proj != nil {
-		cfg.ProjSyncNames = proj.Names() // 配置顺序的项目名，远端只能发起这些
+		cfg.ProjSyncNames = proj.v1.Names() // 配置顺序的项目名，远端只能发起这些
 		cfg.ProjSync = func(ctx context.Context, name string) (any, error) {
-			return proj.Run(ctx, name) // 用户已允许：同步执行并把结果原样交回远端
+			return proj.RunOnce(ctx, name) // 用户已允许：同步执行并把结果原样交回远端
 		}
 	}
 	// 合并设置文件：启动时写一次；之后每次开启协助重新读 claude_settings 再写，改设置不用重启

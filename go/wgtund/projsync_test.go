@@ -9,7 +9,6 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -89,23 +88,6 @@ func pollUntil(t *testing.T, d time.Duration, what string, f func() bool) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatalf("等到超时: %s", what)
-}
-
-type apiItem struct {
-	Name    string          `json:"name"`
-	Running bool            `json:"running"`
-	Last    *projsyncResult `json:"last"`
-}
-
-func getProjects(t *testing.T, body []byte) []apiItem {
-	t.Helper()
-	var st struct {
-		Projects []apiItem `json:"projects"`
-	}
-	if err := json.Unmarshal(body, &st); err != nil {
-		t.Fatalf("解析 /projsync 响应失败: %v\n%s", err, body)
-	}
-	return st.Projects
 }
 
 // ── 配置校验 ─────────────────────────────────────────────
@@ -226,212 +208,6 @@ func TestProjsyncBadConfigStopsRun(t *testing.T) {
 	}
 }
 
-// ── 本机接口（假执行） ───────────────────────────────────
-
-// mkAPI 建两个项目（alpha/beta）的 svc，run 换成可控的假执行；返回 svc、进入通道和放行闸门。
-func mkAPI(t *testing.T) (*projsyncSvc, chan string, chan struct{}) {
-	t.Helper()
-	c := projConfT(t, func(pj, p0 map[string]any, _ *hostConf) {
-		pj["projects"] = []any{
-			p0,
-			map[string]any{"name": "beta", "local": p0["local"], "remote": "/home/chenwy/beta"},
-		}
-	})
-	p, err := prepareProjsync(c)
-	if err != nil {
-		t.Fatal(err)
-	}
-	svc := newProjsyncSvc(p, nil, "127.0.0.1:9")
-	entered := make(chan string, 8)
-	gate := make(chan struct{})
-	svc.run = func(ctx context.Context, tt projsyncTarget) *projsyncResult {
-		entered <- tt.name
-		<-gate
-		return &projsyncResult{Time: time.Now(), Git: &projsync.GitResult{
-			Branches:   []projsync.BranchState{{Branch: "main", Ahead: 1, Remote: true}},
-			RemoteOnly: []string{},
-		}, Files: &projsync.FileResult{Uploaded: []string{"x.jsonl"}, Downloaded: []string{}, Same: 1, Conflicts: []projsync.Conflict{}, Errors: []string{}}}
-	}
-	return svc, entered, gate
-}
-
-func TestProjsyncLocalAPI(t *testing.T) {
-	svc, entered, gate := mkAPI(t)
-	srv := httptest.NewServer(svc.localHandler(context.Background(), []string{"127.0.0.1:8765"}))
-	defer srv.Close()
-	do := func(method, path, origin string) (*http.Response, []byte) {
-		req, err := http.NewRequest(method, srv.URL+path, nil)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if origin != "" {
-			req.Header.Set("Origin", origin)
-		}
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer resp.Body.Close()
-		b, _ := io.ReadAll(resp.Body)
-		return resp, b
-	}
-
-	// GET 结构：按配置顺序、running=false、last=null
-	resp, b := do(http.MethodGet, "/projsync", "")
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("GET 应 200: %d %s", resp.StatusCode, b)
-	}
-	items := getProjects(t, b)
-	if len(items) != 2 || items[0].Name != "alpha" || items[1].Name != "beta" {
-		t.Fatalf("项目列表顺序不对: %s", b)
-	}
-	for _, it := range items {
-		if it.Running || it.Last != nil {
-			t.Fatalf("未跑过应 running=false last=null: %+v", it)
-		}
-	}
-	if !strings.Contains(string(b), `"last":null`) {
-		t.Fatalf("原始 JSON 应含 \"last\":null: %s", b)
-	}
-
-	// 方法不对
-	if resp, _ := do(http.MethodGet, "/projsync/run?name=alpha", testOrigin); resp.StatusCode != http.StatusMethodNotAllowed {
-		t.Errorf("GET /projsync/run 应 405: %d", resp.StatusCode)
-	}
-	if resp, _ := do(http.MethodPost, "/projsync", testOrigin); resp.StatusCode != http.StatusMethodNotAllowed {
-		t.Errorf("POST /projsync 应 405: %d", resp.StatusCode)
-	}
-
-	// Origin：没有 / 不在白名单都 403
-	if resp, _ := do(http.MethodPost, "/projsync/run?name=alpha", ""); resp.StatusCode != http.StatusForbidden {
-		t.Errorf("无 Origin 应 403: %d", resp.StatusCode)
-	}
-	if resp, _ := do(http.MethodPost, "/projsync/run?name=alpha", "http://evil.example"); resp.StatusCode != http.StatusForbidden {
-		t.Errorf("白名单外 Origin 应 403: %d", resp.StatusCode)
-	}
-
-	// 未知项目 404
-	if resp, b := do(http.MethodPost, "/projsync/run?name=zzz", testOrigin); resp.StatusCode != http.StatusNotFound ||
-		!strings.Contains(string(b), "未知项目") {
-		t.Errorf("未知项目应 404: %d %s", resp.StatusCode, b)
-	}
-
-	// 合法发起：202；同步中 GET running=true；期间再来一次 409
-	resp, b = do(http.MethodPost, "/projsync/run?name=alpha", testOrigin)
-	if resp.StatusCode != http.StatusAccepted || !strings.Contains(string(b), `"started":true`) {
-		t.Fatalf("应 202 started:true，得到 %d %s", resp.StatusCode, b)
-	}
-	if n := <-entered; n != "alpha" {
-		t.Fatalf("假执行收到的项目名 = %q", n)
-	}
-	_, b = do(http.MethodGet, "/projsync", "")
-	items = getProjects(t, b)
-	if !items[0].Running || items[1].Running || items[0].Last != nil {
-		t.Fatalf("alpha 应在同步中且无 last: %+v", items)
-	}
-	resp, b = do(http.MethodPost, "/projsync/run?name=alpha", testOrigin)
-	if resp.StatusCode != http.StatusConflict || !strings.Contains(string(b), "正在同步") {
-		t.Fatalf("第二次应 409 正在同步: %d %s", resp.StatusCode, b)
-	}
-	// 另一个项目不受 alpha 阻塞，可以并行发起
-	if resp, _ := do(http.MethodPost, "/projsync/run?name=beta", testOrigin); resp.StatusCode != http.StatusAccepted {
-		t.Errorf("beta 并行发起应 202: %d", resp.StatusCode)
-	}
-	if n := <-entered; n != "beta" {
-		t.Fatalf("假执行第二个项目 = %q", n)
-	}
-
-	close(gate) // 放行两个后台执行
-	pollUntil(t, 5*time.Second, "两次同步结束", func() bool {
-		_, b := do(http.MethodGet, "/projsync", "")
-		items := getProjects(t, b)
-		return !items[0].Running && !items[1].Running
-	})
-	_, b = do(http.MethodGet, "/projsync", "")
-	items = getProjects(t, b)
-	for _, it := range items {
-		if it.Last == nil || it.Last.Git == nil || len(it.Last.Git.Branches) != 1 ||
-			it.Last.Git.Branches[0].Branch != "main" || it.Last.Files == nil {
-			t.Fatalf("%s 的 last 不对: %+v", it.Name, it.Last)
-		}
-		if it.Last.GitError != "" || it.Last.FilesError != "" {
-			t.Fatalf("不应有错误: %+v", it.Last)
-		}
-	}
-}
-
-// 同一项目的同步串行：Run 进行中再来 Run 直接 errProjsyncBusy；整个 Run 套 30 分钟超时。
-func TestProjsyncBusyAndTimeout(t *testing.T) {
-	svc, entered, gate := mkAPI(t)
-	deadlines := make(chan time.Time, 2)
-	base := svc.run
-	svc.run = func(ctx context.Context, tt projsyncTarget) *projsyncResult {
-		if dl, ok := ctx.Deadline(); ok {
-			deadlines <- dl
-		}
-		return base(ctx, tt)
-	}
-	done := make(chan *projsyncResult, 1)
-	go func() {
-		res, err := svc.Run(context.Background(), "alpha")
-		if err != nil {
-			t.Errorf("Run 出错: %v", err)
-		}
-		done <- res
-	}()
-	<-entered
-	if _, err := svc.Run(context.Background(), "alpha"); !errors.Is(err, errProjsyncBusy) {
-		t.Fatalf("第二次 Run 应 errProjsyncBusy，得到 %v", err)
-	}
-	if _, err := svc.Run(context.Background(), "nope"); !errors.Is(err, errProjsyncUnknown) {
-		t.Fatalf("未知项目应 errProjsyncUnknown，得到 %v", err)
-	}
-	dl := <-deadlines
-	if left := time.Until(dl); left < 29*time.Minute || left > projsyncRunTimeout+5*time.Second {
-		t.Errorf("Run 超时应在 30 分钟左右，得到剩 %v", left)
-	}
-	close(gate)
-	res := <-done
-	if res == nil || res.Git == nil {
-		t.Fatalf("第一次 Run 应返回结果: %+v", res)
-	}
-	st := svc.status()
-	items := st["projects"].([]projsyncItem)
-	if items[0].Running || items[0].Last == nil {
-		t.Errorf("结束后应 running=false 且有 last: %+v", items[0])
-	}
-	// 结束之后可以再跑（不再忙）：闸门已关，直接放行
-	res2, err := svc.Run(context.Background(), "alpha")
-	if err != nil || res2 == nil {
-		t.Errorf("空闲后再 Run 应成功: %v %+v", err, res2)
-	}
-}
-
-// 后台执行的 ctx 跟随 wgtund 的 Run ctx：父 ctx 取消能传到执行函数。
-func TestProjsyncStartFollowsCtx(t *testing.T) {
-	svc, entered, _ := mkAPI(t)
-	ctx, cancel := context.WithCancel(context.Background())
-	svc.run = func(ctx context.Context, tt projsyncTarget) *projsyncResult {
-		entered <- tt.name
-		<-ctx.Done()
-		return &projsyncResult{Time: time.Now(), GitError: "取消:" + ctx.Err().Error()}
-	}
-	if err := svc.Start(ctx, "alpha"); err != nil {
-		t.Fatal(err)
-	}
-	<-entered
-	if err := svc.Start(ctx, "alpha"); !errors.Is(err, errProjsyncBusy) {
-		t.Errorf("进行中 Start 应忙: %v", err)
-	}
-	cancel()
-	pollUntil(t, 5*time.Second, "后台执行观察到取消", func() bool {
-		svc.mu.Lock()
-		last := svc.last["alpha"]
-		svc.mu.Unlock()
-		return last != nil && strings.HasPrefix(last.GitError, "取消:")
-	})
-}
-
 // ── 线路与 git 地址 ──────────────────────────────────────
 
 func TestProjsyncGitTarget(t *testing.T) {
@@ -475,82 +251,37 @@ func TestProjsyncGitTarget(t *testing.T) {
 	}
 }
 
-// ── 完整 wgtund 流程（假执行） ──────────────────────────
+// ── 完整 wgtund 流程：v1 旧路径已移除 ───────────────────
 
-func TestProjsyncFullRun(t *testing.T) {
-	t.Cleanup(func() { projsyncRunForTest = nil })
-
-	// 没配置：GET 和 POST 都 404
-	f0 := newFixture(t, nil)
-	st0, _, _ := run(t, f0.dir)
-	if resp, b := get(t, st0, "/projsync", true); resp.StatusCode != http.StatusNotFound ||
-		!strings.Contains(string(b), "没有配置项目同步") {
-		t.Fatalf("没配置应 404: %d %s", resp.StatusCode, b)
-	}
-	if resp, _ := supportPost(t, st0, "/projsync/run?name=a", testOrigin); resp.StatusCode != http.StatusNotFound {
-		t.Fatalf("没配置 POST 应 404: %d", resp.StatusCode)
-	}
-
+func TestProjsyncV1PathsGone(t *testing.T) {
 	repo := gitRepoDir(t)
-	entered := make(chan string, 4)
-	gate := make(chan struct{})
-	projsyncRunForTest = func(ctx context.Context, _ *projsyncSvc, tt projsyncTarget) *projsyncResult {
-		entered <- tt.name
-		<-gate
-		return &projsyncResult{Time: time.Now(), GitError: "fake 执行", Files: &projsync.FileResult{
-			Uploaded: []string{}, Downloaded: []string{}, Conflicts: []projsync.Conflict{}, Errors: []string{}}}
+	for _, withConf := range []bool{false, true} {
+		var mut func(cfg map[string]any)
+		if withConf {
+			mut = func(cfg map[string]any) {
+				cfg["projsync"] = map[string]any{"host": "ubuntu",
+					"projects": []any{map[string]any{"name": "alpha", "local": repo, "remote": "/home/chenwy/alpha"}}}
+			}
+		}
+		f := newFixture(t, mut)
+		st, _, _ := run(t, f.dir)
+		if resp, b := get(t, st, "/projsync", true); resp.StatusCode != http.StatusNotFound {
+			t.Errorf("withConf=%v: GET /projsync 应 404: %d %s", withConf, resp.StatusCode, b)
+		}
+		if resp, _ := supportPost(t, st, "/projsync/run?name=alpha", testOrigin); resp.StatusCode != http.StatusNotFound {
+			t.Errorf("withConf=%v: POST /projsync/run 应 404: %d", withConf, resp.StatusCode)
+		}
+		// v2 仍在
+		if resp, b := get(t, st, "/projsync/v2", true); withConf && resp.StatusCode != http.StatusOK {
+			t.Errorf("有配置时 GET /projsync/v2 应 200: %d %s", resp.StatusCode, b)
+		}
 	}
-
-	f := newFixture(t, func(cfg map[string]any) {
-		cfg["projsync"] = map[string]any{"host": "ubuntu",
-			"projects": []any{
-				map[string]any{"name": "alpha", "local": repo, "remote": "/home/chenwy/alpha"},
-				map[string]any{"name": "beta", "local": repo, "remote": "/home/chenwy/beta"},
-			}}
-	})
-	st, _, _ := run(t, f.dir)
-
-	if resp, _ := get(t, st, "/projsync", false); resp.StatusCode != http.StatusUnauthorized {
-		t.Errorf("不带主令牌应 401: %d", resp.StatusCode)
-	}
-	resp, b := get(t, st, "/projsync", true)
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("GET 应 200: %d %s", resp.StatusCode, b)
-	}
-	items := getProjects(t, b)
-	if len(items) != 2 || items[0].Name != "alpha" || items[1].Name != "beta" || items[0].Last != nil {
-		t.Fatalf("初始结构不对: %s", b)
-	}
-	if resp, _ := supportPost(t, st, "/projsync/run?name=alpha", ""); resp.StatusCode != http.StatusForbidden {
-		t.Errorf("POST 无 Origin 应 403: %d", resp.StatusCode)
-	}
-	resp, b = supportPost(t, st, "/projsync/run?name=alpha", testOrigin)
-	if resp.StatusCode != http.StatusAccepted || !strings.Contains(string(b), `"started":true`) {
-		t.Fatalf("应 202: %d %s", resp.StatusCode, b)
-	}
-	if n := <-entered; n != "alpha" {
-		t.Fatalf("执行项目 = %q", n)
-	}
-	_, b = get(t, st, "/projsync", true)
-	items = getProjects(t, b)
-	if !items[0].Running {
-		t.Fatalf("发起后 GET 应显示 running: %s", b)
-	}
-	if resp, _ := supportPost(t, st, "/projsync/run?name=alpha", testOrigin); resp.StatusCode != http.StatusConflict {
-		t.Errorf("同步中再来应 409: %d", resp.StatusCode)
-	}
-	close(gate)
-	pollUntil(t, 5*time.Second, "同步结束并记下 last", func() bool {
-		_, b := get(t, st, "/projsync", true)
-		items := getProjects(t, b)
-		return !items[0].Running && items[0].Last != nil && items[0].Last.GitError == "fake 执行"
-	})
 }
 
-// ── 协助接线：远端发起 → 用户允许 → proj.Run ────────────
+// ── 协助接线：远端发起 → 用户允许 → v2 RunOnce ──────────
 
 func TestProjsyncSupportWired(t *testing.T) {
-	t.Cleanup(func() { projsyncRunForTest = nil })
+	t.Cleanup(func() { projsyncV2InitForTest = nil })
 	f, lg, _ := supportFixture(t, nil)
 	repo := gitRepoDir(t)
 	patchHosts(t, f.dir, func(cfg map[string]any) {
@@ -558,9 +289,12 @@ func TestProjsyncSupportWired(t *testing.T) {
 			"projects": []any{map[string]any{"name": "ai-browser", "local": repo, "remote": "/home/chenwy/ai-browser"}}}
 	})
 	called := make(chan string, 4)
-	projsyncRunForTest = func(ctx context.Context, _ *projsyncSvc, tt projsyncTarget) *projsyncResult {
-		called <- tt.name
-		return &projsyncResult{Time: time.Now(), GitError: "fake 执行"}
+	projsyncV2InitForTest = func(s *projsyncV2Svc) {
+		s.claudeSync = nil
+		s.round = func(ctx context.Context, env projsync.RoundEnv) projsync.RoundResult {
+			called <- env.Project
+			return projsync.RoundResult{Project: env.Project, Summary: "fake 执行"}
+		}
 	}
 	st, _, _ := run(t, f.dir)
 
@@ -650,11 +384,6 @@ func TestProjsyncSupportWired(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("等远端 projsync 响应超时")
 	}
-	pollUntil(t, 5*time.Second, "GET /projsync 出现 last", func() bool {
-		_, b := get(t, st, "/projsync", true)
-		items := getProjects(t, b)
-		return len(items) == 1 && !items[0].Running && items[0].Last != nil
-	})
 }
 
 // ── 端到端（对话目录）：真 pool + 真 SFTP（sshtest） ────
@@ -749,35 +478,11 @@ func TestProjsyncE2EFiles(t *testing.T) {
 		}},
 	}
 	svc := newProjsyncSvc(prep, pool, "127.0.0.1:9")
-	// git 半边：远端换成本地路径的裸仓库（真 git push/fetch，不走 ssh）；地址/环境拼装由 TestProjsyncGitTarget 覆盖
-	bare := filepath.Join(t.TempDir(), "remote.git")
-	if out, err := exec.Command("git", "init", "-q", "--bare", bare).CombinedOutput(); err != nil {
-		t.Fatalf("git init --bare: %v %s", err, out)
-	}
-	gitIn := func(dir string, args ...string) {
-		t.Helper()
-		c := exec.Command("git", append([]string{"-c", "user.name=t", "-c", "user.email=t@t"}, args...)...)
-		c.Dir = dir
-		if out, err := c.CombinedOutput(); err != nil {
-			t.Fatalf("git %v: %v %s", args, err, out)
-		}
-	}
-	repo := prep.targets[0].local
-	if err := os.WriteFile(filepath.Join(repo, "a.txt"), []byte("a\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	gitIn(repo, "add", "a.txt")
-	gitIn(repo, "commit", "-q", "-m", "init")
-	svc.gitOverride = func(projsyncTarget) (string, []string, error) { return bare, nil, nil }
-
-	res, err := svc.Run(context.Background(), "projA")
+	tg := prep.targets[0]
+	f, err := svc.syncClaude(context.Background(), tg)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("对话同步失败: %v", err)
 	}
-	if res.FilesError != "" {
-		t.Fatalf("对话同步失败: %s", res.FilesError)
-	}
-	f := res.Files
 	if len(f.Errors) != 0 || len(f.Conflicts) != 0 {
 		t.Fatalf("不该有冲突/错误: %+v", f)
 	}
@@ -789,12 +494,6 @@ func TestProjsyncE2EFiles(t *testing.T) {
 	}
 	if f.Same != 1 {
 		t.Errorf("Same = %d，应为 1（shared.jsonl）", f.Same)
-	}
-	if res.GitError != "" || res.Git == nil || len(res.Git.Branches) != 1 {
-		t.Errorf("git 半边应成功: %q %+v", res.GitError, res.Git)
-	}
-	if out, err := exec.Command("git", "-C", bare, "for-each-ref", "refs/remotes/mac/").CombinedOutput(); err != nil || !strings.Contains(string(out), "refs/remotes/mac/") {
-		t.Errorf("对方应有 refs/remotes/mac/*: %q %v", out, err)
 	}
 	shMu.Lock()
 	cmds := strings.Join(shCmds, "\n")
@@ -820,11 +519,11 @@ func TestProjsyncE2EFiles(t *testing.T) {
 	}
 
 	// 再跑一次：全部一致，不再有上传/下载
-	res2, err := svc.Run(context.Background(), "projA")
+	f2, err := svc.syncClaude(context.Background(), tg)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if res2.FilesError != "" || len(res2.Files.Uploaded) != 0 || len(res2.Files.Downloaded) != 0 {
-		t.Fatalf("第二次应全部跳过: %+v %s", res2.Files, res2.FilesError)
+	if len(f2.Uploaded) != 0 || len(f2.Downloaded) != 0 {
+		t.Fatalf("第二次应全部跳过: %+v", f2)
 	}
 }

@@ -688,3 +688,43 @@ func TestRunInterruptible(t *testing.T) {
 		runInterruptible(context.Background(), time.Second, func() {}, func() error { panic("x") })
 	}()
 }
+
+// ── RunOnce（协助通道同步发起） ─────────────────────────
+
+func TestProjsyncV2RunOnce(t *testing.T) {
+	s := v2Svc(t, false)
+	s.claudeSync = nil
+	entered := make(chan struct{}, 2)
+	gate := make(chan struct{})
+	s.round = func(ctx context.Context, env projsync.RoundEnv) projsync.RoundResult {
+		entered <- struct{}{}
+		<-gate
+		return projsync.RoundResult{Project: env.Project, Summary: "fake 一轮"}
+	}
+	if _, err := s.RunOnce(context.Background(), "nope"); !errors.Is(err, errProjsyncUnknown) {
+		t.Fatalf("未知项目应 errProjsyncUnknown: %v", err)
+	}
+	type out struct {
+		v   any
+		err error
+	}
+	done := make(chan out, 1)
+	go func() {
+		v, err := s.RunOnce(context.Background(), "alpha")
+		done <- out{v, err}
+	}()
+	<-entered
+	if _, err := s.RunOnce(context.Background(), "alpha"); !errors.Is(err, errProjsyncBusy) {
+		t.Fatalf("正在跑应 errProjsyncBusy: %v", err)
+	}
+	close(gate)
+	o := <-done
+	rr, ok := o.v.(projsync.RoundResult)
+	if o.err != nil || !ok || rr.Project != "alpha" || rr.Summary != "fake 一轮" {
+		t.Fatalf("应返回 RoundResult: %v %#v", o.err, o.v)
+	}
+	// 结束后可再跑
+	if _, err := s.RunOnce(context.Background(), "alpha"); err != nil {
+		t.Fatalf("空闲后再跑应成功: %v", err)
+	}
+}

@@ -121,6 +121,9 @@ type projsyncV2Svc struct {
 	next     time.Time
 }
 
+// projsyncV2InitForTest 是测试钩子：非 nil 时在服务建好后调用，让测试换掉 round/claudeSync；生产恒为 nil。
+var projsyncV2InitForTest func(s *projsyncV2Svc)
+
 func newProjsyncV2Svc(v1 *projsyncSvc, pool *sshPool) *projsyncV2Svc {
 	s := &projsyncV2Svc{v1: v1, localJudge: judgeLocalAgent, round: projsync.RunRound, claudeSync: v1.syncClaude,
 		interval: v1.prep.v2.interval, initialDelay: projsyncV2InitialDelay, now: time.Now,
@@ -130,6 +133,9 @@ func newProjsyncV2Svc(v1 *projsyncSvc, pool *sshPool) *projsyncV2Svc {
 	}
 	if dir, err := xxyiDir(); err == nil {
 		s.statusPath = filepath.Join(dir, projsyncV2StatusFile)
+	}
+	if f := projsyncV2InitForTest; f != nil {
+		f(s)
 	}
 	return s
 }
@@ -263,6 +269,19 @@ func (s *projsyncV2Svc) execute(ctx context.Context, t projsyncTarget, force []p
 	s.mu.Unlock()
 	s.persist()
 	return res
+}
+
+// RunOnce 同步执行一轮（协助通道在用户允许后调用）。未知项目 errProjsyncUnknown、忙 errProjsyncBusy；
+// 否则返回这一轮的 projsync.RoundResult。
+func (s *projsyncV2Svc) RunOnce(ctx context.Context, name string) (any, error) {
+	t, ok := s.v1.target(name)
+	if !ok {
+		return nil, errProjsyncUnknown
+	}
+	if err := s.acquire(name); err != nil {
+		return nil, err
+	}
+	return s.execute(ctx, t, nil), nil
 }
 
 // Start 本机接口用：先占位再起后台协程，立即返回。

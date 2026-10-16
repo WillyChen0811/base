@@ -253,7 +253,6 @@ func Run(ctx context.Context, dir string, stdin io.Reader, stdout io.Writer) (er
 
 	// 项目同步（可选）：给目标主机开一条本机线路转发口（git 走它、跟随当前线路），
 	// 启动时开一次，退出时一起关（照协助多线路对 fwd 的处理）
-	var projSvc *projsyncSvc
 	var projV2 *projsyncV2Svc
 	if pjPrep != nil {
 		pjFwd, err := routeForwarder(pool, pjPrep.host)
@@ -261,7 +260,7 @@ func Run(ctx context.Context, dir string, stdin io.Reader, stdout io.Writer) (er
 			return fmt.Errorf("projsync: 开线路转发口失败: %w", err)
 		}
 		closers = append(closers, pjFwd)
-		projSvc = newProjsyncSvc(pjPrep, pool, pjFwd.Addr().String())
+		projSvc := newProjsyncSvc(pjPrep, pool, pjFwd.Addr().String())
 		// v2：定时调度（缺省关闭）+ 手动接口；退出时取消并等当前一轮收尾
 		projV2 = newProjsyncV2Svc(projSvc, pool)
 		v2ctx, v2cancel := context.WithCancel(ctx)
@@ -296,11 +295,11 @@ func Run(ctx context.Context, dir string, stdin io.Reader, stdout io.Writer) (er
 	closers = append(closers, ln)
 
 	// 协助服务（可选）：本机 HTTP 地址和钩子令牌都要在写合并设置文件前拿到
-	// （projSvc 必须在这之前建好：协助的 ProjSync 要直接用它）
+	// （projV2 必须在这之前建好：协助的 ProjSync 要直接用它）
 	var supportLocal, supportHook http.Handler
 	var autostart *autostarter // 未启用自动开时为 nil（markManual 对 nil 安全）
 	if prep != nil {
-		svc, fwd, err := startSupport(prep, dir, expand(conf.KnownHosts), ln.Addr().String(), socksAddrs, pool, projSvc)
+		svc, fwd, err := startSupport(prep, dir, expand(conf.KnownHosts), ln.Addr().String(), socksAddrs, pool, projV2)
 		if err != nil {
 			return err
 		}
@@ -431,11 +430,8 @@ func Run(ctx context.Context, dir string, stdin io.Reader, stdout io.Writer) (er
 		writeJSON(w, fwd.item())
 	})
 
-	// 项目同步（可选）：GET 列状态、POST /projsync/run 发起；没配置一律 404
-	if projSvc != nil {
-		h := projSvc.localHandler(ctx, conf.AllowedOrigins)
-		mux.Handle("/projsync", h)
-		mux.Handle("/projsync/run", h)
+	// 项目同步 v2（可选）：/projsync/v2*；没配置一律 404（v1 的 /projsync、/projsync/run 已移除）
+	if projV2 != nil {
 		h2 := projV2.localHandler(ctx, conf.AllowedOrigins)
 		mux.Handle("/projsync/v2", h2)
 		mux.Handle("/projsync/v2/run", h2)
@@ -444,8 +440,6 @@ func Run(ctx context.Context, dir string, stdin io.Reader, stdout io.Writer) (er
 		noProj := func(w http.ResponseWriter, r *http.Request) {
 			errJSON(w, http.StatusNotFound, "没有配置项目同步")
 		}
-		mux.HandleFunc("/projsync", noProj)
-		mux.HandleFunc("/projsync/run", noProj)
 		mux.HandleFunc("/projsync/v2", noProj)
 		mux.HandleFunc("/projsync/v2/run", noProj)
 		mux.HandleFunc("/projsync/v2/commit", noProj)

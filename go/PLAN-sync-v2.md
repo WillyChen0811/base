@@ -136,3 +136,4 @@
 ## 十八、组件状态（10/16）
 - 可用、已过审、随第一版部署：decide.go、apply.go、scope.go、collect.go、quiet.go、commit.go、remote.go、round.go（到 0c4494f）、go/agentstate/、wgtund 的 projsync_v2.go（缺省关闭）、xxyi-msg 的 projsync-facts/projsync-apply。
 - 未完成、未测试、未审查：分支 wip/round-preflight-aborted（6098f81）——「首次写入前完整预检」，按第十七节不再是必须项；若以后要用，先补测试再审。
+- v1 的执行与 HTTP 接口（/projsync、/projsync/run）已于本次移除，v2 复用其配置/连接/对话记录同步零件（prep、targets、gitTarget、syncClaude 等）；协助通道的 ProjectSync 现在走 v2（projsyncV2Svc.RunOnce）并返回 RoundResult。

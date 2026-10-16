@@ -6,10 +6,8 @@ package wgtund
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"net/http"
 	"regexp"
 	"strings"
 	"sync"
@@ -168,42 +166,19 @@ func prepareProjsync(c *fileConf) (*projsyncPrep, error) {
 	return p, nil
 }
 
-// projsyncResult 是一次同步的结果：代码和对话各做各的，一边失败不记在另一边头上。
-type projsyncResult struct {
-	Time       time.Time            `json:"time"`
-	Git        *projsync.GitResult  `json:"git"`
-	GitError   string               `json:"git_error"`
-	Files      *projsync.FileResult `json:"files"`
-	FilesError string               `json:"files_error"`
-}
-
-// projsyncSvc 执行项目同步：同一项目同一时刻只跑一次；每个项目的最后一次结果记在内存里。
+// projsyncSvc 是项目同步的配置与连接零件（v1 的执行与 HTTP 接口已移除，由 projsyncV2Svc 复用）。
 // 这里的 pool 是 wgtund 的主机连接池；fwdAddr 是启动时为本主机开的线路转发口（git 走它）。
 type projsyncSvc struct {
 	pool    *sshPool
 	prep    *projsyncPrep
 	fwdAddr string
 
-	// run 是一次同步的执行；默认 realRun，测试可换成假的（不起真 git/SFTP）。
-	run func(ctx context.Context, t projsyncTarget) *projsyncResult
 	// gitOverride 非 nil 时代替 gitTarget（测试里把远端换成本地路径的仓库，生产恒为 nil）。
 	gitOverride func(t projsyncTarget) (string, []string, error)
-
-	mu      sync.Mutex
-	running map[string]bool
-	last    map[string]*projsyncResult
 }
 
-// projsyncRunForTest 是测试钩子：非 nil 时替换掉真实执行（Run 之后由测试装好）；生产恒为 nil。
-var projsyncRunForTest func(ctx context.Context, s *projsyncSvc, t projsyncTarget) *projsyncResult
-
 func newProjsyncSvc(p *projsyncPrep, pool *sshPool, fwdAddr string) *projsyncSvc {
-	s := &projsyncSvc{pool: pool, prep: p, fwdAddr: fwdAddr, running: map[string]bool{}, last: map[string]*projsyncResult{}}
-	s.run = s.realRun
-	if f := projsyncRunForTest; f != nil {
-		s.run = func(ctx context.Context, t projsyncTarget) *projsyncResult { return f(ctx, s, t) }
-	}
-	return s
+	return &projsyncSvc{pool: pool, prep: p, fwdAddr: fwdAddr}
 }
 
 func (s *projsyncSvc) target(name string) (projsyncTarget, bool) {
@@ -222,84 +197,6 @@ func (s *projsyncSvc) Names() []string {
 		names = append(names, t.name)
 	}
 	return names
-}
-
-// acquire 占位：同一项目已在同步时返回 errProjsyncBusy。
-func (s *projsyncSvc) acquire(name string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.running[name] {
-		return errProjsyncBusy
-	}
-	s.running[name] = true
-	return nil
-}
-
-// execute 跑一次同步并记下结果；调用方必须已占位。整个执行套 projsyncRunTimeout 超时。
-func (s *projsyncSvc) execute(ctx context.Context, t projsyncTarget) *projsyncResult {
-	ctx, cancel := context.WithTimeout(ctx, projsyncRunTimeout)
-	defer cancel()
-	res := s.run(ctx, t)
-	if res == nil { // 防御：执行没给结果也当成一次完成，别把项目卡在 running
-		res = &projsyncResult{Time: time.Now(), GitError: "同步没有返回结果", FilesError: "同步没有返回结果"}
-	}
-	s.mu.Lock()
-	delete(s.running, t.name)
-	s.last[t.name] = res
-	s.mu.Unlock()
-	return res
-}
-
-// Run 同步执行一次（协助通道在用户允许后调用）。未知项目 errProjsyncUnknown、忙 errProjsyncBusy。
-func (s *projsyncSvc) Run(ctx context.Context, name string) (*projsyncResult, error) {
-	t, ok := s.target(name)
-	if !ok {
-		return nil, errProjsyncUnknown
-	}
-	if err := s.acquire(name); err != nil {
-		return nil, err
-	}
-	return s.execute(ctx, t), nil
-}
-
-// Start 本机接口用：先占位再起后台协程，立即返回；ctx 跟随 wgtund 的 Run，不跟随这个 HTTP 请求。
-func (s *projsyncSvc) Start(ctx context.Context, name string) error {
-	t, ok := s.target(name)
-	if !ok {
-		return errProjsyncUnknown
-	}
-	if err := s.acquire(name); err != nil {
-		return err
-	}
-	go s.execute(ctx, t)
-	return nil
-}
-
-// realRun 执行一次同步：先 git（当前线路 + 本机转发口），再经 SFTP 双向补齐对话目录；
-// 两边各自记错误，互不中断。
-func (s *projsyncSvc) realRun(ctx context.Context, t projsyncTarget) *projsyncResult {
-	res := &projsyncResult{Time: time.Now()}
-	gt := s.gitTarget
-	if s.gitOverride != nil {
-		gt = s.gitOverride
-	}
-	url, env, err := gt(t)
-	switch {
-	case err != nil:
-		res.GitError = err.Error()
-	default:
-		if gr, err := projsync.SyncGit(ctx, t.local, url, env, s.prep.localName, s.prep.remoteName); err != nil {
-			res.GitError = err.Error()
-		} else {
-			res.Git = &gr
-		}
-	}
-	if fr, err := s.syncClaude(ctx, t); err != nil {
-		res.FilesError = err.Error()
-	} else {
-		res.Files = fr
-	}
-	return res
 }
 
 // gitTarget 拼 git 的远端地址与环境：地址用主机当前线路（端口是 22 也照写），
@@ -404,60 +301,4 @@ func runInterruptible(ctx context.Context, grace time.Duration, closeFn func(), 
 	case <-t.C:
 		return fmt.Errorf("超时：操作无响应，已放弃等待: %w", ctx.Err())
 	}
-}
-
-// projsyncItem 是 /projsync 里一个项目的状态。
-type projsyncItem struct {
-	Name    string          `json:"name"`
-	Running bool            `json:"running"`
-	Last    *projsyncResult `json:"last"`
-}
-
-// status 返回配置顺序的项目状态。
-func (s *projsyncSvc) status() map[string]any {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	items := make([]projsyncItem, 0, len(s.prep.targets))
-	for _, t := range s.prep.targets {
-		items = append(items, projsyncItem{t.name, s.running[t.name], s.last[t.name]})
-	}
-	return map[string]any{"projects": items}
-}
-
-// localHandler 是本机接口（由 wgtund 挂在主令牌校验之后）：
-// GET /projsync 列状态；POST /projsync/run?name= 发起一次后台同步，
-// 和 /hosts/route 一样只许从 xxyi 页面发起（要求白名单 Origin）。
-func (s *projsyncSvc) localHandler(ctx context.Context, allowedOrigins []string) http.Handler {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/projsync", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			errJSON(w, http.StatusMethodNotAllowed, "只支持 GET")
-			return
-		}
-		writeJSON(w, s.status())
-	})
-	mux.HandleFunc("/projsync/run", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			errJSON(w, http.StatusMethodNotAllowed, "请用 POST")
-			return
-		}
-		if o := r.Header.Get("Origin"); o == "" || !originAllowed(o, allowedOrigins) {
-			errJSON(w, http.StatusForbidden, "需要从 xxyi 页面操作")
-			return
-		}
-		err := s.Start(ctx, r.URL.Query().Get("name"))
-		switch {
-		case errors.Is(err, errProjsyncUnknown):
-			errJSON(w, http.StatusNotFound, "未知项目")
-		case errors.Is(err, errProjsyncBusy):
-			errJSON(w, http.StatusConflict, "正在同步")
-		case err != nil:
-			errJSON(w, http.StatusInternalServerError, err.Error())
-		default:
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusAccepted)
-			json.NewEncoder(w).Encode(map[string]bool{"started": true})
-		}
-	})
-	return mux
 }

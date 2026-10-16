@@ -14,7 +14,7 @@ import (
 )
 
 const (
-	claudeEnd  = `{"type":"user","message":{"content":"hi"}}` + "\n" + `{"type":"assistant","message":{"stop_reason":"end_turn"}}` + "\n"
+	claudeEnd  = `{"type":"user","message":{"content":"hi"}}` + "\n" + `{"type":"assistant","timestamp":"2026-10-16T12:00:10Z","message":{"stop_reason":"end_turn"}}` + "\n"
 	claudeTool = `{"type":"user","message":{"content":"hi"}}` + "\n" + `{"type":"assistant","message":{"stop_reason":"tool_use"}}` + "\n"
 	claudeUser = claudeEnd + `{"type":"user","message":{"content":[{"type":"tool_result"}]}}` + "\n"
 )
@@ -65,8 +65,8 @@ func TestJudgePaneClaude(t *testing.T) {
 }
 
 func TestJudgePaneCodex(t *testing.T) {
-	started := `{"type":"event_msg","payload":{"type":"task_started"}}` + "\n"
-	complete := `{"type":"event_msg","payload":{"type":"task_complete"}}` + "\n"
+	started := `{"timestamp":"2026-10-16T12:00:00Z","type":"event_msg","payload":{"type":"task_started"}}` + "\n"
+	complete := `{"timestamp":"2026-10-16T12:00:10Z","type":"event_msg","payload":{"type":"task_complete"}}` + "\n"
 	in := func(screen, log string) PaneInput {
 		return PaneInput{Command: "codex", Screen: screen, Log: LogInput{Found: true, Content: []byte(log)}}
 	}
@@ -253,7 +253,13 @@ func isolated(t *testing.T) (string, func(args ...string) error) {
 		}
 		return nil
 	}
-	t.Cleanup(func() { _ = run("kill-server") }) // 只杀隔离服务器
+	t.Cleanup(func() { // 只杀隔离服务器，并等它真的退出，免得下一个测试撞上正在关闭的服务器
+		_ = run("kill-server")
+		for i := 0; i < 50 && run("list-sessions") == nil; i++ {
+			time.Sleep(20 * time.Millisecond)
+		}
+		time.Sleep(50 * time.Millisecond)
+	})
 	return "tmux -L " + name, run
 }
 
@@ -419,7 +425,7 @@ func TestJudgeFakeClaudeFinished(t *testing.T) {
 	tm, run := isolated(t)
 	ws := canon(t.TempDir())
 	home := t.TempDir()
-	opt := Options{Tmux: tm, Home: home}
+	opt := Options{Tmux: tm, Home: home, Recheck: noRecheck()}
 	fakeClaude(t, run, ws, "c1")
 
 	// 假 agent 启动后才写入记录
@@ -434,5 +440,148 @@ func TestJudgeFakeClaudeFinished(t *testing.T) {
 	v, ps = waitCmd(t, opt, ws, "claude")
 	if v != VerdictUnknown || !strings.Contains(ps[0].Reason, "2 个") {
 		t.Fatalf("两个记录应 Unknown: %s %+v", v, ps)
+	}
+}
+
+func noRecheck() *time.Duration { d := time.Duration(0); return &d }
+
+// 本轮结束后才启动的子孙进程 → Unknown；早于本轮的常驻子进程不影响（纯函数层）。
+func TestLateProcess(t *testing.T) {
+	done := time.Date(2026, 10, 16, 12, 0, 10, 0, time.UTC)
+	log := fmt.Sprintf(`{"type":"user","timestamp":"2026-10-16T12:00:00Z"}`+"\n"+
+		`{"type":"assistant","timestamp":%q,"message":{"stop_reason":"end_turn"}}`+"\n", done.Format(time.RFC3339Nano))
+	mk := func(extra ...Proc) PaneInput {
+		ps := []Proc{{PID: 1, Args: "bash", Start: done.Add(-time.Hour), StartKnown: true, Root: true},
+			{PID: 2, Args: "claude", Start: done.Add(-time.Hour), StartKnown: true}}
+		return PaneInput{Command: "claude", Screen: "> ", Procs: append(ps, extra...), ProcsKnown: true,
+			Log: LogInput{Found: true, Content: []byte(log)}}
+	}
+	resident := Proc{PID: 3, Args: "mcp-server --stdio", Start: done.Add(-30 * time.Minute), StartKnown: true}
+	late := Proc{PID: 4, Args: "npm test", Start: done.Add(5 * time.Second), StartKnown: true}
+	noStart := Proc{PID: 5, Args: "mystery"}
+
+	if st, r := JudgePane(mk()); st != Done {
+		t.Errorf("无额外进程应 Done: %s %s", st, r)
+	}
+	if st, r := JudgePane(mk(resident)); st != Done {
+		t.Errorf("早于本轮的常驻进程不应影响: %s %s", st, r)
+	}
+	if st, r := JudgePane(mk(resident, late)); st != Unknown || !strings.Contains(r, "本轮结束后仍有进程在运行：npm test") {
+		t.Errorf("本轮结束后启动的进程应 Unknown: %s %s", st, r)
+	}
+	if st, _ := JudgePane(mk(noStart)); st != Unknown {
+		t.Error("子孙进程启动时间未知应 Unknown")
+	}
+	// 完成记录没有时间戳
+	in := mk()
+	in.Log.Content = []byte(`{"type":"assistant","message":{"stop_reason":"end_turn"}}` + "\n")
+	if st, _ := JudgePane(in); st != Unknown {
+		t.Error("完成记录无时间戳应 Unknown")
+	}
+}
+
+// fakeSetup 起假 claude 窗格并写好属于它的记录；返回窗格 pid 与记录路径。
+func fakeSetup(t *testing.T) (opt Options, ws string, panePID int, logPath string) {
+	t.Helper()
+	tm, run := isolated(t)
+	ws = canon(t.TempDir())
+	home := t.TempDir()
+	opt = Options{Tmux: tm, Home: home, Recheck: noRecheck()}
+	fakeClaude(t, run, ws, "c1")
+	_, ps := waitCmd(t, opt, ws, "claude")
+	panePID = ps[0].PID
+	logPath = claudeFile(home, ws, "s.jsonl", time.Now(), ws)
+	return
+}
+
+// 在真实进程表上给窗格挂一个假的子进程。
+func withChild(panePID int, args string, start time.Time) func() (*ProcTable, error) {
+	return func() (*ProcTable, error) {
+		tab, err := psTree()
+		if err != nil {
+			return nil, err
+		}
+		const fake = 99999999
+		tab.Children[panePID] = append(tab.Children[panePID], fake)
+		tab.Args[fake] = args
+		tab.Start[fake] = start
+		return tab, nil
+	}
+}
+
+func TestJudgeLateChildIntegration(t *testing.T) {
+	opt, ws, pid, _ := fakeSetup(t)
+	if v, ps, _ := Judge(context.Background(), ws, opt); v != VerdictFinished {
+		t.Fatalf("基线应 Finished: %s %+v", v, ps)
+	}
+	opt.ProcTree = withChild(pid, "make test", time.Now().Add(time.Minute))
+	v, ps, _ := Judge(context.Background(), ws, opt)
+	if v != VerdictUnknown || !strings.Contains(ps[0].Reason, "本轮结束后仍有进程在运行：make test") {
+		t.Errorf("本轮后启动的子进程应 Unknown: %s %+v", v, ps)
+	}
+	opt.ProcTree = withChild(pid, "mcp-server", time.Now().Add(-time.Hour))
+	if v, ps, _ := Judge(context.Background(), ws, opt); v != VerdictFinished {
+		t.Errorf("常驻子进程不应影响: %s %+v", v, ps)
+	}
+}
+
+func TestJudgeOtherWriters(t *testing.T) {
+	opt, ws, pid, _ := fakeSetup(t)
+	tree := withChild(pid, "vim notes.txt", time.Now().Add(-time.Hour))
+	opt.ProcTree = func() (*ProcTable, error) {
+		tab, err := tree()
+		if err == nil {
+			tab.Args[88888888] = "vim main.go" // 不属于任何窗格的进程
+			tab.Start[88888888] = time.Now().Add(-time.Hour)
+		}
+		return tab, err
+	}
+	// 窗格自己的进程（含子孙）在工作区里：不算
+	opt.ProcCwd = func() (map[int]string, error) { return map[int]string{pid: ws, 99999999: ws + "/sub"}, nil }
+	if v, ps, _ := Judge(context.Background(), ws, opt); v != VerdictFinished {
+		t.Errorf("窗格自己的进程不应算别处写入者: %s %+v", v, ps)
+	}
+	// 工作区外的进程：不算
+	opt.ProcCwd = func() (map[int]string, error) { return map[int]string{88888888: "/tmp"}, nil }
+	if v, _, _ := Judge(context.Background(), ws, opt); v != VerdictFinished {
+		t.Errorf("区外进程不应影响: %s", v)
+	}
+	// 工作区里不属于窗格的进程 → Unknown，Notes 列出命令
+	opt.ProcCwd = func() (map[int]string, error) { return map[int]string{88888888: ws + "/pkg"}, nil }
+	r, err := JudgeDetail(context.Background(), ws, opt)
+	if err != nil || r.Verdict != VerdictUnknown || len(r.Notes) != 1 || !strings.Contains(r.Notes[0], "vim main.go") {
+		t.Errorf("别处写入者应 Unknown: %+v %v", r, err)
+	}
+	// 读不到进程目录 → Unknown
+	opt.ProcCwd = func() (map[int]string, error) { return nil, fmt.Errorf("lsof 不可用") }
+	if v, _, _ := Judge(context.Background(), ws, opt); v != VerdictUnknown {
+		t.Errorf("读不到进程目录应 Unknown: %s", v)
+	}
+}
+
+func TestJudgeDoubleSample(t *testing.T) {
+	opt, ws, _, logPath := fakeSetup(t)
+	d := time.Millisecond
+	opt.Recheck = &d
+	opt.ProcCwd = func() (map[int]string, error) { return map[int]string{}, nil }
+
+	// 两次之间没变化 → Finished
+	opt.sleep = func(time.Duration) {}
+	if r, _ := JudgeDetail(context.Background(), ws, opt); r.Verdict != VerdictFinished {
+		t.Fatalf("没变化应 Finished: %+v", r)
+	}
+	// 两次之间记录被追加 → Unknown
+	opt.sleep = func(time.Duration) {
+		f, err := os.OpenFile(logPath, os.O_APPEND|os.O_WRONLY, 0o644)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		defer f.Close()
+		_, _ = f.WriteString(`{"type":"mode"}` + "\n")
+	}
+	r, _ := JudgeDetail(context.Background(), ws, opt)
+	if r.Verdict != VerdictUnknown || len(r.Notes) == 0 || !strings.Contains(r.Notes[0], "有变化") {
+		t.Errorf("记录变化应 Unknown: %+v", r)
 	}
 }

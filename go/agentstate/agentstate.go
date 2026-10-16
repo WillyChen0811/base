@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -59,6 +60,13 @@ type Options struct {
 	Tmux     string                     // tmux 命令，默认 "tmux"；测试用 "tmux -L 名字"
 	Home     string                     // 用于找 ~/.claude 与 ~/.codex，默认当前用户主目录
 	ProcTree func() (*ProcTable, error) // 读进程树与命令行；默认读 ps
+	// ProcCwd 返回本机所有读得到的进程的工作目录（pid → 目录）；默认 Linux 读 /proc/*/cwd、
+	// macOS 用 lsof。读不到的进程跳过；整体读失败返回 error，结论为 Unknown。
+	ProcCwd func() (map[int]string, error)
+	// Recheck 是双采样的间隔：nil 表示默认 3 秒；指向 0 表示不做第二次采样（仅供测试）。
+	Recheck *time.Duration
+
+	sleep func(time.Duration) // 测试可替换
 }
 
 // ProcTable 是进程表：父→子 pid 列表、每个进程的完整命令行（空格连接）与启动时间。
@@ -170,16 +178,39 @@ func JudgePane(in PaneInput) (PaneState, string) {
 	if !lastLineComplete(in.Log.Content) {
 		return Unknown, why + "会话记录最后一行不完整（可能正在写入）"
 	}
+	var ok bool
+	var doneAt time.Time
+	var basis string
 	if cmd == "claude" {
-		if ok, _ := claudeEndTurn(in.Log.Content); ok {
-			return Done, why + "屏幕无 esc to interrupt，会话记录最后一条 end_turn"
+		ok, doneAt = claudeEndTurn(in.Log.Content)
+		basis = "会话记录最后一条 end_turn"
+		if !ok {
+			return Unknown, why + "屏幕无 esc to interrupt，但会话记录最后不是 end_turn"
 		}
-		return Unknown, why + "屏幕无 esc to interrupt，但会话记录最后不是 end_turn"
+	} else {
+		ok, doneAt = codexTaskComplete(in.Log.Content)
+		basis = "会话记录最后一个 task_started 之后有 task_complete"
+		if !ok {
+			return Unknown, why + "屏幕无 esc to interrupt，但会话记录里最后一个任务未见 task_complete"
+		}
 	}
-	if ok, _ := codexTaskComplete(in.Log.Content); ok {
-		return Done, why + "屏幕无 esc to interrupt，会话记录最后一个 task_started 之后有 task_complete"
+	// 本轮结束后仍在运行的任务：启动时间不早于完成记录的子孙进程（早于本轮的常驻辅助进程不算）。
+	if doneAt.IsZero() {
+		return Unknown, why + "完成记录没有时间戳，无法核对本轮结束后是否还有进程在运行"
 	}
-	return Unknown, why + "屏幕无 esc to interrupt，但会话记录里最后一个任务未见 task_complete"
+	floor := doneAt.Truncate(time.Second) // ps 的启动时间只精确到秒
+	for _, p := range in.Procs {
+		if p.Root {
+			continue
+		}
+		if !p.StartKnown {
+			return Unknown, why + "读不到子孙进程的启动时间：" + p.Args
+		}
+		if !p.Start.Before(floor) {
+			return Unknown, why + "本轮结束后仍有进程在运行：" + p.Args
+		}
+	}
+	return Done, why + "屏幕无 esc to interrupt，" + basis
 }
 
 // procKind 判断一条命令行属于哪种 agent：返回 "claude"、"codex" 或 ""（都不是），
@@ -379,8 +410,64 @@ func Judge(ctx context.Context, worktree string, opt Options) (Verdict, []Pane, 
 }
 
 // JudgeDetail 同 Judge，但额外返回工作区级别的依据。
+//
+// 双采样：先判一次，若是 Finished，等 Options.Recheck（默认 3 秒）再判一次；两次都是 Finished、
+// 且两次用到的会话记录文件的大小与修改时间没变，才返回 Finished，否则 Unknown。
+// 注意：Finished 只代表"此刻看起来做完了"，不是持续有效的许可。调用方在真正 git commit 之前
+// 必须再调用一次 Judge，不能拿更早的结果当许可。
 func JudgeDetail(ctx context.Context, worktree string, opt Options) (Result, error) {
-	return judgeOnce(ctx, worktree, opt)
+	r, err := judgeOnce(ctx, worktree, opt)
+	if err != nil || r.Verdict != VerdictFinished {
+		return r, err
+	}
+	d := 3 * time.Second
+	if opt.Recheck != nil {
+		d = *opt.Recheck
+	}
+	if d <= 0 {
+		return r, nil
+	}
+	if opt.sleep != nil {
+		opt.sleep(d)
+	} else {
+		select {
+		case <-time.After(d):
+		case <-ctx.Done():
+			r.Verdict = VerdictUnknown
+			r.Notes = append(r.Notes, "等待二次采样时被取消")
+			return r, nil
+		}
+	}
+	r2, err := judgeOnce(ctx, worktree, opt)
+	if err != nil {
+		return r2, err
+	}
+	if r2.Verdict != VerdictFinished {
+		r2.Verdict = VerdictUnknown
+		r2.Notes = append(r2.Notes, "二次采样结论与第一次不同，按不确定处理")
+		return r2, nil
+	}
+	if !sameSigs(r.Panes, r2.Panes) {
+		r2.Verdict = VerdictUnknown
+		r2.Notes = append(r2.Notes, "两次采样之间会话记录或窗格有变化，按不确定处理")
+	}
+	return r2, nil
+}
+
+func sameSigs(a, b []Pane) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	m := map[string]string{}
+	for _, p := range a {
+		m[p.ID] = p.sig
+	}
+	for _, p := range b {
+		if s, ok := m[p.ID]; !ok || s != p.sig {
+			return false
+		}
+	}
+	return true
 }
 
 func judgeOnce(ctx context.Context, worktree string, opt Options) (Result, error) {
@@ -454,7 +541,116 @@ func judgeOnce(ctx context.Context, worktree string, opt Options) (Result, error
 		p.sig = in.Log.Sig
 		panes = append(panes, p)
 	}
-	return Result{Verdict: Summarize(panes), Panes: panes}, nil
+	res := Result{Verdict: Summarize(panes), Panes: panes}
+	if res.Verdict == VerdictFinished {
+		if note := otherWriters(ctx, tmuxCmd, worktree, opt, tree, panes); note != "" {
+			res.Verdict = VerdictUnknown
+			res.Notes = append(res.Notes, note)
+		}
+	}
+	return res, nil
+}
+
+// otherWriters 扫描本机所有进程的工作目录：在工作区之内、却不属于任何已判断窗格的进程树
+// （也不是本进程、其祖先子孙或 tmux 服务器）的进程，可能是别处的写入者 → 返回说明；没有则返回空串。
+func otherWriters(ctx context.Context, tmuxCmd []string, worktree string, opt Options, tree *ProcTable, panes []Pane) string {
+	cwdFn := opt.ProcCwd
+	if cwdFn == nil {
+		cwdFn = procCwds
+	}
+	cwds, err := cwdFn()
+	if err != nil {
+		return "读不到各进程的工作目录，无法排除别处写入者：" + err.Error()
+	}
+	if tree == nil {
+		return "没有进程表，无法排除别处写入者"
+	}
+	excl := map[int]bool{os.Getpid(): true}
+	var add func(pid int)
+	add = func(pid int) {
+		if excl[pid] {
+			return
+		}
+		excl[pid] = true
+		for _, c := range tree.Children[pid] {
+			add(c)
+		}
+	}
+	for _, p := range panes {
+		add(p.PID)
+	}
+	add(os.Getpid())
+	parent := map[int]int{}
+	for pp, cs := range tree.Children {
+		for _, c := range cs {
+			parent[c] = pp
+		}
+	}
+	for pid, n := os.Getpid(), 0; parent[pid] != 0 && n < 100; n++ {
+		pid = parent[pid]
+		excl[pid] = true
+	}
+	if out, _, err := runTmux(ctx, tmuxCmd, "display-message", "-p", "#{pid}"); err == nil {
+		if pid, e := strconv.Atoi(strings.TrimSpace(out)); e == nil {
+			excl[pid] = true
+		}
+	}
+	var found []string
+	pids := make([]int, 0, len(cwds))
+	for pid := range cwds {
+		pids = append(pids, pid)
+	}
+	sort.Ints(pids)
+	for _, pid := range pids {
+		if excl[pid] || !InWorktree(worktree, cwds[pid]) {
+			continue
+		}
+		args := tree.Args[pid]
+		if args == "" {
+			args = "(未知命令)"
+		}
+		found = append(found, fmt.Sprintf("%d %s", pid, args))
+	}
+	if len(found) == 0 {
+		return ""
+	}
+	return "工作区内有不属于任何窗格的进程，可能是别处的写入者：" + strings.Join(found, "；")
+}
+
+// procCwds 读本机所有进程的工作目录：Linux 读 /proc/*/cwd（读不到的跳过），其它用 lsof。
+func procCwds() (map[int]string, error) {
+	res := map[int]string{}
+	if ents, err := os.ReadDir("/proc"); err == nil {
+		for _, e := range ents {
+			pid, err := strconv.Atoi(e.Name())
+			if err != nil {
+				continue
+			}
+			if d, err := os.Readlink(filepath.Join("/proc", e.Name(), "cwd")); err == nil {
+				res[pid] = d
+			}
+		}
+		if len(res) > 0 {
+			return res, nil
+		}
+	}
+	out, err := exec.Command("lsof", "-a", "-d", "cwd", "-Fn").Output()
+	if err != nil && len(out) == 0 {
+		return nil, fmt.Errorf("lsof 不可用: %v", err)
+	}
+	pid := 0
+	for _, line := range strings.Split(string(out), "\n") {
+		switch {
+		case strings.HasPrefix(line, "p"):
+			pid, _ = strconv.Atoi(line[1:])
+		case strings.HasPrefix(line, "n") && pid != 0:
+			res[pid] = line[1:]
+		}
+	}
+	if len(res) == 0 {
+		return nil, errors.New("lsof 没有输出")
+	}
+	return res, nil
 }
 
 func noServer(stderr string) bool {

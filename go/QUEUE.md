@@ -9,8 +9,14 @@
 ## 项目同步 v2（PLAN-sync-v2.md，以第十四到十八节为准）
 - [完成] 全部后端（base-msg feat/msg 到 0c4494f）、部署（两边已换新版）、控制中心面板（codex1，xxyi main 的 228f55a/d56dc04/f473c48）。
 - [完成] 10/16 实测：ai-browser、xxyi、websubmit 同步正常（新建分支、快进、遇未提交改动跳过、冲突停下都符合预期）；ai-browser 的冲突由指挥合并（0f64a98）。websubmit 已加入项目列表（需 Mac 重开 XXYI 生效）。自动同步仍关闭，由用户定何时打开。
-- [待] base 被拦：Ubuntu 上 base 有 22 个工作区（上限 8），9 个有未提交改动。建议：每个 wip/ 工作区先提交进 wip/ 分支，再 git worktree remove（分支不删）。等用户确认。
+- [完成] base 22 个旧工作区已清理（16 个 wip/ 全部提交留存、目录移除，Sonnet 做、指挥核对）；base 首次同步成功（27 分支）。Mac 全局已忽略 .DS_Store（xds.sh）。
+- [完成] 对话记录同步并入 v2（base-msg 3ac7c11，omlx 写、指挥复核）；wgtund 已部署到 Mac。待验证：用户点 xxyi 同步后跑 xcheck.sh 看 claude 字段。
+- [待] 验证通过后下架 v1（面板 v1 入口 + /projsync 旧接口）；面板加一行显示对话记录同步结果（Mac 执行者）。
+- [待] 是否打开自动同步（xauto-on.sh 已备好，用户定）；websubmit 已加入列表。
+- [完成] wgtund 打包进 XXYI.app + 固定开发证书签名（xxyi 2f07d5e，omlx3 做）。解决内网被 macOS「本地网络」权限挡住的问题。
 - [待] 面板小毛病：数字 0 显示成 Q（字体/渲染问题，待查）。
+- [待] tests/test_terminal.py 的 3 个测试用 /proc，Mac 上跑不了，应加平台判断。
+- [待] omlx 会话模板里关掉 LSP 插件推荐提示。
 - [待] 小改进：超出范围的分支单独跳过、其他分支继续。
 - [待] 排查 codex1「不知道自己的地址」（errNoSelfAddr，selfAddr 找不到；Codex 启动 MCP 会清环境变量）。
 - [待] Mac 上 xxyi、base 迁到 ~/Documents/codes（步骤先给用户过目）；bioflow、biogateway 加入同步。

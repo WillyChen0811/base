@@ -260,7 +260,7 @@ func TestJudgeIntegration(t *testing.T) {
 
 	// 进程树读不出来 → Unknown，不是 Idle
 	opt2 := opt
-	opt2.ProcTree = func() (map[int][]int, error) { return nil, fmt.Errorf("boom") }
+	opt2.ProcTree = func() (*ProcTable, error) { return nil, fmt.Errorf("boom") }
 	if v, ps, _ := Judge(context.Background(), ws, opt2); v != VerdictUnknown || ps[0].State != Unknown {
 		t.Errorf("进程树失败: %s %+v", v, ps)
 	}
@@ -270,5 +270,66 @@ func TestJudgeTmuxUnavailable(t *testing.T) {
 	v, _, err := Judge(context.Background(), t.TempDir(), Options{Tmux: "/nonexistent/tmux-xyz"})
 	if err == nil || v != VerdictUnknown {
 		t.Errorf("tmux 不可用应为 Unknown+错误: %s %v", v, err)
+	}
+}
+
+func TestIdentifyByCmdline(t *testing.T) {
+	cases := []struct {
+		name  string
+		cmd   string
+		procs []string
+		known bool
+		want  PaneState
+		why   string
+	}{
+		{"node+codex", "node", []string{"node /usr/lib/node_modules/@openai/codex/bin/codex.js --yolo"}, true, Done, "命令行含 codex"},
+		{"node+codex 子进程", "node", []string{"node /x/y.js", "/opt/bin/codex --foo"}, true, Done, "命令行含 codex"},
+		{"node+claude-code", "node", []string{"node /usr/lib/node_modules/@anthropic-ai/claude-code/cli.js"}, true, Done, "命令行含 claude"},
+		{"版本号+子进程 claude", "2.1.300", []string{"-bash", "/home/u/.local/bin/claude --resume"}, true, Done, "命令行含 claude"},
+		{"node 两者都无", "node", []string{"node server.js", "vim claude-notes.txt"}, true, Unknown, ""},
+		{"两者都出现", "node", []string{"node @openai/codex/bin/codex.js", "claude"}, true, Unknown, "同时出现"},
+		{"读不到命令行", "node", nil, false, Unknown, "读不到"},
+	}
+	for _, c := range cases {
+		in := PaneInput{Command: c.cmd, Procs: c.procs, ProcsKnown: c.known, Screen: "> "}
+		if strings.Contains(c.name, "codex") {
+			in.Log = LogInput{Found: true, Content: []byte(realCodexShape)}
+		} else {
+			in.Log = LogInput{Found: true, Content: []byte(claudeEnd)}
+		}
+		got, reason := JudgePane(in)
+		if got != c.want || !strings.Contains(reason, c.why) {
+			t.Errorf("%s: got %s (%s)", c.name, got, reason)
+		}
+	}
+	got, reason := JudgePane(PaneInput{Command: "node", Procs: []string{"node @openai/codex/bin/codex.js"}, ProcsKnown: true, Screen: "esc to interrupt"})
+	if got != Busy || !strings.Contains(reason, "命令行含 codex") {
+		t.Errorf("node+codex busy: %s %s", got, reason)
+	}
+}
+
+// 真实 codex rollout 的结构（脱敏，只留 type / payload.type / cwd；首行 session_meta，
+// task_complete 之后还会有 thread_settings_applied 等事件）。
+const realCodexShape = `{"type":"session_meta","payload":{"cwd":"/work/ws","originator":"codex-tui"}}
+{"type":"event_msg","payload":{"type":"task_started"}}
+{"type":"response_item","payload":{"type":"message"}}
+{"type":"event_msg","payload":{"type":"token_count"}}
+{"type":"event_msg","payload":{"type":"task_complete"}}
+{"type":"event_msg","payload":{"type":"thread_settings_applied"}}
+`
+
+func TestCodexRealShape(t *testing.T) {
+	if !codexTaskComplete([]byte(realCodexShape)) {
+		t.Error("真实结构应判 task_complete")
+	}
+	home := t.TempDir()
+	dir := t.TempDir()
+	sd := filepath.Join(home, ".codex", "sessions", "2026", "10", "15")
+	_ = os.MkdirAll(sd, 0o755)
+	first := fmt.Sprintf(`{"type":"session_meta","payload":{"cwd":%q,"base_instructions":{"text":%q}}}`+"\n", dir, strings.Repeat("x", 200<<10))
+	_ = os.WriteFile(filepath.Join(sd, "rollout-a.jsonl"), []byte(first+realCodexShape[strings.Index(realCodexShape, "\n")+1:]), 0o644)
+	l := findCodexLog(home, dir)
+	if !l.Found || !codexTaskComplete(l.Content) {
+		t.Error("长首行的 rollout 应能按 cwd 找到并判 Done")
 	}
 }

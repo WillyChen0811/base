@@ -5,6 +5,7 @@
 package agentstate
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -53,9 +54,15 @@ type Pane struct {
 
 // Options 是 Judge 的可注入项。
 type Options struct {
-	Tmux     string                        // tmux 命令，默认 "tmux"；测试用 "tmux -L 名字"
-	Home     string                        // 用于找 ~/.claude 与 ~/.codex，默认当前用户主目录
-	ProcTree func() (map[int][]int, error) // 返回 父 pid → 子 pid 列表；默认读 ps
+	Tmux     string                     // tmux 命令，默认 "tmux"；测试用 "tmux -L 名字"
+	Home     string                     // 用于找 ~/.claude 与 ~/.codex，默认当前用户主目录
+	ProcTree func() (*ProcTable, error) // 读进程树与命令行；默认读 ps
+}
+
+// ProcTable 是进程表：父→子 pid 列表，以及每个进程的完整命令行（空格连接）。
+type ProcTable struct {
+	Children map[int][]int
+	Args     map[int]string
 }
 
 // ── 纯判定 ────────────────────────────────────────────
@@ -68,6 +75,10 @@ type PaneInput struct {
 	// 进程树：ChildrenKnown=false 表示读不到，此时不能断言"无子进程"。
 	ChildrenKnown bool
 	HasChildren   bool
+
+	// 窗格进程及其子孙的完整命令行；ProcsKnown=false 表示读不到。
+	Procs      []string
+	ProcsKnown bool
 
 	Screen    string
 	ScreenErr bool // capture-pane 失败
@@ -108,31 +119,96 @@ func JudgePane(in PaneInput) (PaneState, string) {
 		}
 		return Idle, "前台是 shell 且没有子进程"
 	}
+	why := ""
 	if cmd != "claude" && cmd != "codex" {
-		return Unknown, "前台程序 " + in.Command + " 不是已知的 agent"
+		// 前台命令名认不出（如 node、版本号）：看窗格进程及子孙的命令行。
+		if !in.ProcsKnown {
+			return Unknown, "前台程序 " + in.Command + " 认不出，且读不到进程命令行"
+		}
+		var amb string
+		cmd, why, amb = identifyAgent(in.Procs)
+		if cmd == "" {
+			if amb != "" {
+				return Unknown, amb
+			}
+			return Unknown, "前台程序 " + in.Command + " 不是已知的 agent"
+		}
+		why += "；"
 	}
 	if in.ScreenErr {
-		return Unknown, "读不到窗格屏幕"
+		return Unknown, why + "读不到窗格屏幕"
 	}
 	if strings.Contains(in.Screen, escMark) {
-		return Busy, "屏幕有 esc to interrupt"
+		return Busy, why + "屏幕有 esc to interrupt"
 	}
 	if !in.Log.Found {
-		return Unknown, "找不到会话记录"
+		return Unknown, why + "找不到会话记录"
 	}
 	if in.Log.ReadErr {
-		return Unknown, "会话记录读不了"
+		return Unknown, why + "会话记录读不了"
 	}
 	if cmd == "claude" {
 		if claudeEndTurn(in.Log.Content) {
-			return Done, "屏幕无 esc to interrupt，会话记录最后一条 end_turn"
+			return Done, why + "屏幕无 esc to interrupt，会话记录最后一条 end_turn"
 		}
-		return Unknown, "屏幕无 esc to interrupt，但会话记录最后不是 end_turn"
+		return Unknown, why + "屏幕无 esc to interrupt，但会话记录最后不是 end_turn"
 	}
 	if codexTaskComplete(in.Log.Content) {
-		return Done, "屏幕无 esc to interrupt，会话记录最后一个 task_started 之后有 task_complete"
+		return Done, why + "屏幕无 esc to interrupt，会话记录最后一个 task_started 之后有 task_complete"
 	}
-	return Unknown, "屏幕无 esc to interrupt，但会话记录里最后一个任务未见 task_complete"
+	return Unknown, why + "屏幕无 esc to interrupt，但会话记录里最后一个任务未见 task_complete"
+}
+
+// procKind 判断一条命令行属于哪种 agent：返回 "claude"、"codex" 或 ""（都不是），
+// both=true 表示同一条命令行里两者都出现。
+// 只看前两个参数（可执行文件与解释器的脚本）以及包名，免得 `vim claude` 之类误判。
+func procKind(cmdline string) (kind string, both bool) {
+	args := strings.Fields(cmdline)
+	is := func(name, pkg string) bool {
+		if strings.Contains(cmdline, pkg) {
+			return true
+		}
+		for i := 0; i < len(args) && i < 2; i++ {
+			b := filepath.Base(args[i])
+			if b == name || strings.TrimSuffix(b, ".js") == name {
+				return true
+			}
+		}
+		return false
+	}
+	c, x := is("claude", "@anthropic-ai/claude-code"), is("codex", "@openai/codex")
+	switch {
+	case c && x:
+		return "", true
+	case c:
+		return "claude", false
+	case x:
+		return "codex", false
+	}
+	return "", false
+}
+
+// identifyAgent 从窗格进程及其子孙的命令行认 agent。两种都出现或认不出 → 空（Unknown）。
+func identifyAgent(procs []string) (kind, why, ambiguous string) {
+	found := map[string]bool{}
+	for _, p := range procs {
+		k, both := procKind(p)
+		if both {
+			return "", "", "命令行里同时出现 claude 与 codex，无法确定"
+		}
+		if k != "" {
+			found[k] = true
+		}
+	}
+	switch {
+	case found["claude"] && found["codex"]:
+		return "", "", "进程命令行里同时出现 claude 与 codex，无法确定"
+	case found["claude"]:
+		return "claude", "命令行含 claude", ""
+	case found["codex"]:
+		return "codex", "命令行含 codex", ""
+	}
+	return "", "", ""
 }
 
 // claudeEndTurn：最后一条 type=assistant 的 stop_reason 为 end_turn，且其后没有 user/tool_result 记录。
@@ -267,7 +343,7 @@ func Judge(ctx context.Context, worktree string, opt Options) (Verdict, []Pane, 
 	}
 
 	var panes []Pane
-	var tree map[int][]int
+	var tree *ProcTable
 	var treeErr error
 	treeLoaded := false
 	for _, line := range strings.Split(out, "\n") {
@@ -279,14 +355,22 @@ func Judge(ctx context.Context, worktree string, opt Options) (Verdict, []Pane, 
 		p := Pane{ID: f[0], PID: pid, Dead: f[2] == "1", Command: f[3], Path: f[4]}
 		in := PaneInput{Command: p.Command, Dead: p.Dead}
 		cmd := strings.TrimPrefix(p.Command, "-")
-		if !p.Dead && isShell(cmd) {
+		if !p.Dead {
 			if !treeLoaded {
 				tree, treeErr = procTree()
 				treeLoaded = true
 			}
 			if treeErr == nil && tree != nil {
-				in.ChildrenKnown = true
-				in.HasChildren = len(tree[pid]) > 0
+				if isShell(cmd) {
+					in.ChildrenKnown = true
+					in.HasChildren = len(tree.Children[pid]) > 0
+				} else if cmd != "claude" && cmd != "codex" {
+					in.ProcsKnown = true
+					in.Procs = descendantArgs(tree, pid)
+				}
+			}
+			if in.ProcsKnown {
+				cmd, _, _ = identifyAgent(in.Procs)
 			}
 		}
 		if !p.Dead && (cmd == "claude" || cmd == "codex") {
@@ -332,16 +416,16 @@ func cleanEnv() []string {
 }
 
 // psTree 用 `ps -A -o pid=,ppid=` 建 父→子 表（Linux 与 macOS 通用）。
-func psTree() (map[int][]int, error) {
-	cmd := exec.Command("ps", "-A", "-o", "pid=,ppid=")
+func psTree() (*ProcTable, error) {
+	cmd := exec.Command("ps", "-A", "-o", "pid=,ppid=,args=")
 	out, err := cmd.Output()
 	if err != nil {
 		return nil, err
 	}
-	tree := map[int][]int{}
+	tab := &ProcTable{Children: map[int][]int{}, Args: map[int]string{}}
 	for _, line := range strings.Split(string(out), "\n") {
 		f := strings.Fields(line)
-		if len(f) != 2 {
+		if len(f) < 2 {
 			continue
 		}
 		pid, e1 := strconv.Atoi(f[0])
@@ -349,9 +433,33 @@ func psTree() (map[int][]int, error) {
 		if e1 != nil || e2 != nil {
 			continue
 		}
-		tree[ppid] = append(tree[ppid], pid)
+		tab.Children[ppid] = append(tab.Children[ppid], pid)
+		tab.Args[pid] = strings.Join(f[2:], " ")
 	}
-	return tree, nil
+	if len(tab.Args) == 0 {
+		return nil, errors.New("ps 没有输出")
+	}
+	return tab, nil
+}
+
+// descendantArgs 返回 pid 自己及其所有子孙的命令行。
+func descendantArgs(t *ProcTable, pid int) []string {
+	var res []string
+	seen := map[int]bool{}
+	stack := []int{pid}
+	for len(stack) > 0 {
+		p := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		if seen[p] {
+			continue
+		}
+		seen[p] = true
+		if a, ok := t.Args[p]; ok {
+			res = append(res, a)
+		}
+		stack = append(stack, t.Children[p]...)
+	}
+	return res
 }
 
 const tailBytes = 8 << 20
@@ -456,11 +564,21 @@ func codexCwd(path string) (string, bool) {
 		return "", false
 	}
 	defer f.Close()
-	buf := make([]byte, 64<<10)
-	n, _ := f.Read(buf)
-	line := buf[:n]
-	if i := bytes.IndexByte(line, '\n'); i >= 0 {
-		line = line[:i]
+	// 首行 session_meta 含很长的 base_instructions（真实样本约 22KB），按行完整读，上限 4MB。
+	r := bufio.NewReaderSize(f, 64<<10)
+	var line []byte
+	for {
+		chunk, isPrefix, err := r.ReadLine()
+		if err != nil {
+			return "", false
+		}
+		line = append(line, chunk...)
+		if !isPrefix {
+			break
+		}
+		if len(line) > 4<<20 {
+			return "", false
+		}
 	}
 	var rec struct {
 		Type    string `json:"type"`

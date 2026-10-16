@@ -1,18 +1,19 @@
 # 待办队列（指挥维护，每次变动就更新）
 
-更新：2026-10-16
+更新：2026-10-16（下午）
 
 ## 等用户在 Mac 上做
-1. 在 mac:shell1 跑 `scp chenwy@192.168.147.115:xv2.sh ~ && sh ~/xv2.sh`（新版 wgtund、xxyi-msg，同步 v2 配置缺省关闭），然后退出并重开 XXYI。
-2. 重开后手测面板复制（0a93543）：拖选+⌘C、「复制正文」、选区过一个刷新周期不消失。终端里用 Shift 拖选再 ⌘C（用户定：不做专门按钮）。
-3. 消息面板里处理遗留的 #5fc122a6（pending）、#3d326d84（发给 shell1 的部署命令，跑完点拒绝以免重复注入）。
+1. 消息面板里处理遗留的 #5fc122a6（pending）、#3d326d84（发给 shell1 的部署命令，点拒绝以免重复注入）。
+2. 决定 base 的 22 个旧工作区怎么处理（见下）。
 
 ## 项目同步 v2（PLAN-sync-v2.md，以第十四到十八节为准）
-- [完成] 判定、执行、范围检查、事实采集、静止计时、agent 状态、远程协议、自动提交、编排调度（base-msg feat/msg 到 0c4494f，均过审，可用）。wip/round-preflight-aborted 为被叫停的半成品。
-- [进行中] 部署：Ubuntu 的 xxyi-msg 已换新版；Mac 待上面第 1 步。之后指挥给一条命令，对 xxyi 手动试一轮，看结果再由用户决定是否打开自动同步。
-- [待] ④ 控制中心显示与按钮（Mac 执行者）。
-- [待] 小改进：超出范围的分支单独跳过、其他分支继续（现在是停下这一轮，数据安全，不阻塞）。
-- [待] Mac 上 xxyi、base 迁到 ~/Documents/codes（步骤先给用户过目）；websubmit/bioflow/biogateway 加入。
+- [完成] 全部后端（base-msg feat/msg 到 0c4494f）、部署（两边已换新版）、控制中心面板（codex1，xxyi main 的 228f55a/d56dc04/f473c48）。
+- [完成] 10/16 实测：ai-browser、xxyi、websubmit 同步正常（新建分支、快进、遇未提交改动跳过、冲突停下都符合预期）；ai-browser 的冲突由指挥合并（0f64a98）。websubmit 已加入项目列表（需 Mac 重开 XXYI 生效）。自动同步仍关闭，由用户定何时打开。
+- [待] base 被拦：Ubuntu 上 base 有 22 个工作区（上限 8），9 个有未提交改动。建议：每个 wip/ 工作区先提交进 wip/ 分支，再 git worktree remove（分支不删）。等用户确认。
+- [待] 面板小毛病：数字 0 显示成 Q（字体/渲染问题，待查）。
+- [待] 小改进：超出范围的分支单独跳过、其他分支继续。
+- [待] 排查 codex1「不知道自己的地址」（errNoSelfAddr，selfAddr 找不到；Codex 启动 MCP 会清环境变量）。
+- [待] Mac 上 xxyi、base 迁到 ~/Documents/codes（步骤先给用户过目）；bioflow、biogateway 加入同步。
 - [待] 日志同步（第一版不做）。
 - [待] XXYI 自动启动、停止 agent（让「做完」状态天然确定）。
 

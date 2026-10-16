@@ -8,8 +8,7 @@ Q=$REPO/go/tasks-macexec
 ST=$Q/state; mkdir -p "$ST"
 log(){ echo "$(date '+%m-%d %H:%M:%S') $*" | tee -a "$ST/runner.log"; }
 studio_free(){
-  local s; s=$(timeout 20 xxyi-msg who 2>/dev/null) || return 1
-  echo "$s" | grep -qE '^mac:(omlx[0-9]+|codex1) busy' && return 1
+  # 只看本机有没有本地模型任务在跑；Mac 会话显示 busy 不代表在用 Studio（用户 10/16 指出），不再据此等待
   pgrep -f '/\.omlx-agent/omlx-agent ' >/dev/null && return 1
   return 0
 }

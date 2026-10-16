@@ -119,7 +119,7 @@ func (c *captured) handler() http.HandlerFunc {
 			xxauth: r.Header.Get("X-XXYI-Auth"),
 			query:  r.URL.RawQuery,
 		}
-		if r.Method == http.MethodPost && (r.URL.Path == "/msg/send" || r.URL.Path == "/approval/ask") {
+		if r.Method == http.MethodPost && (r.URL.Path == "/msg/send" || r.URL.Path == "/msg/recall" || r.URL.Path == "/approval/ask") {
 			b, _ := io.ReadAll(r.Body)
 			rec.raw = b
 			if r.URL.Path == "/msg/send" {
@@ -145,6 +145,8 @@ func (c *captured) handler() http.HandlerFunc {
 				id = "ab12"
 			}
 			fmt.Fprintf(w, `{"id":%q}`, id)
+		case "/msg/recall":
+			fmt.Fprint(w, `{"ok":true}`)
 		case "/msg/state":
 			fmt.Fprint(w, c.stateResp())
 		case "/msg/inbox":

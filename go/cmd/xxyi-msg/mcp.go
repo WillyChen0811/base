@@ -1,11 +1,13 @@
 package main
 
 // MCP 服务：标准输入/输出上的 JSON-RPC 2.0，一行一个 JSON（newline-delimited），只用标准库。
-// 给另一侧的 Claude 用：它只能通过这五个工具碰消息通道，收发核验之外的事一律不暴露。
+// 给另一侧的 Claude 用：五个消息工具碰消息通道，九个 mac_* 工具经协助远端碰 Mac（见 macexec.go），
+// 名单之外的事一律不暴露。
 
 import (
 	"bufio"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -83,13 +85,10 @@ func handleRPC(line string) (rpcResponse, bool) {
 	case "ping":
 		resp.Result = map[string]any{}
 	case "tools/list":
-		resp.Result = map[string]any{"tools": mcpTools}
+		resp.Result = map[string]any{"tools": allMcpTools()}
 	case "tools/call":
-		text, isError := callTool(req.Params)
-		resp.Result = map[string]any{
-			"content": []map[string]any{{"type": "text", "text": text}},
-			"isError": isError,
-		}
+		content, isError := callTool(req.Params)
+		resp.Result = map[string]any{"content": content, "isError": isError}
 	default:
 		resp.Error = &rpcError{Code: rpcMethodNotFound, Message: "method not found"}
 	}
@@ -114,7 +113,7 @@ func initializeResult(params json.RawMessage) map[string]any {
 	}
 }
 
-// mcpTools 是 tools/list 的内容：五个工具，参数用 JSON Schema 描述。
+// mcpTools 是消息通道的五个工具（mac_* 九个见 macexec.go 的 mcpMacTools），参数用 JSON Schema 描述。
 var mcpTools = []map[string]any{
 	{
 		"name":        "xxyi_send",
@@ -180,25 +179,46 @@ var mcpTools = []map[string]any{
 }
 
 // callTool 执行 tools/call：工具层面的失败一律 isError=true + 中文原因，不用 JSON-RPC error。
-func callTool(params json.RawMessage) (string, bool) {
+// mac_screenshot 走图片通道（返回 MCP image 内容），其余都是文字。
+func callTool(params json.RawMessage) ([]map[string]any, bool) {
 	var p struct {
 		Name      string         `json:"name"`
 		Arguments map[string]any `json:"arguments"`
 	}
 	if err := json.Unmarshal(params, &p); err != nil {
-		return "调用参数不是合法的对象", true
+		return textContent("调用参数不是合法的对象"), true
+	}
+	if p.Name == "mac_screenshot" {
+		data, err := macScreenshot(context.Background(), p.Arguments)
+		if err != nil {
+			return textContent(err.Error()), true
+		}
+		return []map[string]any{{
+			"type":     "image",
+			"data":     base64.StdEncoding.EncodeToString(data),
+			"mimeType": "image/png",
+		}}, false
 	}
 	text, err := runTool(context.Background(), p.Name, p.Arguments)
 	if err != nil {
-		return err.Error(), true
+		return textContent(err.Error()), true
 	}
-	return text, false
+	return textContent(text), false
+}
+
+// textContent 把一段文字包成 MCP 的 text 内容项。
+func textContent(text string) []map[string]any {
+	return []map[string]any{{"type": "text", "text": text}}
 }
 
 // runTool 是五个工具的实现；每次调用自带 httpTimeout。
 // 每次工具调用前先尝试补发暂存（连不上/超时就放下，不挡这次的调用；
 // 被拒的落 rejected/ + .reason，xxyi_inbox 从盘上列一次）。
 func runTool(ctx context.Context, name string, args map[string]any) (string, error) {
+	if strings.HasPrefix(name, "mac_") {
+		// mac 工具不碰消息暂存，超时预算按任务长短自定（见 macexec.go），不占 httpTimeout 这一份。
+		return runMacTool(ctx, name, args)
+	}
 	ctx, cancel := context.WithTimeout(ctx, httpTimeout)
 	defer cancel()
 	flushSpool(ctx)

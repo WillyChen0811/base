@@ -155,6 +155,11 @@ func (e *statusError) serverReason() string {
 // 需要证书的路径（needsClientAuth）发请求前先签 X-XXYI-Auth：
 // 签名的 path 就是实际发出去的 RequestURI（含查询串，Mac 侧的 token=… 也在里面）。
 func (c *client) do(ctx context.Context, method, path string, body []byte) ([]byte, error) {
+	return c.doLimited(ctx, method, path, body, 0)
+}
+
+// doLimited 同 do，但响应体最多读 maxBytes 字节（0 表示不限）；超限报错而不是全收进内存。
+func (c *client) doLimited(ctx context.Context, method, path string, body []byte, maxBytes int64) ([]byte, error) {
 	var rdr io.Reader
 	if body != nil {
 		rdr = bytes.NewReader(body)
@@ -184,7 +189,14 @@ func (c *client) do(ctx context.Context, method, path string, body []byte) ([]by
 		return nil, &connError{err}
 	}
 	defer resp.Body.Close()
-	b, _ := io.ReadAll(resp.Body)
+	var respRdr io.Reader = resp.Body
+	if maxBytes > 0 {
+		respRdr = io.LimitReader(resp.Body, maxBytes+1)
+	}
+	b, _ := io.ReadAll(respRdr)
+	if maxBytes > 0 && int64(len(b)) > maxBytes {
+		return nil, fmt.Errorf("响应超过 %d 字节上限", maxBytes)
+	}
 	if resp.StatusCode != http.StatusOK {
 		var e struct {
 			Error string `json:"error"`

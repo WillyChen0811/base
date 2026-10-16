@@ -565,7 +565,7 @@ func (s *Service) reconnectLoop(sess *session) (net.Listener, *http.Server) {
 // ---------- 远端接口 ----------
 
 // remoteMux 是某个会话的远端接口；只有 GET /status、POST /task、GET /events、POST /sync、
-// POST /stop-claude、POST /projsync，绝不含开始/停止协助或批准请求。
+// POST /stop-claude、POST /projsync、/exec/*（见 macexec.go），绝不含开始/停止协助或批准请求。
 func (s *Service) remoteMux(sess *session) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/status", only(http.MethodGet, s.remoteStatus))
@@ -576,6 +576,7 @@ func (s *Service) remoteMux(sess *session) http.Handler {
 	mux.HandleFunc("/projsync", only(http.MethodPost, s.remoteProjSync))
 	s.mountMsgRemote(mux)
 	s.mountApprovalRemote(mux)
+	s.mountMacExecRemote(mux)
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, http.StatusNotFound, "没有这个路径")
 	})

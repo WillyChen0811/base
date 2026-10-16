@@ -1,0 +1,407 @@
+package wgtund
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/WillyChen0811/base/go/projsync"
+)
+
+// ── 配置 ─────────────────────────────────────────────
+
+func TestProjsyncV2Config(t *testing.T) {
+	// 没有 v2 段：关闭，间隔 5，缺省 xxyi-msg 路径
+	p, err := prepareProjsync(projConfT(t, nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.v2.enabled || p.v2.interval != 5*time.Minute || p.v2.xxyiMsg != "~/.local/bin/xxyi-msg" {
+		t.Fatalf("缺省: %+v", p.v2)
+	}
+	// v2 段里没写 enabled：仍然关闭
+	p, err = prepareProjsync(projConfT(t, func(pj, _ map[string]any, _ *hostConf) { pj["v2"] = map[string]any{"interval_minutes": 9} }))
+	if err != nil || p.v2.enabled || p.v2.interval != 9*time.Minute {
+		t.Fatalf("enabled 缺省应为 false: %v %+v", err, p.v2)
+	}
+	// 小于 5 一律按 5（含 0、负数、1、4）；5 与更大的保持
+	for _, c := range []struct{ in, want int }{{0, 5}, {-3, 5}, {1, 5}, {4, 5}, {5, 5}, {7, 7}, {60, 60}} {
+		p, err := prepareProjsync(projConfT(t, func(pj, _ map[string]any, _ *hostConf) {
+			pj["v2"] = map[string]any{"enabled": true, "interval_minutes": c.in}
+		}))
+		if err != nil || !p.v2.enabled || p.v2.interval != time.Duration(c.want)*time.Minute {
+			t.Fatalf("interval_minutes=%d: %v %+v", c.in, err, p.v2)
+		}
+	}
+	// xxyi_msg 字符集
+	for _, bad := range []string{"a b", "x;rm -rf /", "$(id)", "-x", "a'b", "a\nb"} {
+		_, err := prepareProjsync(projConfT(t, func(pj, _ map[string]any, _ *hostConf) { pj["v2"] = map[string]any{"xxyi_msg": bad} }))
+		if err == nil || !strings.Contains(err.Error(), "hosts.json: projsync 的 v2") || !strings.Contains(err.Error(), "xxyi_msg") {
+			t.Errorf("xxyi_msg=%q 应被拒绝: %v", bad, err)
+		}
+	}
+	p, err = prepareProjsync(projConfT(t, func(pj, _ map[string]any, _ *hostConf) {
+		pj["v2"] = map[string]any{"xxyi_msg": "/opt/bin/xxyi-msg_2.x~"}
+	}))
+	if err != nil || p.v2.xxyiMsg != "/opt/bin/xxyi-msg_2.x~" {
+		t.Fatalf("%v %+v", err, p.v2)
+	}
+}
+
+// ── 调度 ─────────────────────────────────────────────
+
+func v2Svc(t *testing.T, enabled bool) *projsyncV2Svc {
+	t.Helper()
+	c := projConfT(t, func(pj, p0 map[string]any, _ *hostConf) {
+		pj["projects"] = []any{p0,
+			map[string]any{"name": "beta", "local": p0["local"], "remote": "/home/chenwy/beta"}}
+		pj["v2"] = map[string]any{"enabled": enabled, "interval_minutes": 5}
+	})
+	p, err := prepareProjsync(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := newProjsyncV2Svc(newProjsyncSvc(p, nil, "127.0.0.1:9"), nil)
+	s.statusPath = filepath.Join(t.TempDir(), "sub", projsyncV2StatusFile)
+	return s
+}
+
+func TestProjsyncV2DisabledDoesNotRunAutomatically(t *testing.T) {
+	s := v2Svc(t, false)
+	var n int
+	s.round = func(ctx context.Context, env projsync.RoundEnv) projsync.RoundResult {
+		n++
+		return projsync.RoundResult{}
+	}
+	s.initialDelay, s.interval = time.Millisecond, time.Millisecond
+	done := make(chan struct{})
+	go func() { s.loop(context.Background()); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("enabled=false 时 loop 应立即返回")
+	}
+	time.Sleep(30 * time.Millisecond)
+	if n != 0 || s.status().NextRun != nil || s.status().Enabled {
+		t.Fatalf("不应自动跑: n=%d %+v", n, s.status())
+	}
+	// 手动接口仍可用
+	if err := s.Start(context.Background(), "alpha", nil); err != nil {
+		t.Fatal(err)
+	}
+	pollUntil(t, 3*time.Second, "手动跑完", func() bool { return s.status().Projects[0].Last != nil })
+	if n != 1 {
+		t.Fatalf("n=%d", n)
+	}
+}
+
+func TestProjsyncV2EnabledRunsProjectsSequentially(t *testing.T) {
+	s := v2Svc(t, true)
+	var mu sync.Mutex
+	var order []string
+	cur, maxCur := 0, 0
+	s.round = func(ctx context.Context, env projsync.RoundEnv) projsync.RoundResult {
+		mu.Lock()
+		cur++
+		if cur > maxCur {
+			maxCur = cur
+		}
+		order = append(order, env.Project)
+		mu.Unlock()
+		time.Sleep(15 * time.Millisecond)
+		mu.Lock()
+		cur--
+		mu.Unlock()
+		return projsync.RoundResult{Project: env.Project, Summary: "ok"}
+	}
+	s.initialDelay, s.interval = 5*time.Millisecond, 30*time.Millisecond
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { s.loop(ctx); close(done) }()
+	pollUntil(t, 5*time.Second, "两个项目跑了两轮", func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(order) >= 4
+	})
+	st := s.status()
+	if st.NextRun == nil || !st.Enabled || st.Projects[0].Last == nil || st.Projects[1].Last == nil {
+		t.Fatalf("%+v", st)
+	}
+	cancel()
+	<-done
+	mu.Lock()
+	defer mu.Unlock()
+	if maxCur != 1 {
+		t.Fatalf("项目应依次进行，最大并发 %d", maxCur)
+	}
+	if order[0] != "alpha" || order[1] != "beta" || order[2] != "alpha" {
+		t.Fatalf("顺序: %v", order)
+	}
+	// 状态文件：0600、内容是合法 JSON
+	fi, err := os.Stat(s.statusPath)
+	if err != nil || fi.Mode().Perm() != 0o600 {
+		t.Fatalf("状态文件: %v %v", fi, err)
+	}
+	b, _ := os.ReadFile(s.statusPath)
+	var back projsyncV2Status
+	if err := json.Unmarshal(b, &back); err != nil || len(back.Projects) != 2 {
+		t.Fatalf("状态文件内容: %v %s", err, b)
+	}
+	if ents, _ := os.ReadDir(filepath.Dir(s.statusPath)); len(ents) != 1 {
+		t.Fatalf("不应留下临时文件: %v", ents)
+	}
+}
+
+func TestProjsyncV2SkippedRoundRecordedSeparately(t *testing.T) {
+	s := v2Svc(t, false)
+	s.round = func(ctx context.Context, env projsync.RoundEnv) projsync.RoundResult {
+		return projsync.RoundResult{Project: env.Project, Skipped: true, SkipReason: "上一轮还在进行"}
+	}
+	tt, _ := s.v1.target("alpha")
+	s.acquire("alpha")
+	s.execute(context.Background(), tt, nil)
+	it := s.status().Projects[0]
+	if it.Last != nil || it.LastSkip == nil || it.LastSkip.SkipReason != "上一轮还在进行" || it.Running {
+		t.Fatalf("%+v", it)
+	}
+}
+
+// ── 接口 ─────────────────────────────────────────────
+
+func v2Do(t *testing.T, srv *httptest.Server, method, path, origin string) (*http.Response, []byte) {
+	t.Helper()
+	req, err := http.NewRequest(method, srv.URL+path, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if origin != "" {
+		req.Header.Set("Origin", origin)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(resp.Body)
+	return resp, b
+}
+
+func TestProjsyncV2LocalAPI(t *testing.T) {
+	s := v2Svc(t, false)
+	entered := make(chan projsync.RoundEnv, 4)
+	gate := make(chan struct{})
+	s.round = func(ctx context.Context, env projsync.RoundEnv) projsync.RoundResult {
+		entered <- env
+		<-gate
+		return projsync.RoundResult{Project: env.Project, Summary: "假的一轮", Attention: []projsync.AttentionItem{}}
+	}
+	srv := httptest.NewServer(s.localHandler(context.Background(), []string{"127.0.0.1:8765"}))
+	defer srv.Close()
+
+	resp, b := v2Do(t, srv, http.MethodGet, "/projsync/v2", "")
+	var st projsyncV2Status
+	if resp.StatusCode != 200 || json.Unmarshal(b, &st) != nil || len(st.Projects) != 2 || st.Enabled || st.NextRun != nil {
+		t.Fatalf("GET: %d %s", resp.StatusCode, b)
+	}
+	if !strings.Contains(string(b), `"last":null`) || !strings.Contains(string(b), `"next_run":null`) {
+		t.Fatalf("未跑过应 last/next_run 为 null: %s", b)
+	}
+	// 方法
+	if r, _ := v2Do(t, srv, http.MethodPost, "/projsync/v2", testOrigin); r.StatusCode != 405 {
+		t.Errorf("POST /projsync/v2 应 405: %d", r.StatusCode)
+	}
+	for _, p := range []string{"/projsync/v2/run?name=alpha", "/projsync/v2/commit?name=alpha&side=mac&worktree=/x"} {
+		if r, _ := v2Do(t, srv, http.MethodGet, p, testOrigin); r.StatusCode != 405 {
+			t.Errorf("GET %s 应 405: %d", p, r.StatusCode)
+		}
+		// Origin：没有 / 白名单外都 403
+		if r, _ := v2Do(t, srv, http.MethodPost, p, ""); r.StatusCode != 403 {
+			t.Errorf("无 Origin %s 应 403: %d", p, r.StatusCode)
+		}
+		if r, _ := v2Do(t, srv, http.MethodPost, p, "http://evil.example"); r.StatusCode != 403 {
+			t.Errorf("坏 Origin %s 应 403: %d", p, r.StatusCode)
+		}
+	}
+	if r, _ := v2Do(t, srv, http.MethodPost, "/projsync/v2/run?name=zzz", testOrigin); r.StatusCode != 404 {
+		t.Errorf("未知项目应 404: %d", r.StatusCode)
+	}
+	for _, q := range []string{"side=root&worktree=/x", "side=mac&worktree=rel/path", "side=mac&worktree=", "side=&worktree=/x"} {
+		if r, _ := v2Do(t, srv, http.MethodPost, "/projsync/v2/commit?name=alpha&"+q, testOrigin); r.StatusCode != 400 {
+			t.Errorf("%s 应 400: %d", q, r.StatusCode)
+		}
+	}
+	// 合法 run：202；运行中 409；放行后出现 last
+	if r, b := v2Do(t, srv, http.MethodPost, "/projsync/v2/run?name=alpha", testOrigin); r.StatusCode != 202 || !strings.Contains(string(b), `"started":true`) {
+		t.Fatalf("run: %d %s", r.StatusCode, b)
+	}
+	env := <-entered
+	if len(env.Force) != 0 || env.Project != "alpha" || env.XxyiMsg != "~/.local/bin/xxyi-msg" || env.RemoteNS != "ubuntu" {
+		t.Fatalf("env: %+v", env)
+	}
+	if r, _ := v2Do(t, srv, http.MethodPost, "/projsync/v2/run?name=alpha", testOrigin); r.StatusCode != 409 {
+		t.Errorf("同一项目运行中应 409: %d", r.StatusCode)
+	}
+	if r, _ := v2Do(t, srv, http.MethodPost, "/projsync/v2/commit?name=alpha&side=ubuntu&worktree=/x", testOrigin); r.StatusCode != 409 {
+		t.Errorf("commit 运行中也应 409: %d", r.StatusCode)
+	}
+	_, b = v2Do(t, srv, http.MethodGet, "/projsync/v2", "")
+	json.Unmarshal(b, &st)
+	if !st.Projects[0].Running {
+		t.Fatalf("应在运行: %s", b)
+	}
+	gate <- struct{}{}
+	pollUntil(t, 3*time.Second, "跑完", func() bool { return s.status().Projects[0].Last != nil && !s.status().Projects[0].Running })
+
+	// commit：Force 被带进这一轮的环境
+	if r, b := v2Do(t, srv, http.MethodPost, "/projsync/v2/commit?name=beta&side=ubuntu&worktree=/home/chenwy/beta", testOrigin); r.StatusCode != 202 {
+		t.Fatalf("commit: %d %s", r.StatusCode, b)
+	}
+	env = <-entered
+	if env.Project != "beta" || len(env.Force) != 1 || env.Force[0].Side != projsync.SideUbuntu || env.Force[0].Worktree != "/home/chenwy/beta" {
+		t.Fatalf("Force: %+v", env.Force)
+	}
+	gate <- struct{}{}
+	pollUntil(t, 3*time.Second, "beta 跑完", func() bool { return s.status().Projects[1].Last != nil })
+}
+
+func TestProjsyncV2WiredIntoRun(t *testing.T) {
+	t.Setenv("HOME", t.TempDir()) // 状态文件不得落到真实家目录
+	repo := gitRepoDir(t)
+	f := newFixture(t, func(cfg map[string]any) {
+		cfg["projsync"] = map[string]any{"host": "ubuntu",
+			"projects": []any{map[string]any{"name": "alpha", "local": repo, "remote": "/home/chenwy/alpha"}}}
+	})
+	st, _, _ := run(t, f.dir)
+	if r, _ := get(t, st, "/projsync/v2", false); r.StatusCode != http.StatusUnauthorized {
+		t.Errorf("不带主令牌应 401: %d", r.StatusCode)
+	}
+	r, b := get(t, st, "/projsync/v2", true)
+	var s projsyncV2Status
+	if r.StatusCode != 200 || json.Unmarshal(b, &s) != nil || s.Enabled || len(s.Projects) != 1 {
+		t.Fatalf("GET: %d %s", r.StatusCode, b)
+	}
+	for _, p := range []string{"/projsync/v2/run?name=alpha", "/projsync/v2/commit?name=alpha&side=mac&worktree=/x"} {
+		if r, _ := supportPost(t, st, p, ""); r.StatusCode != 403 {
+			t.Errorf("无 Origin 应 403: %s %d", p, r.StatusCode)
+		}
+	}
+	// 没配置 projsync：404
+	f0 := newFixture(t, nil)
+	st0, _, _ := run(t, f0.dir)
+	if r, _ := get(t, st0, "/projsync/v2", true); r.StatusCode != http.StatusNotFound {
+		t.Errorf("没配置应 404: %d", r.StatusCode)
+	}
+}
+
+// ── 手动 commit 接口端到端：真 RunRound + 真仓库，Force 才能提交 ──
+
+type v2UbuRunner struct{}
+
+func (v2UbuRunner) Run(ctx context.Context, cmd string, stdin []byte) ([]byte, []byte, int, error) {
+	var out []byte
+	var err error
+	switch strings.Fields(cmd)[1] {
+	case projsync.SubcmdFacts:
+		out, err = projsync.ServeFacts(ctx, stdin, func(ctx context.Context, wt string) projsync.AgentVerdict {
+			return projsync.AgentVerdict{Verdict: "unknown", Notes: []string{"测试：不确定"}}
+		})
+	default:
+		out, err = projsync.ServeApplyWith(ctx, stdin, func(ctx context.Context, wt string) (bool, string) { return false, "测试：不确定" })
+	}
+	if err != nil {
+		return nil, []byte(err.Error()), 2, nil
+	}
+	return out, nil, 0, nil
+}
+
+func gitT(t *testing.T, dir string, args ...string) string {
+	t.Helper()
+	out, err := exec.Command("git", append([]string{"-C", dir}, args...)...).CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %s: %v %s", strings.Join(args, " "), err, out)
+	}
+	return strings.TrimSpace(string(out))
+}
+
+func TestProjsyncV2ManualCommitForcesCommit(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(os.Getenv("HOME"), "xdg"))
+	ubu := filepath.Join(t.TempDir(), "ubu")
+	os.MkdirAll(ubu, 0o755)
+	gitT(t, ubu, "init", "-q", "-b", "main")
+	gitT(t, ubu, "config", "user.name", "t")
+	gitT(t, ubu, "config", "user.email", "t@t")
+	gitT(t, ubu, "config", "commit.gpgsign", "false")
+	os.WriteFile(filepath.Join(ubu, "a.txt"), []byte("a\n"), 0o644)
+	gitT(t, ubu, "add", ".")
+	gitT(t, ubu, "commit", "-q", "-m", "init")
+	mac := filepath.Join(t.TempDir(), "mac")
+	if out, err := exec.Command("git", "clone", "-q", ubu, mac).CombinedOutput(); err != nil {
+		t.Fatalf("%v %s", err, out)
+	}
+	canonMac, _ := filepath.EvalSymlinks(mac)
+	os.WriteFile(filepath.Join(ubu, "wip.txt"), []byte("wip\n"), 0o644)
+
+	c := projConfT(t, func(pj, p0 map[string]any, _ *hostConf) {
+		p0["local"], p0["remote"] = canonMac, ubu
+	})
+	p, err := prepareProjsync(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	v1 := newProjsyncSvc(p, nil, "127.0.0.1:9")
+	v1.gitOverride = func(projsyncTarget) (string, []string, error) { return ubu, nil, nil }
+	s := newProjsyncV2Svc(v1, nil)
+	s.runner = v2UbuRunner{}
+	s.statusPath = filepath.Join(t.TempDir(), projsyncV2StatusFile)
+	srv := httptest.NewServer(s.localHandler(context.Background(), []string{"127.0.0.1:8765"}))
+	defer srv.Close()
+	waitLast := func() *projsync.RoundResult {
+		pollUntil(t, 20*time.Second, "一轮跑完", func() bool { it := s.status().Projects[0]; return it.Last != nil && !it.Running })
+		return s.status().Projects[0].Last
+	}
+
+	// 先手动跑一轮：agent 状态不确定，不提交，事项带「提交并同步」
+	if r, b := v2Do(t, srv, http.MethodPost, "/projsync/v2/run?name=alpha", testOrigin); r.StatusCode != 202 {
+		t.Fatalf("%d %s", r.StatusCode, b)
+	}
+	res := waitLast()
+	if len(res.Attention) != 1 || res.Attention[0].Kind != projsync.AttUncertainDirt || !res.Attention[0].CanCommit {
+		t.Fatalf("%+v", res)
+	}
+	head0 := gitT(t, ubu, "rev-parse", "HEAD")
+	if gitT(t, ubu, "status", "--porcelain") != "?? wip.txt" {
+		t.Fatal("不确定时不应提交")
+	}
+
+	// 用户点「提交并同步」：Force=true，提交后同步到 Mac
+	wt := res.Attention[0].Worktree
+	s.mu.Lock()
+	s.last = map[string]*projsync.RoundResult{}
+	s.mu.Unlock()
+	q := fmt.Sprintf("/projsync/v2/commit?name=alpha&side=ubuntu&worktree=%s", wt)
+	if r, b := v2Do(t, srv, http.MethodPost, q, testOrigin); r.StatusCode != 202 {
+		t.Fatalf("%d %s", r.StatusCode, b)
+	}
+	res = waitLast()
+	head1 := gitT(t, ubu, "rev-parse", "HEAD")
+	if head1 == head0 || gitT(t, ubu, "status", "--porcelain") != "" {
+		t.Fatalf("Force 应已提交: %+v", res)
+	}
+	if gitT(t, mac, "rev-parse", "HEAD") != head1 || res.NeedsAttention {
+		t.Fatalf("提交后应同步到 Mac: %+v", res)
+	}
+	if len(res.Worktrees) != 1 || res.Worktrees[0].Verdict != "用户指定" {
+		t.Fatalf("%+v", res.Worktrees)
+	}
+}

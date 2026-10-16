@@ -24,6 +24,7 @@ type projsyncConf struct {
 	LocalName  string            `json:"local_name"`  // 本机命名空间，默认 "mac"
 	RemoteName string            `json:"remote_name"` // 对方命名空间，默认主机名
 	Projects   []projsyncProject `json:"projects"`
+	V2         *projsyncV2Conf   `json:"v2"` // 可选：项目全面同步 v2（见 projsync_v2.go），缺省关闭
 }
 
 // projsyncProject 是一个要同步的项目：两边的仓库目录和各自的 Claude 对话目录。
@@ -68,6 +69,7 @@ type projsyncPrep struct {
 	localName  string
 	remoteName string
 	targets    []projsyncTarget // 配置顺序
+	v2         projsyncV2Prep   // v2 同步的调度设置（没配 v2 段时为关闭的缺省值）
 }
 
 // checkProjsyncNS 校验命名空间名：只允许 [a-z0-9-]、1..32 字节（和 projsync.SyncGit 的要求一致，
@@ -119,6 +121,11 @@ func prepareProjsync(c *fileConf) (*projsyncPrep, error) {
 		identity: expand(host.IdentityFiles[0]), knownHosts: expand(c.KnownHosts),
 		localName: localName, remoteName: remoteName,
 	}
+	v2, err := prepareProjsyncV2(pc.V2)
+	if err != nil {
+		return nil, bad("的 v2 %v", err)
+	}
+	p.v2 = v2
 	seen := map[string]bool{}
 	for i, pr := range pc.Projects {
 		if !projNameRe.MatchString(pr.Name) {

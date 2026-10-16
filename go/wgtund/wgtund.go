@@ -254,6 +254,7 @@ func Run(ctx context.Context, dir string, stdin io.Reader, stdout io.Writer) (er
 	// 项目同步（可选）：给目标主机开一条本机线路转发口（git 走它、跟随当前线路），
 	// 启动时开一次，退出时一起关（照协助多线路对 fwd 的处理）
 	var projSvc *projsyncSvc
+	var projV2 *projsyncV2Svc
 	if pjPrep != nil {
 		pjFwd, err := routeForwarder(pool, pjPrep.host)
 		if err != nil {
@@ -261,6 +262,12 @@ func Run(ctx context.Context, dir string, stdin io.Reader, stdout io.Writer) (er
 		}
 		closers = append(closers, pjFwd)
 		projSvc = newProjsyncSvc(pjPrep, pool, pjFwd.Addr().String())
+		// v2：定时调度（缺省关闭）+ 手动接口；退出时取消并等当前一轮收尾
+		projV2 = newProjsyncV2Svc(projSvc, pool)
+		v2ctx, v2cancel := context.WithCancel(ctx)
+		v2done := make(chan struct{})
+		go func() { defer close(v2done); projV2.loop(v2ctx) }()
+		closers = append(closers, closerFunc(func() { v2cancel(); <-v2done }))
 	}
 
 	open := func(r *http.Request, cols, rows int) (*sshterm.Session, error) {
@@ -429,12 +436,19 @@ func Run(ctx context.Context, dir string, stdin io.Reader, stdout io.Writer) (er
 		h := projSvc.localHandler(ctx, conf.AllowedOrigins)
 		mux.Handle("/projsync", h)
 		mux.Handle("/projsync/run", h)
+		h2 := projV2.localHandler(ctx, conf.AllowedOrigins)
+		mux.Handle("/projsync/v2", h2)
+		mux.Handle("/projsync/v2/run", h2)
+		mux.Handle("/projsync/v2/commit", h2)
 	} else {
 		noProj := func(w http.ResponseWriter, r *http.Request) {
 			errJSON(w, http.StatusNotFound, "没有配置项目同步")
 		}
 		mux.HandleFunc("/projsync", noProj)
 		mux.HandleFunc("/projsync/run", noProj)
+		mux.HandleFunc("/projsync/v2", noProj)
+		mux.HandleFunc("/projsync/v2/run", noProj)
+		mux.HandleFunc("/projsync/v2/commit", noProj)
 	}
 
 	// tmux 会话管理。写操作用 POST 但不带请求体和自定义头，

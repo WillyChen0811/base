@@ -140,7 +140,11 @@ type RoundResult struct {
 	// NeedsAttention：Attention 非空。
 	NeedsAttention bool     `json:"needs_attention"`
 	Notes          []string `json:"notes,omitempty"`
-	Summary        string   `json:"summary"`
+	// Claude：本轮代码同步之后补做的对话记录同步结果（没做则为空）；
+	// ClaudeError：对话记录同步失败的原因——只影响这两项，不改变代码同步的结论。
+	Claude      *FileResult `json:"claude,omitempty"`
+	ClaudeError string      `json:"claude_error,omitempty"`
+	Summary     string      `json:"summary"`
 }
 
 // tmpMergePrefix 是 AutoMerge 传送合并提交用的临时分支前缀。它只是传送载体，不是用户分支：

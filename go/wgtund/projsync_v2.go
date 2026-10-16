@@ -98,6 +98,9 @@ type projsyncV2Svc struct {
 	localJudge projsync.AgentJudge
 	// round 是一轮的执行；默认 projsync.RunRound，测试可换成假的。
 	round func(ctx context.Context, env projsync.RoundEnv) projsync.RoundResult
+	// claudeSync 在每轮代码同步之后补做一次两边 Claude 对话目录的双向补齐；
+	// 默认 v1.syncClaude，测试可换成假的；为 nil 时跳过，不碰对话记录。
+	claudeSync func(ctx context.Context, t projsyncTarget) (*projsync.FileResult, error)
 	// statusPath 状态文件；空则不写。
 	statusPath   string
 	interval     time.Duration
@@ -112,7 +115,7 @@ type projsyncV2Svc struct {
 }
 
 func newProjsyncV2Svc(v1 *projsyncSvc, pool *sshPool) *projsyncV2Svc {
-	s := &projsyncV2Svc{v1: v1, localJudge: judgeLocalAgent, round: projsync.RunRound,
+	s := &projsyncV2Svc{v1: v1, localJudge: judgeLocalAgent, round: projsync.RunRound, claudeSync: v1.syncClaude,
 		interval: v1.prep.v2.interval, initialDelay: projsyncV2InitialDelay, now: time.Now,
 		running: map[string]bool{}, last: map[string]*projsync.RoundResult{}, lastSkip: map[string]*projsync.RoundResult{}}
 	if pool != nil {
@@ -168,10 +171,40 @@ func (s *projsyncV2Svc) acquire(name string) error {
 }
 
 // execute 跑一轮并记下结果、写状态文件；调用方必须已占位。
+// 代码同步走完（拿到了锁、没提前结束、没超出范围）之后补做一次对话记录同步：
+// 共用上面这个带超时的 ctx；它的失败或内部出错只记进 ClaudeError 并往 Notes 追加一条说明，
+// 绝不改变代码同步的结论（Error/Stopped/NeedsAttention/Attention/Summary 原样不动）。
 func (s *projsyncV2Svc) execute(ctx context.Context, t projsyncTarget, force []projsync.ForceCommit) projsync.RoundResult {
 	ctx, cancel := context.WithTimeout(ctx, projsyncRunTimeout)
 	defer cancel()
 	res := s.round(ctx, s.env(t, force))
+	if !res.Skipped && !res.OutOfScope && s.claudeSync != nil {
+		func() {
+			defer func() {
+				if p := recover(); p != nil {
+					res.ClaudeError = fmt.Sprintf("内部错误: %v", p)
+					res.Notes = append(res.Notes, "对话记录同步失败："+res.ClaudeError+"（代码同步不受影响）")
+				}
+			}()
+			fr, err := s.claudeSync(ctx, t)
+			switch {
+			case err != nil:
+				res.ClaudeError = err.Error()
+				res.Notes = append(res.Notes, "对话记录同步失败："+res.ClaudeError+"（代码同步不受影响）")
+			case fr == nil:
+				res.ClaudeError = "对话记录同步没有返回结果"
+				res.Notes = append(res.Notes, "对话记录同步失败："+res.ClaudeError+"（代码同步不受影响）")
+			default:
+				res.Claude = fr
+				note := fmt.Sprintf("对话记录：拷到对方 %d 个、拉回 %d 个、相同 %d 个、冲突 %d 个",
+					len(fr.Uploaded), len(fr.Downloaded), fr.Same, len(fr.Conflicts))
+				if len(fr.Errors) > 0 {
+					note += fmt.Sprintf("、单文件失败 %d 个", len(fr.Errors))
+				}
+				res.Notes = append(res.Notes, note)
+			}
+		}()
+	}
 	s.mu.Lock()
 	delete(s.running, t.name)
 	r := res

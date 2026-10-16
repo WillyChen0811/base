@@ -176,6 +176,133 @@ func TestProjsyncV2SkippedRoundRecordedSeparately(t *testing.T) {
 	}
 }
 
+// ── 对话记录同步（每轮代码同步之后补做一次）────────────────
+
+func v2OkRound(env0 projsync.RoundEnv) projsync.RoundResult {
+	return projsync.RoundResult{Project: env0.Project, Summary: "代码同步 ok"}
+}
+
+func TestProjsyncV2ClaudeSyncAfterCodeRound(t *testing.T) {
+	s := v2Svc(t, false)
+	s.round = func(ctx context.Context, env projsync.RoundEnv) projsync.RoundResult { return v2OkRound(env) }
+	tt, _ := s.v1.target("alpha")
+	var gotTarget projsyncTarget
+	s.claudeSync = func(ctx context.Context, tgt projsyncTarget) (*projsync.FileResult, error) {
+		gotTarget = tgt
+		return &projsync.FileResult{
+			Uploaded:   []string{"a.jsonl"},
+			Downloaded: []string{"b.jsonl", "c.jsonl"},
+			Same:       2,
+			Conflicts:  []projsync.Conflict{{Path: "d.jsonl", Reason: "两边都有对方没有的改动"}},
+		}, nil
+	}
+	res := s.execute(context.Background(), tt, nil)
+	if gotTarget.name != "alpha" {
+		t.Fatalf("claudeSync 应拿到本项目: %+v", gotTarget)
+	}
+	if res.Claude == nil || res.ClaudeError != "" {
+		t.Fatalf("Claude=%+v ClaudeError=%q", res.Claude, res.ClaudeError)
+	}
+	want := "对话记录：拷到对方 1 个、拉回 2 个、相同 2 个、冲突 1 个"
+	if len(res.Notes) != 1 || res.Notes[0] != want {
+		t.Fatalf("Notes: %v，期望只有一条 %q", res.Notes, want)
+	}
+	if res.Error != "" || res.Stopped || res.NeedsAttention || res.Summary != "代码同步 ok" {
+		t.Fatalf("代码同步的结论被动过: %+v", res)
+	}
+	// 状态接口的 JSON 里能看到 claude 字段
+	b, err := json.Marshal(s.status())
+	if err != nil || !strings.Contains(string(b), `"claude"`) {
+		t.Fatalf("状态 JSON 应含 claude: %v %s", err, b)
+	}
+	var back projsyncV2Status
+	if err := json.Unmarshal(b, &back); err != nil || len(back.Projects) != 2 || back.Projects[0].Last == nil || back.Projects[0].Last.Claude == nil {
+		t.Fatalf("状态反序列化后 Last.Claude 应在: %v %s", err, b)
+	}
+}
+
+func TestProjsyncV2ClaudeSyncFailureKeepsCodeResult(t *testing.T) {
+	s := v2Svc(t, false)
+	s.round = func(ctx context.Context, env projsync.RoundEnv) projsync.RoundResult { return v2OkRound(env) }
+	tt, _ := s.v1.target("alpha")
+	// 先跑一次没有对话记录同步的，作为「代码结果应与它完全相同」的基线
+	s.claudeSync = nil
+	base := s.execute(context.Background(), tt, nil)
+	s.claudeSync = func(ctx context.Context, _ projsyncTarget) (*projsync.FileResult, error) {
+		return nil, fmt.Errorf("SFTP 连接断开")
+	}
+	res := s.execute(context.Background(), tt, nil)
+	if res.Claude != nil || res.ClaudeError != "SFTP 连接断开" {
+		t.Fatalf("Claude=%+v ClaudeError=%q", res.Claude, res.ClaudeError)
+	}
+	if res.Error != base.Error || res.Stopped != base.Stopped || res.NeedsAttention != base.NeedsAttention ||
+		res.Summary != base.Summary || fmt.Sprint(res.Attention) != fmt.Sprint(base.Attention) {
+		t.Fatalf("对话记录失败改了代码同步结论: %+v vs %+v", res, base)
+	}
+	want := "对话记录同步失败：SFTP 连接断开（代码同步不受影响）"
+	if len(res.Notes) != len(base.Notes)+1 || res.Notes[len(res.Notes)-1] != want {
+		t.Fatalf("Notes: %v，期望末尾是 %q", res.Notes, want)
+	}
+	if b, _ := json.Marshal(res); !strings.Contains(string(b), `"claude_error":"SFTP 连接断开"`) {
+		t.Fatalf("JSON 应含 claude_error: %s", b)
+	}
+}
+
+func TestProjsyncV2ClaudeSyncPanicBecomesClaudeError(t *testing.T) {
+	s := v2Svc(t, false)
+	s.round = func(ctx context.Context, env projsync.RoundEnv) projsync.RoundResult { return v2OkRound(env) }
+	tt, _ := s.v1.target("alpha")
+	s.claudeSync = func(ctx context.Context, _ projsyncTarget) (*projsync.FileResult, error) {
+		panic("假崩溃")
+	}
+	res := s.execute(context.Background(), tt, nil) // 不能 panic 出来
+	if res.Claude != nil || res.ClaudeError == "" || !strings.Contains(res.ClaudeError, "假崩溃") {
+		t.Fatalf("Claude=%+v ClaudeError=%q", res.Claude, res.ClaudeError)
+	}
+	if res.Error != "" || res.Stopped || res.NeedsAttention || res.Summary != "代码同步 ok" {
+		t.Fatalf("panic 改了代码同步结论: %+v", res)
+	}
+	last := res.Notes[len(res.Notes)-1]
+	if !strings.Contains(last, "对话记录同步失败") || !strings.Contains(last, "假崩溃") || !strings.HasSuffix(last, "（代码同步不受影响）") {
+		t.Fatalf("Notes 末尾: %q", last)
+	}
+}
+
+func TestProjsyncV2ClaudeSyncNotRunOnSkippedOrOutOfScope(t *testing.T) {
+	s := v2Svc(t, false)
+	tt, _ := s.v1.target("alpha")
+	var called int
+	s.claudeSync = func(ctx context.Context, _ projsyncTarget) (*projsync.FileResult, error) { called++; return nil, nil }
+	s.round = func(ctx context.Context, env projsync.RoundEnv) projsync.RoundResult {
+		return projsync.RoundResult{Project: env.Project, Skipped: true, SkipReason: "上一轮还在进行", Summary: "上一轮还在进行"}
+	}
+	res := s.execute(context.Background(), tt, nil)
+	if called != 0 || res.Claude != nil || res.ClaudeError != "" || len(res.Notes) != 0 {
+		t.Fatalf("Skipped 轮不应碰对话记录: called=%d %+v", called, res)
+	}
+	s.round = func(ctx context.Context, env projsync.RoundEnv) projsync.RoundResult {
+		return projsync.RoundResult{Project: env.Project, OutOfScope: true, Error: "超出自动同步范围，本轮不写任何东西", Summary: "超出自动同步范围，本轮不写任何东西"}
+	}
+	res = s.execute(context.Background(), tt, nil)
+	if called != 0 || res.Claude != nil || res.ClaudeError != "" || len(res.Notes) != 0 {
+		t.Fatalf("OutOfScope 轮不应碰对话记录: called=%d %+v", called, res)
+	}
+}
+
+func TestProjsyncV2ClaudeSyncNilSkips(t *testing.T) {
+	s := v2Svc(t, false)
+	s.round = func(ctx context.Context, env projsync.RoundEnv) projsync.RoundResult { return v2OkRound(env) }
+	tt, _ := s.v1.target("alpha")
+	s.claudeSync = nil
+	res := s.execute(context.Background(), tt, nil) // 不能崩
+	if res.Claude != nil || res.ClaudeError != "" || len(res.Notes) != 0 {
+		t.Fatalf("claudeSync 为 nil 应整体跳过: %+v", res)
+	}
+	if res.Summary != "代码同步 ok" {
+		t.Fatalf("%+v", res)
+	}
+}
+
 // ── 接口 ─────────────────────────────────────────────
 
 func v2Do(t *testing.T, srv *httptest.Server, method, path, origin string) (*http.Response, []byte) {

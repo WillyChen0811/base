@@ -84,17 +84,21 @@ func NewRunner(dir string, keep int) (*Runner, error) {
 		return nil, fmt.Errorf("runner 目录创建失败 %q: %w", absDir, err)
 	}
 	r := &Runner{dir: absDir, keep: keep, jobs: map[string]*Job{}}
-	r.recoverStaleRunning()
+	if err := r.recoverStaleRunning(); err != nil {
+		return nil, err
+	}
 	return r, nil
 }
 
 // recoverStaleRunning 清算上个进程留下的 running 任务：一律改成 failed 并注明
 // 「执行器重启，任务中断」——不去接管已失控的进程，只把状态记实。
+// 清算结果必须写回落盘：写不回去就返回错误由 NewRunner 传播，
+// 不能让磁盘上继续留着 running（下次重启又会清算一遍，状态永远记不实）。
 // 在 NewRunner 里调用，此时 Runner 还没交给别人，不加锁。
-func (r *Runner) recoverStaleRunning() {
+func (r *Runner) recoverStaleRunning() error {
 	entries, err := os.ReadDir(r.dir)
 	if err != nil {
-		return
+		return nil
 	}
 	for _, e := range entries {
 		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
@@ -120,8 +124,11 @@ func (r *Runner) recoverStaleRunning() {
 		if job.Ended.IsZero() {
 			job.Ended = time.Now()
 		}
-		_ = r.persistLocked(&job)
+		if perr := r.persistLocked(&job); perr != nil {
+			return fmt.Errorf("重启清算遗留任务落盘失败 %s: %w", job.ID, perr)
+		}
 	}
+	return nil
 }
 
 // Start 启动一个任务；已有 running 的返回 ErrBusy。
@@ -525,9 +532,17 @@ func Tail(path string, lines, maxBytes int) (string, error) {
 	}
 	buf = buf[:n]
 	if size-window > 0 {
-		// 窗口从行中间开始：丢掉开头残缺的一段；整窗没有换行说明最后一行本身就超长，原样保留。
-		if i := bytes.IndexByte(buf, '\n'); i >= 0 {
-			buf = buf[i+1:]
+		// 窗口没有覆盖整个文件：先看窗口前一个字节是不是 '\n'，
+		// 是则窗口正好从行边界开始，首行完整，保留；
+		// 否则窗口从行中间开始，丢掉开头残缺的一段；
+		// 整窗没有换行说明最后一行本身就超长，原样保留。
+		prev := make([]byte, 1)
+		_, perr := f.ReadAt(prev, size-window-1)
+		atBoundary := perr == nil && prev[0] == '\n'
+		if !atBoundary {
+			if i := bytes.IndexByte(buf, '\n'); i >= 0 {
+				buf = buf[i+1:]
+			}
 		}
 	}
 	text := strings.TrimSuffix(string(buf), "\n")

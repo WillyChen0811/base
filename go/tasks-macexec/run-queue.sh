@@ -8,6 +8,8 @@ Q=$REPO/go/tasks-macexec
 ST=$Q/state; mkdir -p "$ST"
 log(){ echo "$(date '+%m-%d %H:%M:%S') $*" | tee -a "$ST/runner.log"; }
 studio_free(){
+  # 让路开关：存在 PAUSE 文件就不开新任务（入件等优先任务用 Studio 时由指挥创建）
+  [ -f "$Q/PAUSE" ] && return 1
   # 只看本机有没有本地模型任务在跑；Mac 会话显示 busy 不代表在用 Studio（用户 10/16 指出），不再据此等待
   pgrep -f '/\.omlx-agent/omlx-agent ' >/dev/null && return 1
   return 0

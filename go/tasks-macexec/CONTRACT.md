@@ -31,5 +31,5 @@
 
 ## MCP（Ubuntu 端 `cmd/xxyi-msg`，经现有远端地址与令牌）
 `mac_git_status{repo}`、`mac_read_file{repo,path,offset,limit}`、`mac_logs{name,lines}`、`mac_job{id}`、
-`mac_build{}`、`mac_selftest{}`、`mac_node_test{name}`、`mac_build_app{}`、`mac_screenshot{target}`（返回 MCP image 内容）。
+`mac_build{}`、`mac_selftest{}`、`mac_node_test{name}`、`mac_build_app{}`、`mac_install_app{}`、`mac_screenshot{target}`（返回 MCP image 内容）。
 长任务工具内部每 5 秒查一次 job，最多等 9 分钟；没完就返回 job id 让调用方用 mac_job 接着查。

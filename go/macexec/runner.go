@@ -33,6 +33,10 @@ const (
 // MaxOutputBytes 是单个 job 的 stdout+stderr 合计上限；超过就杀掉进程组、任务标 failed。
 const MaxOutputBytes int64 = 32 << 20
 
+// waitDelay 是 cmd.WaitDelay：进程退出（或取消）之后输出管道最多再等这么久就强制关闭。
+// 后台子进程继承 stdout/stderr 又不退出时，没有它 cmd.Wait 会永远卡在管道拷贝上。
+const waitDelay = 5 * time.Second
+
 // Spec 描述一次要执行的命令：argv 直接 exec（不经 shell），Env 为空则继承当前环境。
 type Spec struct {
 	Action  string        `json:"action"`
@@ -158,6 +162,9 @@ func (r *Runner) Start(s Spec) (Job, error) {
 	setNewProcessGroup(cmd)
 	// 超时/取消时杀整个进程组（默认只杀主进程）。
 	cmd.Cancel = func() error { return killProcessGroup(cmd) }
+	// 兜底关闭管道：主进程先退出、后台子进程还继承着 stdout/stderr 时，
+	// Wait 最多在进程退出后再等 waitDelay 就强制关掉父端管道，不会永挂。
+	cmd.WaitDelay = waitDelay
 	// stdout/stderr 共用一个计数写入器（exec 会为两路管道各起一个拷贝 goroutine，Write 会并发进来）。
 	w := &cappedWriter{f: logFile, limit: MaxOutputBytes}
 	w.onLimit = func() { _ = killProcessGroup(cmd) }
@@ -186,18 +193,52 @@ func (r *Runner) Start(s Spec) (Job, error) {
 	if perr := r.persistLocked(job); perr != nil {
 		job.Note = "running 状态落盘失败: " + perr.Error()
 	}
+	// 自管截止计时器：CommandContext 的取消监视在主进程先退出那一刻就结束了
+	// （watchCtx 把结果交给 Wait 后退出），之后若后台子进程继承着输出管道，
+	// 超时不会再有任何人执行。这个计时器活到输出收集与清理全部结束，
+	// 到点直接对进程组发 SIGKILL（杀不掉/组已空由 Wait + WaitDelay 兜底返回）。
+	var deadlineTimer *time.Timer
+	if s.Timeout > 0 {
+		deadlineTimer = time.NewTimer(s.Timeout)
+	}
+
 	started := *job
 	r.rotateLocked()
 	r.mu.Unlock()
 
-	go r.wait(ctx, cancel, cmd, w, job)
+	go r.wait(ctx, cancel, cmd, w, job, deadlineTimer)
 	return started, nil
 }
 
 // wait 在后台等进程结束，把最终状态写进内存与 json；
-// 进程（含超时/超额时被杀的整个进程组）确认退出后才释放单任务占用。
-func (r *Runner) wait(ctx context.Context, cancel context.CancelFunc, cmd *exec.Cmd, w *cappedWriter, job *Job) {
-	err := cmd.Wait()
+// 超时判定不依赖 CommandContext 的取消监视（它在主进程先退出时就已结束），
+// 而是自己盯 deadlineTimer：到点先对进程组发 SIGKILL，再靠 Wait + WaitDelay 兜底返回；
+// 返回后还对进程组补一次清理（扫掉继承输出管道还活着的后台子进程），
+// 全部清理完成后才释放单任务占用。
+func (r *Runner) wait(ctx context.Context, cancel context.CancelFunc, cmd *exec.Cmd, w *cappedWriter, job *Job, deadlineTimer *time.Timer) {
+	waitErr := make(chan error, 1)
+	go func() { waitErr <- cmd.Wait() }()
+
+	var err error
+	timedOut := false
+	if deadlineTimer != nil {
+		select {
+		case err = <-waitErr:
+			deadlineTimer.Stop()
+		case <-deadlineTimer.C:
+			timedOut = true
+			// 进程组里还有活口（主进程没退，或后台子进程占着管道）：直接 SIGKILL 整组。
+			_ = killProcessGroup(cmd)
+			// 主进程收不掉时（setsid 逃逸等）由 WaitDelay 强制关管道，保证这里能返回。
+			err = <-waitErr
+		}
+	} else {
+		err = <-waitErr
+	}
+
+	// 清理：主进程已回收，进程组里若还有继承输出管道的后台进程（如 build.sh 起的守护），
+	// 补一发 SIGKILL 扫掉，不留孤儿；组已空时 ESRCH 不算错。
+	_ = killProcessGroup(cmd)
 	w.close()
 	defer cancel()
 
@@ -205,7 +246,7 @@ func (r *Runner) wait(ctx context.Context, cancel context.CancelFunc, cmd *exec.
 	defer r.mu.Unlock()
 
 	job.Ended = time.Now()
-	job.ExitCode = exitCodeOf(err)
+	job.ExitCode = exitCodeOf(cmd, err)
 	switch {
 	case w.overLimit():
 		job.State = StateFailed
@@ -213,9 +254,13 @@ func (r *Runner) wait(ctx context.Context, cancel context.CancelFunc, cmd *exec.
 	case w.failErr() != nil:
 		job.State = StateFailed
 		job.Note = "日志写入失败: " + w.failErr().Error()
-	case ctx.Err() == context.DeadlineExceeded:
+	case timedOut || ctx.Err() == context.DeadlineExceeded:
 		job.State = StateTimeout
 		job.Note = "超时被终止"
+	case errors.Is(err, exec.ErrWaitDelay):
+		// 主进程正常退出，只是后台子进程占着管道没退，由 WaitDelay 强制关闭并清理。
+		job.State = StateDone
+		job.Note = "主进程已退出，输出管道由 WaitDelay 强制关闭，残留后台进程已清理"
 	case err != nil:
 		job.State = StateFailed
 		job.Note = err.Error()
@@ -430,11 +475,12 @@ func newJobID() (string, error) {
 	return time.Now().Format("20060102-150405") + "-" + hex.EncodeToString(b), nil
 }
 
-// exitCodeOf 从 Wait 的错误里取退出码；取不到（被信号杀、没起起来等）记 -1。
-func exitCodeOf(err error) int {
-	var ee *exec.ExitError
-	if errors.As(err, &ee) {
-		return ee.ExitCode()
+// exitCodeOf 取退出码：优先看进程自身的 ProcessState——Wait 因 WaitDelay 强制关管道时
+// err 是 ErrWaitDelay 而不是 ExitError，但主进程可能正常退出 0，退出码不能因此丢成 -1；
+// 取不到（进程没被收掉等）记 -1（被信号杀时 ProcessState.ExitCode 本身也是 -1）。
+func exitCodeOf(cmd *exec.Cmd, err error) int {
+	if cmd.ProcessState != nil {
+		return cmd.ProcessState.ExitCode()
 	}
 	if err != nil {
 		return -1

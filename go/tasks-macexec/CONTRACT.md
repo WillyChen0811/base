@@ -1,35 +1,32 @@
-# macexec 接口约定（各任务都按这份写，别自己改名字）
+# macexec v2 约定（10/16 用户要求收缩范围：只做够用的，不做边角）
 
-## Go 包 `go/macexec`（新建，纯逻辑，不依赖 HTTP，不依赖 support 包）
-- `paths.go`
-  - `func RepoRoot(home, name string, allowed []string) (string, error)`：只认 allowed 里的名字，返回 `<home>/xxyi-work/<name>`（目录须存在）。
-  - `func ResolveInRepo(root, rel string) (string, error)`：拒绝空、绝对路径、含 `..` 段、含 `.git` 段；`filepath.EvalSymlinks` 之后仍须在 root（同样 EvalSymlinks 过）之内；返回绝对路径。
-  - `var DefaultRepos = []string{"xxyi", "base", "websubmit", "ai-browser"}`
-- `runner.go`
-  - `type Spec struct { Action, Dir string; Argv []string; Env []string; Timeout time.Duration }`
-  - `type Job struct { ID, Action, State string; ExitCode int; Started, Ended time.Time; Note string }`，State ∈ running|done|failed|timeout
-  - `func NewRunner(dir string, keep int) (*Runner, error)`：dir 存 `<id>.log`（完整输出）与 `<id>.json`（Job）；只保留最近 keep 个 job 的文件。
-  - `func (r *Runner) Start(s Spec) (Job, error)`：已有 running 的返回 `ErrBusy`；用 exec.CommandContext（不经 shell），stdout+stderr 写 log；结束更新 json。
-  - `func (r *Runner) Get(id string) (Job, error)`：内存没有就读 json（进程重启后也能查）。
-  - `func Tail(path string, lines, maxBytes int) (string, error)`
+目的：Ubuntu 上的 Claude 能在 Mac 上 编译 / 自检 / 打包 / 装上并重启 XXYI / 截图 / 看日志 / 看 git 状态。
+内部工具，只在用户打开「协助」时可用，调用方只有总指挥。**不做**：任务持久化、重启恢复、输出上限文件、job 轮询、写文件、任意命令。
+
+## Go 包 go/macexec
+- `paths.go`（已有，保留不动）：RepoRoot、ResolveInRepo、DefaultRepos。
+- `runner.go`（重写，替换现有全部内容；runner_unix.go/runner_other.go 只放进程组相关的几行）：
+  - `type Spec struct { Action, Dir string; Argv []string; Timeout time.Duration }`
+  - `type Result struct { ExitCode int; TimedOut bool; Seconds float64; Tail string }`
   - `var ErrBusy = errors.New("Mac 上正有任务在跑")`
-- `actions.go`
-  - `type Params struct { Repo, Name string; Lines int }`
-  - `func BuildSpec(action string, p Params, home string) (Spec, error)`：固定命令——
-    `git_status`: `git status --porcelain=v1 -b`（Dir=仓库根，30s）；
-    `swift_build`: `swift build`（Dir=xxyi/mac，15min）；`selftest`: `swift run xxyi-selftest`（xxyi/mac，15min）；
-    `node_test`: `node tests/js/<Name>.test.js`（Dir=xxyi 根；Name 只许 `[a-z0-9_]+` 且文件存在，5min）；
-    `build_app`: `./build.sh`（xxyi/mac，20min）。未知动作返回错误。
+  - `func Run(ctx context.Context, s Spec) (Result, error)`：同步执行；全局 sync.Mutex.TryLock 保证同一时间只一个，拿不到返回 ErrBusy；
+    exec.CommandContext、不经 shell、Setpgid，超时或 ctx 取消时杀整个进程组；cmd.WaitDelay = 5s；
+    stdout+stderr 合并进内存，只保留最后 64KB（简单环形或截断即可），Tail 返回它。
+- `actions.go`：`BuildSpec(action string, p Params, home string) (Spec, error)`，动作：
+  `git_status`（`git status -b --porcelain=v1`，仓库根，30s）、
+  `swift_build`（xxyi/mac，15min）、`selftest`（`swift run xxyi-selftest`，xxyi/mac，15min）、
+  `node_test`（`node tests/js/<name>.test.js`，xxyi 根，name 只许 [a-z0-9_]+ 且解析后是普通文件，5min）、
+  `build_app`（`<解析后的 mac/build.sh 绝对路径>`，xxyi/mac，20min）。
+  工作目录用 ResolveInRepo(root, "mac") 取；build.sh 用 ResolveInRepo 解析并要求普通文件。
 
-## HTTP（wgtund 协助远端接口 remoteMux，`support/macexec.go`）
-- `POST /exec/start {action, repo, name}` → `{job: Job}`；忙时 409。
-- `GET /exec/job?id=` → `{job: Job, tail: string}`（tail ≤200 行 / 64KB）。
-- `POST /exec/read {repo, path, offset, limit}` → `{text, lines_total}`（按行，≤256KB，非 UTF-8 报 400）。
-- `GET /exec/logs?name=&lines=` → `{text}`；name ∈ service|wgtund|ui，lines ≤500。
-- `GET /exec/screenshot?target=screen|xxyi` → `image/png`（≤1600 像素宽）。
-- 每次调用 `s.logEvent("exec", …)`；runner 目录 `~/.xxyi/macexec`，keep=50。
+## HTTP（Mac 端，support/macexec.go，挂在 remoteMux）
+- `POST /exec/run {action, repo, name}` → `{exit_code, timed_out, seconds, tail}`（同步，忙 409，参数错 400）。
+- `GET /exec/logs?name=service|wgtund&lines=N` → `{text}`（N ≤ 500；路径照现有代码查清楚）。
+- `GET /exec/screenshot` → image/png（screencapture -x 整屏，sips -Z 1600 缩小，临时文件用完删；非 darwin 501）。
+- `POST /exec/install` → `{started: true}`：把一段 Go 里写死的脚本写到临时文件，Setpgid 起 /bin/sh 执行后立即返回；
+  脚本：校验 build/XXYI.app 签名 → 退出 XXYI → pkill 残留服务与 wgtund → ditto 到 ~/Desktop/XXYI.app → 校验 → open；每步 echo 到 ~/.xxyi/macexec-install.log。
+- 每次调用 s.logEvent("exec", 动作与结果)。
 
-## MCP（Ubuntu 端 `cmd/xxyi-msg`，经现有远端地址与令牌）
-`mac_git_status{repo}`、`mac_read_file{repo,path,offset,limit}`、`mac_logs{name,lines}`、`mac_job{id}`、
-`mac_build{}`、`mac_selftest{}`、`mac_node_test{name}`、`mac_build_app{}`、`mac_install_app{}`、`mac_screenshot{target}`（返回 MCP image 内容）。
-长任务工具内部每 5 秒查一次 job，最多等 9 分钟；没完就返回 job id 让调用方用 mac_job 接着查。
+## MCP（Ubuntu 端，cmd/xxyi-msg/macexec.go，重写替换现有内容）
+工具：`mac_git_status{repo}`、`mac_build{}`、`mac_selftest{}`、`mac_node_test{name}`、`mac_build_app{}`、`mac_install_app{}`、`mac_screenshot{}`（返回 MCP image）、`mac_logs{name,lines}`。
+每次调用重新读入口（复用现有 connect）；HTTP 超时 = 动作超时 + 1 分钟（截图/日志 60s）；结果按文字返回 exit_code/用时/尾部输出。不轮询、不重试。

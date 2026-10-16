@@ -42,15 +42,14 @@ while id=$(next_id); do
   if grep -q 'is_error=True' "$ST/$id.out" || [ $rc -ne 0 ]; then log "$id 模型没做完（rc=$rc），停下"; exit 1; fi
   if grep -q "^# .*只读" "$Q/$id.md"; then touch "$ST/$id.done"; log "$id 调研完成：$ST/$id.out"; continue; fi
   ( cd "$REPO/go" && env -u TMUX -u TMUX_PANE go build ./... && env -u TMUX -u TMUX_PANE go vet ./macexec/ ./support/ ./cmd/xxyi-msg/ \
-    && env -u TMUX -u TMUX_PANE go test ./macexec/ ./cmd/xxyi-msg/ && env -u TMUX -u TMUX_PANE go test ./support/ -run Exec ) > "$ST/$id.verify" 2>&1
+    && env -u TMUX -u TMUX_PANE go test ./macexec/ ./cmd/xxyi-msg/ && env -u TMUX -u TMUX_PANE go test ./support/ -run Exec && env -u TMUX -u TMUX_PANE go test ./projsync/ ) > "$ST/$id.verify" 2>&1
   if [ $? -ne 0 ]; then log "$id 编译/测试不过，停下：$ST/$id.verify"; exit 1; fi
   git -C "$REPO" add -A && git -C "$REPO" commit -q -m "wip(macexec): $id（本地模型完成，待评审）
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01D3ZUfDjCvHzpd8EyoH6EPU"
   c=$(git -C "$REPO" rev-parse HEAD)
-  touch "$ST/$id.done"; log "$id 已提交 $c，后台评审中"
-  review "$id" "$base" "$c" &
+  touch "$ST/$id.done"; log "$id 已提交 $c（最后统一评审）"
 done
 wait
 log "队列全部完成"

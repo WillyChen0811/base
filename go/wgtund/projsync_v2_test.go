@@ -3,6 +3,7 @@ package wgtund
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -531,4 +532,159 @@ func TestProjsyncV2ManualCommitForcesCommit(t *testing.T) {
 	if len(res.Worktrees) != 1 || res.Worktrees[0].Verdict != "用户指定" {
 		t.Fatalf("%+v", res.Worktrees)
 	}
+}
+
+// ── 超时与不被卡住 ─────────────────────────────────────
+
+// 一个项目的 round 卡死（不理会 ctx）：execute 在超时 + 宽限后仍会返回，Error 含「超时」，
+// runAll 里下一个项目照常执行。
+func TestProjsyncV2HungRoundTimesOutAndNextProjectRuns(t *testing.T) {
+	oldGrace := interruptGrace
+	interruptGrace = 50 * time.Millisecond
+	defer func() { interruptGrace = oldGrace }()
+
+	s := v2Svc(t, false)
+	s.runTimeout = 100 * time.Millisecond
+	block := make(chan struct{})
+	defer close(block)
+	var mu sync.Mutex
+	var order []string
+	s.round = func(ctx context.Context, env projsync.RoundEnv) projsync.RoundResult {
+		mu.Lock()
+		order = append(order, env.Project)
+		mu.Unlock()
+		if env.Project == "alpha" {
+			<-block // 永远不返回
+		}
+		return v2OkRound(env)
+	}
+	s.claudeSync = nil
+	done := make(chan struct{})
+	go func() { s.runAll(context.Background()); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("alpha 卡死时 runAll 也应在超时后返回")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(order) != 2 || order[1] != "beta" {
+		t.Fatalf("beta 应在 alpha 超时后照常执行: %v", order)
+	}
+	st := s.status()
+	a, b := st.Projects[0], st.Projects[1]
+	if a.Running || b.Running {
+		t.Fatalf("占位应已释放: %+v", st)
+	}
+	if a.Last == nil || !strings.Contains(a.Last.Error, "超时") {
+		t.Fatalf("alpha 的 Error 应含「超时」: %+v", a.Last)
+	}
+	if b.Last == nil || b.Last.Error != "" {
+		t.Fatalf("beta 应正常: %+v", b.Last)
+	}
+}
+
+// round 理会 ctx 但自己不写 Error：execute 补上含「超时」的说明。
+func TestProjsyncV2RoundCtxExpiredMarksTimeout(t *testing.T) {
+	s := v2Svc(t, false)
+	s.runTimeout = 50 * time.Millisecond
+	s.claudeSync = nil
+	s.round = func(ctx context.Context, env projsync.RoundEnv) projsync.RoundResult {
+		<-ctx.Done()
+		return projsync.RoundResult{Project: env.Project}
+	}
+	tt, _ := s.v1.target("alpha")
+	res := s.execute(context.Background(), tt, nil)
+	if !strings.Contains(res.Error, "超时") {
+		t.Fatalf("Error 应含「超时」: %+v", res)
+	}
+}
+
+func TestProjsyncV2DefaultTimeouts(t *testing.T) {
+	if projsyncV2RunTimeout != 8*time.Minute || projsyncV2ClaudeTimeout != 3*time.Minute {
+		t.Fatal("v2 默认超时应为 8 分钟 / 对话记录 3 分钟")
+	}
+	if projsyncRunTimeout != 30*time.Minute {
+		t.Fatal("v1 常量不应改动")
+	}
+	s := v2Svc(t, false)
+	var dl time.Time
+	s.round = func(ctx context.Context, env projsync.RoundEnv) projsync.RoundResult {
+		dl, _ = ctx.Deadline()
+		return v2OkRound(env)
+	}
+	s.claudeSync = nil
+	tt, _ := s.v1.target("alpha")
+	s.execute(context.Background(), tt, nil)
+	if left := time.Until(dl); left < 7*time.Minute || left > 8*time.Minute+time.Second {
+		t.Fatalf("v2 单项目上限应约 8 分钟，剩 %v", left)
+	}
+}
+
+// 对话记录同步卡死：只记 ClaudeError（含「超时」），代码同步的结论不变，execute 仍返回。
+func TestProjsyncV2ClaudeSyncTimeoutOnlyClaudeError(t *testing.T) {
+	oldGrace := interruptGrace
+	interruptGrace = 50 * time.Millisecond
+	defer func() { interruptGrace = oldGrace }()
+
+	s := v2Svc(t, false)
+	s.claudeTimeout = 100 * time.Millisecond
+	s.round = func(ctx context.Context, env projsync.RoundEnv) projsync.RoundResult { return v2OkRound(env) }
+	block := make(chan struct{})
+	defer close(block)
+	s.claudeSync = func(ctx context.Context, tgt projsyncTarget) (*projsync.FileResult, error) {
+		<-block
+		return &projsync.FileResult{}, nil
+	}
+	tt, _ := s.v1.target("alpha")
+	start := time.Now()
+	res := s.execute(context.Background(), tt, nil)
+	if time.Since(start) > 5*time.Second {
+		t.Fatal("execute 应在对话记录超时后返回")
+	}
+	if !strings.Contains(res.ClaudeError, "超时") || res.Claude != nil {
+		t.Fatalf("ClaudeError 应含「超时」: %+v", res)
+	}
+	if res.Error != "" || res.Summary != "代码同步 ok" {
+		t.Fatalf("代码同步结论被动过: %+v", res)
+	}
+}
+
+// runInterruptible：ctx 到期后调用 closeFn、在宽限内返回「超时」错误；work 的 panic 原样抛给调用方。
+func TestRunInterruptible(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	block := make(chan struct{})
+	defer close(block)
+	closed := make(chan struct{})
+	start := time.Now()
+	err := runInterruptible(ctx, 50*time.Millisecond, func() { close(closed) }, func() error { <-block; return nil })
+	if err == nil || !strings.Contains(err.Error(), "超时") || time.Since(start) > 3*time.Second {
+		t.Fatalf("应带「超时」及时返回: %v (%v)", err, time.Since(start))
+	}
+	select {
+	case <-closed:
+	case <-time.After(time.Second):
+		t.Fatal("ctx 到期应调用 closeFn 关闭资源")
+	}
+	// 关闭资源让 work 返回错误：同样带「超时」
+	unblock := make(chan struct{})
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel2()
+	err = runInterruptible(ctx2, time.Second, func() { close(unblock) }, func() error { <-unblock; return errors.New("closed") })
+	if err == nil || !strings.Contains(err.Error(), "超时") {
+		t.Fatalf("got %v", err)
+	}
+	// 正常完成不受影响
+	if err := runInterruptible(context.Background(), time.Second, func() {}, func() error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Fatal("work 的 panic 应传给调用方")
+			}
+		}()
+		runInterruptible(context.Background(), time.Second, func() {}, func() error { panic("x") })
+	}()
 }

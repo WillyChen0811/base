@@ -17,7 +17,23 @@ import (
 var (
 	keepAliveInterval = 15 * time.Second
 	keepAliveTimeout  = 10 * time.Second
+	keepAliveMaxFails = 3 // 连续这么多次请求出错才判定断开；单次超过 keepAliveTimeout 无响应立即判定
 )
+
+// failCounter 统计连续失败：成功清零，达到 max 次连续失败返回 true。
+type failCounter struct{ n, max int }
+
+func (f *failCounter) record(ok bool) (dead bool) {
+	if ok {
+		f.n = 0
+		return false
+	}
+	f.n++
+	return f.n >= f.max
+}
+
+// runGrace 是 ctx 到期后等 Run 自己返回的宽限；超过则关整条连接。测试里调小。
+var runGrace = 2 * time.Second
 
 // Run 的输出上限。
 const (
@@ -126,6 +142,30 @@ func startPtySession(ctx context.Context, sess *ssh.Session, command string, col
 	return in, out, nil
 }
 
+// interruptible 在 goroutine 里跑 work，保证 ctx 到期后调用方一定能返回。
+// 正常情况下 work 自己会因 ctx 到期关会话而返回；但对端失联（线路切换、睡眠）时，
+// 本地关会话不会唤醒阻塞的读/Wait，开会话也可能一直等不到回应。
+// 所以 ctx 到期后再给 runGrace 的宽限，仍未返回就把整条连接关掉（阻塞的调用随之返回），
+// 并返回带「超时」字样的错误。
+func (c *Client) interruptible(ctx context.Context, work func() error) error {
+	done := make(chan error, 1)
+	go func() { done <- work() }()
+	select {
+	case err := <-done:
+		return err
+	case <-ctx.Done():
+	}
+	t := time.NewTimer(runGrace)
+	defer t.Stop()
+	select {
+	case err := <-done:
+		return err
+	case <-t.C:
+		c.fail(fmt.Errorf("sshterm: 远端命令超时无响应，已关闭连接: %w", ctx.Err()))
+		return fmt.Errorf("sshterm: 远端命令超时（连接无响应，已关闭）: %w", ctx.Err())
+	}
+}
+
 // ctxOr 返回 ctx 的错误（优先，便于调用方识别取消），否则返回原错误。
 func ctxOr(ctx context.Context, err error) error {
 	if ctxErr := ctx.Err(); ctxErr != nil {
@@ -137,6 +177,18 @@ func ctxOr(ctx context.Context, err error) error {
 // Run 不申请 PTY 执行 command，返回标准输出。退出码非 0 时返回 *ExitError（带退出码和标准错误前 4KB）。
 // 标准输出最多收 1MB，超出返回错误。ctx 到期关掉这个会话（不关连接）并返回 ctx 错误。
 func (c *Client) Run(ctx context.Context, command string) ([]byte, error) {
+	var out []byte
+	err := c.interruptible(ctx, func() (err error) {
+		out, err = c.run(ctx, command)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *Client) run(ctx context.Context, command string) ([]byte, error) {
 	if err := c.live(); err != nil {
 		return nil, err
 	}
@@ -199,6 +251,19 @@ func (c *Client) Run(ctx context.Context, command string) ([]byte, error) {
 // 退出码非 0 不算错误（exit 里给出）；连接/会话/超时/输出超限才返回 err。
 // 输出上限：stdout 与 stderr 各 maxRunInputOut。命令串由调用方负责安全，需要传的数据请走 stdin。
 func (c *Client) RunInput(ctx context.Context, command string, stdin []byte) (stdout, stderr []byte, exit int, err error) {
+	var so, se []byte // 局部变量：超时放弃后 goroutine 才返回时不会写到已返回函数的结果上
+	var ex int
+	err = c.interruptible(ctx, func() (e error) {
+		so, se, ex, e = c.runInput(ctx, command, stdin)
+		return e
+	})
+	if err != nil {
+		return nil, nil, -1, err
+	}
+	return so, se, ex, nil
+}
+
+func (c *Client) runInput(ctx context.Context, command string, stdin []byte) (stdout, stderr []byte, exit int, err error) {
 	if err := c.live(); err != nil {
 		return nil, nil, -1, err
 	}
@@ -353,6 +418,7 @@ func (c *Client) SFTP() (*sftp.Client, error) {
 func (c *Client) keepAlive(interval, timeout time.Duration) {
 	t := time.NewTicker(interval)
 	defer t.Stop()
+	fc := failCounter{max: keepAliveMaxFails}
 	for {
 		select {
 		case <-c.done:
@@ -365,8 +431,8 @@ func (c *Client) keepAlive(interval, timeout time.Duration) {
 			}()
 			select {
 			case err := <-res:
-				if err != nil {
-					c.fail(fmt.Errorf("sshterm: keepalive 失败: %w", err))
+				if fc.record(err == nil) {
+					c.fail(fmt.Errorf("sshterm: keepalive 连续失败: %w", err))
 					return
 				}
 			case <-time.After(timeout):

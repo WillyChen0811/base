@@ -507,3 +507,72 @@ func TestClientSFTP(t *testing.T) {
 		t.Error("连接关闭后 SFTP 应报错")
 	}
 }
+
+// ---------- 对端失联时 Run 仍能被 ctx 打断 ----------
+
+func TestFailCounter(t *testing.T) {
+	f := failCounter{max: 3}
+	for i, ok := range []bool{false, false, true, false, false} {
+		if f.record(ok) {
+			t.Fatalf("第 %d 次不该判定断开", i)
+		}
+	}
+	if !f.record(false) {
+		t.Fatal("连续第 3 次失败应判定断开")
+	}
+	if f.record(true) || f.n != 0 {
+		t.Fatal("成功应清零")
+	}
+}
+
+// 对端装死（写全被吞）时，Run / RunInput 在 ctx 到期 + 宽限内返回含「超时」的错误，且连接被关闭。
+func TestRunInterruptedWhenPeerSilent(t *testing.T) {
+	oldG := runGrace
+	runGrace = 100 * time.Millisecond
+	defer func() { runGrace = oldG }()
+	// keepalive 调大，避免干扰
+	oldInt := keepAliveInterval
+	keepAliveInterval = time.Hour
+	defer func() { keepAliveInterval = oldInt }()
+
+	for _, name := range []string{"Run", "RunInput"} {
+		t.Run(name, func(t *testing.T) {
+			e := newCliEnv(t)
+			var mu sync.Mutex
+			var cur *swallowConn
+			d := swallowDialer{onDial: func(c *swallowConn) { mu.Lock(); cur = c; mu.Unlock() }}
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			c, err := Dial(ctx, d, Target{Addr: e.addr, User: "chenwy"},
+				Auth{Signers: []ssh.Signer{e.ck}, HostKeyCallback: ssh.FixedHostKey(e.srv.HostKey.PublicKey())})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer c.Close()
+			mu.Lock()
+			sc := cur
+			mu.Unlock()
+			sc.swallow.Store(true)
+
+			rctx, rcancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+			defer rcancel()
+			start := time.Now()
+			if name == "Run" {
+				_, err = c.Run(rctx, "ok")
+			} else {
+				_, _, _, err = c.RunInput(rctx, "ok", []byte("x"))
+			}
+			if err == nil || time.Since(start) > 5*time.Second {
+				t.Fatalf("应及时返回错误: %v (%v)", err, time.Since(start))
+			}
+			if !errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), "超时") {
+				t.Fatalf("错误应带「超时」并可识别为 ctx 超时: %v", err)
+			}
+			select {
+			case <-c.Done():
+			case <-time.After(time.Second):
+				t.Fatal("无响应的连接应被关闭")
+			}
+		})
+	}
+}

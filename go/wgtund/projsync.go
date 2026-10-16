@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/WillyChen0811/base/go/projsync"
+	"github.com/pkg/sftp"
 )
 
 // projsyncConf 是 hosts.json 里可选的 projsync 段。
@@ -318,20 +319,90 @@ func (s *projsyncSvc) syncClaude(ctx context.Context, t projsyncTarget) (*projsy
 	if err != nil {
 		return nil, err
 	}
-	sc, err := c.SFTP()
-	if err != nil {
-		return nil, err
+	var scMu sync.Mutex
+	var sc *sftp.Client
+	closeAll := func() { // ctx 到期：关 sftp 会话，并丢掉（关闭）可能已失联的共用连接，让阻塞的 SFTP 调用返回
+		scMu.Lock()
+		cur := sc
+		scMu.Unlock()
+		if cur != nil {
+			cur.Close()
+		}
+		s.pool.drop(s.prep.host, c)
 	}
-	defer sc.Close()
-	remote := &projsync.SFTPFS{Client: sc, Root: t.remoteClaude, Run: func(ctx context.Context, cmd string) ([]byte, error) {
-		return s.pool.run(ctx, s.prep.host, cmd)
-	}}
-	local := &projsync.LocalFS{Root: t.localClaude}
-	fr, err := projsync.SyncDirs(ctx, local, remote)
+	var fr projsync.FileResult
+	err = runInterruptible(ctx, interruptGrace, closeAll, func() error {
+		cl, err := c.SFTP()
+		if err != nil {
+			return err
+		}
+		scMu.Lock()
+		sc = cl
+		scMu.Unlock()
+		defer cl.Close()
+		remote := &projsync.SFTPFS{Client: cl, Root: t.remoteClaude, Run: func(ctx context.Context, cmd string) ([]byte, error) {
+			return s.pool.run(ctx, s.prep.host, cmd)
+		}}
+		local := &projsync.LocalFS{Root: t.localClaude}
+		r, err := projsync.SyncDirs(ctx, local, remote)
+		if err != nil {
+			return err
+		}
+		fr = r
+		return nil
+	})
 	if err != nil {
 		return nil, err
 	}
 	return &fr, nil
+}
+
+// interruptGrace 是 ctx 到期后等阻塞调用自己返回的宽限（测试里调小）。
+var interruptGrace = 2 * time.Second
+
+// runInterruptible 在 goroutine 里跑 work；ctx 先到期就调用 closeFn（关掉底层资源，让阻塞的调用因连接关闭而返回），
+// 最多再等 grace，仍不返回就放弃等待，返回带「超时」字样的错误。work 若在等待内正常返回，则返回它的结果。
+// 调用方只能在 nil 返回之后读 work 写的结果变量。
+func runInterruptible(ctx context.Context, grace time.Duration, closeFn func(), work func() error) error {
+	type result struct {
+		err error
+		p   any
+	}
+	done := make(chan result, 1)
+	go func() {
+		var r result
+		defer func() {
+			if p := recover(); p != nil {
+				r.p = p
+			}
+			done <- r
+		}()
+		r.err = work()
+	}()
+	// work 的 panic 在调用方协程里原样重新抛出，保持与同步调用一致的行为（调用方可能有 recover）。
+	get := func(r result) error {
+		if r.p != nil {
+			panic(r.p)
+		}
+		return r.err
+	}
+	select {
+	case r := <-done:
+		return get(r)
+	case <-ctx.Done():
+	}
+	go closeFn() // 关闭本身也可能因连接失联而阻塞，不能占着调用方
+	t := time.NewTimer(grace)
+	defer t.Stop()
+	select {
+	case r := <-done:
+		if err := get(r); err != nil {
+			return fmt.Errorf("超时：%w", ctx.Err())
+		}
+		return nil
+	case <-t.C:
+		return fmt.Errorf("超时：操作无响应，已关闭连接: %w", ctx.Err())
+	}
 }
 
 // projsyncItem 是 /projsync 里一个项目的状态。

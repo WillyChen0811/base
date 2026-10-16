@@ -36,6 +36,10 @@ const (
 	projsyncV2StatusFile = "projsync-v2-status.json"
 	// 启动后第一轮自动同步的等待时间（不超过一个间隔），避免刚启动就抢网络。
 	projsyncV2InitialDelay = 30 * time.Second
+	// 单个项目一轮（含对话记录同步）的整体上限；v1 仍用 projsyncRunTimeout。
+	projsyncV2RunTimeout = 8 * time.Minute
+	// 对话记录同步的子超时：超时只记 ClaudeError，不影响代码同步结果。
+	projsyncV2ClaudeTimeout = 3 * time.Minute
 )
 
 // 与 projsync.remoteCommand 同一个字符集；这里提前在启动时挡住，不等到第一轮才报错。
@@ -102,10 +106,13 @@ type projsyncV2Svc struct {
 	// 默认 v1.syncClaude，测试可换成假的；为 nil 时跳过，不碰对话记录。
 	claudeSync func(ctx context.Context, t projsyncTarget) (*projsync.FileResult, error)
 	// statusPath 状态文件；空则不写。
-	statusPath   string
-	interval     time.Duration
-	initialDelay time.Duration
-	now          func() time.Time
+	statusPath string
+	// 超时可注入（测试用）；零值用 projsyncV2RunTimeout / projsyncV2ClaudeTimeout。
+	runTimeout    time.Duration
+	claudeTimeout time.Duration
+	interval      time.Duration
+	initialDelay  time.Duration
+	now           func() time.Time
 
 	mu       sync.Mutex
 	running  map[string]bool
@@ -175,10 +182,37 @@ func (s *projsyncV2Svc) acquire(name string) error {
 // 共用上面这个带超时的 ctx；它的失败或内部出错只记进 ClaudeError 并往 Notes 追加一条说明，
 // 绝不改变代码同步的结论（Error/Stopped/NeedsAttention/Attention/Summary 原样不动）。
 func (s *projsyncV2Svc) execute(ctx context.Context, t projsyncTarget, force []projsync.ForceCommit) projsync.RoundResult {
-	ctx, cancel := context.WithTimeout(ctx, projsyncRunTimeout)
+	rt := s.runTimeout
+	if rt <= 0 {
+		rt = projsyncV2RunTimeout
+	}
+	ctx, cancel := context.WithTimeout(ctx, rt)
 	defer cancel()
-	res := s.round(ctx, s.env(t, force))
-	if !res.Skipped && !res.OutOfScope && s.claudeSync != nil {
+	started := s.now()
+	var res, rr projsync.RoundResult // rr 只由 round 的 goroutine 写；超时放弃后不再读，避免竞争
+	// round 在 goroutine 里跑：即使它卡在不响应 ctx 的调用里，超时后 execute 也一定返回，不拖住后面的项目。
+	rerr := runInterruptible(ctx, interruptGrace, func() {}, func() error {
+		rr = s.round(ctx, s.env(t, force))
+		return nil
+	})
+	if rerr == nil {
+		res = rr
+	}
+	if rerr != nil {
+		res = projsync.RoundResult{Project: t.name, Started: started, Finished: s.now(),
+			Error: fmt.Sprintf("本轮超时（上限 %v），已中止: %v", rt, rerr), Summary: "本轮超时"}
+	} else if ctx.Err() != nil && !res.Skipped && !strings.Contains(res.Error, "超时") {
+		note := fmt.Sprintf("本轮超时（上限 %v）", rt)
+		if res.Error == "" {
+			res.Error = note
+		} else {
+			res.Error += "（" + note + "）"
+		}
+	}
+	if rerr != nil {
+		res.Notes = append(res.Notes, "本轮超时，已放弃等待")
+	}
+	if rerr == nil && !res.Skipped && !res.OutOfScope && s.claudeSync != nil {
 		func() {
 			defer func() {
 				if p := recover(); p != nil {
@@ -186,7 +220,20 @@ func (s *projsyncV2Svc) execute(ctx context.Context, t projsyncTarget, force []p
 					res.Notes = append(res.Notes, "对话记录同步失败："+res.ClaudeError+"（代码同步不受影响）")
 				}
 			}()
-			fr, err := s.claudeSync(ctx, t)
+			ct := s.claudeTimeout
+			if ct <= 0 {
+				ct = projsyncV2ClaudeTimeout
+			}
+			cctx, ccancel := context.WithTimeout(ctx, ct)
+			defer ccancel()
+			var fr *projsync.FileResult
+			err := runInterruptible(cctx, interruptGrace, func() {}, func() (e error) {
+				fr, e = s.claudeSync(cctx, t)
+				return e
+			})
+			if err != nil && cctx.Err() != nil && !strings.Contains(err.Error(), "超时") {
+				err = fmt.Errorf("超时：%w", err)
+			}
 			switch {
 			case err != nil:
 				res.ClaudeError = err.Error()

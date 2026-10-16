@@ -45,6 +45,8 @@ const (
 	ErrKindNotFinished     = "not_finished"
 	ErrKindNothingToCommit = "nothing_to_commit"
 	ErrKindCommitFailed    = "commit_failed"
+	// 提交已完成但现场需确认（ErrCommittedUncertain）。
+	ErrKindCommittedUncertain = "committed_uncertain"
 )
 
 // RequestAutoCommit 是 ApplyRequest.Kind 的取值：自动提交一个工作区的未提交改动。
@@ -332,6 +334,8 @@ func classifyApplyErr(err error) string {
 		return ErrKindNotFinished
 	case errors.Is(err, ErrNothingToCommit):
 		return ErrKindNothingToCommit
+	case errors.Is(err, ErrCommittedUncertain):
+		return ErrKindCommittedUncertain
 	case errors.As(err, &cf):
 		return ErrKindCommitFailed
 	case errors.As(err, &oos):
@@ -347,6 +351,7 @@ func classifyApplyErr(err error) string {
 var knownErrKinds = map[string]bool{
 	ErrKindOutOfScope: true, ErrKindCheckedOut: true, ErrKindRefs: true, ErrKindOther: true,
 	ErrKindNotFinished: true, ErrKindNothingToCommit: true, ErrKindCommitFailed: true,
+	ErrKindCommittedUncertain: true,
 }
 
 // validateApplyResponse 校验响应的必需字段与字段组合：

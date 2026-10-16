@@ -403,3 +403,32 @@ func TestRemoteApplyResponseValidation(t *testing.T) {
 		}
 	}
 }
+
+func TestAutoCommitHeadMovedAfterCommit(t *testing.T) {
+	dir, head := commitRepo(t)
+	hook := filepath.Join(dir, ".git", "hooks", "post-commit")
+	write(t, hook, "#!/bin/sh\ngit checkout -q -b other\n")
+	os.Chmod(hook, 0o755)
+	write(t, filepath.Join(dir, "a.txt"), "a\n")
+	_, err := AutoCommit(context.Background(), basePlan(dir, head), finishedJudge(nil))
+	if !errors.Is(err, ErrCommittedUncertain) || !strings.Contains(err.Error(), "已提交、现场需确认") {
+		t.Fatalf("提交后 HEAD 被切走应报现场需确认: %v", err)
+	}
+	if classifyApplyErr(err) != ErrKindCommittedUncertain {
+		t.Fatal("远程分类")
+	}
+}
+
+func TestCommitFailedOutputTruncatedNote(t *testing.T) {
+	dir, head := commitRepo(t)
+	hook := filepath.Join(dir, ".git", "hooks", "pre-commit")
+	// 输出远超上限
+	write(t, hook, "#!/bin/sh\nhead -c 100000 /dev/zero | tr '\\0' 'x' >&2\nexit 1\n")
+	os.Chmod(hook, 0o755)
+	write(t, filepath.Join(dir, "a.txt"), "a\n")
+	_, err := AutoCommit(context.Background(), basePlan(dir, head), finishedJudge(nil))
+	var cf *ErrCommitFailed
+	if !errors.As(err, &cf) || !strings.HasSuffix(cf.Output, "字节）") || !strings.Contains(cf.Output, "…（已截断，原文共 ") {
+		t.Fatalf("应带截断说明: %v", err)
+	}
+}

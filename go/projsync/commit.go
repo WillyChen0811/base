@@ -43,6 +43,10 @@ var (
 	ErrNothingToCommit = errors.New("工作区没有未提交的改动")
 )
 
+// ErrCommittedUncertain：提交已经完成，但事后核对发现现场与预期不符（新 HEAD 读不到、父提交不符、
+// HEAD 已不在该分支）。调用方必须停止该项目后续写动作，并报告「已提交、现场需确认」。
+var ErrCommittedUncertain = errors.New("已提交、现场需确认")
+
 // MaxCommitOutput 是 ErrCommitFailed.Output 的上限。
 const MaxCommitOutput = 64 << 10
 
@@ -71,7 +75,8 @@ func runGitFull(ctx context.Context, dir string, args ...string) (output string,
 	err = cmd.Run()
 	all := append(append([]byte{}, stderr.Bytes()...), stdout.Bytes()...)
 	if len(all) > MaxCommitOutput {
-		all = append(all[:MaxCommitOutput:MaxCommitOutput], []byte("\n…（输出过长，已截断）")...)
+		total := len(all)
+		all = append(all[:MaxCommitOutput:MaxCommitOutput], []byte(fmt.Sprintf("…（已截断，原文共 %d 字节）", total))...)
 	}
 	output = strings.ToValidUTF8(string(all), "�")
 	if err == nil {
@@ -264,11 +269,19 @@ func AutoCommit(ctx context.Context, p CommitPlan, judge CommitJudge) (newOID st
 	// g) 核对新提交：HEAD 仍在该分支上、唯一父提交 == ExpectHead
 	out, err := runGit(ctx, p.Worktree, nil, "rev-list", "--parents", "-n", "1", "HEAD")
 	if err != nil {
-		return "", fmt.Errorf("%s：提交已完成但读取新 HEAD 失败，需重新确认现场: %w", tag, err)
+		return "", fmt.Errorf("%s：提交已完成但读取新 HEAD 失败，%w: %w", tag, ErrCommittedUncertain, err)
 	}
 	f := strings.Fields(string(out))
 	if len(f) != 2 || !oidRe.MatchString(f[0]) || f[1] != p.ExpectHead {
-		return "", fmt.Errorf("%s：提交已完成，但新提交的父提交与预期 %s 不符（%q），需重新确认现场", tag, p.ExpectHead, f)
+		return "", fmt.Errorf("%s：提交已完成，但新提交的父提交与预期 %s 不符（%q），%w", tag, p.ExpectHead, f, ErrCommittedUncertain)
+	}
+	// 提交后再读一次 HEAD 的符号引用：必须仍在该分支上（提交过程中钩子/他人切走分支则现场需确认）
+	sym2, err := runGit(ctx, p.Worktree, nil, "symbolic-ref", "-q", "HEAD")
+	if err != nil {
+		return "", fmt.Errorf("%s：提交已完成（%s），但提交后读取 HEAD 符号引用失败，%w: %w", tag, f[0], ErrCommittedUncertain, err)
+	}
+	if got := strings.TrimSuffix(string(sym2), "\n"); got != "refs/heads/"+p.Branch {
+		return "", fmt.Errorf("%s：提交已完成（%s），但提交后工作区 HEAD 指向 %s，预期 refs/heads/%s，%w", tag, f[0], got, p.Branch, ErrCommittedUncertain)
 	}
 	return f[0], nil
 }

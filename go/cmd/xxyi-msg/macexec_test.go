@@ -306,7 +306,7 @@ func TestMacToolLogs(t *testing.T) {
 	}
 
 	for _, args := range []map[string]any{
-		{"name": "ui"},                // ui 已从名单去掉
+		{"name": "ui"}, // ui 已从名单去掉
 		{"name": "service", "lines": 0},
 		{"name": "service", "lines": 501},
 	} {

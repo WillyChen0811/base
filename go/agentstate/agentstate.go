@@ -179,35 +179,40 @@ func JudgePane(in PaneInput) (PaneState, string) {
 		return Unknown, why + "会话记录最后一行不完整（可能正在写入）"
 	}
 	var ok bool
-	var doneAt time.Time
 	var basis string
 	if cmd == "claude" {
-		ok, doneAt = claudeEndTurn(in.Log.Content)
+		ok, _ = claudeEndTurn(in.Log.Content)
 		basis = "会话记录最后一条 end_turn"
 		if !ok {
 			return Unknown, why + "屏幕无 esc to interrupt，但会话记录最后不是 end_turn"
 		}
 	} else {
-		ok, doneAt = codexTaskComplete(in.Log.Content)
+		ok, _ = codexTaskComplete(in.Log.Content)
 		basis = "会话记录最后一个 task_started 之后有 task_complete"
 		if !ok {
 			return Unknown, why + "屏幕无 esc to interrupt，但会话记录里最后一个任务未见 task_complete"
 		}
 	}
-	// 本轮结束后仍在运行的任务：启动时间不早于完成记录的子孙进程（早于本轮的常驻辅助进程不算）。
-	if doneAt.IsZero() {
-		return Unknown, why + "完成记录没有时间戳，无法核对本轮结束后是否还有进程在运行"
-	}
-	floor := doneAt.Truncate(time.Second) // ps 的启动时间只精确到秒
+	// agent 窗格的子孙进程：启动链与常驻辅助（启动时间 ≤ agent 启动 + launchHelperWindow，或在白名单里）
+	// 不影响；其余仍存活的一律视为任务进程（如本轮中途起的构建、代码生成），判 Unknown。
+	var agentAt time.Time
+	agentKnown, agentLooked := false, false
 	for _, p := range in.Procs {
-		if p.Root {
+		if p.Root || isHelperProcess(p.Args) {
 			continue
+		}
+		if !agentLooked {
+			agentAt, agentKnown = agentStart(in.Procs, cmd)
+			agentLooked = true
+		}
+		if !agentKnown {
+			return Unknown, why + "读不到 agent 进程的启动时间，无法区分子孙进程是常驻辅助还是任务进程：" + p.Args
 		}
 		if !p.StartKnown {
 			return Unknown, why + "读不到子孙进程的启动时间：" + p.Args
 		}
-		if !p.Start.Before(floor) {
-			return Unknown, why + "本轮结束后仍有进程在运行：" + p.Args
+		if p.Start.After(agentAt.Add(launchHelperWindow)) {
+			return Unknown, why + "仍有任务进程在运行：" + p.Args
 		}
 	}
 	return Done, why + "屏幕无 esc to interrupt，" + basis
@@ -817,8 +822,8 @@ func agentStart(procs []Proc, kind string) (time.Time, bool) {
 const (
 	tailBytes = 8 << 20
 	headBytes = 4 << 20
-	// 记录文件的首条时间戳允许比进程启动时间早这么多（时钟取整与启动先后的误差）。
-	startSlack = 5 * time.Second
+	// MCP 服务、消息工具这类常驻辅助在 agent 启动时一起起来：启动时间不晚于 agent 启动 + 这个窗口的子孙进程不算任务进程。
+	launchHelperWindow = 30 * time.Second
 )
 
 // readTail 读文件末尾最多 tailBytes 字节，并返回读取前的大小与修改时间组成的签名。
@@ -867,13 +872,35 @@ func readHeadLines(path string) ([][]byte, error) {
 	return bytes.Split(buf, []byte("\n")), nil
 }
 
+const sameSecondProblem = "会话记录的修改时间与 agent 进程启动落在同一秒，无法判断它属于新进程还是刚结束的旧会话"
+
+type modRel int
+
+const (
+	modBefore     modRel = iota // 修改时间早于进程启动
+	modSameSecond               // 同一秒（ps 启动时间只到秒），无法判断
+	modAfter                    // 严格晚于进程启动
+)
+
+// modAfterStart 比较记录修改时间与进程启动时间，均向下取整到秒（ps 的启动时间只精确到秒）。
+func modAfterStart(mod, start time.Time) modRel {
+	m, s := mod.Truncate(time.Second), start.Truncate(time.Second)
+	switch {
+	case m.Before(s):
+		return modBefore
+	case m.Equal(s):
+		return modSameSecond
+	}
+	return modAfter
+}
+
 type fileMod struct {
 	path string
 	mod  time.Time
 }
 
-// findClaudeLog 找属于该 agent 进程的会话记录：目录里最后修改时间 ≥ 进程启动时间 − 5 秒
-// （即进程启动后仍有写入）的 .jsonl，恰好一个才用；零个或多个 → Problem。
+// findClaudeLog 找属于该 agent 进程的会话记录：目录里最后修改时间严格晚于进程启动时间
+// （即进程启动后仍有写入；修改时间与启动落在同一秒的记录无法判断归属 → Problem）的 .jsonl，恰好一个才用；零个或多个 → Problem。
 // 不要求首条记录晚于启动：resume 的会话首条记录早于进程启动是正常的。
 // 记录里的首个 cwd 必须等于窗格目录。
 func findClaudeLog(home, paneDir string, start time.Time) LogInput {
@@ -890,13 +917,21 @@ func findClaudeLog(home, paneDir string, start time.Time) LogInput {
 		cwd  string
 	}
 	var cs []cand
+	ambiguous := false
 	for _, e := range ents {
 		if e.IsDir() || !strings.HasSuffix(e.Name(), ".jsonl") {
 			continue
 		}
 		info, err := e.Info()
-		if err != nil || info.ModTime().Before(start.Add(-startSlack)) {
+		if err != nil {
+			continue
+		}
+		switch modAfterStart(info.ModTime(), start) {
+		case modBefore:
 			continue // 最后修改早于进程启动，不可能是它的
+		case modSameSecond:
+			ambiguous = true
+			continue
 		}
 		path := filepath.Join(dir, e.Name())
 		lines, err := readHeadLines(path)
@@ -914,6 +949,9 @@ func findClaudeLog(home, paneDir string, start time.Time) LogInput {
 			}
 		}
 		cs = append(cs, cand{path, cwd})
+	}
+	if ambiguous {
+		return LogInput{Found: true, Problem: sameSecondProblem}
 	}
 	paths := make([]string, len(cs))
 	for i, c := range cs {
@@ -942,23 +980,33 @@ func pickLog(paths []string, cwdOf func(int) string, paneDir string) LogInput {
 }
 
 // findCodexLog 在 ~/.codex/sessions 下找 session_meta 的 cwd 等于窗格目录、
-// 且最后修改时间 ≥ 进程启动时间 − 5 秒（启动后仍有写入）的 rollout，恰好一个才用。
+// 且最后修改时间严格晚于进程启动时间（启动后仍有写入；同一秒的无法判断归属 → Problem）的 rollout，恰好一个才用。
 func findCodexLog(home, paneDir string, start time.Time) LogInput {
 	root := filepath.Join(home, ".codex", "sessions")
-	var fs []fileMod
+	var fs, same []fileMod
 	_ = filepath.WalkDir(root, func(p string, d os.DirEntry, err error) error {
 		if err != nil || d.IsDir() {
 			return nil
 		}
 		n := d.Name()
 		if strings.HasPrefix(n, "rollout-") && strings.HasSuffix(n, ".jsonl") {
-			if info, e := d.Info(); e == nil && !info.ModTime().Before(start.Add(-startSlack)) {
-				fs = append(fs, fileMod{p, info.ModTime()})
+			if info, e := d.Info(); e == nil {
+				switch modAfterStart(info.ModTime(), start) {
+				case modAfter:
+					fs = append(fs, fileMod{p, info.ModTime()})
+				case modSameSecond:
+					same = append(same, fileMod{p, info.ModTime()})
+				}
 			}
 		}
 		return nil
 	})
 	want := canon(paneDir)
+	for _, f := range same {
+		if cwd, _, ok := codexMeta(f.path); ok && canon(cwd) == want {
+			return LogInput{Found: true, Problem: sameSecondProblem}
+		}
+	}
 	var paths []string
 	for _, f := range fs {
 		cwd, _, ok := codexMeta(f.path)

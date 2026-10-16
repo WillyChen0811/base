@@ -448,6 +448,7 @@ func TestJudgeFakeClaudeFinished(t *testing.T) {
 
 	// 假 agent 启动后才写入记录
 	waitCmd(t, opt, ws, "claude")
+	time.Sleep(1100 * time.Millisecond) // 记录修改时间须严格晚于进程启动（ps 启动时间只到秒）
 	claudeFile(home, ws, "s.jsonl", time.Now(), ws)
 	v, ps := waitCmd(t, opt, ws, "claude")
 	if v != VerdictFinished || ps[0].State != Done {
@@ -463,38 +464,96 @@ func TestJudgeFakeClaudeFinished(t *testing.T) {
 
 func noRecheck() *time.Duration { d := time.Duration(0); return &d }
 
-// 本轮结束后才启动的子孙进程 → Unknown；早于本轮的常驻子进程不影响（纯函数层）。
+// 子孙进程分类（纯函数层）：agent 启动 + 30 秒内的启动链/常驻辅助与白名单进程不影响；
+// 之后启动且仍存活的（如本轮中途起的构建）→ Unknown。
 func TestLateProcess(t *testing.T) {
-	done := time.Date(2026, 10, 16, 12, 0, 10, 0, time.UTC)
+	agentAt := time.Date(2026, 10, 16, 12, 0, 0, 0, time.UTC)
+	done := agentAt.Add(10 * time.Minute)
 	log := fmt.Sprintf(`{"type":"user","timestamp":"2026-10-16T12:00:00Z"}`+"\n"+
 		`{"type":"assistant","timestamp":%q,"message":{"stop_reason":"end_turn"}}`+"\n", done.Format(time.RFC3339Nano))
 	mk := func(extra ...Proc) PaneInput {
-		ps := []Proc{{PID: 1, Args: "bash", Start: done.Add(-time.Hour), StartKnown: true, Root: true},
-			{PID: 2, Args: "claude", Start: done.Add(-time.Hour), StartKnown: true}}
+		ps := []Proc{{PID: 1, Args: "bash", Start: agentAt.Add(-time.Hour), StartKnown: true, Root: true},
+			{PID: 2, Args: "claude", Start: agentAt, StartKnown: true}}
 		return PaneInput{Command: "claude", Screen: "> ", Procs: append(ps, extra...), ProcsKnown: true,
 			Log: LogInput{Found: true, Content: []byte(log)}}
 	}
-	resident := Proc{PID: 3, Args: "mcp-server --stdio", Start: done.Add(-30 * time.Minute), StartKnown: true}
-	late := Proc{PID: 4, Args: "npm test", Start: done.Add(5 * time.Second), StartKnown: true}
+	resident := Proc{PID: 3, Args: "mcp-server --stdio", Start: agentAt.Add(10 * time.Second), StartKnown: true}
+	edge := Proc{PID: 6, Args: "helper-at-edge", Start: agentAt.Add(30 * time.Second), StartKnown: true}
+	midTurn := Proc{PID: 4, Args: "npm run build", Start: agentAt.Add(60 * time.Second), StartKnown: true}
+	whitelisted := Proc{PID: 7, Args: "/usr/bin/xxyi-msg mcp", Start: agentAt.Add(5 * time.Minute), StartKnown: true}
 	noStart := Proc{PID: 5, Args: "mystery"}
 
 	if st, r := JudgePane(mk()); st != Done {
 		t.Errorf("无额外进程应 Done: %s %s", st, r)
 	}
-	if st, r := JudgePane(mk(resident)); st != Done {
-		t.Errorf("早于本轮的常驻进程不应影响: %s %s", st, r)
+	if st, r := JudgePane(mk(resident, edge)); st != Done {
+		t.Errorf("agent 启动后 30 秒内的常驻子进程不应影响: %s %s", st, r)
 	}
-	if st, r := JudgePane(mk(resident, late)); st != Unknown || !strings.Contains(r, "本轮结束后仍有进程在运行：npm test") {
-		t.Errorf("本轮结束后启动的进程应 Unknown: %s %s", st, r)
+	if st, r := JudgePane(mk(whitelisted)); st != Done {
+		t.Errorf("白名单进程不应影响: %s %s", st, r)
+	}
+	if st, r := JudgePane(mk(resident, midTurn)); st != Unknown || !strings.Contains(r, "仍有任务进程在运行：npm run build") {
+		t.Errorf("中途启动且仍存活的子孙进程应 Unknown: %s %s", st, r)
 	}
 	if st, _ := JudgePane(mk(noStart)); st != Unknown {
 		t.Error("子孙进程启动时间未知应 Unknown")
 	}
-	// 完成记录没有时间戳
-	in := mk()
-	in.Log.Content = []byte(`{"type":"assistant","message":{"stop_reason":"end_turn"}}` + "\n")
+	// 读不到 agent 自己的启动时间
+	in := mk(resident)
+	in.Procs[1].StartKnown = false
 	if st, _ := JudgePane(in); st != Unknown {
-		t.Error("完成记录无时间戳应 Unknown")
+		t.Error("agent 启动时间未知应 Unknown")
+	}
+}
+
+// 记录修改时间与进程启动的先后：旧记录不绑定、同一秒无法判断、严格晚于才绑定。
+func TestLogBindingStrict(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "proj")
+	_ = os.MkdirAll(dir, 0o755)
+	start := time.Now().Truncate(time.Second).Add(-time.Minute) // ps 启动时间只到秒
+	set := func(home, name string, mod time.Time) {
+		p := claudeFile(home, dir, name, mod, dir)
+		_ = os.Chtimes(p, mod, mod)
+	}
+	// 旧记录刚结束（早于启动 3 秒）：不绑定；新 agent 没有自己的记录 → Unknown
+	home := t.TempDir()
+	set(home, "old.jsonl", start.Add(-3*time.Second))
+	l := findClaudeLog(home, dir, start)
+	if l.Path != "" || l.Problem == "" {
+		t.Errorf("旧记录不应绑定: %+v", l)
+	}
+	if st, _ := JudgePane(PaneInput{Command: "claude", Screen: "> ", Log: l}); st != Unknown {
+		t.Error("新 agent 无自身记录应 Unknown")
+	}
+	// 同一秒（含 .9 秒）→ Unknown
+	home = t.TempDir()
+	set(home, "same.jsonl", start.Add(900*time.Millisecond))
+	l = findClaudeLog(home, dir, start)
+	if l.Path != "" || !strings.Contains(l.Problem, "同一秒") {
+		t.Errorf("同一秒应无法判断: %+v", l)
+	}
+	if st, _ := JudgePane(PaneInput{Command: "claude", Screen: "> ", Log: l}); st != Unknown {
+		t.Error("同一秒应 Unknown")
+	}
+	// 严格晚于（下一秒）→ 绑定
+	home = t.TempDir()
+	set(home, "new.jsonl", start.Add(time.Second))
+	if l = findClaudeLog(home, dir, start); l.Problem != "" || l.Path == "" {
+		t.Errorf("晚一秒应绑定: %+v", l)
+	}
+	// codex 同理
+	chome := t.TempDir()
+	sd := filepath.Join(chome, ".codex", "sessions", "2026", "10", "16")
+	_ = os.MkdirAll(sd, 0o755)
+	cp := filepath.Join(sd, "rollout-a.jsonl")
+	_ = os.WriteFile(cp, []byte(fmt.Sprintf(`{"type":"session_meta","payload":{"cwd":%q}}`+"\n", dir)), 0o644)
+	_ = os.Chtimes(cp, start.Add(500*time.Millisecond), start.Add(500*time.Millisecond))
+	if l = findCodexLog(chome, dir, start); !strings.Contains(l.Problem, "同一秒") {
+		t.Errorf("codex 同一秒应无法判断: %+v", l)
+	}
+	_ = os.Chtimes(cp, start.Add(-2*time.Second), start.Add(-2*time.Second))
+	if l = findCodexLog(chome, dir, start); l.Path != "" {
+		t.Errorf("codex 旧记录不应绑定: %+v", l)
 	}
 }
 
@@ -508,6 +567,7 @@ func fakeSetup(t *testing.T) (opt Options, ws string, panePID int, logPath strin
 	fakeClaude(t, run, ws, "c1")
 	_, ps := waitCmd(t, opt, ws, "claude")
 	panePID = ps[0].PID
+	time.Sleep(1100 * time.Millisecond) // 记录修改时间须严格晚于进程启动（ps 启动时间只到秒）
 	logPath = claudeFile(home, ws, "s.jsonl", time.Now(), ws)
 	return
 }
@@ -534,7 +594,7 @@ func TestJudgeLateChildIntegration(t *testing.T) {
 	}
 	opt.ProcTree = withChild(pid, "make test", time.Now().Add(time.Minute))
 	v, ps, _ := Judge(context.Background(), ws, opt)
-	if v != VerdictUnknown || !strings.Contains(ps[0].Reason, "本轮结束后仍有进程在运行：make test") {
+	if v != VerdictUnknown || !strings.Contains(ps[0].Reason, "仍有任务进程在运行：make test") {
 		t.Errorf("本轮后启动的子进程应 Unknown: %s %+v", v, ps)
 	}
 	opt.ProcTree = withChild(pid, "mcp-server", time.Now().Add(-time.Hour))

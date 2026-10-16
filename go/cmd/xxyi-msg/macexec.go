@@ -43,6 +43,25 @@ var (
 // pngSignature 是 PNG 的完整 8 字节签名（RFC 2083）；只比 "\x89PNG" 4 字节太松，半截响应也可能撞上。
 var pngSignature = []byte{0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'}
 
+// macJob 是 Mac 端旧 /exec/start、/exec/job 响应 JSON 结构的本地镜像。
+// go/macexec 的执行器已按 v2 约定改成同步 Run、不再提供 Job 类型；
+// 本文件将在后续任务（tasks-macexec/S4）里整体替换为同步调用，这里类型先就地保留维持编译。
+type macJob struct {
+	ID       string    `json:"id"`
+	Action   string    `json:"action"`
+	State    string    `json:"state"`
+	ExitCode int       `json:"exitCode"`
+	Started  time.Time `json:"started"`
+	Ended    time.Time `json:"ended"`
+	Note     string    `json:"note"`
+}
+
+// 旧 /exec/job 协议里的任务状态取值。
+const (
+	macStateRunning = "running"
+	macStateDone    = "done"
+)
+
 // macRepoXxyi 是长任务动作所在的仓库（swift_build/selftest/node_test/build_app 都在 xxyi 里）。
 const macRepoXxyi = "xxyi"
 
@@ -388,10 +407,10 @@ func macRunJob(ctx context.Context, action, repo, name string, quick bool) (stri
 		job2, tail, err := macGetJob(qctx, job.ID)
 		cancel()
 		next = pollAt.Add(interval)
-		if err == nil && job2.State != macexec.StateRunning {
+		if err == nil && job2.State != macStateRunning {
 			// 查询成功且已收尾：结果优先于预算——哪怕正好压线，也是干完了，不是没等到。
 			text := macJobText(job2, tail)
-			if job2.State != macexec.StateDone {
+			if job2.State != macStateDone {
 				return "", errors.New(text)
 			}
 			return text, nil
@@ -421,40 +440,40 @@ func macRunJob(ctx context.Context, action, repo, name string, quick bool) (stri
 
 // macStartJob 启动任务（经 macCall：每次现读入口，入口旧了重读再试一次）；
 // 忙（409）等错误由 client.do 原样带出服务端原因，不重试。
-func macStartJob(ctx context.Context, action, repo, name string) (macexec.Job, error) {
+func macStartJob(ctx context.Context, action, repo, name string) (macJob, error) {
 	body, err := json.Marshal(map[string]any{"action": action, "repo": repo, "name": name})
 	if err != nil {
-		return macexec.Job{}, err
+		return macJob{}, err
 	}
 	b, err := macCall(ctx, func(c *client) ([]byte, error) {
 		return c.do(ctx, http.MethodPost, c.path("/exec/start", nil), body)
 	})
 	if err != nil {
-		return macexec.Job{}, err
+		return macJob{}, err
 	}
 	var r struct {
-		Job macexec.Job `json:"job"`
+		Job macJob `json:"job"`
 	}
 	if json.Unmarshal(b, &r) != nil || r.Job.ID == "" {
-		return macexec.Job{}, errors.New("Mac 端响应里没有 job id")
+		return macJob{}, errors.New("Mac 端响应里没有 job id")
 	}
 	return r.Job, nil
 }
 
 // macGetJob 查任务状态与输出末尾（服务端已截到 200 行 / 64KB）；同样每次现读入口。
-func macGetJob(ctx context.Context, id string) (macexec.Job, string, error) {
+func macGetJob(ctx context.Context, id string) (macJob, string, error) {
 	b, err := macCall(ctx, func(c *client) ([]byte, error) {
 		return c.do(ctx, http.MethodGet, c.path("/exec/job", url.Values{"id": {id}}), nil)
 	})
 	if err != nil {
-		return macexec.Job{}, "", err
+		return macJob{}, "", err
 	}
 	var r struct {
-		Job  macexec.Job `json:"job"`
-		Tail string      `json:"tail"`
+		Job  macJob `json:"job"`
+		Tail string `json:"tail"`
 	}
 	if json.Unmarshal(b, &r) != nil || r.Job.ID == "" {
-		return macexec.Job{}, "", errors.New("Mac 端 job 响应格式不对")
+		return macJob{}, "", errors.New("Mac 端 job 响应格式不对")
 	}
 	return r.Job, r.Tail, nil
 }
@@ -551,10 +570,10 @@ func macCheckPNG(b []byte) error {
 }
 
 // macJobText 渲染任务状态：一行摘要 + 输出末尾。
-func macJobText(job macexec.Job, tail string) string {
+func macJobText(job macJob, tail string) string {
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "任务 %s（%s）：%s", job.ID, job.Action, job.State)
-	if job.State != macexec.StateRunning {
+	if job.State != macStateRunning {
 		fmt.Fprintf(&sb, "，退出码 %d", job.ExitCode)
 	}
 	if job.Note != "" {

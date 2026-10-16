@@ -7,8 +7,7 @@ import (
 	"syscall"
 )
 
-// setNewProcessGroup 让子进程自成一个进程组（pgid == 子进程 pid），
-// 这样杀任务时能把 build.sh/swift build 派生的子进程一起杀掉。
+// setNewProcessGroup 让子进程自成一个进程组（pgid == 子进程 pid），杀任务时把它派生的子进程一起杀掉。
 func setNewProcessGroup(cmd *exec.Cmd) {
 	if cmd.SysProcAttr == nil {
 		cmd.SysProcAttr = &syscall.SysProcAttr{}

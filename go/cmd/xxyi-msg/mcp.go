@@ -1,7 +1,7 @@
 package main
 
 // MCP 服务：标准输入/输出上的 JSON-RPC 2.0，一行一个 JSON（newline-delimited），只用标准库。
-// 给另一侧的 Claude 用：五个消息工具碰消息通道，八个 mac_* 工具经协助远端碰 Mac（见 macexec.go），
+// 给另一侧的 Claude 用：六个消息工具碰消息通道，八个 mac_* 工具经协助远端碰 Mac（见 macexec.go），
 // 名单之外的事一律不暴露。
 
 import (
@@ -113,7 +113,7 @@ func initializeResult(params json.RawMessage) map[string]any {
 	}
 }
 
-// mcpTools 是消息通道的五个工具（mac_* 八个见 macexec.go 的 mcpMacTools），参数用 JSON Schema 描述。
+// mcpTools 是消息通道的六个工具（mac_* 八个见 macexec.go 的 mcpMacTools），参数用 JSON Schema 描述。
 var mcpTools = []map[string]any{
 	{
 		"name":        "xxyi_send",
@@ -143,6 +143,17 @@ var mcpTools = []map[string]any{
 				"file_path": map[string]any{"type": "string", "description": "可选附件的本地路径（必须绝对路径，~/ 开头会展开到家目录）：只能是当前项目目录或 ~/xxyi-work 下的普通文件，上限 1MB"},
 			},
 			"required": []string{"id", "text"},
+		},
+	},
+	{
+		"name":        "xxyi_recall",
+		"description": "撤回自己发出的消息。未送达的直接取消，对方永远收不到；已送达的标记为撤回并通知对方。只能撤回自己发的。",
+		"inputSchema": map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"id": map[string]any{"type": "string", "description": "要撤回的消息编号"},
+			},
+			"required": []string{"id"},
 		},
 	},
 	{
@@ -211,7 +222,7 @@ func textContent(text string) []map[string]any {
 	return []map[string]any{{"type": "text", "text": text}}
 }
 
-// runTool 是五个工具的实现；每次调用自带 httpTimeout。
+// runTool 是消息通道工具的实现；每次调用自带 httpTimeout。
 // 每次工具调用前先尝试补发暂存（连不上/超时就放下，不挡这次的调用；
 // 被拒的落 rejected/ + .reason，xxyi_inbox 从盘上列一次）。
 func runTool(ctx context.Context, name string, args map[string]any) (string, error) {
@@ -227,6 +238,12 @@ func runTool(ctx context.Context, name string, args map[string]any) (string, err
 		return toolSend(ctx, args)
 	case "xxyi_reply":
 		return toolReply(ctx, args)
+	case "xxyi_recall":
+		id, err := argString(args, "id", true)
+		if err != nil {
+			return "", err
+		}
+		return doRecall(ctx, id)
 	case "xxyi_inbox":
 		return toolInbox(ctx, args)
 	case "xxyi_verify":

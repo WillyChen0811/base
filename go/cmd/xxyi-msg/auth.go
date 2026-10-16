@@ -58,7 +58,7 @@ func loadClientBundle(path string) *clientBundle {
 func needsClientAuth(path string) bool {
 	p, _, _ := strings.Cut(path, "?")
 	switch p {
-	case "/msg/send", "/msg/state", "/msg/inbox", "/msg/who", "/approval/ask":
+	case "/msg/send", "/msg/recall", "/msg/state", "/msg/inbox", "/msg/who", "/approval/ask":
 		return true
 	}
 	return false

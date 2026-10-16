@@ -83,6 +83,7 @@ func tmuxSessionArgs(pane string) []string {
 
 const usage = "用法：xxyi-msg send <收件人> [文字|-] [--file 路径] [--repo 名 --branch 名] [--kind request|notice|code] [--ask-user]" +
 	" | xxyi-msg reply <消息id> [文字|-] [--file 路径]" +
+	" | xxyi-msg recall <消息id>" +
 	" | xxyi-msg inbox [n] | xxyi-msg verify <消息id> | xxyi-msg who" +
 	" | xxyi-msg state busy|idle|gone [--check|--start] | xxyi-msg mcp" +
 	" | xxyi-msg approve-hook [--agent claude|codex]" +
@@ -994,6 +995,47 @@ func cmdReply(ctx context.Context, args []string, stdin io.Reader, out io.Writer
 	return nil
 }
 
+// doRecall 撤回自己发出的消息（POST /msg/recall）；命令行和 MCP 共用。
+// 不进暂存：撤回要立刻知道结果，连不上就直接报错。
+func doRecall(ctx context.Context, id string) (string, error) {
+	if strings.TrimSpace(id) == "" {
+		return "", errors.New("缺少消息 id（xxyi-msg recall <消息id>）")
+	}
+	from, err := selfAddr()
+	if err != nil {
+		return "", err
+	}
+	raw, err := json.Marshal(map[string]string{"id": strings.TrimPrefix(strings.TrimSpace(id), "#"), "from": from})
+	if err != nil {
+		return "", err
+	}
+	c, err := connect(ctx, httpTimeout)
+	if err != nil {
+		return "", err
+	}
+	if _, err := c.do(ctx, http.MethodPost, c.path("/msg/recall", nil), raw); err != nil {
+		var ce *connError
+		if errors.As(err, &ce) {
+			return "", err
+		}
+		return "", fmt.Errorf("撤回失败：%w", err)
+	}
+	return "已撤回 #" + strings.TrimPrefix(strings.TrimSpace(id), "#") + "（未送达的直接取消；已送达的标记撤回并通知了对方）", nil
+}
+
+// cmdRecall：xxyi-msg recall <消息id>。
+func cmdRecall(ctx context.Context, args []string, out io.Writer) error {
+	if len(args) != 1 {
+		return errors.New("用法：xxyi-msg recall <消息id>")
+	}
+	text, err := doRecall(ctx, args[0])
+	if err != nil {
+		return err
+	}
+	fmt.Fprintln(out, text)
+	return nil
+}
+
 // cmdInbox 打印收件箱：先欠回复的请求，再最近消息，每行带签名核验标记。
 func cmdInbox(ctx context.Context, args []string, out io.Writer) error {
 	n := inboxDefaultN
@@ -1219,7 +1261,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	}
 	var err error
 	switch args[0] {
-	case "send", "reply", "inbox", "who", "verify":
+	case "send", "reply", "recall", "inbox", "who", "verify":
 		// 这几个子命令先尝试补发暂存（state 钩子不补发）；补发与正事共用 httpTimeout 这一份总预算。
 		// send/reply 若暂存非空还会"先进暂存再补发"（见 doSendSpool），保证老消息先发。
 		ctx, cancel := context.WithTimeout(context.Background(), httpTimeout)
@@ -1230,6 +1272,8 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 			err = cmdSend(ctx, args[1:], stdin, stdout)
 		case "reply":
 			err = cmdReply(ctx, args[1:], stdin, stdout)
+		case "recall":
+			err = cmdRecall(ctx, args[1:], stdout)
 		case "inbox":
 			err = cmdInbox(ctx, args[1:], stdout)
 		case "who":

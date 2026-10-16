@@ -124,7 +124,7 @@ func TestMCPToolsList(t *testing.T) {
 		t.Fatalf("回应条数 %d", len(resps))
 	}
 	tools := resps[0]["result"].(map[string]any)["tools"].([]any)
-	if len(tools) != 13 { // 5 个消息工具 + 8 个 mac_*（见 tasks-macexec/CONTRACT.md）
+	if len(tools) != 14 { // 6 个消息工具 + 8 个 mac_*（见 tasks-macexec/CONTRACT.md）
 		t.Fatalf("工具数 %d", len(tools))
 	}
 	names := make([]string, 0, len(tools))
@@ -149,14 +149,14 @@ func TestMCPToolsList(t *testing.T) {
 			t.Errorf("xxyi_peers 不该有必填参数：%v", req)
 		}
 	}
-	want := []string{"xxyi_send", "xxyi_reply", "xxyi_inbox", "xxyi_verify", "xxyi_peers",
+	want := []string{"xxyi_send", "xxyi_reply", "xxyi_recall", "xxyi_inbox", "xxyi_verify", "xxyi_peers",
 		"mac_git_status", "mac_build", "mac_selftest", "mac_node_test", "mac_build_app",
 		"mac_install_app", "mac_screenshot", "mac_logs"}
 	if strings.Join(names, ",") != strings.Join(want, ",") {
 		t.Errorf("工具名 %v", names)
 	}
 	// verify 必填 id
-	vsch := tools[3].(map[string]any)["inputSchema"].(map[string]any)
+	vsch := tools[4].(map[string]any)["inputSchema"].(map[string]any)
 	if r := fmt.Sprint(vsch["required"]); !strings.Contains(r, "id") {
 		t.Errorf("xxyi_verify 必填 %v", r)
 	}

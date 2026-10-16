@@ -20,7 +20,7 @@
 - [待] tests/test_terminal.py 的 3 个测试用 /proc，Mac 上跑不了，应加平台判断。
 - [待] omlx 会话模板里关掉 LSP 插件推荐提示。
 - [进行中] wgtund 退出残留堵端口（18080）：A) wgtund 关闭 3 秒硬超时（Go，Sonnet）；B) Python 看护启动前清理残留 wgtund（pid 文件，Sonnet）。完成后：编译 Mac 版 wgtund 给用户部署，并重新打包 XXYI.app。
-- [待] 线路面板在连不上后台时（服务在、wgtund 报错）仍显示切换按钮（用户：不是最严重的）。
+- [取消] 线路面板出错时的按钮：用户确认当时是服务根本没通，没按钮是预期；根治靠 wgtund 稳定（A、B）。
 - [待] build.sh 小修：结尾改 codesign -dvv 才能打出 Authority；错误提示里「仍是上一次构建的产物」说法不准（脚本开头已重建未签名产物）。
 - [待] 提交写法：给 omlx 的任务书一律写「Write 写说明文件 → git add 文件 → git commit -F 文件」，单条执行，不用 git -C/&&/heredoc（omlx1 照此成功提交）。
 - [待] 小改进：超出范围的分支单独跳过、其他分支继续。

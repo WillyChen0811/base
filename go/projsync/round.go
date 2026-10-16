@@ -12,9 +12,12 @@ package projsync
 //   - 互斥按本地 `git rev-parse --git-common-dir` 的规范化路径；手动与定时共用同一把锁，拿不到即跳过；
 //   - 通信失败（RemoteFacts/RemoteApply 返回 error）、写后复查失败（ErrCheckedOutDuringUpdate、提交后现场需确认）
 //     ——立即停止本项目本轮所有后续写动作，标记「结果不确定，需重新确认」，不重试；
-//   - 超出支持范围（任何一侧 CheckScope 不通过）——本轮不写任何东西；
+//   - 超出支持范围——写之前完整预检（两边分支名并集的 CheckScope、本轮涉及提交的树 CheckCommitsScope、
+//     dirty 工作区当前 HEAD），任一不过则整轮不写任何东西；自动提交后重新采集会再预检一次；
+//     若执行中途才因现场变化判超出，停止后续写并如实列出已完成的写入；
 //   - 自动提交失败（含钩子拒绝）——记录完整输出，本轮不再写；
-//   - AutoMerge：Parents[0]=mac、Parents[1]=ubuntu；Mac 先快进，再把合并对象送到 Ubuntu 后 Ubuntu 快进，禁止回退。
+//   - AutoMerge：Parents[0]=mac、Parents[1]=ubuntu；先在 Mac 本地生成合并提交（只写对象）并传到 Ubuntu，
+//     再分别快进 Mac、Ubuntu（先传后快进），禁止回退；任一步失败，已完成的保留，停止后续写。
 
 import (
 	"context"
@@ -125,7 +128,8 @@ type RoundResult struct {
 	// Stopped：本轮在中途停止了后续写动作；StopReason 为首个原因。
 	Stopped    bool   `json:"stopped,omitempty"`
 	StopReason string `json:"stop_reason,omitempty"`
-	// OutOfScope：本项目超出自动同步范围，本轮没有写任何东西。
+	// OutOfScope：本项目超出自动同步范围。预检阶段发现则本轮没有写任何东西；
+	// 若执行中途才发现，已完成的写入见 Error/Attention 的说明，并已停止后续写。
 	OutOfScope bool `json:"out_of_scope,omitempty"`
 	// Recollected：自动提交成功后重新交换与采集过一次。
 	Recollected bool              `json:"recollected,omitempty"`
@@ -192,7 +196,10 @@ type roundRun struct {
 	remote     FactsResponse
 
 	attSeen map[string]bool
+	written []string // 本轮已完成的写入（中文描述），超出范围时如实报告
 }
+
+func (r *roundRun) wrote(s string) { r.written = append(r.written, s) }
 
 func (r *roundRun) att(a AttentionItem) {
 	key := a.Kind + "|" + string(a.Side) + "|" + a.Branch + "|" + a.Worktree
@@ -268,6 +275,10 @@ func (r *roundRun) run(ctx context.Context) {
 	if !r.exchangeAndCollect(ctx) {
 		return
 	}
+	// 写之前预检：dirty 工作区的当前 HEAD 提交树（自动提交会基于它们）。
+	if !r.checkDirtyHeads(ctx) {
+		return
+	}
 	// c) 自动提交
 	committed := r.commitStep(ctx)
 	if r.res.Stopped {
@@ -283,6 +294,20 @@ func (r *roundRun) run(ctx context.Context) {
 	}
 	// d)(e) 判定并执行
 	r.decideAndApply(ctx)
+}
+
+// checkDirtyHeads 对两边所有 dirty 工作区的当前 HEAD 调用提交树预检。
+func (r *roundRun) checkDirtyHeads(ctx context.Context) bool {
+	var oids []string
+	for _, d := range r.dirtyWorktrees() {
+		if d.branch == "" {
+			continue
+		}
+		if head, err := r.expectHead(ctx, d); err == nil {
+			oids = append(oids, head) // 读不到的交给 commitStep 记为状态不确定
+		}
+	}
+	return r.checkCommits(ctx, oids...)
 }
 
 func (r *roundRun) exchangeAndCollect(ctx context.Context) bool {
@@ -323,9 +348,23 @@ func (r *roundRun) collect(ctx context.Context) bool {
 		r.outOfScope(SideUbuntu, rf.ScopeError, rf.ScopeReasons)
 		return false
 	}
-	names := make([]string, 0, len(rf.Branches))
-	for n := range rf.Branches {
+	// 两边分支名并集（Mac refs/heads + Ubuntu refs/heads）：本地 CheckScope 同时覆盖 Mac 独有分支的配置
+	// （mergeOptions/rebase）与将要在 Mac 创建的 Ubuntu 独有分支名；Ubuntu 一侧已由 rf.ScopeError 覆盖。
+	localNames, err := listLocalBranches(ctx, r.env.Repo, nil)
+	if err != nil {
+		r.res.Error = "列出本地分支失败，本轮结束: " + err.Error()
+		return false
+	}
+	seen := map[string]bool{}
+	var names []string
+	for _, n := range localNames {
+		seen[n] = true
 		names = append(names, n)
+	}
+	for n := range rf.Branches {
+		if !seen[n] {
+			names = append(names, n)
+		}
 	}
 	sort.Strings(names)
 	if err := CheckScope(ctx, r.env.Repo, nil, names); err != nil {
@@ -340,12 +379,49 @@ func (r *roundRun) collect(ctx context.Context) bool {
 	return true
 }
 
+// checkCommits 预检本轮涉及的提交树（含子模块即超出范围）。oids 可含空串与重复。返回 false 表示本轮应结束。
+func (r *roundRun) checkCommits(ctx context.Context, oids ...string) bool {
+	seen := map[string]bool{}
+	var list []string
+	for _, o := range oids {
+		if o != "" && !seen[o] {
+			seen[o] = true
+			list = append(list, o)
+		}
+	}
+	err := CheckCommitsScope(ctx, r.env.Repo, nil, list...)
+	if err == nil {
+		return true
+	}
+	var oos *ErrOutOfScope
+	if errors.As(err, &oos) {
+		r.outOfScope("", oos.Error(), oos.Reasons)
+	} else {
+		r.res.Error = "提交树预检失败，本轮结束: " + err.Error()
+		r.stop("提交树预检失败", false, "", "")
+	}
+	return false
+}
+
+// outOfScope 记录超出范围。尚无写入则「本轮不写任何东西」；已有写入（自动提交、已执行的分支）则停止后续写，
+// 并如实列出已完成的写入。side 为空表示不归属某一侧（提交树预检）。
 func (r *roundRun) outOfScope(side Side, msg string, reasons []string) {
 	r.res.OutOfScope = true
-	r.res.Error = "超出自动同步范围，本轮不写任何东西"
-	r.att(AttentionItem{Kind: AttOutOfScope, Side: side,
-		Message: sideNames([]Side{side}) + "侧超出自动同步范围，本轮不写任何东西：" + strings.Join(reasons, "；"),
-		Detail:  msg})
+	who := ""
+	if side != "" {
+		who = sideNames([]Side{side}) + "侧"
+	}
+	var text string
+	if len(r.written) == 0 {
+		r.res.Error = "超出自动同步范围，本轮不写任何东西"
+		text = who + "超出自动同步范围，本轮不写任何东西："
+	} else {
+		done := strings.Join(r.written, "；")
+		r.res.Error = "超出自动同步范围，已停止后续写；本轮已完成的写入：" + done
+		text = who + "超出自动同步范围，已停止后续写（本轮已完成的写入：" + done + "）："
+		r.stop("超出自动同步范围", false, side, "")
+	}
+	r.att(AttentionItem{Kind: AttOutOfScope, Side: side, Message: text + strings.Join(reasons, "；"), Detail: msg})
 }
 
 // ── c) 自动提交 ──
@@ -445,6 +521,7 @@ func (r *roundRun) commitStep(ctx context.Context) bool {
 		oid, ok := r.doCommit(ctx, d, head, force)
 		if ok {
 			committed = true
+			r.wrote(fmt.Sprintf("%s工作区 %s 自动提交 %s", sideNames([]Side{d.side}), d.path, short(oid)))
 			r.wtOutcome(d, force, WtCommitted, "已自动提交 "+oid, oid)
 		}
 	}
@@ -593,7 +670,20 @@ func (r *roundRun) decideAndApply(ctx context.Context) {
 	for _, b := range bfs {
 		facts[b.Name] = b
 	}
-	for _, act := range DecideBranches(repo, bfs) {
+	acts := DecideBranches(repo, bfs)
+	// 写之前（含重新采集后的新事实）再预检一次：所有要写的动作涉及的提交（两边 OID、目标 OID）。
+	var oids []string
+	for _, act := range acts {
+		switch act.Kind {
+		case KindCreateOnOther, KindFastForward, KindAutoMerge:
+			bf := facts[act.Name]
+			oids = append(oids, bf.Mac, bf.Ubuntu, act.Target)
+		}
+	}
+	if !r.checkCommits(ctx, oids...) {
+		return
+	}
+	for _, act := range acts {
 		bf := facts[act.Name]
 		switch act.Kind {
 		case KindNothing:
@@ -746,6 +836,7 @@ func (r *roundRun) execSimple(ctx context.Context, act BranchAction, bf BranchFa
 	}
 	o := r.applyOn(ctx, side, plan)
 	if r.finishApply(act, side, o) {
+		r.wrote(fmt.Sprintf("分支 %s 在%s已更新到 %s", act.Name, sideNames([]Side{side}), short(act.Target)))
 		r.addBranch(act, ResultDone, act.Reason)
 	}
 }
@@ -770,30 +861,64 @@ func (r *roundRun) execMerge(ctx context.Context, act BranchAction, bf BranchFac
 		return
 	}
 	act.Target = merged
-	// 2) Mac 本地快进到合并提交
+	if !r.checkCommits(ctx, merged) { // 合并提交的树也要过一遍（此时分支都没动）
+		r.addBranch(act, ResultFailed, "合并提交的树超出自动同步范围，两边分支都未更新")
+		return
+	}
+	// 2) 把合并提交传到 Ubuntu（先传后快进）。v1 的交换只推 refs/heads，所以临时在 Mac 本地建一个专用分支
+	//    xxyi-tmp-merge-<合并提交>（指向合并提交，不碰用户分支），交换后合并对象随它落到 Ubuntu 的
+	//    refs/remotes/mac/ 下；传完（无论成败）立刻在 Mac 删掉。Ubuntu 上那个远程跟踪引用由下一次交换
+	//    （push --prune）自动清掉，不会出现在 Ubuntu 的 refs/heads。
+	tmp := "refs/heads/xxyi-tmp-merge-" + merged
+	if _, err := runGit(ctx, r.env.Repo, nil, "update-ref", tmp, merged, strings.Repeat("0", len(merged))); err != nil {
+		r.addBranch(act, ResultFailed, "建立传送用的临时引用失败，两边分支都未更新: "+err.Error())
+		r.att(AttentionItem{Kind: AttApplyFailed, Side: SideMac, Branch: act.Name,
+			Message: fmt.Sprintf("分支 %s 自动合并失败（两边分支都未更新），请查看原因", act.Name), Detail: err.Error()})
+		r.stop(fmt.Sprintf("分支 %s：无法建立传送用临时引用", act.Name), false, SideMac, act.Name)
+		return
+	}
+	xerr := r.env.Exchange(ctx)
+	if _, err := runGit(ctx, r.env.Repo, nil, "update-ref", "-d", tmp, merged); err != nil {
+		r.res.Notes = append(r.res.Notes, fmt.Sprintf("临时引用 %s 删除失败，请手动删除: %v", tmp, err))
+	}
+	if xerr != nil {
+		r.addBranch(act, ResultFailed, "把合并提交 "+merged+" 传送到 Ubuntu 失败，两边分支都未更新: "+xerr.Error())
+		r.stop(fmt.Sprintf("分支 %s：传送合并对象到 Ubuntu 失败（%v），两边分支都未更新", act.Name, xerr), true, SideUbuntu, act.Name)
+		return
+	}
+	// 3) Mac 本地快进到合并提交（旧值=mac 原提交）。对象已安全到达 Ubuntu；Ubuntu 一侧是否真有该对象，
+	//    由下面 Ubuntu 快进原语写之前的 requireCommit 复查，缺失则拒绝写入。
 	o := r.applyOn(ctx, SideMac, ApplyPlan{Branch: act.Name, OldOID: bf.Mac, NewOID: merged, Kind: KindFastForward})
 	if !r.finishApply(act, SideMac, o) {
+		if o.state == applyFailed && o.refs { // 竞争：没写入也要让用户知道本轮提前停了
+			r.att(AttentionItem{Kind: AttApplyFailed, Side: SideMac, Branch: act.Name,
+				Message: fmt.Sprintf("分支 %s 在 Mac 更新时现场已变化（未写入），本轮停止后续写", act.Name), Detail: o.detail})
+		}
+		r.stop(fmt.Sprintf("分支 %s 的合并在 Mac 一侧未完成", act.Name), false, SideMac, act.Name)
 		return
 	}
-	// 3) 再交换一次，把合并对象送到 Ubuntu；失败按通信失败处理（Mac 已更新，保留，不回退）
-	if err := r.env.Exchange(ctx); err != nil {
-		r.addBranch(act, ResultUncertain, "Mac 已快进到合并提交 "+merged+"，但把对象送到 Ubuntu 失败: "+err.Error())
-		r.stop(fmt.Sprintf("分支 %s：Mac 已更新、传送合并对象到 Ubuntu 失败（%v）", act.Name, err), true, SideUbuntu, act.Name)
-		return
-	}
+	r.wrote(fmt.Sprintf("分支 %s 在 Mac 已快进到合并提交 %s", act.Name, short(merged)))
 	// 4) Ubuntu 快进到合并提交（旧值=ubuntu 原提交）
 	o = r.applyOn(ctx, SideUbuntu, ApplyPlan{Branch: act.Name, OldOID: bf.Ubuntu, NewOID: merged, Kind: KindFastForward})
-	if o.state != applyOK {
-		// 一边成功另一边失败：保留成功结果，报告，下一轮重新采集后会把 Ubuntu 快进上来
-		if o.state == applyFailed {
-			o.detail = "Mac 已快进到合并提交 " + merged + "，Ubuntu 未更新（下一轮重新判定）: " + o.detail
-		} else {
-			o.detail = "Mac 已快进到合并提交 " + merged + "；" + o.detail
-		}
+	switch o.state {
+	case applyOK:
+		r.wrote(fmt.Sprintf("分支 %s 在 Ubuntu 已快进到合并提交 %s", act.Name, short(merged)))
+		r.addBranch(act, ResultDone, fmt.Sprintf("两边分叉但可干净合并，已生成合并提交 %s（父提交：mac %s、ubuntu %s），两边都已更新", merged, short(bf.Mac), short(bf.Ubuntu)))
+	case applyUncertain:
+		// 保留 Mac 的结果，不回退；finishApply 记不确定并停止
+		o.detail = "Mac 已快进到合并提交 " + merged + "；" + o.detail
 		r.finishApply(act, SideUbuntu, o)
-		return
+	default:
+		// 保留 Mac 的结果，不回退；停止后续写，下一轮重新采集后会把 Ubuntu 快进上来
+		d := "Mac 已快进到合并提交 " + merged + "，Ubuntu 未更新（下一轮重新判定）: " + o.detail
+		r.addBranch(act, ResultFailed, d)
+		if o.oos {
+			r.outOfScope(SideUbuntu, o.detail, []string{o.detail})
+		}
+		r.att(AttentionItem{Kind: AttApplyFailed, Side: SideUbuntu, Branch: act.Name,
+			Message: fmt.Sprintf("分支 %s：Mac 已快进到合并提交，Ubuntu 更新失败（未写入），本轮停止后续写", act.Name), Detail: o.detail})
+		r.stop(fmt.Sprintf("分支 %s：Mac 已更新、Ubuntu 快进失败", act.Name), false, SideUbuntu, act.Name)
 	}
-	r.addBranch(act, ResultDone, fmt.Sprintf("两边分叉但可干净合并，已生成合并提交 %s（父提交：mac %s、ubuntu %s），两边都已更新", merged, short(bf.Mac), short(bf.Ubuntu)))
 }
 
 func summarize(res *RoundResult) string {

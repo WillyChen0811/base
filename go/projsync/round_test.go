@@ -410,3 +410,168 @@ func TestRoundNowInjected(t *testing.T) {
 		t.Fatalf("%v %v", res.Started, res.Finished)
 	}
 }
+
+// ── 预检与 AutoMerge 顺序（审查修正）──
+
+// gitlinkBranch 在 dir 仓库里新建分支 name：内容 = main 的树 + 一个 gitlink（子模块），不动工作区与 HEAD。
+func gitlinkBranch(t *testing.T, dir, name string) string {
+	t.Helper()
+	idx := filepath.Join(t.TempDir(), "idx")
+	run := func(args ...string) string {
+		cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
+		cmd.Env = append(os.Environ(), "GIT_INDEX_FILE="+idx)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v: %v %s", args, err, out)
+		}
+		return strings.TrimSpace(string(out))
+	}
+	base := rev(t, dir, "main")
+	run("read-tree", base)
+	run("update-index", "--add", "--cacheinfo", "160000,"+base+",sub")
+	tree := run("write-tree")
+	c := run("commit-tree", tree, "-p", base, "-m", "含子模块")
+	ag(t, dir, "branch", name, c)
+	return c
+}
+
+func branchExists(dir, name string) bool {
+	return exec.Command("git", "-C", dir, "rev-parse", "--verify", "-q", "refs/heads/"+name).Run() == nil
+}
+
+func TestRoundPreflightCommitTreeBlocksEarlierPlainBranch(t *testing.T) {
+	p := newPair(t)
+	m := commitFile(t, p.mac, "m.txt", "m\n") // main：Mac 领先，本可普通快进
+	gitlinkBranch(t, p.ubu, "z")              // z 只在 Ubuntu，提交树含子模块
+	ubuMain := rev(t, p.ubu, "main")
+	res := RunRound(context.Background(), p.env(&ubuRunner{}))
+	if !res.OutOfScope || hasAtt(res, AttOutOfScope) == nil || !res.NeedsAttention {
+		t.Fatalf("应判超出范围: %+v", res)
+	}
+	if !strings.Contains(res.Error, "不写任何东西") || len(res.Branches) != 0 {
+		t.Fatalf("预检阶段发现，应整轮不写: %+v", res)
+	}
+	if rev(t, p.ubu, "main") != ubuMain || rev(t, p.mac, "main") != m {
+		t.Fatal("a 分支（main）也不得更新")
+	}
+	if branchExists(p.mac, "z") {
+		t.Fatal("Mac 不得创建 z")
+	}
+}
+
+func TestRoundPreflightLocalOnlyBranchMergeOptions(t *testing.T) {
+	p := newPair(t)
+	commitFile(t, p.mac, "m.txt", "m\n")
+	ag(t, p.mac, "branch", "only", "main")
+	ag(t, p.mac, "config", "branch.only.mergeOptions", "--no-ff")
+	ubuMain := rev(t, p.ubu, "main")
+	res := RunRound(context.Background(), p.env(&ubuRunner{}))
+	if !res.OutOfScope || len(res.Branches) != 0 || !strings.Contains(res.Error, "不写任何东西") {
+		t.Fatalf("本地独有分支的 mergeOptions 应整轮不写: %+v", res)
+	}
+	if rev(t, p.ubu, "main") != ubuMain || branchExists(p.ubu, "only") {
+		t.Fatal("Ubuntu 不得被写")
+	}
+}
+
+func TestRoundSecondPreflightAfterAutoCommitReportsWrites(t *testing.T) {
+	p := newPair(t)
+	// 提交前钩子在提交时塞进一个 gitlink：自动提交前一切在范围内，提交后新提交含子模块
+	hook := filepath.Join(p.ubu, ".git", "hooks", "pre-commit")
+	write(t, hook, "#!/bin/sh\ngit update-index --add --cacheinfo 160000,$(git rev-parse HEAD),sub\n")
+	os.Chmod(hook, 0o755)
+	os.WriteFile(filepath.Join(p.ubu, "x.txt"), []byte("x\n"), 0o644)
+	// Mac 另有一个普通新分支：被拦下后不得同步
+	ag(t, p.mac, "branch", "feat", "main")
+	res := RunRound(context.Background(), p.env(&ubuRunner{verdict: "finished"}))
+	if !res.OutOfScope || !res.NeedsAttention {
+		t.Fatalf("提交后的新事实应被拦下: %+v", res)
+	}
+	committed := false
+	for _, w := range res.Worktrees {
+		if w.Action == WtCommitted {
+			committed = true
+		}
+	}
+	if !committed {
+		t.Fatalf("本例应已自动提交: %+v", res.Worktrees)
+	}
+	if !res.Stopped || !strings.Contains(res.Error, "已完成的写入") || strings.Contains(res.Error, "本轮不写任何东西") {
+		t.Fatalf("已提交的要如实报告: %+v", res)
+	}
+	if branchExists(p.ubu, "feat") {
+		t.Fatal("被拦下后 feat 不得同步")
+	}
+}
+
+// failExchangeWhenTmp 包装 Exchange：合并提交的传送用临时分支存在时（即传送那一次）返回错误。
+func failExchangeWhenTmp(p rpair, env RoundEnv) RoundEnv {
+	orig := env.Exchange
+	env.Exchange = func(ctx context.Context) error {
+		out, _ := exec.Command("git", "-C", p.mac, "for-each-ref", "refs/heads/xxyi-tmp-merge-*").Output()
+		if len(out) > 0 {
+			return fmt.Errorf("注入：传送失败")
+		}
+		return orig(ctx)
+	}
+	return env
+}
+
+func TestRoundAutoMergeTransferFailureUpdatesNeitherSide(t *testing.T) {
+	p := newPair(t)
+	m := commitFile(t, p.mac, "a.txt", "a\n")
+	u := commitFile(t, p.ubu, "b.txt", "b\n")
+	res := RunRound(context.Background(), failExchangeWhenTmp(p, p.env(&ubuRunner{})))
+	if rev(t, p.mac, "main") != m || rev(t, p.ubu, "main") != u {
+		t.Fatal("先传后快进：传送失败时两边分支都不得更新")
+	}
+	if b := findBranch(t, res, "main"); b.Result != ResultFailed || !strings.Contains(b.Detail, "两边分支都未更新") {
+		t.Fatalf("%+v", b)
+	}
+	if !res.Stopped || !res.NeedsAttention {
+		t.Fatalf("应停止并提示: %+v", res)
+	}
+	out := ag(t, p.mac, "for-each-ref", "refs/heads/xxyi-tmp-merge-*")
+	if out != "" {
+		t.Fatalf("临时引用应已删除: %s", out)
+	}
+}
+
+// beforeApplyRunner 在每次 apply 之前执行 hook（用于制造 Ubuntu 一侧的现场变化）。
+type beforeApplyRunner struct {
+	*ubuRunner
+	hook func()
+}
+
+func (b *beforeApplyRunner) Run(ctx context.Context, cmd string, stdin []byte) ([]byte, []byte, int, error) {
+	if f := strings.Fields(cmd); len(f) > 1 && f[1] == SubcmdApply && b.hook != nil {
+		h := b.hook
+		b.hook = nil
+		h()
+	}
+	return b.ubuRunner.Run(ctx, cmd, stdin)
+}
+
+func TestRoundAutoMergeUbuntuFastForwardFailureKeepsMac(t *testing.T) {
+	p := newPair(t)
+	commitFile(t, p.mac, "a.txt", "a\n")
+	commitFile(t, p.ubu, "b.txt", "b\n")
+	var u2 string
+	r := &beforeApplyRunner{ubuRunner: &ubuRunner{}, hook: func() {
+		u2 = commitFile(t, p.ubu, "c.txt", "c\n") // Ubuntu 的 main 在判定后又前进：旧值对不上，快进被拒
+	}}
+	res := RunRound(context.Background(), p.env(r))
+	merged := rev(t, p.mac, "main")
+	if merged == rev(t, p.mac, "main^1") || rev(t, p.mac, "main^2") == "" {
+		t.Fatal("Mac 应已快进到合并提交并保留")
+	}
+	if rev(t, p.ubu, "main") != u2 {
+		t.Fatal("Ubuntu 的 main 应保持它自己的新提交，未被改写")
+	}
+	if !res.Stopped || !res.NeedsAttention || hasAtt(res, AttApplyFailed) == nil {
+		t.Fatalf("应停止并需要处理: %+v", res)
+	}
+	if b := findBranch(t, res, "main"); b.Result != ResultFailed || !strings.Contains(b.Detail, "Mac 已快进") {
+		t.Fatalf("%+v", b)
+	}
+}

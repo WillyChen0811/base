@@ -11,12 +11,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/WillyChen0811/base/go/projsync"
 )
@@ -50,6 +51,7 @@ type Pane struct {
 	PID     int
 	State   PaneState
 	Reason  string // 中文，写明依据
+	sig     string // 所用会话记录的大小+修改时间，双采样比对用
 }
 
 // Options 是 Judge 的可注入项。
@@ -59,10 +61,20 @@ type Options struct {
 	ProcTree func() (*ProcTable, error) // 读进程树与命令行；默认读 ps
 }
 
-// ProcTable 是进程表：父→子 pid 列表，以及每个进程的完整命令行（空格连接）。
+// ProcTable 是进程表：父→子 pid 列表、每个进程的完整命令行（空格连接）与启动时间。
 type ProcTable struct {
 	Children map[int][]int
 	Args     map[int]string
+	Start    map[int]time.Time // 读不到启动时间的进程没有条目
+}
+
+// Proc 是窗格进程树里的一个进程。
+type Proc struct {
+	PID        int
+	Args       string
+	Start      time.Time
+	StartKnown bool
+	Root       bool // 窗格进程本身
 }
 
 // ── 纯判定 ────────────────────────────────────────────
@@ -76,8 +88,8 @@ type PaneInput struct {
 	ChildrenKnown bool
 	HasChildren   bool
 
-	// 窗格进程及其子孙的完整命令行；ProcsKnown=false 表示读不到。
-	Procs      []string
+	// 窗格进程（Root）及其子孙；ProcsKnown=false 表示读不到进程表。
+	Procs      []Proc
 	ProcsKnown bool
 
 	Screen    string
@@ -92,6 +104,11 @@ type LogInput struct {
 	Found   bool
 	ReadErr bool
 	Content []byte
+	// Problem 非空表示无法把记录文件可靠地绑定到这个 agent 进程（多个候选、cwd 不符、
+	// 读不到进程启动时间等），内容就是原因；此时一律 Unknown。
+	Problem string
+	Path    string
+	Sig     string // 大小+修改时间，用于前后两次采样比对
 }
 
 const escMark = "esc to interrupt"
@@ -141,19 +158,25 @@ func JudgePane(in PaneInput) (PaneState, string) {
 	if strings.Contains(in.Screen, escMark) {
 		return Busy, why + "屏幕有 esc to interrupt"
 	}
+	if in.Log.Problem != "" {
+		return Unknown, why + in.Log.Problem
+	}
 	if !in.Log.Found {
 		return Unknown, why + "找不到会话记录"
 	}
 	if in.Log.ReadErr {
 		return Unknown, why + "会话记录读不了"
 	}
+	if !lastLineComplete(in.Log.Content) {
+		return Unknown, why + "会话记录最后一行不完整（可能正在写入）"
+	}
 	if cmd == "claude" {
-		if claudeEndTurn(in.Log.Content) {
+		if ok, _ := claudeEndTurn(in.Log.Content); ok {
 			return Done, why + "屏幕无 esc to interrupt，会话记录最后一条 end_turn"
 		}
 		return Unknown, why + "屏幕无 esc to interrupt，但会话记录最后不是 end_turn"
 	}
-	if codexTaskComplete(in.Log.Content) {
+	if ok, _ := codexTaskComplete(in.Log.Content); ok {
 		return Done, why + "屏幕无 esc to interrupt，会话记录最后一个 task_started 之后有 task_complete"
 	}
 	return Unknown, why + "屏幕无 esc to interrupt，但会话记录里最后一个任务未见 task_complete"
@@ -189,10 +212,10 @@ func procKind(cmdline string) (kind string, both bool) {
 }
 
 // identifyAgent 从窗格进程及其子孙的命令行认 agent。两种都出现或认不出 → 空（Unknown）。
-func identifyAgent(procs []string) (kind, why, ambiguous string) {
+func identifyAgent(procs []Proc) (kind, why, ambiguous string) {
 	found := map[string]bool{}
 	for _, p := range procs {
-		k, both := procKind(p)
+		k, both := procKind(p.Args)
 		if both {
 			return "", "", "命令行里同时出现 claude 与 codex，无法确定"
 		}
@@ -211,51 +234,70 @@ func identifyAgent(procs []string) (kind, why, ambiguous string) {
 	return "", "", ""
 }
 
+// lastLineComplete：记录必须以换行结尾，且最后一个非空行是完整 JSON；否则可能正在写入。
+func lastLineComplete(content []byte) bool {
+	if len(content) == 0 || content[len(content)-1] != '\n' {
+		return false
+	}
+	lines := bytes.Split(bytes.TrimRight(content, "\r\n \t"), []byte("\n"))
+	return json.Valid(bytes.TrimSpace(lines[len(lines)-1]))
+}
+
+func parseTS(s string) time.Time {
+	t, err := time.Parse(time.RFC3339Nano, s)
+	if err != nil {
+		return time.Time{}
+	}
+	return t
+}
+
 // claudeEndTurn：最后一条 type=assistant 的 stop_reason 为 end_turn，且其后没有 user/tool_result 记录。
-func claudeEndTurn(content []byte) bool {
-	lastAssistant := -1
-	endTurn := false
-	n := 0
-	var afterUser bool
+// 同时返回那条 end_turn 记录的时间戳（没有则为零值）。
+func claudeEndTurn(content []byte) (bool, time.Time) {
+	seen, endTurn, afterUser := false, false, false
+	var ts time.Time
 	for _, line := range bytes.Split(content, []byte("\n")) {
 		line = bytes.TrimSpace(line)
 		if len(line) == 0 {
 			continue
 		}
 		var rec struct {
-			Type    string `json:"type"`
-			Message struct {
+			Type      string `json:"type"`
+			Timestamp string `json:"timestamp"`
+			Message   struct {
 				StopReason *string `json:"stop_reason"`
 			} `json:"message"`
 		}
 		if json.Unmarshal(line, &rec) != nil {
-			continue // 截断的首行或坏行
+			continue // 截断的首行或坏行（末行是否完整由 lastLineComplete 另查）
 		}
 		switch rec.Type {
 		case "assistant":
-			lastAssistant = n
+			seen = true
 			endTurn = rec.Message.StopReason != nil && *rec.Message.StopReason == "end_turn"
+			ts = parseTS(rec.Timestamp)
 			afterUser = false
 		case "user":
-			if lastAssistant >= 0 {
+			if seen {
 				afterUser = true
 			}
 		}
-		n++
 	}
-	return lastAssistant >= 0 && endTurn && !afterUser
+	return seen && endTurn && !afterUser, ts
 }
 
-// codexTaskComplete：最后一个 task_started 之后有 task_complete。
-func codexTaskComplete(content []byte) bool {
+// codexTaskComplete：最后一个 task_started 之后有 task_complete；同时返回 task_complete 的时间戳。
+func codexTaskComplete(content []byte) (bool, time.Time) {
 	started, complete := false, false
+	var ts time.Time
 	for _, line := range bytes.Split(content, []byte("\n")) {
 		line = bytes.TrimSpace(line)
 		if len(line) == 0 {
 			continue
 		}
 		var rec struct {
-			Payload struct {
+			Timestamp string `json:"timestamp"`
+			Payload   struct {
 				Type string `json:"type"`
 			} `json:"payload"`
 		}
@@ -268,31 +310,36 @@ func codexTaskComplete(content []byte) bool {
 		case "task_complete":
 			if started {
 				complete = true
+				ts = parseTS(rec.Timestamp)
 			}
 		}
 	}
-	return started && complete
+	return started && complete, ts
 }
 
 // Summarize 由各窗格状态得出工作区结论（纯函数）。
+// 任一 Busy → Busy；任一 Unknown → Unknown；至少一个 Done 且其余都是 Idle/Done → Finished；
+// 没有窗格，或只有空闲 shell / 死窗格（没有任何 Done 的 agent）→ NoAgent。
 func Summarize(panes []Pane) Verdict {
-	if len(panes) == 0 {
-		return VerdictNoAgent
-	}
-	unknown := false
+	unknown, done := false, false
 	for _, p := range panes {
 		switch p.State {
 		case Busy:
 			return VerdictBusy
-		case Idle, Done:
+		case Idle:
+		case Done:
+			done = true
 		default:
 			unknown = true
 		}
 	}
-	if unknown {
+	switch {
+	case unknown:
 		return VerdictUnknown
+	case done:
+		return VerdictFinished
 	}
-	return VerdictFinished
+	return VerdictNoAgent
 }
 
 // ── 路径匹配 ──────────────────────────────────────────
@@ -318,8 +365,25 @@ func InWorktree(root, dir string) bool {
 
 // ── 采集 ──────────────────────────────────────────────
 
+// Result 是 JudgeDetail 的完整结果。
+type Result struct {
+	Verdict Verdict
+	Panes   []Pane
+	Notes   []string // 工作区级别的依据（别处写入者、双采样不一致等），中文
+}
+
 // Judge 判断 worktree 里的 agent 是否做完。
 func Judge(ctx context.Context, worktree string, opt Options) (Verdict, []Pane, error) {
+	r, err := JudgeDetail(ctx, worktree, opt)
+	return r.Verdict, r.Panes, err
+}
+
+// JudgeDetail 同 Judge，但额外返回工作区级别的依据。
+func JudgeDetail(ctx context.Context, worktree string, opt Options) (Result, error) {
+	return judgeOnce(ctx, worktree, opt)
+}
+
+func judgeOnce(ctx context.Context, worktree string, opt Options) (Result, error) {
 	tmuxCmd := strings.Fields(opt.Tmux)
 	if len(tmuxCmd) == 0 {
 		tmuxCmd = []string{"tmux"}
@@ -337,9 +401,9 @@ func Judge(ctx context.Context, worktree string, opt Options) (Verdict, []Pane, 
 		"#{pane_id}\t#{pane_pid}\t#{pane_dead}\t#{pane_current_command}\t#{pane_current_path}")
 	if err != nil {
 		if noServer(stderr) {
-			return VerdictNoAgent, nil, nil // tmux 在，但没有服务器 = 没有任何窗格
+			return Result{Verdict: VerdictNoAgent}, nil // tmux 在，但没有服务器 = 没有任何窗格
 		}
-		return VerdictUnknown, nil, fmt.Errorf("tmux list-panes 失败: %v: %s", err, strings.TrimSpace(stderr))
+		return Result{Verdict: VerdictUnknown}, fmt.Errorf("tmux list-panes 失败: %v: %s", err, strings.TrimSpace(stderr))
 	}
 
 	var panes []Pane
@@ -364,28 +428,33 @@ func Judge(ctx context.Context, worktree string, opt Options) (Verdict, []Pane, 
 				if isShell(cmd) {
 					in.ChildrenKnown = true
 					in.HasChildren = len(tree.Children[pid]) > 0
-				} else if cmd != "claude" && cmd != "codex" {
+				} else {
 					in.ProcsKnown = true
-					in.Procs = descendantArgs(tree, pid)
+					in.Procs = descendantProcs(tree, pid)
 				}
 			}
-			if in.ProcsKnown {
+			if in.ProcsKnown && cmd != "claude" && cmd != "codex" {
 				cmd, _, _ = identifyAgent(in.Procs)
 			}
 		}
 		if !p.Dead && (cmd == "claude" || cmd == "codex") {
 			scr, _, cerr := runTmux(ctx, tmuxCmd, "capture-pane", "-p", "-t", p.ID)
 			in.Screen, in.ScreenErr = scr, cerr != nil
-			if cmd == "claude" {
-				in.Log = findClaudeLog(home, p.Path)
-			} else {
-				in.Log = findCodexLog(home, p.Path)
+			start, ok := agentStart(in.Procs, cmd)
+			switch {
+			case !ok:
+				in.Log = LogInput{Found: true, Problem: "读不到 agent 进程的启动时间，无法绑定会话记录"}
+			case cmd == "claude":
+				in.Log = findClaudeLog(home, p.Path, start)
+			default:
+				in.Log = findCodexLog(home, p.Path, start)
 			}
 		}
 		p.State, p.Reason = JudgePane(in)
+		p.sig = in.Log.Sig
 		panes = append(panes, p)
 	}
-	return Summarize(panes), panes, nil
+	return Result{Verdict: Summarize(panes), Panes: panes}, nil
 }
 
 func noServer(stderr string) bool {
@@ -415,17 +484,18 @@ func cleanEnv() []string {
 	return env
 }
 
-// psTree 用 `ps -A -o pid=,ppid=` 建 父→子 表（Linux 与 macOS 通用）。
+// psTree 用 `ps -A -o pid=,ppid=,lstart=,args=` 建进程表（Linux 与 macOS 通用）。
 func psTree() (*ProcTable, error) {
-	cmd := exec.Command("ps", "-A", "-o", "pid=,ppid=,args=")
+	cmd := exec.Command("ps", "-A", "-o", "pid=,ppid=,lstart=,args=")
+	cmd.Env = append(cleanEnv(), "LC_ALL=C", "LANG=C")
 	out, err := cmd.Output()
 	if err != nil {
 		return nil, err
 	}
-	tab := &ProcTable{Children: map[int][]int{}, Args: map[int]string{}}
+	tab := &ProcTable{Children: map[int][]int{}, Args: map[int]string{}, Start: map[int]time.Time{}}
 	for _, line := range strings.Split(string(out), "\n") {
 		f := strings.Fields(line)
-		if len(f) < 2 {
+		if len(f) < 7 {
 			continue
 		}
 		pid, e1 := strconv.Atoi(f[0])
@@ -434,7 +504,10 @@ func psTree() (*ProcTable, error) {
 			continue
 		}
 		tab.Children[ppid] = append(tab.Children[ppid], pid)
-		tab.Args[pid] = strings.Join(f[2:], " ")
+		tab.Args[pid] = strings.Join(f[7:], " ")
+		if t, err := time.ParseInLocation("Mon Jan _2 15:04:05 2006", strings.Join(f[2:7], " "), time.Local); err == nil {
+			tab.Start[pid] = t
+		}
 	}
 	if len(tab.Args) == 0 {
 		return nil, errors.New("ps 没有输出")
@@ -442,9 +515,9 @@ func psTree() (*ProcTable, error) {
 	return tab, nil
 }
 
-// descendantArgs 返回 pid 自己及其所有子孙的命令行。
-func descendantArgs(t *ProcTable, pid int) []string {
-	var res []string
+// descendantProcs 返回 pid 自己（Root）及其所有子孙。
+func descendantProcs(t *ProcTable, pid int) []Proc {
+	var res []Proc
 	seen := map[int]bool{}
 	stack := []int{pid}
 	for len(stack) > 0 {
@@ -455,25 +528,46 @@ func descendantArgs(t *ProcTable, pid int) []string {
 		}
 		seen[p] = true
 		if a, ok := t.Args[p]; ok {
-			res = append(res, a)
+			st, known := t.Start[p]
+			res = append(res, Proc{PID: p, Args: a, Start: st, StartKnown: known, Root: p == pid})
 		}
 		stack = append(stack, t.Children[p]...)
 	}
 	return res
 }
 
-const tailBytes = 8 << 20
+// agentStart 返回命令行属于 kind 的进程里最早的启动时间。
+func agentStart(procs []Proc, kind string) (time.Time, bool) {
+	var best time.Time
+	ok := false
+	for _, p := range procs {
+		if k, _ := procKind(p.Args); k != kind || !p.StartKnown {
+			continue
+		}
+		if !ok || p.Start.Before(best) {
+			best, ok = p.Start, true
+		}
+	}
+	return best, ok
+}
 
-// readTail 读文件末尾最多 tailBytes 字节。
-func readTail(path string) ([]byte, error) {
+const (
+	tailBytes = 8 << 20
+	headBytes = 4 << 20
+	// 记录文件的首条时间戳允许比进程启动时间早这么多（时钟取整与启动先后的误差）。
+	startSlack = 5 * time.Second
+)
+
+// readTail 读文件末尾最多 tailBytes 字节，并返回读取前的大小与修改时间组成的签名。
+func readTail(path string) ([]byte, string, error) {
 	f, err := os.Open(path)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	defer f.Close()
 	st, err := f.Stat()
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	off := int64(0)
 	if st.Size() > tailBytes {
@@ -481,21 +575,44 @@ func readTail(path string) ([]byte, error) {
 	}
 	buf := make([]byte, st.Size()-off)
 	if _, err := f.ReadAt(buf, off); err != nil && len(buf) > 0 {
+		return nil, "", err
+	}
+	return buf, fmt.Sprintf("%d|%d", st.Size(), st.ModTime().UnixNano()), nil
+}
+
+// readHeadLines 读文件开头最多 headBytes 字节的完整行。
+func readHeadLines(path string) ([][]byte, error) {
+	f, err := os.Open(path)
+	if err != nil {
 		return nil, err
 	}
-	return buf, nil
+	defer f.Close()
+	buf := make([]byte, headBytes)
+	n, err := f.Read(buf)
+	if err != nil && n == 0 {
+		if errors.Is(err, io.EOF) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	buf = buf[:n]
+	if n == headBytes { // 丢掉被截断的最后一行
+		if i := bytes.LastIndexByte(buf, '\n'); i >= 0 {
+			buf = buf[:i]
+		}
+	}
+	return bytes.Split(buf, []byte("\n")), nil
 }
 
 type fileMod struct {
 	path string
-	mod  int64
+	mod  time.Time
 }
 
-func newestFirst(fs []fileMod) {
-	sort.Slice(fs, func(i, j int) bool { return fs[i].mod > fs[j].mod })
-}
-
-func findClaudeLog(home, paneDir string) LogInput {
+// findClaudeLog 找属于该 agent 进程的会话记录：目录里首条带时间戳的记录
+// ≥ 进程启动时间 − 5 秒的 .jsonl，恰好一个才用；零个或多个 → Problem。
+// 记录里的首个 cwd 必须等于窗格目录。
+func findClaudeLog(home, paneDir string, start time.Time) LogInput {
 	dir := filepath.Join(home, ".claude", "projects", projsync.ClaudeDirName(paneDir))
 	ents, err := os.ReadDir(dir)
 	if err != nil {
@@ -504,30 +621,78 @@ func findClaudeLog(home, paneDir string) LogInput {
 		}
 		return LogInput{Found: true, ReadErr: true}
 	}
-	var fs []fileMod
+	type cand struct {
+		path string
+		cwd  string
+	}
+	var cs []cand
 	for _, e := range ents {
 		if e.IsDir() || !strings.HasSuffix(e.Name(), ".jsonl") {
 			continue
 		}
 		info, err := e.Info()
+		if err != nil || info.ModTime().Before(start.Add(-startSlack)) {
+			continue // 最后修改早于进程启动，不可能是它的
+		}
+		path := filepath.Join(dir, e.Name())
+		lines, err := readHeadLines(path)
 		if err != nil {
+			return LogInput{Found: true, ReadErr: true}
+		}
+		var first time.Time
+		cwd := ""
+		for _, ln := range lines {
+			var rec struct {
+				Timestamp string `json:"timestamp"`
+				Cwd       string `json:"cwd"`
+			}
+			if json.Unmarshal(ln, &rec) != nil {
+				continue
+			}
+			if first.IsZero() {
+				first = parseTS(rec.Timestamp)
+			}
+			if cwd == "" {
+				cwd = rec.Cwd
+			}
+			if !first.IsZero() && cwd != "" {
+				break
+			}
+		}
+		if first.IsZero() || first.Before(start.Add(-startSlack)) {
 			continue
 		}
-		fs = append(fs, fileMod{filepath.Join(dir, e.Name()), info.ModTime().UnixNano()})
+		cs = append(cs, cand{path, cwd})
 	}
-	if len(fs) == 0 {
-		return LogInput{}
+	paths := make([]string, len(cs))
+	for i, c := range cs {
+		paths[i] = c.path
 	}
-	newestFirst(fs)
-	b, err := readTail(fs[0].path)
+	return pickLog(paths, func(i int) string { return cs[i].cwd }, paneDir)
+}
+
+// pickLog 在候选里挑唯一的一个并读出内容；cwd 为空表示记录里没有 cwd 字段，不核对。
+func pickLog(paths []string, cwdOf func(int) string, paneDir string) LogInput {
+	switch len(paths) {
+	case 0:
+		return LogInput{Found: true, Problem: "没有晚于 agent 启动的会话记录，无法绑定"}
+	case 1:
+	default:
+		return LogInput{Found: true, Problem: fmt.Sprintf("有 %d 个会话记录晚于 agent 启动，无法确定哪个属于它", len(paths))}
+	}
+	if c := cwdOf(0); c != "" && canon(c) != canon(paneDir) {
+		return LogInput{Found: true, Problem: "会话记录里的 cwd（" + c + "）与窗格目录不符"}
+	}
+	b, sig, err := readTail(paths[0])
 	if err != nil {
 		return LogInput{Found: true, ReadErr: true}
 	}
-	return LogInput{Found: true, Content: b}
+	return LogInput{Found: true, Content: b, Path: paths[0], Sig: sig}
 }
 
-// findCodexLog 在 ~/.codex/sessions 下找 session_meta 的 cwd 等于窗格目录的最近一个 rollout。
-func findCodexLog(home, paneDir string) LogInput {
+// findCodexLog 在 ~/.codex/sessions 下找 session_meta 的 cwd 等于窗格目录、
+// 且开始时间 ≥ 进程启动时间 − 5 秒的 rollout，恰好一个才用。
+func findCodexLog(home, paneDir string, start time.Time) LogInput {
 	root := filepath.Join(home, ".codex", "sessions")
 	var fs []fileMod
 	_ = filepath.WalkDir(root, func(p string, d os.DirEntry, err error) error {
@@ -536,32 +701,32 @@ func findCodexLog(home, paneDir string) LogInput {
 		}
 		n := d.Name()
 		if strings.HasPrefix(n, "rollout-") && strings.HasSuffix(n, ".jsonl") {
-			if info, e := d.Info(); e == nil {
-				fs = append(fs, fileMod{p, info.ModTime().UnixNano()})
+			if info, e := d.Info(); e == nil && !info.ModTime().Before(start.Add(-startSlack)) {
+				fs = append(fs, fileMod{p, info.ModTime()})
 			}
 		}
 		return nil
 	})
-	newestFirst(fs)
 	want := canon(paneDir)
+	var paths []string
 	for _, f := range fs {
-		cwd, ok := codexCwd(f.path)
-		if !ok || canon(cwd) != want {
+		cwd, ts, ok := codexMeta(f.path)
+		if !ok || canon(cwd) != want || ts.Before(start.Add(-startSlack)) {
 			continue
 		}
-		b, err := readTail(f.path)
-		if err != nil {
-			return LogInput{Found: true, ReadErr: true}
-		}
-		return LogInput{Found: true, Content: b}
+		paths = append(paths, f.path)
 	}
-	return LogInput{}
+	if len(paths) == 0 && len(fs) == 0 {
+		return LogInput{}
+	}
+	return pickLog(paths, func(int) string { return "" }, paneDir)
 }
 
-func codexCwd(path string) (string, bool) {
+// codexMeta 读首行 session_meta 的 payload.cwd 与开始时间（payload.timestamp，缺则取外层 timestamp）。
+func codexMeta(path string) (string, time.Time, bool) {
 	f, err := os.Open(path)
 	if err != nil {
-		return "", false
+		return "", time.Time{}, false
 	}
 	defer f.Close()
 	// 首行 session_meta 含很长的 base_instructions（真实样本约 22KB），按行完整读，上限 4MB。
@@ -570,24 +735,33 @@ func codexCwd(path string) (string, bool) {
 	for {
 		chunk, isPrefix, err := r.ReadLine()
 		if err != nil {
-			return "", false
+			return "", time.Time{}, false
 		}
 		line = append(line, chunk...)
 		if !isPrefix {
 			break
 		}
 		if len(line) > 4<<20 {
-			return "", false
+			return "", time.Time{}, false
 		}
 	}
 	var rec struct {
-		Type    string `json:"type"`
-		Payload struct {
-			Cwd string `json:"cwd"`
+		Type      string `json:"type"`
+		Timestamp string `json:"timestamp"`
+		Payload   struct {
+			Cwd       string `json:"cwd"`
+			Timestamp string `json:"timestamp"`
 		} `json:"payload"`
 	}
 	if json.Unmarshal(line, &rec) != nil || rec.Type != "session_meta" || rec.Payload.Cwd == "" {
-		return "", false
+		return "", time.Time{}, false
 	}
-	return rec.Payload.Cwd, true
+	ts := parseTS(rec.Payload.Timestamp)
+	if ts.IsZero() {
+		ts = parseTS(rec.Timestamp)
+	}
+	if ts.IsZero() {
+		return "", time.Time{}, false
+	}
+	return rec.Payload.Cwd, ts, true
 }

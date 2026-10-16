@@ -19,6 +19,15 @@ const (
 	claudeUser = claudeEnd + `{"type":"user","message":{"content":[{"type":"tool_result"}]}}` + "\n"
 )
 
+// procs 把命令行列表做成 Proc（第一个是 Root，启动时间已知）。
+func procs(args ...string) []Proc {
+	var r []Proc
+	for i, a := range args {
+		r = append(r, Proc{PID: 100 + i, Args: a, Start: time.Unix(1000, 0), StartKnown: true, Root: i == 0})
+	}
+	return r
+}
+
 func claudeIn(screen, log string) PaneInput {
 	return PaneInput{Command: "claude", Screen: screen, Log: LogInput{Found: true, Content: []byte(log)}}
 }
@@ -38,6 +47,9 @@ func TestJudgePaneClaude(t *testing.T) {
 		{"记录读不了", PaneInput{Command: "claude", Screen: "> ", Log: LogInput{Found: true, ReadErr: true}}, Unknown},
 		{"屏幕读不了", PaneInput{Command: "claude", ScreenErr: true, Log: LogInput{Found: true, Content: []byte(claudeEnd)}}, Unknown},
 		{"空记录", claudeIn("> ", ""), Unknown},
+		{"最后一行不完整", claudeIn("> ", claudeEnd+`{"type":"assistant","mess`), Unknown},
+		{"不以换行结尾", claudeIn("> ", strings.TrimSuffix(claudeEnd, "\n")), Unknown},
+		{"记录绑定有问题", PaneInput{Command: "claude", Screen: "> ", Log: LogInput{Found: true, Problem: "有 2 个会话记录晚于 agent 启动", Content: []byte(claudeEnd)}}, Unknown},
 		{"shell 无子进程", PaneInput{Command: "bash", ChildrenKnown: true}, Idle},
 		{"shell 有子进程", PaneInput{Command: "zsh", ChildrenKnown: true, HasChildren: true}, Unknown},
 		{"shell 进程树不可读", PaneInput{Command: "sh"}, Unknown},
@@ -92,6 +104,8 @@ func TestSummarize(t *testing.T) {
 		{p(Idle, Done), VerdictFinished},
 		{p(Idle, Unknown), VerdictUnknown},
 		{p(Unknown, Busy, Done), VerdictBusy},
+		{p(Idle), VerdictNoAgent},
+		{p(Idle, Idle), VerdictNoAgent},
 	}
 	for i, c := range cases {
 		if got := Summarize(c.in); got != c.want {
@@ -127,48 +141,93 @@ func TestInWorktree(t *testing.T) {
 	}
 }
 
-func TestFindLogs(t *testing.T) {
+func ts(d time.Duration) string { return time.Now().Add(d).UTC().Format(time.RFC3339Nano) }
+
+func claudeFile(home, dir, name string, first time.Time, cwd string) string {
+	cd := filepath.Join(home, ".claude", "projects", projsync.ClaudeDirName(dir))
+	_ = os.MkdirAll(cd, 0o755)
+	p := filepath.Join(cd, name)
+	body := fmt.Sprintf(`{"type":"mode"}`+"\n"+`{"type":"user","timestamp":%q,"cwd":%q,"message":{}}`+"\n"+
+		`{"type":"assistant","timestamp":%q,"cwd":%q,"message":{"stop_reason":"end_turn"}}`+"\n",
+		first.UTC().Format(time.RFC3339Nano), cwd, first.Add(time.Second).UTC().Format(time.RFC3339Nano), cwd)
+	_ = os.WriteFile(p, []byte(body), 0o644)
+	return p
+}
+
+func TestFindClaudeLogBinding(t *testing.T) {
 	home := t.TempDir()
 	dir := filepath.Join(t.TempDir(), "proj")
 	_ = os.MkdirAll(dir, 0o755)
+	start := time.Now().Add(-time.Minute)
 
-	if l := findClaudeLog(home, dir); l.Found {
+	if l := findClaudeLog(home, dir, start); l.Found {
 		t.Error("没有记录目录应为 Found=false")
 	}
-	cd := filepath.Join(home, ".claude", "projects", projsync.ClaudeDirName(dir))
-	_ = os.MkdirAll(cd, 0o755)
-	old := filepath.Join(cd, "old.jsonl")
-	_ = os.WriteFile(old, []byte(claudeTool), 0o644)
-	_ = os.Chtimes(old, time.Now().Add(-time.Hour), time.Now().Add(-time.Hour))
-	_ = os.WriteFile(filepath.Join(cd, "new.jsonl"), []byte(claudeEnd), 0o644)
-	l := findClaudeLog(home, dir)
-	if !l.Found || !claudeEndTurn(l.Content) {
-		t.Error("应取最近修改的记录")
+	// 启动前的旧会话不算；启动后只有一个 → 用它
+	claudeFile(home, dir, "old.jsonl", start.Add(-time.Hour), dir)
+	_ = os.Chtimes(filepath.Join(home, ".claude", "projects", projsync.ClaudeDirName(dir), "old.jsonl"), start.Add(-time.Hour), start.Add(-time.Hour))
+	mine := claudeFile(home, dir, "mine.jsonl", start.Add(2*time.Second), dir)
+	l := findClaudeLog(home, dir, start)
+	if l.Problem != "" || l.Path != mine {
+		t.Errorf("应只绑定 mine: %+v", l)
 	}
-	// 记录目录不可读 → ReadErr
-	if os.Geteuid() != 0 {
-		_ = os.Chmod(cd, 0)
-		l = findClaudeLog(home, dir)
-		_ = os.Chmod(cd, 0o755)
-		if !l.Found || !l.ReadErr {
-			t.Error("读不了应标 ReadErr")
-		}
+	if ok, _ := claudeEndTurn(l.Content); !ok {
+		t.Error("内容应是 end_turn")
 	}
+	// 启动前 3 秒的首条记录在容差内
+	// 同目录第二个也在启动之后 → Unknown
+	claudeFile(home, dir, "other.jsonl", start.Add(10*time.Second), dir)
+	l = findClaudeLog(home, dir, start)
+	if l.Problem == "" || !strings.Contains(l.Problem, "2 个") {
+		t.Errorf("两个候选应有 Problem: %+v", l)
+	}
+	if st, _ := JudgePane(PaneInput{Command: "claude", Screen: "> ", Log: l}); st != Unknown {
+		t.Error("多候选应 Unknown")
+	}
+}
 
-	sd := filepath.Join(home, ".codex", "sessions", "2026", "10", "16")
+func TestFindClaudeLogCwdMismatch(t *testing.T) {
+	home := t.TempDir()
+	dir := filepath.Join(t.TempDir(), "proj")
+	_ = os.MkdirAll(dir, 0o755)
+	start := time.Now().Add(-time.Minute)
+	claudeFile(home, dir, "a.jsonl", start.Add(time.Second), "/somewhere/else")
+	l := findClaudeLog(home, dir, start)
+	if !strings.Contains(l.Problem, "cwd") {
+		t.Errorf("cwd 不符应有 Problem: %+v", l)
+	}
+}
+
+func TestFindCodexLogBinding(t *testing.T) {
+	home := t.TempDir()
+	dir := t.TempDir()
+	start := time.Now().Add(-time.Minute)
+	sd := filepath.Join(home, ".codex", "sessions", "2026", "10", "15")
 	_ = os.MkdirAll(sd, 0o755)
-	meta := func(cwd string) string {
-		return fmt.Sprintf(`{"type":"session_meta","payload":{"cwd":%q}}`+"\n", cwd)
+	meta := func(cwd string, at time.Time) string {
+		return fmt.Sprintf(`{"timestamp":%q,"type":"session_meta","payload":{"cwd":%q,"timestamp":%q}}`+"\n",
+			at.UTC().Format(time.RFC3339Nano), cwd, at.Add(-time.Second).UTC().Format(time.RFC3339Nano))
 	}
-	tc := `{"type":"event_msg","payload":{"type":"task_started"}}` + "\n" + `{"type":"event_msg","payload":{"type":"task_complete"}}` + "\n"
-	_ = os.WriteFile(filepath.Join(sd, "rollout-other.jsonl"), []byte(meta("/elsewhere")), 0o644)
-	_ = os.WriteFile(filepath.Join(sd, "rollout-mine.jsonl"), []byte(meta(dir)+tc), 0o644)
-	cl := findCodexLog(home, dir)
-	if !cl.Found || !codexTaskComplete(cl.Content) {
-		t.Error("应找到 cwd 匹配的 codex 记录")
+	tc := `{"timestamp":"2026-10-15T01:00:00Z","type":"event_msg","payload":{"type":"task_started"}}` + "\n" +
+		`{"timestamp":"2026-10-15T01:00:09Z","type":"event_msg","payload":{"type":"task_complete"}}` + "\n"
+	w := func(name, body string) {
+		_ = os.WriteFile(filepath.Join(sd, name), []byte(body), 0o644)
 	}
-	if findCodexLog(home, "/nowhere").Found {
-		t.Error("cwd 不匹配不应找到")
+	w("rollout-other.jsonl", meta("/elsewhere", start.Add(time.Second)))
+	w("rollout-mine.jsonl", meta(dir, start.Add(time.Second))+tc)
+	cl := findCodexLog(home, dir, start)
+	if cl.Problem != "" || !strings.HasSuffix(cl.Path, "rollout-mine.jsonl") {
+		t.Fatalf("应找到 cwd 匹配的唯一 rollout: %+v", cl)
+	}
+	if ok, _ := codexTaskComplete(cl.Content); !ok {
+		t.Error("应判 task_complete")
+	}
+	if findCodexLog(home, "/nowhere", start).Problem == "" {
+		t.Error("cwd 不匹配不应绑定到记录")
+	}
+	w("rollout-second.jsonl", meta(dir, start.Add(5*time.Second))+tc)
+	if findCodexLog(home, dir, start).Problem == "" {
+		t.Error("两个候选应有 Problem")
 	}
 }
 
@@ -254,7 +313,7 @@ func TestJudgeIntegration(t *testing.T) {
 		t.Fatal(err)
 	}
 	v, ps = waitCmd(t, opt, ws, "sh")
-	if v != VerdictFinished || ps[0].State != Idle {
+	if v != VerdictNoAgent || ps[0].State != Idle {
 		t.Errorf("sh: %s %+v", v, ps)
 	}
 
@@ -291,7 +350,7 @@ func TestIdentifyByCmdline(t *testing.T) {
 		{"读不到命令行", "node", nil, false, Unknown, "读不到"},
 	}
 	for _, c := range cases {
-		in := PaneInput{Command: c.cmd, Procs: c.procs, ProcsKnown: c.known, Screen: "> "}
+		in := PaneInput{Command: c.cmd, Procs: procs(c.procs...), ProcsKnown: c.known, Screen: "> "}
 		if strings.Contains(c.name, "codex") {
 			in.Log = LogInput{Found: true, Content: []byte(realCodexShape)}
 		} else {
@@ -302,7 +361,7 @@ func TestIdentifyByCmdline(t *testing.T) {
 			t.Errorf("%s: got %s (%s)", c.name, got, reason)
 		}
 	}
-	got, reason := JudgePane(PaneInput{Command: "node", Procs: []string{"node @openai/codex/bin/codex.js"}, ProcsKnown: true, Screen: "esc to interrupt"})
+	got, reason := JudgePane(PaneInput{Command: "node", Procs: procs("node @openai/codex/bin/codex.js"), ProcsKnown: true, Screen: "esc to interrupt"})
 	if got != Busy || !strings.Contains(reason, "命令行含 codex") {
 		t.Errorf("node+codex busy: %s %s", got, reason)
 	}
@@ -310,26 +369,70 @@ func TestIdentifyByCmdline(t *testing.T) {
 
 // 真实 codex rollout 的结构（脱敏，只留 type / payload.type / cwd；首行 session_meta，
 // task_complete 之后还会有 thread_settings_applied 等事件）。
-const realCodexShape = `{"type":"session_meta","payload":{"cwd":"/work/ws","originator":"codex-tui"}}
-{"type":"event_msg","payload":{"type":"task_started"}}
-{"type":"response_item","payload":{"type":"message"}}
-{"type":"event_msg","payload":{"type":"token_count"}}
-{"type":"event_msg","payload":{"type":"task_complete"}}
-{"type":"event_msg","payload":{"type":"thread_settings_applied"}}
+const realCodexShape = `{"timestamp":"2026-10-15T20:28:21.228Z","type":"session_meta","payload":{"cwd":"/work/ws","originator":"codex-tui"}}
+{"timestamp":"2026-10-15T20:28:21.300Z","type":"event_msg","payload":{"type":"task_started"}}
+{"timestamp":"2026-10-15T20:28:22.000Z","type":"response_item","payload":{"type":"message"}}
+{"timestamp":"2026-10-15T20:28:23.000Z","type":"event_msg","payload":{"type":"token_count"}}
+{"timestamp":"2026-10-15T20:28:24.000Z","type":"event_msg","payload":{"type":"task_complete"}}
+{"timestamp":"2026-10-15T20:28:25.000Z","type":"event_msg","payload":{"type":"thread_settings_applied"}}
 `
 
 func TestCodexRealShape(t *testing.T) {
-	if !codexTaskComplete([]byte(realCodexShape)) {
-		t.Error("真实结构应判 task_complete")
+	if ok, ts := codexTaskComplete([]byte(realCodexShape)); !ok || ts.IsZero() {
+		t.Error("真实结构应判 task_complete 且有时间戳")
 	}
 	home := t.TempDir()
 	dir := t.TempDir()
+	start := time.Now().Add(-time.Minute)
 	sd := filepath.Join(home, ".codex", "sessions", "2026", "10", "15")
 	_ = os.MkdirAll(sd, 0o755)
-	first := fmt.Sprintf(`{"type":"session_meta","payload":{"cwd":%q,"base_instructions":{"text":%q}}}`+"\n", dir, strings.Repeat("x", 200<<10))
+	at := start.Add(time.Second).UTC().Format(time.RFC3339Nano)
+	first := fmt.Sprintf(`{"timestamp":%q,"type":"session_meta","payload":{"cwd":%q,"timestamp":%q,"base_instructions":{"text":%q}}}`+"\n", at, dir, at, strings.Repeat("x", 200<<10))
 	_ = os.WriteFile(filepath.Join(sd, "rollout-a.jsonl"), []byte(first+realCodexShape[strings.Index(realCodexShape, "\n")+1:]), 0o644)
-	l := findCodexLog(home, dir)
-	if !l.Found || !codexTaskComplete(l.Content) {
-		t.Error("长首行的 rollout 应能按 cwd 找到并判 Done")
+	l := findCodexLog(home, dir, start)
+	if ok, _ := codexTaskComplete(l.Content); l.Problem != "" || !ok {
+		t.Errorf("长首行的 rollout 应能按 cwd 找到并判 Done: %+v", l.Problem)
+	}
+}
+
+// 起一个名叫 claude 的假 agent（拷贝 sleep 改名，不产生子进程），用于集成测试。
+func fakeClaude(t *testing.T, run func(args ...string) error, ws, session string) {
+	t.Helper()
+	bin := filepath.Join(t.TempDir(), "claude")
+	sleep, err := exec.LookPath("sleep")
+	if err != nil {
+		t.Skip("没有 sleep")
+	}
+	data, err := os.ReadFile(sleep)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(bin, data, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := run("new-session", "-d", "-s", session, "-c", ws, bin+" 300"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestJudgeFakeClaudeFinished(t *testing.T) {
+	tm, run := isolated(t)
+	ws := canon(t.TempDir())
+	home := t.TempDir()
+	opt := Options{Tmux: tm, Home: home}
+	fakeClaude(t, run, ws, "c1")
+
+	// 假 agent 启动后才写入记录
+	waitCmd(t, opt, ws, "claude")
+	claudeFile(home, ws, "s.jsonl", time.Now(), ws)
+	v, ps := waitCmd(t, opt, ws, "claude")
+	if v != VerdictFinished || ps[0].State != Done {
+		t.Fatalf("应 Finished: %s %+v", v, ps)
+	}
+	// 同目录再来一个启动后的记录文件 → 无法确定 → Unknown
+	claudeFile(home, ws, "t.jsonl", time.Now(), ws)
+	v, ps = waitCmd(t, opt, ws, "claude")
+	if v != VerdictUnknown || !strings.Contains(ps[0].Reason, "2 个") {
+		t.Fatalf("两个记录应 Unknown: %s %+v", v, ps)
 	}
 }

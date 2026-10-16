@@ -240,6 +240,53 @@ func (s *Service) msgSend(side string) http.HandlerFunc {
 	}
 }
 
+// msgRecallReq 是 POST /msg/recall 的正文。
+type msgRecallReq struct {
+	ID   string `json:"id"`
+	From string `json:"from"` // 必须属于本侧（mac:/ubuntu:）且等于原消息发件人
+}
+
+// msgRecall 是 POST /msg/recall {id,from}；side 是本侧允许的 From 前缀。
+// 只有原发件人能撤回：from 必须属于本侧且等于原消息的 From。
+// 配了 MsgAuth 时是证书接口：撤回按发送权限的地址前缀检查 from。
+func (s *Service) msgRecall(side string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		body := readMsgBody(w, r)
+		if body == nil {
+			return
+		}
+		cert, ok := s.certCheck(w, r, body)
+		if !ok {
+			return
+		}
+		var req msgRecallReq
+		if err := json.Unmarshal(body, &req); err != nil || req.ID == "" {
+			errJSON(w, http.StatusBadRequest, "正文必须是 {\"id\":..., \"from\":...}")
+			return
+		}
+		if s.cfg.MsgAuth != nil {
+			if code, msg := certAddrPerm(cert.Perm, req.From); code != 0 {
+				errJSON(w, code, msg)
+				return
+			}
+		}
+		if code, msg := checkSide(req.From, side); code != 0 {
+			errJSON(w, code, msg)
+			return
+		}
+		if err := s.hub.Recall(req.ID, req.From); err != nil {
+			if errors.Is(err, ErrNotSender) {
+				errJSON(w, http.StatusForbidden, err.Error())
+				return
+			}
+			msgErr(w, err)
+			return
+		}
+		s.kickMsgPump()
+		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+	}
+}
+
 // unansweredItem 是 /msg/state?check=1 与 /msg/inbox 里欠回复请求的简要形式。
 type unansweredItem struct {
 	ID   string `json:"id"`
@@ -428,6 +475,7 @@ func (s *Service) mountMsgLocal(mux *http.ServeMux) {
 	mux.HandleFunc("/msg/send", only(http.MethodPost, s.msgSend("mac:")))
 	mux.HandleFunc("/msg/state", only(http.MethodPost, s.msgState("mac:")))
 	mux.HandleFunc("/msg/inbox", only(http.MethodGet, s.msgInbox("mac:")))
+	mux.HandleFunc("/msg/recall", only(http.MethodPost, s.msgRecall("mac:")))
 	mux.HandleFunc("/msg/decide", only(http.MethodPost, s.msgDecide))
 	mux.HandleFunc("/msg/auto", only(http.MethodPost, s.msgAuto))
 	mux.HandleFunc("/msg/outbox", only(http.MethodGet, s.msgOutbox))
@@ -440,5 +488,6 @@ func (s *Service) mountMsgRemote(mux *http.ServeMux) {
 	mux.HandleFunc("/msg/send", only(http.MethodPost, s.msgSend("ubuntu:")))
 	mux.HandleFunc("/msg/state", only(http.MethodPost, s.msgState("ubuntu:")))
 	mux.HandleFunc("/msg/inbox", only(http.MethodGet, s.msgInbox("ubuntu:")))
+	mux.HandleFunc("/msg/recall", only(http.MethodPost, s.msgRecall("ubuntu:")))
 	mux.HandleFunc("/msg/who", only(http.MethodGet, s.msgWho))
 }

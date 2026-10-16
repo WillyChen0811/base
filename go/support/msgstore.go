@@ -427,7 +427,7 @@ func (h *Hub) cleanupOrphanAttachments() {
 	}
 	keep := make(map[string]bool)
 	for _, m := range h.msgs {
-		if m.State != MsgDelivered && m.State != MsgRejected {
+		if m.State != MsgDelivered && m.State != MsgRejected && m.State != MsgRecalled {
 			keep[m.ID] = true
 		}
 	}

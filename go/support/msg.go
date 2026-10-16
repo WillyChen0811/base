@@ -9,6 +9,7 @@ import (
 	"path"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -25,6 +26,7 @@ const (
 	MsgInjected   MsgState = "injected"    // 已注入对方终端，等对方下一次上报确认（Now 消息不做这一步）
 	MsgDelivered  MsgState = "delivered"   // 已送达（对方确认收到）
 	MsgRejected   MsgState = "rejected"    // 用户拒绝
+	MsgRecalled   MsgState = "recalled"    // 原发件人撤回（未送达的直接取消；已送达的保留原文，面板显示为划掉）
 	MsgSyncFailed MsgState = "sync_failed" // 同步重试用完（预算内先自动重试），等用户处理
 	MsgFailed     MsgState = "failed"      // 重试预算用完，需人工处理（带失败报告）
 )
@@ -205,7 +207,14 @@ const (
 	overdueNoticeFmt = "#%s 发给 %s 的请求超过 %s没有回复（对方状态：%s）。需要的话请换个方式或交给用户。"
 	// overdueLogKind 是欠回复超时的日志 kind。
 	overdueLogKind = "msg_overdue"
+	// recallNoticeFmt 是撤回已送达消息时给收件人的系统通知正文。
+	recallNoticeFmt = "#%s 已被发件人撤回（终端里已出现的文字请忽略，不必再处理或回复）。"
+	// recallLogKind 是撤回的日志 kind。
+	recallLogKind = "msg_recall"
 )
+
+// ErrNotSender 表示撤回者不是原消息的发件人。
+var ErrNotSender = errors.New("support: 只有原发件人能撤回自己的消息")
 
 var addrNameIllegal = regexp.MustCompile(`[^A-Za-z0-9._-]`)
 
@@ -879,7 +888,7 @@ func (h *Hub) markOverdueReplies() {
 // 被拒绝的回复等于没回，之后还可以再回复）。调用方须持锁。
 func (h *Hub) hasLiveReplyLocked(reqID, from string) (string, bool) {
 	for _, m := range h.msgs {
-		if m.Kind == KindReply && m.ReplyTo == reqID && m.From == from && m.State != MsgRejected {
+		if m.Kind == KindReply && m.ReplyTo == reqID && m.From == from && m.State != MsgRejected && m.State != MsgRecalled {
 			return m.ID, true
 		}
 	}
@@ -926,7 +935,7 @@ func (h *Hub) trimLocked() (wake chan struct{}) {
 	for len(h.msgs) > maxMsgKeep {
 		idx := -1
 		for i, m := range h.msgs {
-			if m.State == MsgDelivered || m.State == MsgRejected {
+			if m.State == MsgDelivered || m.State == MsgRejected || m.State == MsgRecalled {
 				idx = i
 				break
 			}
@@ -1470,6 +1479,94 @@ func (h *Hub) Decide(id, action string) error {
 	}
 	h.logMsg(out)
 	h.persist() // 决定后的状态/Now/Synced/附件释放（删附件文件）落盘
+	return nil
+}
+
+// Recall 由原发件人（from）撤回自己发出的消息。
+// 还没到对方终端的（pending/queued/sync_failed/failed）直接取消：状态置 recalled，
+// 移出 outbox，对方永远收不到；已到对方终端的（injected/delivered，以及正被注入或
+// 已被 Mac 取走未确认的 queued）状态置 recalled 但保留原文，并给收件人补一条
+// 「#<id> 已被发件人撤回」系统通知。rejected/recalled 再撤回报错。
+// 撤回的回复会让原请求重新变成未回复（可以再回复）。
+func (h *Hub) Recall(id, from string) error {
+	h.mu.Lock()
+	i := h.findLocked(id)
+	if i < 0 {
+		h.mu.Unlock()
+		return ErrMsgNotFound
+	}
+	cur := &h.msgs[i]
+	if cur.From != from {
+		h.mu.Unlock()
+		return ErrNotSender
+	}
+	reached := false
+	switch cur.State {
+	case MsgPending, MsgSyncFailed, MsgFailed:
+	case MsgQueued:
+		_, taken := h.takenAt[id]
+		reached = h.injecting[id] || taken // 正在注入或已被取走：文字可能已进对方终端
+	case MsgInjected, MsgDelivered:
+		reached = true
+	default:
+		st := cur.State
+		h.mu.Unlock()
+		return fmt.Errorf("support: 消息 %s 当前状态 %s，不能撤回", id, st)
+	}
+	cur.State = MsgRecalled
+	cur.Reason = ""
+	var wake chan struct{}
+	if h.removeFromOutboxLocked(id) {
+		wake = h.flipWakeupLocked()
+	}
+	delete(h.outPlaced, id)
+	delete(h.takenAt, id)
+	delete(h.nextTry, id)
+	delete(h.fails, id)
+	clearStageBudgetLocked(h, id)
+	delete(h.injectedAt, id)
+	delete(h.ackSeq, id)
+	delete(h.ackBase, id)
+	delete(h.deliveredAt, id)
+	// injecting 留给 pumpOne 注入结束时自己清
+	h.releaseAttachLocked(cur)
+	if cur.Kind == KindReply && cur.ReplyTo != "" {
+		if _, live := h.hasLiveReplyLocked(cur.ReplyTo, cur.From); !live {
+			if j := h.findLocked(cur.ReplyTo); j >= 0 {
+				h.msgs[j].Answered = false
+			}
+		}
+	}
+	out := *cur
+	var draft Message
+	if reached {
+		draft = newSystemNotice(h.now(), h.reserveIDLocked(), cur.To, fmt.Sprintf(recallNoticeFmt, id))
+	}
+	h.markDirtyLocked()
+	h.mu.Unlock()
+
+	if wake != nil {
+		close(wake)
+	}
+	var notice *Message
+	if reached {
+		if h.cfg.Sign != nil { // 不允许持 h.mu 调 Sign
+			draft.Sig = h.cfg.Sign(xxyica.MessageSigningBytes(msgSignFields(draft)))
+		}
+		h.mu.Lock()
+		h.msgs = append(h.msgs, draft)
+		h.markDirtyLocked()
+		h.mu.Unlock()
+		notice = &draft
+	}
+	if h.cfg.Log != nil {
+		h.cfg.Log(recallLogKind, map[string]string{"id": id, "from": out.From, "to": out.To, "notified": strconv.FormatBool(reached)})
+	}
+	h.logMsg(out)
+	if notice != nil {
+		h.logMsg(*notice)
+	}
+	h.persist()
 	return nil
 }
 

@@ -143,6 +143,12 @@ type RoundResult struct {
 	Summary        string   `json:"summary"`
 }
 
+// tmpMergePrefix 是 AutoMerge 传送合并提交用的临时分支前缀。它只是传送载体，不是用户分支：
+// 采集、判定、范围预检时一律忽略（Mac 与 Ubuntu 两侧都忽略），以免中断后的残留被当成新分支同步。
+const tmpMergePrefix = "xxyi-tmp-merge-"
+
+func isTmpMerge(name string) bool { return strings.HasPrefix(name, tmpMergePrefix) }
+
 // ── 互斥 ──────────────────────────────────────────
 
 var repoLocks = struct {
@@ -270,7 +276,50 @@ func RunRound(ctx context.Context, env RoundEnv) (res RoundResult) {
 	return
 }
 
+// cleanupTmpMerge 清理 Mac 本地遗留的临时分支（上一轮在删除前被中断）：只删引用（带旧值），不碰工作区；
+// 正被某个工作区检出的不删，记 needs_attention。结果写进 Notes。
+func (r *roundRun) cleanupTmpMerge(ctx context.Context) {
+	out, err := runGit(ctx, r.env.Repo, nil, "for-each-ref", "--format=%(objectname) %(refname)", "refs/heads/"+tmpMergePrefix+"*")
+	if err != nil {
+		r.res.Notes = append(r.res.Notes, "检查遗留临时分支失败: "+err.Error())
+		return
+	}
+	lines := nameLines(out)
+	if len(lines) == 0 {
+		return
+	}
+	checked := map[string]bool{}
+	if wo, err := runGit(ctx, r.env.Repo, nil, "worktree", "list", "--porcelain"); err == nil {
+		for _, l := range strings.Split(string(wo), "\n") {
+			if v, ok := strings.CutPrefix(l, "branch "); ok {
+				checked[v] = true
+			}
+		}
+	} else {
+		r.res.Notes = append(r.res.Notes, "无法列出工作区，遗留临时分支未清理: "+err.Error())
+		return
+	}
+	for _, line := range lines {
+		oid, ref, ok := strings.Cut(line, " ")
+		if !ok {
+			continue
+		}
+		if checked[ref] {
+			r.res.Notes = append(r.res.Notes, "遗留临时分支 "+ref+" 正被工作区检出，未删除")
+			r.att(AttentionItem{Kind: AttApplyFailed, Side: SideMac, Branch: strings.TrimPrefix(ref, "refs/heads/"),
+				Message: "遗留的临时分支 " + ref + " 正被工作区检出，未清理，请手动处理"})
+			continue
+		}
+		if _, err := runGit(ctx, r.env.Repo, nil, "update-ref", "-d", ref, oid); err != nil {
+			r.res.Notes = append(r.res.Notes, "删除遗留临时分支 "+ref+" 失败: "+err.Error())
+			continue
+		}
+		r.res.Notes = append(r.res.Notes, "已清理遗留临时分支 "+ref)
+	}
+}
+
 func (r *roundRun) run(ctx context.Context) {
+	r.cleanupTmpMerge(ctx)
 	// a) 交换引用 b) 采集
 	if !r.exchangeAndCollect(ctx) {
 		return
@@ -358,11 +407,14 @@ func (r *roundRun) collect(ctx context.Context) bool {
 	seen := map[string]bool{}
 	var names []string
 	for _, n := range localNames {
+		if isTmpMerge(n) {
+			continue
+		}
 		seen[n] = true
 		names = append(names, n)
 	}
 	for n := range rf.Branches {
-		if !seen[n] {
+		if !seen[n] && !isTmpMerge(n) {
 			names = append(names, n)
 		}
 	}
@@ -667,6 +719,14 @@ func (r *roundRun) decideAndApply(ctx context.Context) {
 		return
 	}
 	facts := map[string]BranchFacts{}
+	kept := bfs[:0]
+	for _, b := range bfs {
+		if isTmpMerge(b.Name) {
+			continue
+		}
+		kept = append(kept, b)
+	}
+	bfs = kept
 	for _, b := range bfs {
 		facts[b.Name] = b
 	}

@@ -575,3 +575,41 @@ func TestRoundAutoMergeUbuntuFastForwardFailureKeepsMac(t *testing.T) {
 		t.Fatalf("%+v", b)
 	}
 }
+
+func TestRoundLeftoverTmpMergeBranchIsCleanedAndIgnored(t *testing.T) {
+	p := newPair(t)
+	c := commitFile(t, p.mac, "m.txt", "m\n")
+	name := tmpMergePrefix + c
+	ag(t, p.mac, "branch", name, c)                                     // Mac 上的残留
+	ag(t, p.ubu, "branch", tmpMergePrefix+"old", rev(t, p.ubu, "main")) // Ubuntu 上的早期残留
+	res := RunRound(context.Background(), p.env(&ubuRunner{}))
+	if res.Error != "" || res.NeedsAttention {
+		t.Fatalf("%+v", res)
+	}
+	if branchExists(p.mac, name) {
+		t.Fatal("Mac 上的残留应被删除")
+	}
+	if branchExists(p.ubu, name) {
+		t.Fatal("残留不得在 Ubuntu 创建")
+	}
+	if branchExists(p.mac, tmpMergePrefix+"old") || !branchExists(p.ubu, tmpMergePrefix+"old") {
+		t.Fatal("Ubuntu 的同名前缀分支应被忽略：不同步回 Mac，也不被删")
+	}
+	for _, b := range res.Branches {
+		if isTmpMerge(b.Name) {
+			t.Fatalf("临时分支不应出现在结果里: %+v", b)
+		}
+	}
+	if rev(t, p.ubu, "main") != c {
+		t.Fatal("正常分支照常同步")
+	}
+	found := false
+	for _, n := range res.Notes {
+		if strings.Contains(n, "已清理遗留临时分支") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("Notes 应记录清理: %v", res.Notes)
+	}
+}

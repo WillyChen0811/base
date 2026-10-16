@@ -30,6 +30,9 @@ const (
 	StateTimeout = "timeout"
 )
 
+// MaxOutputBytes 是单个 job 的 stdout+stderr 合计上限；超过就杀掉进程组、任务标 failed。
+const MaxOutputBytes int64 = 32 << 20
+
 // Spec 描述一次要执行的命令：argv 直接 exec（不经 shell），Env 为空则继承当前环境。
 type Spec struct {
 	Action  string        `json:"action"`
@@ -75,7 +78,45 @@ func NewRunner(dir string, keep int) (*Runner, error) {
 	if err := os.MkdirAll(absDir, 0o700); err != nil {
 		return nil, fmt.Errorf("runner 目录创建失败 %q: %w", absDir, err)
 	}
-	return &Runner{dir: absDir, keep: keep, jobs: map[string]*Job{}}, nil
+	r := &Runner{dir: absDir, keep: keep, jobs: map[string]*Job{}}
+	r.recoverStaleRunning()
+	return r, nil
+}
+
+// recoverStaleRunning 清算上个进程留下的 running 任务：一律改成 failed 并注明
+// 「执行器重启，任务中断」——不去接管已失控的进程，只把状态记实。
+// 在 NewRunner 里调用，此时 Runner 还没交给别人，不加锁。
+func (r *Runner) recoverStaleRunning() {
+	entries, err := os.ReadDir(r.dir)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
+			continue
+		}
+		id := strings.TrimSuffix(e.Name(), ".json")
+		if !jobIDPattern.MatchString(id) {
+			continue
+		}
+		data, err := os.ReadFile(r.jsonPath(id))
+		if err != nil {
+			continue
+		}
+		var job Job
+		if err := json.Unmarshal(data, &job); err != nil {
+			continue
+		}
+		if job.State != StateRunning {
+			continue
+		}
+		job.State = StateFailed
+		job.Note = "执行器重启，任务中断"
+		if job.Ended.IsZero() {
+			job.Ended = time.Now()
+		}
+		_ = r.persistLocked(&job)
+	}
 }
 
 // Start 启动一个任务；已有 running 的返回 ErrBusy。
@@ -113,8 +154,15 @@ func (r *Runner) Start(s Spec) (Job, error) {
 	if len(s.Env) > 0 {
 		cmd.Env = s.Env
 	}
-	cmd.Stdout = logFile
-	cmd.Stderr = logFile
+	// 子进程放进独立进程组：build.sh/swift build 会派生子进程，只杀主进程它们还会跑。
+	setNewProcessGroup(cmd)
+	// 超时/取消时杀整个进程组（默认只杀主进程）。
+	cmd.Cancel = func() error { return killProcessGroup(cmd) }
+	// stdout/stderr 共用一个计数写入器（exec 会为两路管道各起一个拷贝 goroutine，Write 会并发进来）。
+	w := &cappedWriter{f: logFile, limit: MaxOutputBytes}
+	w.onLimit = func() { _ = killProcessGroup(cmd) }
+	cmd.Stdout = w
+	cmd.Stderr = w
 
 	if err := cmd.Start(); err != nil {
 		logFile.Close()
@@ -134,18 +182,23 @@ func (r *Runner) Start(s Spec) (Job, error) {
 
 	r.jobs[id] = job
 	r.running = job
+	// Start 返回前先落一份 State=running 的 json：执行器中途重启才能发现并清算这个任务。
+	if perr := r.persistLocked(job); perr != nil {
+		job.Note = "running 状态落盘失败: " + perr.Error()
+	}
 	started := *job
 	r.rotateLocked()
 	r.mu.Unlock()
 
-	go r.wait(ctx, cancel, cmd, logFile, job)
+	go r.wait(ctx, cancel, cmd, w, job)
 	return started, nil
 }
 
-// wait 在后台等进程结束，把最终状态写进内存与 json。
-func (r *Runner) wait(ctx context.Context, cancel context.CancelFunc, cmd *exec.Cmd, logFile *os.File, job *Job) {
+// wait 在后台等进程结束，把最终状态写进内存与 json；
+// 进程（含超时/超额时被杀的整个进程组）确认退出后才释放单任务占用。
+func (r *Runner) wait(ctx context.Context, cancel context.CancelFunc, cmd *exec.Cmd, w *cappedWriter, job *Job) {
 	err := cmd.Wait()
-	logFile.Close()
+	w.close()
 	defer cancel()
 
 	r.mu.Lock()
@@ -154,6 +207,12 @@ func (r *Runner) wait(ctx context.Context, cancel context.CancelFunc, cmd *exec.
 	job.Ended = time.Now()
 	job.ExitCode = exitCodeOf(err)
 	switch {
+	case w.overLimit():
+		job.State = StateFailed
+		job.Note = fmt.Sprintf("输出超过上限 %d 字节", MaxOutputBytes)
+	case w.failErr() != nil:
+		job.State = StateFailed
+		job.Note = "日志写入失败: " + w.failErr().Error()
 	case ctx.Err() == context.DeadlineExceeded:
 		job.State = StateTimeout
 		job.Note = "超时被终止"
@@ -200,6 +259,70 @@ func (r *Runner) Get(id string) (Job, error) {
 	}
 	r.mu.Unlock()
 	return job, nil
+}
+
+// cappedWriter 给日志文件计数：stdout/stderr 两路拷贝并发写入，所以要带锁。
+// 累计超过 limit 时只写到 limit 为止，随后触发 onLimit（杀进程组）并置 exceeded；
+// 写文件本身出错同样触发 onLimit 并记住错误，由 wait 把任务标 failed。
+type cappedWriter struct {
+	mu       sync.Mutex
+	f        *os.File
+	limit    int64
+	total    int64
+	exceeded bool
+	writeErr error
+	onLimit  func()
+}
+
+func (w *cappedWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.exceeded || w.writeErr != nil {
+		// 已定局：数据直接丢弃（进程正在被杀，别让管道拷贝卡住）。
+		return len(p), nil
+	}
+	n := int64(len(p))
+	if w.total+n > w.limit {
+		n = w.limit - w.total
+		if n > 0 {
+			if _, err := w.f.Write(p[:n]); err != nil {
+				w.writeErr = err
+				w.killNow()
+				return 0, err
+			}
+			w.total += n
+		}
+		w.exceeded = true
+		w.killNow()
+		return len(p), nil
+	}
+	if _, err := w.f.Write(p); err != nil {
+		w.writeErr = err
+		w.killNow()
+		return 0, err
+	}
+	w.total += n
+	return len(p), nil
+}
+
+func (w *cappedWriter) killNow() {
+	if w.onLimit != nil {
+		w.onLimit()
+	}
+}
+
+func (w *cappedWriter) close() error { return w.f.Close() }
+
+func (w *cappedWriter) overLimit() bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.exceeded
+}
+
+func (w *cappedWriter) failErr() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.writeErr
 }
 
 // persistLocked 把 Job 原子写进 <dir>/<id>.json（临时文件 + rename）；须持有 r.mu。

@@ -96,14 +96,31 @@ func defaultListPanes() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), tmuxTimeout)
-	defer cancel()
-	out, err := exec.CommandContext(ctx, tmux, "list-panes", "-a", "-F", "#{pane_pid} #{session_name}").Output()
-	if err != nil {
-		return "", err
+	// 默认 tmux 实例之外，还要查 XXYI 在 Mac 上建本机会话用的独立实例（tmux -L xxyi）：
+	// Codex 起 MCP 工具时清掉了 XXYI_ADDR/TMUX，只能靠这里找到自己住在哪个会话。
+	var all strings.Builder
+	var firstErr error
+	for _, extra := range [][]string{nil, {"-L", xxyiTmuxSocket}} {
+		ctx, cancel := context.WithTimeout(context.Background(), tmuxTimeout)
+		args := append(append([]string{}, extra...), "list-panes", "-a", "-F", "#{pane_pid} #{session_name}")
+		out, err := exec.CommandContext(ctx, tmux, args...).Output()
+		cancel()
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		all.Write(out)
 	}
-	return string(out), nil
+	if all.Len() == 0 && firstErr != nil {
+		return "", firstErr
+	}
+	return all.String(), nil
 }
+
+// xxyiTmuxSocket 是 XXYI 在 Mac 上建本机会话用的 tmux 实例名（与 XxyiCore.tmuxSocket 一致）。
+const xxyiTmuxSocket = "xxyi"
 
 // paneSessionsOf 把 list-panes 的输出解析成 pane_pid→会话名；解析不了的行跳过。
 // 会话名按"第一个空格之后的全部"取（带空格的怪名字留着让 checkSessionName 去拒，不在这里截断）。

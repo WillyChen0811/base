@@ -148,6 +148,30 @@
   不给 `bypassCSP`；哪些文件能读由调用方 `resolvePath` 决定
 - `segmentWords` 会把 `take-off` 拆成三段、`don't` 不拆，合并短语是界面层的事
 
+### storage / fileops / retry / inventory
+- 上层逻辑只认 `Storage` 接口，不许在 fileops/inventory 里写死本地路径或某种协议；连接方式（挂载、SMB 协议、HTTPS、
+  隧道）只出现在 `Storage` 实现里
+- 网络盘掉线后挂载点目录常常还在、只是空的：`LocalStorage` 判可用要给 `mount_point` 查 `ismount`，不能只看 `is_dir`；
+  `stat` 遇连接问题必须抛 `OSError`，不能返回 None（None 表示"确实不存在"，会被当成"对方没有"）
+- 拷贝只有 `copy_file` 一个函数，校验是 `verify` 开关（默认关），不要再加 `copy_verified` 之类的平行函数
+- `copy_file` 目标已存在且判定不同一律 `conflict`，不加"强制覆盖"开关；正式名只在临时文件写完后 `replace`
+- `retry_call` 资源不可用期间不计次数；等待间隔没有默认值（交互几秒、过夜批处理十几分钟，由调用方定）
+- inventory 的"同名+大小"只是快速判断，不是内容证明；修改时间不参与比对
+
+### timemachine
+- 系统常已把快照挂在 `/Volumes/.timemachine/<UUID>/`，再 `mount_apfs` 同一快照报 Resource busy：先查挂载表复用
+- 自己挂一律 `rdonly,nobrowse`；快照里卷名随系统版本不同（`Macintosh HD - Data`/`Data`），不要写死
+
+### db
+- 只放零业务的方言无关操作；业务表结构、升级脚本、身份取值都留在调用方
+- 函数的 `bind` 可传 Engine / Connection / Session：给 Engine 自己提交，给 Connection/Session 并入调用方事务，绝不自行提交
+- SQLite 引擎在 `make_engine` 里关掉 pysqlite 隐式事务并显式 BEGIN，DDL 才能随事务回滚；别绕开 `make_engine` 自己 `create_engine`
+- SQLite 删唯一约束/改可空性只能重建表（`schema._rebuild_sqlite`），只带普通列索引，表达式/部分索引、触发器不带
+- upsert 的受影响行数靠 `RETURNING` 数，不用 `cursor.rowcount`（psycopg 下带自增主键时是 -1）
+- 身份标记不覆盖：已有且不同一律抛 `IdentityMismatch`；无标记行为由 `check_identity(on_missing=)` 选
+- PostgreSQL 测试连本机、建 `pybase_test_*` 临时库，连不上 skip
+- 审计（`audit`）仅 PostgreSQL：触发器挂业务表，写入 `audit.row_log`；SQLite 上返回 False/空列表不报错。上下文键靠 `SET LOCAL`（`set_audit_context` 要传 Connection/Session），`make_engine(application_name=)` 区分写入方
+
 ## gobase
 
 - 模块路径 `github.com/WillyChen0811/base/go`；本机 Go 工具链在 `~/.local/go`

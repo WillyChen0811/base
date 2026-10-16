@@ -32,7 +32,10 @@ class MediaCancelled(MediaError):
 
 
 def resolve_tool(explicit: str | os.PathLike | None, name: str) -> str:
-    """`explicit` 优先；没给就用 `shutil.which` 按 `name` 找 PATH；
+    """解析一个可执行文件的路径，返回可直接用于拼命令行的绝对/可执行路径字符串。
+
+    `explicit` 优先：给了就校验它存在且可执行（或能在 PATH 里按它解析），
+    无效抛 `ToolNotFoundError`；没给就用 `shutil.which` 按 `name` 在 PATH 里找。
     都找不到抛 `ToolNotFoundError`，消息里说清缺的是哪个工具。
     """
     if explicit:
@@ -60,7 +63,17 @@ def run(
     cancel_event: "threading.Event | None" = None,
     poll_interval: float = 0.2,
 ) -> subprocess.CompletedProcess:
-    """跑一个子进程，轮询 `timeout`/`cancel_event`，命中就杀掉子进程。
+    """跑一个子进程并等它结束，轮询 `timeout`/`cancel_event`，命中就杀掉整个进程组。
+
+    给需要自己拼命令的调用方用（如拼一条 ffmpeg 命令读它的 stderr）；
+    probe/clip/sync 等封装函数内部也走这里，超时/取消语义一致。
+
+    - `cmd`：参数列表（不走 shell）；子进程在独立进程组里启动，
+      超时/取消时连同它自己起的子进程（如 ffsubsync 起的 ffmpeg）一起杀掉。
+    - `timeout`：秒数，超时抛 `MediaTimeoutError`；`cancel_event` 置位抛
+      `MediaCancelled`。
+    - 返回 `subprocess.CompletedProcess`，`stdout`/`stderr` 为 UTF-8 文本
+      （非法字节替换）；**不检查返回码**，失败与否由调用方看 `returncode` 决定。
 
     反复以短超时调用 `communicate()` 是标准库支持的轮询写法：`TimeoutExpired`
     时已读到的输出会留在内部缓冲区，下次调用接着读，不会丢数据。

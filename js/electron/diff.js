@@ -2,6 +2,7 @@
 'use strict';
 
 // 比较两个版本的快照，输出新增/删除/变更的 key，是"这次升级动了哪些 API"的机械底稿。
+// loadSnapshot 定义在这里，包入口（../index.js）直接复用，不要再拷一份。
 
 const path = require('node:path');
 const { snapshotPath } = require('./extract');

@@ -33,6 +33,16 @@
 - `pybase.net`：网络内核基础件。`wireguard`/`engine`/`routes`/`tunnel` 自建 WireGuard 隧道
   （wireguard-go 用户态引擎，需 root；生成密钥要 `pip install "pybase[net]"`）；`diag` 路由查询、
   地址分类、TCP 探测；`monitor` 采集接口/路由/DNS/代理/VPN/NetBird/mihomo/自定义目标，SQLite 记录并检测变化
+- `pybase.storage`：存储接口 `Storage`（相对 posix 路径；`available`/`stat`/`listdir`/读写/原子改名/删除），
+  把"连到哪"（本地盘、挂载的网络盘、SMB 协议、HTTPS…，以及其下的 WireGuard/NetBird 等隧道）和上层的读写、核对、
+  续传逻辑解耦；自带 `LocalStorage`（本地目录与任何已挂载网络盘，可要求挂载点在挂才算可用），新通道照接口实现即可
+- `pybase.fileops`：两端都是 `Storage` 的拷贝 `copy_file`（临时文件转正；`verify` 开关默认关、只比大小，开了边拷边哈希
+  并读回核对；目标已有不同内容报 `conflict` 不覆盖）、`delete_confirmed`（调用方核对通过才删）、`prune_empty_dirs`
+- `pybase.retry`：`wait_until`（等资源回来，间隔由调用方给）、`retry_call`（资源断着的时间不计入重试次数）
+- `pybase.inventory`：经 `Storage` 列目录树清单（跳过规则由调用方给，列不动的目录单独上报），按"相对路径+大小"
+  再"同名+大小"两级比对；只看元数据，不是内容证明
+- `pybase.timemachine`：macOS Time Machine：备份路径识别（`inspect_selection`）、APFS 快照列表、复用系统已挂载的快照、
+  其余只读挂载（`ensure_mounted`）
 - `pybase.dictionary`：词典查询统一模型（`Entry`，必带出处与授权说明）+ 数据源适配器。**不内置任何词典数据**；
   目前有 `macos`（系统『词典』App 里已下载的词典，ctypes 直调，零依赖，仅限本机个人使用）
 
@@ -95,7 +105,8 @@ pip install -e "./py[all]"
 ```
 
 模块与 extra 对照表（没列出的模块——`rpc`（stdio/HTTP 部分）、`ramdisk`、`aiclient`、
-`cdpnet`、`playwright_launch`、`media`、`dictionary`、`digest`、`search`、`asr`（Apple 后端）、`net`（密钥生成除外）——零第三方依赖，直接 `import` 即可）：
+`cdpnet`、`playwright_launch`、`media`、`dictionary`、`digest`、`search`、`asr`（Apple 后端）、`net`（密钥生成除外）、
+`storage`、`fileops`、`retry`、`inventory`、`timemachine`——零第三方依赖，直接 `import` 即可）：
 
 | extra | 第三方依赖 | 覆盖模块 |
 |---|---|---|
@@ -108,6 +119,8 @@ pip install -e "./py[all]"
 | `rpc-server` | fastapi | `pybase.rpc.create_fastapi_rpc_router` |
 | `subtitle` | pysubs2 | `pybase.subtitle` |
 | `net` | cryptography | `pybase.net.wireguard` 的密钥生成/推导 |
+| `db` | sqlalchemy | `pybase.db`（引擎/会话、方言无关的表结构操作、upsert、库身份标记） |
+| `postgres` | `db` + psycopg[binary] | `pybase.db` 连 PostgreSQL |
 | `asr-mlx` | mlx-audio（仅 Apple Silicon） | `pybase.asr.MlxAudio` |
 | `all` | 以上全部 | —— |
 

@@ -543,9 +543,13 @@ func judgeOnce(ctx context.Context, worktree string, opt Options) (Result, error
 	}
 	res := Result{Verdict: Summarize(panes), Panes: panes}
 	if res.Verdict == VerdictFinished {
-		if note := otherWriters(ctx, tmuxCmd, worktree, opt, tree, panes); note != "" {
+		block, ignored := otherWriters(ctx, tmuxCmd, worktree, opt, tree, panes)
+		if ignored != "" {
+			res.Notes = append(res.Notes, ignored)
+		}
+		if block != "" {
 			res.Verdict = VerdictUnknown
-			res.Notes = append(res.Notes, note)
+			res.Notes = append(res.Notes, block)
 		}
 	}
 	return res, nil
@@ -553,17 +557,17 @@ func judgeOnce(ctx context.Context, worktree string, opt Options) (Result, error
 
 // otherWriters 扫描本机所有进程的工作目录：在工作区之内、却不属于任何已判断窗格的进程树
 // （也不是本进程、其祖先子孙或 tmux 服务器）的进程，可能是别处的写入者 → 返回说明；没有则返回空串。
-func otherWriters(ctx context.Context, tmuxCmd []string, worktree string, opt Options, tree *ProcTable, panes []Pane) string {
+func otherWriters(ctx context.Context, tmuxCmd []string, worktree string, opt Options, tree *ProcTable, panes []Pane) (blocking, ignored string) {
 	cwdFn := opt.ProcCwd
 	if cwdFn == nil {
 		cwdFn = procCwds
 	}
 	cwds, err := cwdFn()
 	if err != nil {
-		return "读不到各进程的工作目录，无法排除别处写入者：" + err.Error()
+		return "读不到各进程的工作目录，无法排除别处写入者：" + err.Error(), ""
 	}
 	if tree == nil {
-		return "没有进程表，无法排除别处写入者"
+		return "没有进程表，无法排除别处写入者", ""
 	}
 	excl := map[int]bool{os.Getpid(): true}
 	var add func(pid int)
@@ -595,7 +599,7 @@ func otherWriters(ctx context.Context, tmuxCmd []string, worktree string, opt Op
 			excl[pid] = true
 		}
 	}
-	var found []string
+	var found, skipped []string
 	pids := make([]int, 0, len(cwds))
 	for pid := range cwds {
 		pids = append(pids, pid)
@@ -609,12 +613,75 @@ func otherWriters(ctx context.Context, tmuxCmd []string, worktree string, opt Op
 		if args == "" {
 			args = "(未知命令)"
 		}
+		if isHelperProcess(args) {
+			skipped = append(skipped, fmt.Sprintf("%d %s", pid, args))
+			continue
+		}
 		found = append(found, fmt.Sprintf("%d %s", pid, args))
 	}
-	if len(found) == 0 {
-		return ""
+	if len(skipped) > 0 {
+		ignored = "已忽略 agent 自带的辅助进程（白名单）：" + strings.Join(skipped, "；")
 	}
-	return "工作区内有不属于任何窗格的进程，可能是别处的写入者：" + strings.Join(found, "；")
+	if len(found) > 0 {
+		blocking = "工作区内有不属于任何窗格的进程，可能是别处的写入者：" + strings.Join(found, "；")
+	}
+	return blocking, ignored
+}
+
+// helperProcesses 是 agent 自带、会把工作目录留在工作区里但不改文件的辅助进程，
+// 扫描别处写入者时忽略（按命令行精确匹配可执行文件名与第一个参数）。
+// exe 是可执行文件名（basename）；anyArg 非空表示参数里须含其中之一；
+// firstArg 非空表示第一个参数须是其中之一；两者都空表示只看可执行名。
+var helperProcesses = []struct {
+	exe      string
+	anyArg   []string
+	firstArg []string
+	why      string
+}{
+	{"codex", []string{"app-server"}, nil, "Codex 的 app-server 守护进程（含 daemon pid-update-loop）"},
+	{"codex-code-mode-host", nil, nil, "Codex 的 code mode 宿主进程"},
+	{"xxyi-msg", nil, []string{"mcp", "state"}, "XXYI 的 MCP 服务与状态钩子"},
+}
+
+func isHelperProcess(cmdline string) bool {
+	args := strings.Fields(cmdline)
+	if len(args) == 0 {
+		return false
+	}
+	exe := filepath.Base(args[0])
+	for _, h := range helperProcesses {
+		if exe != h.exe {
+			continue
+		}
+		if len(h.anyArg) > 0 {
+			ok := false
+			for _, a := range args[1:] {
+				for _, w := range h.anyArg {
+					if a == w {
+						ok = true
+					}
+				}
+			}
+			if !ok {
+				continue
+			}
+		}
+		if len(h.firstArg) > 0 {
+			ok := false
+			if len(args) > 1 {
+				for _, w := range h.firstArg {
+					if args[1] == w {
+						ok = true
+					}
+				}
+			}
+			if !ok {
+				continue
+			}
+		}
+		return true
+	}
+	return false
 }
 
 // procCwds 读本机所有进程的工作目录：Linux 读 /proc/*/cwd（读不到的跳过），其它用 lsof。
@@ -805,8 +872,9 @@ type fileMod struct {
 	mod  time.Time
 }
 
-// findClaudeLog 找属于该 agent 进程的会话记录：目录里首条带时间戳的记录
-// ≥ 进程启动时间 − 5 秒的 .jsonl，恰好一个才用；零个或多个 → Problem。
+// findClaudeLog 找属于该 agent 进程的会话记录：目录里最后修改时间 ≥ 进程启动时间 − 5 秒
+// （即进程启动后仍有写入）的 .jsonl，恰好一个才用；零个或多个 → Problem。
+// 不要求首条记录晚于启动：resume 的会话首条记录早于进程启动是正常的。
 // 记录里的首个 cwd 必须等于窗格目录。
 func findClaudeLog(home, paneDir string, start time.Time) LogInput {
 	dir := filepath.Join(home, ".claude", "projects", projsync.ClaudeDirName(paneDir))
@@ -835,28 +903,15 @@ func findClaudeLog(home, paneDir string, start time.Time) LogInput {
 		if err != nil {
 			return LogInput{Found: true, ReadErr: true}
 		}
-		var first time.Time
 		cwd := ""
 		for _, ln := range lines {
 			var rec struct {
-				Timestamp string `json:"timestamp"`
-				Cwd       string `json:"cwd"`
+				Cwd string `json:"cwd"`
 			}
-			if json.Unmarshal(ln, &rec) != nil {
-				continue
-			}
-			if first.IsZero() {
-				first = parseTS(rec.Timestamp)
-			}
-			if cwd == "" {
+			if json.Unmarshal(ln, &rec) == nil && rec.Cwd != "" {
 				cwd = rec.Cwd
-			}
-			if !first.IsZero() && cwd != "" {
 				break
 			}
-		}
-		if first.IsZero() || first.Before(start.Add(-startSlack)) {
-			continue
 		}
 		cs = append(cs, cand{path, cwd})
 	}
@@ -887,7 +942,7 @@ func pickLog(paths []string, cwdOf func(int) string, paneDir string) LogInput {
 }
 
 // findCodexLog 在 ~/.codex/sessions 下找 session_meta 的 cwd 等于窗格目录、
-// 且开始时间 ≥ 进程启动时间 − 5 秒的 rollout，恰好一个才用。
+// 且最后修改时间 ≥ 进程启动时间 − 5 秒（启动后仍有写入）的 rollout，恰好一个才用。
 func findCodexLog(home, paneDir string, start time.Time) LogInput {
 	root := filepath.Join(home, ".codex", "sessions")
 	var fs []fileMod
@@ -906,8 +961,8 @@ func findCodexLog(home, paneDir string, start time.Time) LogInput {
 	want := canon(paneDir)
 	var paths []string
 	for _, f := range fs {
-		cwd, ts, ok := codexMeta(f.path)
-		if !ok || canon(cwd) != want || ts.Before(start.Add(-startSlack)) {
+		cwd, _, ok := codexMeta(f.path)
+		if !ok || canon(cwd) != want {
 			continue
 		}
 		paths = append(paths, f.path)
@@ -955,9 +1010,6 @@ func codexMeta(path string) (string, time.Time, bool) {
 	ts := parseTS(rec.Payload.Timestamp)
 	if ts.IsZero() {
 		ts = parseTS(rec.Timestamp)
-	}
-	if ts.IsZero() {
-		return "", time.Time{}, false
 	}
 	return rec.Payload.Cwd, ts, true
 }

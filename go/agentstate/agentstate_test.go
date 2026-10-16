@@ -174,8 +174,7 @@ func TestFindClaudeLogBinding(t *testing.T) {
 	if ok, _ := claudeEndTurn(l.Content); !ok {
 		t.Error("内容应是 end_turn")
 	}
-	// 启动前 3 秒的首条记录在容差内
-	// 同目录第二个也在启动之后 → Unknown
+	// 同目录第二个在启动后也有写入 → Unknown
 	claudeFile(home, dir, "other.jsonl", start.Add(10*time.Second), dir)
 	l = findClaudeLog(home, dir, start)
 	if l.Problem == "" || !strings.Contains(l.Problem, "2 个") {
@@ -183,6 +182,25 @@ func TestFindClaudeLogBinding(t *testing.T) {
 	}
 	if st, _ := JudgePane(PaneInput{Command: "claude", Screen: "> ", Log: l}); st != Unknown {
 		t.Error("多候选应 Unknown")
+	}
+}
+
+// resume 的会话：首条记录早于进程启动，但启动后仍有写入 → 能绑定。
+func TestFindClaudeLogResume(t *testing.T) {
+	home := t.TempDir()
+	dir := filepath.Join(t.TempDir(), "proj")
+	_ = os.MkdirAll(dir, 0o755)
+	start := time.Now().Add(-time.Minute)
+	p := claudeFile(home, dir, "resumed.jsonl", start.Add(-48*time.Hour), dir) // 首条记录两天前，文件刚写过
+	l := findClaudeLog(home, dir, start)
+	if l.Problem != "" || l.Path != p {
+		t.Fatalf("resume 的会话应能绑定: %+v", l)
+	}
+	// 启动后一直没写入的旧会话不算
+	old := time.Now().Add(-time.Hour)
+	_ = os.Chtimes(p, old, old)
+	if findClaudeLog(home, dir, start).Problem == "" {
+		t.Error("启动后没有写入的记录不应绑定")
 	}
 }
 
@@ -583,5 +601,57 @@ func TestJudgeDoubleSample(t *testing.T) {
 	r, _ := JudgeDetail(context.Background(), ws, opt)
 	if r.Verdict != VerdictUnknown || len(r.Notes) == 0 || !strings.Contains(r.Notes[0], "有变化") {
 		t.Errorf("记录变化应 Unknown: %+v", r)
+	}
+}
+
+func TestHelperWhitelist(t *testing.T) {
+	yes := []string{
+		"/home/u/.codex/packages/x/bin/codex app-server --listen unix://",
+		"/home/u/.codex/packages/x/bin/codex app-server daemon pid-update-loop",
+		"/home/u/.codex/packages/x/bin/codex-code-mode-host",
+		"/home/u/.local/bin/xxyi-msg mcp",
+		"xxyi-msg state --event stop",
+	}
+	no := []string{
+		"codex", "codex exec fix bug", "node /usr/bin/codex", "xxyi-msg send hi", "xxyi-msg",
+		"vim app-server", "/usr/bin/python3 mcp", "cp codex-code-mode-host-backup x",
+	}
+	for _, c := range yes {
+		if !isHelperProcess(c) {
+			t.Errorf("应在白名单: %s", c)
+		}
+	}
+	for _, c := range no {
+		if isHelperProcess(c) {
+			t.Errorf("不应在白名单: %s", c)
+		}
+	}
+}
+
+func TestJudgeOtherWritersWhitelist(t *testing.T) {
+	opt, ws, pid, _ := fakeSetup(t)
+	opt.ProcTree = func() (*ProcTable, error) {
+		tab, err := withChild(pid, "mcp-server", time.Now().Add(-time.Hour))()
+		if err == nil {
+			tab.Args[88888881] = "/h/.codex/bin/codex app-server --listen unix://"
+			tab.Args[88888882] = "/h/.local/bin/xxyi-msg mcp"
+			tab.Args[88888883] = "vim main.go"
+		}
+		return tab, err
+	}
+	opt.ProcCwd = func() (map[int]string, error) {
+		return map[int]string{88888881: ws, 88888882: ws + "/sub"}, nil
+	}
+	r, _ := JudgeDetail(context.Background(), ws, opt)
+	if r.Verdict != VerdictFinished || len(r.Notes) != 1 || !strings.Contains(r.Notes[0], "已忽略") ||
+		!strings.Contains(r.Notes[0], "app-server") || !strings.Contains(r.Notes[0], "xxyi-msg mcp") {
+		t.Errorf("白名单进程不应影响，且应列出: %+v", r)
+	}
+	opt.ProcCwd = func() (map[int]string, error) {
+		return map[int]string{88888881: ws, 88888883: ws}, nil
+	}
+	r, _ = JudgeDetail(context.Background(), ws, opt)
+	if r.Verdict != VerdictUnknown || !strings.Contains(strings.Join(r.Notes, "|"), "vim main.go") {
+		t.Errorf("白名单外进程应 Unknown: %+v", r)
 	}
 }

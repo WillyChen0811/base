@@ -321,14 +321,15 @@ func (s *projsyncSvc) syncClaude(ctx context.Context, t projsyncTarget) (*projsy
 	}
 	var scMu sync.Mutex
 	var sc *sftp.Client
-	closeAll := func() { // ctx 到期：关 sftp 会话，并丢掉（关闭）可能已失联的共用连接，让阻塞的 SFTP 调用返回
+	// ctx 到期：只关本次专用的 sftp 会话，不丢共用连接（会连带断掉终端、消息、其它同步）。
+	// 连接真失联时由 keepalive 判定并关闭，阻塞的 SFTP 调用随之返回。
+	closeAll := func() {
 		scMu.Lock()
 		cur := sc
 		scMu.Unlock()
 		if cur != nil {
 			cur.Close()
 		}
-		s.pool.drop(s.prep.host, c)
 	}
 	var fr projsync.FileResult
 	err = runInterruptible(ctx, interruptGrace, closeAll, func() error {
@@ -360,7 +361,7 @@ func (s *projsyncSvc) syncClaude(ctx context.Context, t projsyncTarget) (*projsy
 // interruptGrace 是 ctx 到期后等阻塞调用自己返回的宽限（测试里调小）。
 var interruptGrace = 2 * time.Second
 
-// runInterruptible 在 goroutine 里跑 work；ctx 先到期就调用 closeFn（关掉底层资源，让阻塞的调用因连接关闭而返回），
+// runInterruptible 在 goroutine 里跑 work；ctx 先到期就调用 closeFn（只应关本次专用的资源，不要关共用连接；连接失联由 keepalive 兜底），
 // 最多再等 grace，仍不返回就放弃等待，返回带「超时」字样的错误。work 若在等待内正常返回，则返回它的结果。
 // 调用方只能在 nil 返回之后读 work 写的结果变量。
 func runInterruptible(ctx context.Context, grace time.Duration, closeFn func(), work func() error) error {
@@ -401,7 +402,7 @@ func runInterruptible(ctx context.Context, grace time.Duration, closeFn func(), 
 		}
 		return nil
 	case <-t.C:
-		return fmt.Errorf("超时：操作无响应，已关闭连接: %w", ctx.Err())
+		return fmt.Errorf("超时：操作无响应，已放弃等待: %w", ctx.Err())
 	}
 }
 

@@ -32,7 +32,7 @@ func (f *failCounter) record(ok bool) (dead bool) {
 	return f.n >= f.max
 }
 
-// runGrace 是 ctx 到期后等 Run 自己返回的宽限；超过则关整条连接。测试里调小。
+// runGrace 是 ctx 到期后等 Run 自己返回的宽限；超过则放弃等待（不关连接）。测试里调小。
 var runGrace = 2 * time.Second
 
 // Run 的输出上限。
@@ -145,8 +145,11 @@ func startPtySession(ctx context.Context, sess *ssh.Session, command string, col
 // interruptible 在 goroutine 里跑 work，保证 ctx 到期后调用方一定能返回。
 // 正常情况下 work 自己会因 ctx 到期关会话而返回；但对端失联（线路切换、睡眠）时，
 // 本地关会话不会唤醒阻塞的读/Wait，开会话也可能一直等不到回应。
-// 所以 ctx 到期后再给 runGrace 的宽限，仍未返回就把整条连接关掉（阻塞的调用随之返回），
-// 并返回带「超时」字样的错误。
+// 所以 ctx 到期后再给 runGrace 的宽限，仍未返回就放弃等待，返回带「超时」字样、保留 ctx.Err() 链的错误。
+// 取舍：这里绝不关共用连接。OpenSSH 对 exec 通道的 close 要等远端子进程退出才回，
+// 慢命令很容易超过宽限；若因此关连接，会连带断掉所有终端会话、消息投递和项目同步。
+// 连接是否真死了只交给 keepalive 判断；被放弃的 goroutine 留着，work 内部已在 ctx 到期时
+// 关掉了它自己的 ssh session，连接真断时（keepalive 或传输层出错关连接）自然返回而被回收。
 func (c *Client) interruptible(ctx context.Context, work func() error) error {
 	done := make(chan error, 1)
 	go func() { done <- work() }()
@@ -161,8 +164,7 @@ func (c *Client) interruptible(ctx context.Context, work func() error) error {
 	case err := <-done:
 		return err
 	case <-t.C:
-		c.fail(fmt.Errorf("sshterm: 远端命令超时无响应，已关闭连接: %w", ctx.Err()))
-		return fmt.Errorf("sshterm: 远端命令超时（连接无响应，已关闭）: %w", ctx.Err())
+		return fmt.Errorf("sshterm: 远端命令超时（无响应，已放弃等待，连接保留）: %w", ctx.Err())
 	}
 }
 

@@ -525,7 +525,7 @@ func TestFailCounter(t *testing.T) {
 	}
 }
 
-// 对端装死（写全被吞）时，Run / RunInput 在 ctx 到期 + 宽限内返回含「超时」的错误，且连接被关闭。
+// 对端装死（写全被吞）时，Run / RunInput 在 ctx 到期 + 宽限内返回含「超时」的错误，且连接仍存活（交给 keepalive 判断）。
 func TestRunInterruptedWhenPeerSilent(t *testing.T) {
 	oldG := runGrace
 	runGrace = 100 * time.Millisecond
@@ -570,8 +570,8 @@ func TestRunInterruptedWhenPeerSilent(t *testing.T) {
 			}
 			select {
 			case <-c.Done():
-			case <-time.After(time.Second):
-				t.Fatal("无响应的连接应被关闭")
+				t.Fatalf("单条命令超时不应关闭连接: %v", c.Err())
+			case <-time.After(300 * time.Millisecond):
 			}
 		})
 	}

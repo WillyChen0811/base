@@ -1,3 +1,5 @@
+// Package macexec 提供 Mac 执行端的纯逻辑：仓库路径校验、命令任务执行与动作映射，
+// 不依赖 HTTP，也不依赖 support 包。
 package macexec
 
 import (
@@ -9,7 +11,7 @@ import (
 	"time"
 )
 
-// 固定的动作名单（HTTP /exec/start 的 action、MCP mac_* 工具一一对应）。
+// 固定的动作名单（HTTP /exec/run 的 action、MCP mac_* 工具一一对应，见 tasks-macexec/CONTRACT.md）。
 // 不提供任意命令执行：命令、工作目录、超时都在这里写死，参数只是选项。
 const (
 	ActionGitStatus  = "git_status"
@@ -34,17 +36,18 @@ const xxyiRepo = "xxyi"
 // nodeTestNamePattern 限定 node 测试文件名：小写字母/数字/下划线，不含路径分隔符与点。
 var nodeTestNamePattern = regexp.MustCompile(`^[a-z0-9_]+$`)
 
-// Params 是动作的参数：Repo 仓库名（仅 git_status 有意义），
-// Name 是 tests/js 下的 node 测试文件名（不含 .test.js 后缀，仅 node_test 用），
-// Lines 是尾部行数（取日志/输出用的选项，BuildSpec 不消费）。
+// Params 是 BuildSpec 的输入，对应 HTTP /exec/run 的 {action, repo, name}：
+// Repo 仓库名（仅 git_status 有意义），
+// Name 是 tests/js 下的 node 测试文件名（不含 .test.js 后缀，仅 node_test 用）。
 type Params struct {
-	Repo  string `json:"repo"`
-	Name  string `json:"name"`
-	Lines int    `json:"lines"`
+	Repo string `json:"repo"`
+	Name string `json:"name"`
 }
 
-// BuildSpec 把动作 + 参数拼成可直接交给 Runner.Start 的 Spec；
-// 未知动作、仓库不合法、node 测试名不合法或文件不存在都返回错误，不拼半截命令。
+// BuildSpec 把动作 + 参数拼成可直接交给 Run 的 Spec；
+// 未知动作、仓库不合法、工作目录/脚本不可用都返回错误，不拼半截命令。
+// 编译类动作的工作目录一律经 ResolveInRepo 解析（挡住 mac 是指向仓库外的符号链接）；
+// build_app 用解析后的 build.sh 绝对路径，不依赖 ./。
 func BuildSpec(action string, p Params, home string) (Spec, error) {
 	switch action {
 	case ActionGitStatus:
@@ -55,7 +58,7 @@ func BuildSpec(action string, p Params, home string) (Spec, error) {
 		return Spec{
 			Action:  action,
 			Dir:     root,
-			Argv:    []string{"git", "status", "--porcelain=v1", "-b"},
+			Argv:    []string{"git", "status", "-b", "--porcelain=v1"},
 			Timeout: gitStatusTimeout,
 		}, nil
 	case ActionSwiftBuild:
@@ -75,7 +78,18 @@ func BuildSpec(action string, p Params, home string) (Spec, error) {
 		if err != nil {
 			return Spec{}, err
 		}
-		return Spec{Action: action, Dir: dir, Argv: []string{"./build.sh"}, Timeout: buildAppTimeout}, nil
+		script, err := ResolveInRepo(dir, "build.sh")
+		if err != nil {
+			return Spec{}, fmt.Errorf("build.sh 不可用: %w", err)
+		}
+		st, err := os.Stat(script)
+		if err != nil {
+			return Spec{}, fmt.Errorf("build.sh 不可用 %q: %w", script, err)
+		}
+		if !st.Mode().IsRegular() {
+			return Spec{}, fmt.Errorf("build.sh 不是普通文件: %q", script)
+		}
+		return Spec{Action: action, Dir: dir, Argv: []string{script}, Timeout: buildAppTimeout}, nil
 	case ActionNodeTest:
 		root, err := xxyiRepoRoot(home, p.Repo)
 		if err != nil {
@@ -85,9 +99,17 @@ func BuildSpec(action string, p Params, home string) (Spec, error) {
 			return Spec{}, fmt.Errorf("node 测试文件名不合法 %q（只许小写字母/数字/下划线）", p.Name)
 		}
 		rel := filepath.Join("tests", "js", p.Name+".test.js")
-		// ResolveInRepo 顺带完成"文件存在"校验，并挡住 tests/js 被符号链接挪出仓库的情况。
-		if _, err := ResolveInRepo(root, rel); err != nil {
+		// ResolveInRepo 顺带挡住 tests/js 或文件本身被符号链接挪出仓库；解析后还须是普通文件。
+		target, err := ResolveInRepo(root, rel)
+		if err != nil {
 			return Spec{}, fmt.Errorf("node 测试文件不可用: %w", err)
+		}
+		st, err := os.Stat(target)
+		if err != nil {
+			return Spec{}, fmt.Errorf("node 测试文件不可用 %q: %w", target, err)
+		}
+		if !st.Mode().IsRegular() {
+			return Spec{}, fmt.Errorf("node 测试文件不是普通文件: %q", target)
 		}
 		return Spec{
 			Action:  action,
@@ -110,13 +132,17 @@ func xxyiRepoRoot(home, repo string) (string, error) {
 	return RepoRoot(home, xxyiRepo, DefaultRepos)
 }
 
-// xxyiMacDir 取编译类动作的工作目录 <xxyi 仓库根>/mac（须存在且是目录）。
+// xxyiMacDir 取编译类动作的工作目录：ResolveInRepo 解析 <xxyi 仓库根>/mac，
+// 挡住 mac 本身是指向仓库外的符号链接；解析结果须存在且是目录。
 func xxyiMacDir(home, repo string) (string, error) {
 	root, err := xxyiRepoRoot(home, repo)
 	if err != nil {
 		return "", err
 	}
-	dir := filepath.Join(root, "mac")
+	dir, err := ResolveInRepo(root, "mac")
+	if err != nil {
+		return "", fmt.Errorf("mac 目录不可用: %w", err)
+	}
 	st, err := os.Stat(dir)
 	if err != nil {
 		return "", fmt.Errorf("mac 目录不可用 %q: %w", dir, err)

@@ -31,7 +31,8 @@ const (
 )
 
 // MaxOutputBytes 是单个 job 的 stdout+stderr 合计上限；超过就杀掉进程组、任务标 failed。
-const MaxOutputBytes int64 = 32 << 20
+// 包级变量（不是常量）：测试里可临时调小来验证超限路径，生产代码不要改。
+var MaxOutputBytes int64 = 32 << 20
 
 // waitDelay 是 cmd.WaitDelay：进程退出（或取消）之后输出管道最多再等这么久就强制关闭。
 // 后台子进程继承 stdout/stderr 又不退出时，没有它 cmd.Wait 会永远卡在管道拷贝上。

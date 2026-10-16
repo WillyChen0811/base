@@ -1,7 +1,7 @@
 # macexec v2 约定（10/16 用户要求收缩范围：只做够用的，不做边角）
 
 目的：Ubuntu 上的 Claude 能在 Mac 上 编译 / 自检 / 打包 / 装上并重启 XXYI / 截图 / 看日志 / 看 git 状态。
-内部工具，只在用户打开「协助」时可用，调用方只有总指挥。**不做**：任务持久化、重启恢复、输出上限文件、job 轮询、写文件、任意命令。
+内部工具，只在用户打开「协助」时可用，调用方只有总指挥。**不做**：任务持久化、重启恢复、日志/记录落盘（要留什么由调用方自己存）、job 轮询、写文件、任意命令。
 
 ## Go 包 go/macexec
 - `paths.go`（已有，保留不动）：RepoRoot、ResolveInRepo、DefaultRepos。
@@ -24,7 +24,7 @@
 - `GET /exec/logs?name=service|wgtund&lines=N` → `{text}`（N ≤ 500；路径照现有代码查清楚）。
 - `GET /exec/screenshot` → image/png（screencapture -x 整屏，sips -Z 1600 缩小，临时文件用完删；非 darwin 501）。
 - `POST /exec/install` → `{started: true}`：把一段 Go 里写死的脚本写到临时文件，Setpgid 起 /bin/sh 执行后立即返回；
-  脚本：校验 build/XXYI.app 签名 → 退出 XXYI → pkill 残留服务与 wgtund → ditto 到 ~/Desktop/XXYI.app → 校验 → open；每步 echo 到 ~/.xxyi/macexec-install.log。
+  脚本：校验 build/XXYI.app 签名 → 退出 XXYI → pkill 残留服务与 wgtund → ditto 到 ~/Desktop/XXYI.app → 校验 → open。不另存日志文件（调用方用截图和 /exec/logs 看结果）。
 - 每次调用 s.logEvent("exec", 动作与结果)。
 
 ## MCP（Ubuntu 端，cmd/xxyi-msg/macexec.go，重写替换现有内容）

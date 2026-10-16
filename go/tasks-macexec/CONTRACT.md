@@ -29,4 +29,4 @@
 
 ## MCP（Ubuntu 端，cmd/xxyi-msg/macexec.go，重写替换现有内容）
 工具：`mac_git_status{repo}`、`mac_build{}`、`mac_selftest{}`、`mac_node_test{name}`、`mac_build_app{}`、`mac_install_app{}`、`mac_screenshot{}`（返回 MCP image）、`mac_logs{name,lines}`。
-每次调用重新读入口（复用现有 connect）；HTTP 超时 = 动作超时 + 1 分钟（截图/日志 60s）；结果按文字返回 exit_code/用时/尾部输出。不轮询、不重试。
+每次调用重新读入口（复用现有 connect）；唯一的重试例外：401 时重读入口再试一次（XXYI 重启后令牌会换）；HTTP 超时 = 动作超时 + 1 分钟（截图/日志 60s）；结果按文字返回 exit_code/用时/尾部输出。不轮询、不重试。

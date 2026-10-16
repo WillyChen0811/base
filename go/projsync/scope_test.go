@@ -205,13 +205,14 @@ func TestScopeInheritedGitDir(t *testing.T) {
 
 func TestScopeTooManyWorktrees(t *testing.T) {
 	dir, c1, c2 := ffRepo(t)
-	for i := 1; i <= maxWorktrees-1; i++ { // 主 + 7 = 8，边界内
+	for i := 1; i <= maxWorktrees-1; i++ { // 主 + (上限-1) = 上限，边界内
 		ag(t, dir, "worktree", "add", "-b", fmt.Sprintf("w%d", i), filepath.Join(t.TempDir(), fmt.Sprintf("w%d", i)))
 	}
 	if err := CheckScope(context.Background(), dir, nil, []string{"feat"}); err != nil {
-		t.Fatalf("8 个工作区应在范围内: %v", err)
+		t.Fatalf("%d 个工作区应在范围内: %v", maxWorktrees, err)
 	}
-	ag(t, dir, "worktree", "add", "-b", "w9", filepath.Join(t.TempDir(), "w9"))
+	extra := fmt.Sprintf("w%d", maxWorktrees)
+	ag(t, dir, "worktree", "add", "-b", extra, filepath.Join(t.TempDir(), extra))
 	wantOOS(t, dir, ffPlan(dir, "feat", c1, c2), "超过上限")
 }
 

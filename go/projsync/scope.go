@@ -37,7 +37,7 @@ import (
 
 // maxWorktrees：工作区总数（含主工作区）上限。超过说明仓库被用在预期之外的方式（大量并行工作区），
 // 枚举与检查的假设不再可靠，故判超出范围。
-const maxWorktrees = 8
+const maxWorktrees = 12
 
 // 最低 Git 版本。
 const minGitMajor, minGitMinor = 2, 38

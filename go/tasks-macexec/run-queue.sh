@@ -22,15 +22,15 @@ review(){ # $1=id $2=base $3=commit
   git -C "$REPO" worktree remove --force "$wt" 2>/dev/null
   log "$1 评审完成：$ST/$1.review.md"
 }
-for id in $(cat "$Q/QUEUE"); do
-  [ -f "$ST/$id.done" ] && continue
+next_id(){ local i; for i in $(cat "$Q/QUEUE"); do [ -f "$ST/$i.done" ] || { echo "$i"; return 0; }; done; return 1; }
+while id=$(next_id); do
   until studio_free; do sleep 60; done
   base=$(git -C "$REPO" rev-parse HEAD)
   log "$id 开始（base $base）"
   ~/.omlx-agent/omlx-agent "$REPO" "按 go/tasks-macexec/$id.md 做（先读它，再读 go/tasks-macexec/CONTRACT.md）。不要 git commit。" > "$ST/$id.out" 2>&1
   rc=$?
   if grep -q 'is_error=True' "$ST/$id.out" || [ $rc -ne 0 ]; then log "$id 模型没做完（rc=$rc），停下"; exit 1; fi
-  if [ "$id" = D1 ]; then touch "$ST/$id.done"; log "$id 调研完成：$ST/$id.out"; continue; fi
+  if grep -q "^# .*只读" "$Q/$id.md"; then touch "$ST/$id.done"; log "$id 调研完成：$ST/$id.out"; continue; fi
   ( cd "$REPO/go" && env -u TMUX -u TMUX_PANE go build ./... && env -u TMUX -u TMUX_PANE go vet ./macexec/ ./support/ ./cmd/xxyi-msg/ \
     && env -u TMUX -u TMUX_PANE go test ./macexec/ ./cmd/xxyi-msg/ && env -u TMUX -u TMUX_PANE go test ./support/ -run Exec ) > "$ST/$id.verify" 2>&1
   if [ $? -ne 0 ]; then log "$id 编译/测试不过，停下：$ST/$id.verify"; exit 1; fi

@@ -59,6 +59,10 @@ type ApplyPlan struct {
 // applyTestHook 仅测试使用：在 FastForwardBranch 通过检查、真正写入之前被调用。
 var applyTestHook func(stage string)
 
+// ErrRefsChanged 是「引用已变化 / 目标分支已存在 / 被抢先建立」的哨兵错误（用 %w 包装；用 errors.Is 判断，
+// 远程协议据此分类为 refs_changed，不依赖错误文案）。含义：现场与调用方采集时不同，需重新采集判定。
+var ErrRefsChanged = errors.New("引用已变化")
+
 // ErrCheckedOutDuringUpdate 表示更新引用期间该分支被某工作区检出：引用已改、工作区文件未随之更新。
 // 只报告，不做任何回退或补救写；需人工处理。用 errors.As 取出详情。
 type ErrCheckedOutDuringUpdate struct {
@@ -360,7 +364,7 @@ func CreateBranch(ctx context.Context, p ApplyPlan) error {
 		return fmt.Errorf("%s：读取失败，停止: %w", p.tag(), err)
 	}
 	if ex {
-		return fmt.Errorf("%s：目标分支已存在，拒绝创建，需重新判定", p.tag())
+		return fmt.Errorf("%s：%w：目标分支已存在，拒绝创建，需重新判定", p.tag(), ErrRefsChanged)
 	}
 	wts, err := listWorktrees(ctx, p.RepoDir, p.Env)
 	if err != nil {
@@ -379,7 +383,7 @@ func CreateBranch(ctx context.Context, p ApplyPlan) error {
 	// 竞态：上面的检查与此处写入之间不是原子的，写后只能事后复查发现（见 postCheckNotCheckedOut），
 	// 调度层必须对同一仓库串行。
 	if _, err := p.writeGit(ctx, p.RepoDir, false, nil, "update-ref", "--no-deref", ref, p.NewOID, zeroOID(p.NewOID)); err != nil {
-		return fmt.Errorf("%s：创建引用失败（可能被抢先建立），需重新判定: %w", p.tag(), err)
+		return fmt.Errorf("%s：%w：创建引用失败（可能被抢先建立），需重新判定: %w", p.tag(), ErrRefsChanged, err)
 	}
 	return p.postCheckNotCheckedOut(ctx)
 }
@@ -407,7 +411,7 @@ func FastForwardBranch(ctx context.Context, p ApplyPlan) error {
 		return fmt.Errorf("%s：读取失败，停止: %w", p.tag(), err)
 	}
 	if !ex || cur != p.OldOID {
-		return fmt.Errorf("%s：引用已变化（当前 %q，预期 %s），需重新判定", p.tag(), cur, p.OldOID)
+		return fmt.Errorf("%s：%w（当前 %q，预期 %s），需重新判定", p.tag(), ErrRefsChanged, cur, p.OldOID)
 	}
 	isAnc, err := isAncestor(ctx, p.RepoDir, p.Env, p.OldOID, p.NewOID)
 	if err != nil {

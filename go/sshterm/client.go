@@ -228,9 +228,14 @@ func (c *Client) RunInput(ctx context.Context, command string, stdin []byte) (st
 		}
 		return nil, nil, -1, fmt.Errorf("sshterm: 启动远端命令失败: %w", err)
 	}
-	go func() { // 输入写完就关；远端提前退出时写失败无所谓
-		in.Write(stdin)
-		in.Close()
+	wc := make(chan error, 1)
+	go func() { // 输入写完就关；写失败（远端提前退出、连接断）记下来，最后显式返回
+		_, werr := in.Write(stdin)
+		cerr := in.Close()
+		if werr == nil {
+			werr = cerr
+		}
+		wc <- werr
 	}()
 	type res struct {
 		b   []byte
@@ -255,9 +260,21 @@ func (c *Client) RunInput(ctx context.Context, command string, stdin []byte) (st
 	}
 	io.Copy(io.Discard, out)
 	er := <-ec
+	inErr := <-wc
 	werr := sess.Wait()
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		return nil, nil, -1, ctxErr
+	}
+	if er.err != nil {
+		return nil, nil, -1, fmt.Errorf("sshterm: 读远端 stderr 失败: %w", er.err)
+	}
+	if inErr != nil {
+		// 请求可能没完整送达；不论远端退出码如何都按失败返回（附带远端 stderr 便于排查）。
+		msg := er.b
+		if len(msg) > 1024 {
+			msg = msg[:1024]
+		}
+		return nil, nil, -1, fmt.Errorf("sshterm: 向远端写 stdin 失败（请求可能未完整送达）: %w; 远端 stderr: %s", inErr, msg)
 	}
 	if len(er.b) > maxRunInputOut {
 		return nil, nil, -1, ErrOutputTooLarge

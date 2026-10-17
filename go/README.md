@@ -153,5 +153,33 @@ HTTP 接口都要带 `token` 参数；每台主机共用一条 SSH 连接（第�
 
 远端 Claude 也可以用 `macsup projsync <项目名>` 发起：进入待批队列，用户在 xxyi 点允许后才同步，同步完成后打印结果 JSON。
 
+## omlxgw（oMLX 网关）
+
+所有访问 oMLX 的请求都经它统一控制并发与优先级。只监听回环地址（Mac 经 SSH 转发连）。
+
+    omlxgw -config <json文件>
+
+配置（`listen`、`upstream` 启动后不可改；其余可经 `PUT /gw/config` 热改）：
+
+    {"listen":"127.0.0.1:18192","upstream":"http://192.168.147.196:8192","default_priority":5,
+     "models":{"Qwen3.8-Flash-Next-oQ4e-mtp":{"max_concurrent":1,"exclusive":true}},
+     "default_model":{"max_concurrent":8,"exclusive":false},"max_total":16}
+
+- 透明反向代理：路径、请求头（含 Authorization / x-api-key）、请求体原样转发，响应流式回传（SSE 边收边发）。
+  从请求体 JSON 的 `model` 判断模型；不带模型的请求（如 `GET /v1/models`）不排队直接转。
+- 调度按请求粒度，不打断在跑的请求；一个请求从开始转发到响应结束（或客户端断开）占一个名额。
+  有名额空出时挑优先级最高、同级先到的放行，须满足并发规则：`exclusive` 模型在跑时其他请求不放，其他在跑时它不进；
+  普通模型各有 `max_concurrent` 上限，全局另有 `max_total`。
+  防饿死：独占模型在排队且优先级不低于某请求时，不再放这个请求进去，等在跑的结束让独占模型先进。
+  排队中客户端断开即移出队列。
+- 优先级：请求头 `X-Xxyi-Priority: 0-9`（缺省 `default_priority`）。约定：9 用户现场交互；7 用户发起、在后台跑的对话任务；
+  5 agent 编码/整理任务；3 评测与批量；1 闲时。`X-Xxyi-Client` 可选，只用于状态与日志。
+- 管理接口（同一监听口，均返回 JSON，错误为 `{"error":"..."}`）：
+  - `GET /gw/status`：`{"running":[...],"queued":[...]}`，每项含 model、priority、client、run_seconds / wait_seconds。
+  - `GET /gw/config`、`PUT /gw/config`：PUT 整份配置，先校验（改 listen / upstream 或值非法返回 400），
+    通过后原子写回配置文件（临时文件 + rename）并立即生效，在跑的请求不受影响。
+- 日志写 stderr，每个请求一行：时间、model、prio、client、wait（排队秒）、run（运行秒）、status（排队中断开记 499）。
+- systemd 用户服务示例：`cmd/omlxgw/omlxgw.service`。
+
 ## 测试
     cd go && go test ./...

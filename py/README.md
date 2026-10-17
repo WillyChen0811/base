@@ -36,6 +36,8 @@
 - `pybase.storage`：存储接口 `Storage`（相对 posix 路径；`available`/`stat`/`listdir`/读写/原子改名/删除），
   把"连到哪"（本地盘、挂载的网络盘、SMB 协议、HTTPS…，以及其下的 WireGuard/NetBird 等隧道）和上层的读写、核对、
   续传逻辑解耦；自带 `LocalStorage`（本地目录与任何已挂载网络盘，可要求挂载点在挂才算可用），新通道照接口实现即可；另有 `read_bytes`/`as_memory_file`（读进内存，BytesIO 可直接交给 python-docx/openpyxl/`pybase.sheets`，不落盘，可限 `max_bytes`）和 `materialize`（必须要真实路径时用：本地盘给原路径，其他通道临时拷进内存盘，退出即删）
+- `pybase.sshstorage`：`SSHStorage`，经 SFTP 读写远端目录（`pip install "pybase[ssh]"`）；路径锁在 root 下，断线后下次操作自动重连，
+  未知主机默认拒绝
 - `pybase.fileops`：两端都是 `Storage` 的拷贝 `copy_file`（临时文件转正；`verify` 开关默认关、只比大小，开了边拷边哈希
   并读回核对；目标已有不同内容报 `conflict` 不覆盖）、`delete_confirmed`（调用方核对通过才删）、`prune_empty_dirs`
 - `pybase.retry`：`wait_until`（等资源回来，间隔由调用方给）、`retry_call`（资源断着的时间不计入重试次数）
@@ -118,6 +120,7 @@ pip install -e "./py[all]"
 | `office-word` | pywin32（仅 Windows） | `pybase.office.word` 的 Word COM 驱动 |
 | `rpc-server` | fastapi | `pybase.rpc.create_fastapi_rpc_router` |
 | `subtitle` | pysubs2 | `pybase.subtitle` |
+| `ssh` | paramiko | `pybase.sshstorage`（`SSHStorage`） |
 | `net` | cryptography | `pybase.net.wireguard` 的密钥生成/推导 |
 | `db` | sqlalchemy | `pybase.db`（引擎/会话、方言无关的表结构操作、upsert、库身份标记） |
 | `postgres` | `db` + psycopg[binary] | `pybase.db` 连 PostgreSQL |

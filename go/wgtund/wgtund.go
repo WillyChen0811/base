@@ -738,13 +738,17 @@ func watchHandshake(ctx context.Context, name string, t *wgtunnel.Tunnel) {
 					next = "未握手"
 				}
 			case time.Since(p.LastHandshake) > handshakeStale:
-				next = "握手过旧（空闲或链路中断）"
+				next = "stale"
 			}
 		}
 		if next != state && !(state == "" && next == "ok") {
-			if next == "ok" {
+			switch next {
+			case "ok":
 				logf("隧道 %s 握手正常", name)
-			} else {
+			case "stale":
+				// 隧道空闲时 WireGuard 本就不重握手，这不是故障；同时段有拨号失败才说明链路断了
+				logf("隧道 %s 超过 %v 没有新握手（空闲时正常）", name, handshakeStale)
+			default:
 				logf("隧道 %s 握手失败：%s", name, next)
 			}
 		}

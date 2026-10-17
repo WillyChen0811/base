@@ -15,10 +15,13 @@ NetBird 隧道、局域网直连……）更是通道之下的事，换隧道不
 
 from __future__ import annotations
 
+import io
 import os
 from dataclasses import dataclass
+import shutil
+from contextlib import contextmanager
 from pathlib import Path, PurePosixPath
-from typing import BinaryIO, List, Optional, Protocol, Union, runtime_checkable
+from typing import BinaryIO, Iterator, List, Optional, Protocol, Union, runtime_checkable
 
 
 @dataclass(frozen=True)
@@ -137,3 +140,58 @@ class LocalStorage:
 
     def set_mtime(self, path: str, mtime: float) -> None:
         os.utime(self._p(path), (mtime, mtime), follow_symlinks=False)
+
+
+# ---- 读进内存：不落盘的读法 ----
+# 临时读一份文件（委托单、需求文档……）就读进内存解析；只有必须给真实路径的外部
+# 工具才走 materialize（本地盘直接给原路径，其他通道拷进内存盘）。
+
+def read_bytes(storage: Storage, path: str, *, max_bytes: Optional[int] = None) -> bytes:
+    """经 `open_read` 读成 bytes。给了 `max_bytes` 且文件更大抛 `ValueError`
+    （先看 stat；读的过程中也计数，防 stat 不准或拿不到）。"""
+    if max_bytes is not None:
+        ent = storage.stat(path)
+        if ent is not None and ent.size > max_bytes:
+            raise ValueError(f"{path} 大小 {ent.size} 超过上限 {max_bytes} 字节")
+    buf = bytearray()
+    chunk = 1 << 20
+    with storage.open_read(path) as f:
+        while True:
+            want = chunk if max_bytes is None else min(chunk, max_bytes + 1 - len(buf))
+            data = f.read(want)
+            if not data:
+                break
+            buf += data
+            if max_bytes is not None and len(buf) > max_bytes:
+                raise ValueError(f"{path} 超过上限 {max_bytes} 字节")
+    return bytes(buf)
+
+
+def as_memory_file(storage: Storage, path: str, **kw) -> io.BytesIO:
+    """`read_bytes` 的 BytesIO 版（定位在 0），可直接交给 python-docx / openpyxl。
+    带 `.name`（原文件名），`pybase.sheets` 据此认扩展名。"""
+    bio = io.BytesIO(read_bytes(storage, path, **kw))
+    bio.name = PurePosixPath(path).name
+    return bio
+
+
+@contextmanager
+def materialize(storage: Storage, path: str, *, ramdisk=None) -> Iterator[str]:
+    """给"必须要真实文件路径"的工具用。`LocalStorage` 直接给本地真实路径（不复制）；
+    其他实现把文件拷进内存盘（`ramdisk.get_workspace()` 下的随机子目录，保留原文件名），
+    退出时删除。`ramdisk` 缺省取 `pybase.ramdisk.get_ram_disk()`；Windows 退化为磁盘目录
+    沿用 ramdisk 自己的语义。"""
+    if isinstance(storage, LocalStorage):
+        yield str(storage._p(path))
+        return
+    if ramdisk is None:
+        from .ramdisk import get_ram_disk
+        ramdisk = get_ram_disk()
+    work = ramdisk.get_workspace()
+    try:
+        dst = os.path.join(work, PurePosixPath(path).name)
+        with storage.open_read(path) as src, open(dst, "wb") as out:
+            shutil.copyfileobj(src, out, 1 << 20)
+        yield dst
+    finally:
+        shutil.rmtree(work, ignore_errors=True)

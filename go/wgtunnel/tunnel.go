@@ -31,6 +31,7 @@ type Tunnel struct {
 	net        *netstack.Net
 	listenPort atomic.Uint64
 	logf       func(format string, args ...any)
+	hasDNS     bool // 配置里写了 DNS= 的 IP
 	closed     atomic.Bool
 	closeOnce  sync.Once
 }
@@ -85,7 +86,7 @@ func Open(cfg *Config, opts Options) (*Tunnel, error) {
 	if logf == nil {
 		logf = func(string, ...any) {}
 	}
-	t := &Tunnel{dev: dev, net: tnet, logf: logf}
+	t := &Tunnel{dev: dev, net: tnet, logf: logf, hasDNS: len(cfg.DNS) > 0}
 	// listen_port 以设备实际绑定为准（配置写 0 时由系统分配）
 	if s, err := dev.IpcGet(); err == nil {
 		for _, line := range strings.Split(s, "\n") {
@@ -98,6 +99,9 @@ func Open(cfg *Config, opts Options) (*Tunnel, error) {
 	}
 	return t, nil
 }
+
+// HasDNS 报告隧道配置是否写了 DNS 服务器；没写时隧道内无法解析域名（不会回落到本机解析）。
+func (t *Tunnel) HasDNS() bool { return t.hasDNS }
 
 // ListenPort 返回实际绑定的 UDP 端口。
 func (t *Tunnel) ListenPort() int {

@@ -21,6 +21,7 @@ import (
 type forwardView struct {
 	Name          string      `json:"name"`
 	Listen        string      `json:"listen"`
+	Target        []string    `json:"target"`
 	Tunnel        string      `json:"tunnel"`
 	Connected     bool        `json:"connected"`
 	Error         string      `json:"error"`

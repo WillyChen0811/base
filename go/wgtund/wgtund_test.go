@@ -135,6 +135,7 @@ type started struct {
 	HTTP  string            `json:"http"`
 	Token string            `json:"token"`
 	Socks map[string]string `json:"socks"`
+	Proxy *proxyStatus      `json:"proxy"`
 }
 
 // run 启动助手，返回启动信息、关掉 stdin 的函数、Run 的返回值通道

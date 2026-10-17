@@ -54,6 +54,9 @@ asr-mlx = [
 net = [
     "cryptography>=44.0.0",
 ]
+ssh = [
+    "paramiko>=3.4",
+]
 db = [
     "sqlalchemy>=2.0.36",
 ]
@@ -63,7 +66,7 @@ postgres = [
 ]
 # 引用自身 extras（pip >= 21.2），新增 extra 时只要在这里加名字，不会漏抄依赖
 all = [
-    "pybase[docx,sheets,smb,crypto,office,office-word,rpc-server,subtitle,asr-mlx,net,db,postgres]",
+    "pybase[docx,sheets,smb,crypto,office,office-word,rpc-server,subtitle,asr-mlx,net,ssh,db,postgres]",
 ]
 dev = [
     "pytest>=7.0.0",

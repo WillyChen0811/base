@@ -1,0 +1,14 @@
+{
+  "listen": "127.0.0.1:18192",
+  "upstream": "http://192.168.147.196:8192",
+  "default_priority": 5,
+  "models": {"Qwen3.8-Flash-Next-oQ4e-mtp": {"max_concurrent": 1, "exclusive": true}},
+  "default_model": {"max_concurrent": 8, "exclusive": false},
+  "max_total": 16,
+  "wake": {"host": "192.168.147.196", "knock_ports": [22, 5900], "max_wait_seconds": 120},
+  "keepawake": {
+    "command": ["ssh", "-i", "/home/chenwy/.ssh/omlxgw_studio", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "omlxwake@192.168.147.196"],
+    "refresh_seconds": 240,
+    "idle_seconds": 600
+  }
+}

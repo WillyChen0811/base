@@ -369,6 +369,37 @@ func (c *Client) Listen(addr string) (net.Listener, error) {
 	return ln, nil
 }
 
+// DialContext 经这条 SSH 连接开 direct-tcpip 通道连到远端视角下的 addr（等同 ssh -L）。
+// ctx 到期则放弃等待并返回 ctx 错误（后到的连接会被关掉）；连接已断时直接返回错误。
+func (c *Client) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	if err := c.live(); err != nil {
+		return nil, err
+	}
+	type res struct {
+		c   net.Conn
+		err error
+	}
+	ch := make(chan res, 1)
+	go func() {
+		conn, err := c.client.Dial(network, addr)
+		ch <- res{conn, err}
+	}()
+	select {
+	case r := <-ch:
+		if r.err != nil {
+			return nil, fmt.Errorf("sshterm: 经 SSH 连 %s 失败: %w", addr, r.err)
+		}
+		return r.c, nil
+	case <-ctx.Done():
+		go func() {
+			if r := <-ch; r.c != nil {
+				r.c.Close()
+			}
+		}()
+		return nil, ctx.Err()
+	}
+}
+
 // Done 在连接断开（对端关、keepalive 失败）或 Close 后关闭。
 func (c *Client) Done() <-chan struct{} { return c.done }
 

@@ -24,7 +24,7 @@ type Options struct {
 	Exec func(cmd string) (stdout, stderr string, code int)
 	// ExecStdin 不为 nil 时优先于 Exec：读完客户端的标准输入（直到 EOF）再交给它处理。
 	ExecStdin func(cmd string, stdin []byte) (stdout, stderr string, code int)
-	// Forward 为 true 时支持远端端口转发（tcpip-forward）；默认拒绝。
+	// Forward 为 true 时支持远端端口转发（tcpip-forward）和本地转发（direct-tcpip，连服务器本机可达的地址）；默认拒绝。
 	Forward bool
 	// SFTPRoot 非空时，session 通道上的 "subsystem" 请求且名字是 "sftp" 时回 true，
 	// 并用 sftp.NewServer 服务（Serve 结束后关通道）。为空时 subsystem 请求照旧回 false。
@@ -252,6 +252,10 @@ func (s *Server) serve(c net.Conn, cfg *ssh.ServerConfig) {
 	}()
 	go s.globalReqs(sc, reqs)
 	for nc := range chans {
+		if nc.ChannelType() == "direct-tcpip" && s.opts.Forward {
+			go s.direct(nc)
+			continue
+		}
 		if nc.ChannelType() != "session" {
 			nc.Reject(ssh.UnknownChannelType, "")
 			continue
@@ -321,6 +325,32 @@ func (s *Server) serve(c net.Conn, cfg *ssh.ServerConfig) {
 			}
 		}()
 	}
+}
+
+// direct 处理 direct-tcpip 通道：拨到请求里的目标地址再双向拷贝。
+func (s *Server) direct(nc ssh.NewChannel) {
+	var d struct {
+		Host     string
+		Port     uint32
+		OrigHost string
+		OrigPort uint32
+	}
+	if ssh.Unmarshal(nc.ExtraData(), &d) != nil {
+		nc.Reject(ssh.ConnectionFailed, "bad payload")
+		return
+	}
+	up, err := net.Dial("tcp", net.JoinHostPort(d.Host, strconv.Itoa(int(d.Port))))
+	if err != nil {
+		nc.Reject(ssh.ConnectionFailed, err.Error())
+		return
+	}
+	ch, reqs, err := nc.Accept()
+	if err != nil {
+		up.Close()
+		return
+	}
+	go ssh.DiscardRequests(reqs)
+	pipe(up, ch)
 }
 
 // exec 处理无 PTY 的 exec：标准输出/标准错误分开写回，发 exit-status 后关通道。

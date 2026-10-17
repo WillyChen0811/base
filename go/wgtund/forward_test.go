@@ -13,6 +13,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/WillyChen0811/base/go/internal/sshtest"
 )
 
 // forwardView 是 /forwards 的一项：字段与 hostView 一致，外加 listen。
@@ -586,7 +588,7 @@ func waitNoFwdGoroutines(t *testing.T, within time.Duration) {
 func TestForwardOldRouteConnRefusedAfterSwitch(t *testing.T) {
 	d := &ctrlDialer{}
 	f := newForward(forwardConf{Name: "x", Listen: "127.0.0.1:0",
-		Routes: []routeConf{{Label: "A", Addr: "a:1"}, {Label: "B", Addr: "b:2"}}}, nil)
+		Routes: []routeConf{{Label: "A", Addr: "a:1"}, {Label: "B", Addr: "b:2"}}}, nil, nil)
 	f.dialers[0] = d
 	t.Cleanup(func() { f.Close() })
 
@@ -647,7 +649,7 @@ func TestForwardCloseStopsAllGoroutines(t *testing.T) {
 	probeStuck := &ctrlDialer{gate: make(chan struct{})} // 首选：探测永远挂到这被取消
 	serveStuck := &ctrlDialer{gate: make(chan struct{})} // 备用：业务拨号挂到这被取消
 	f := newForward(forwardConf{Name: "x", Listen: "127.0.0.1:0",
-		Routes: []routeConf{{Label: "A", Addr: "a:1"}, {Label: "B", Addr: "b:2"}}}, nil)
+		Routes: []routeConf{{Label: "A", Addr: "a:1"}, {Label: "B", Addr: "b:2"}}}, nil, nil)
 	f.dialers[0], f.dialers[1] = probeStuck, serveStuck
 	t.Cleanup(func() { f.Close() }) // 已停则幂等
 
@@ -684,7 +686,7 @@ func TestForwardStartPortOccupied(t *testing.T) {
 	t.Cleanup(func() { hold.Close() })
 	addr := hold.Addr().String()
 	f := newForward(forwardConf{Name: "busy", Listen: addr,
-		Routes: []routeConf{{Label: "直连", Addr: "10.99.0.1:8192"}}}, nil)
+		Routes: []routeConf{{Label: "直连", Addr: "10.99.0.1:8192"}}}, nil, nil)
 	t.Cleanup(func() { f.Close() })
 	if err := f.start(); err == nil {
 		t.Fatal("监听端口被占用时 start 应返回错误")
@@ -754,5 +756,105 @@ func TestForwardBadConfig(t *testing.T) {
 				t.Errorf("出错时不应打印启动信息: %q", out.String())
 			}
 		})
+	}
+}
+
+// via 线路：fwdVia 造一条经主机 SSH 的线路。
+func fwdVia(label, via, addr string) map[string]any {
+	m := map[string]any{"via": via, "addr": addr}
+	if label != "" {
+		m["label"] = label
+	}
+	return m
+}
+
+func roundTrip(c net.Conn, br *bufio.Reader, msg string) (string, error) {
+	if _, err := io.WriteString(c, msg+"\n"); err != nil {
+		return "", err
+	}
+	return br.ReadString('\n')
+}
+
+// via：经主机的共用 SSH 连接（direct-tcpip）转到上游，label 缺省「经 主机」，/forwards 带 via
+func TestForwardViaSSHReachesUpstream(t *testing.T) {
+	u := startFwdUpstream(t, "U")
+	f := newFixtureOpts(t, func(cfg map[string]any) {
+		addFwd(cfg, fwdConf("chat", "127.0.0.1:0", fwdVia("", "ubuntu", u.addr())))
+	}, sshtest.Options{Forward: true})
+	st, _, _ := run(t, f.dir)
+	fs := forwardsOf(t, st)
+	if len(fs) != 1 || len(fs[0].Routes) != 1 || fs[0].Routes[0].Label != "经 ubuntu" || fs[0].Routes[0].Via != "ubuntu" {
+		t.Fatalf("/forwards = %+v", fs)
+	}
+	c := dialFwd(t, fs[0].Listen)
+	br := bufio.NewReader(c)
+	if l, err := roundTrip(c, br, "ping"); err != nil || l != "U:ping\n" {
+		t.Fatalf("回程 = %q, %v，期望 U:ping", l, err)
+	}
+	// 再开一条转发连接，仍共用同一条 SSH 连接
+	c2 := dialFwd(t, fs[0].Listen)
+	if l, err := roundTrip(c2, bufio.NewReader(c2), "pong"); err != nil || l != "U:pong\n" {
+		t.Fatalf("第二条 = %q, %v", l, err)
+	}
+	if n := f.ssh.Conns(); n != 1 {
+		t.Errorf("SSH 连接数 = %d，应复用同一条", n)
+	}
+	if fs = forwardsOf(t, st); !fs[0].Connected || fs[0].Error != "" {
+		t.Errorf("连上后 /forwards = %+v", fs[0])
+	}
+}
+
+// via 指向不存在的主机、via 与 tunnel 同写：启动失败
+func TestForwardViaConfigErrors(t *testing.T) {
+	u := startFwdUpstream(t, "U")
+	cases := map[string]map[string]any{
+		"不存在的主机":       fwdVia("", "nope", u.addr()),
+		"via 与 tunnel": {"via": "ubuntu", "tunnel": "home", "addr": u.addr()},
+	}
+	for name, route := range cases {
+		f := newFixture(t, func(cfg map[string]any) {
+			addFwd(cfg, fwdConf("chat", "127.0.0.1:0", route))
+		})
+		err := runErr(t, f.dir)
+		if err == nil || !strings.Contains(err.Error(), "via") {
+			t.Errorf("%s：err = %v，期望提到 via 的配置错误", name, err)
+		}
+	}
+}
+
+// SSH 断开后，新进来的转发连接经重拨的新连接可用
+func TestForwardViaSSHReconnect(t *testing.T) {
+	u := startFwdUpstream(t, "U")
+	f := newFixtureOpts(t, func(cfg map[string]any) {
+		addFwd(cfg, fwdConf("chat", "127.0.0.1:0", fwdVia("", "ubuntu", u.addr())))
+	}, sshtest.Options{Forward: true})
+	st, _, _ := run(t, f.dir)
+	listen := forwardsOf(t, st)[0].Listen
+	c := dialFwd(t, listen)
+	br := bufio.NewReader(c)
+	if l, err := roundTrip(c, br, "one"); err != nil || l != "U:one\n" {
+		t.Fatalf("断线前 = %q, %v", l, err)
+	}
+	f.ssh.CloseConns()
+	readClosed(t, c, 3*time.Second) // 在途连接随旧连接结束
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		c2, err := net.DialTimeout("tcp", listen, 5*time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		c2.SetDeadline(time.Now().Add(5 * time.Second))
+		l, err := roundTrip(c2, bufio.NewReader(c2), "two")
+		c2.Close()
+		if err == nil && l == "U:two\n" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("断线重连后仍不可用: %q, %v", l, err)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if n := f.ssh.Conns(); n != 2 {
+		t.Errorf("SSH 连接数 = %d，期望重拨后共 2 条", n)
 	}
 }

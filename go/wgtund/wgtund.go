@@ -44,6 +44,7 @@ type routeConf struct {
 	Label  string `json:"label"`
 	Tunnel string `json:"tunnel"`
 	Addr   string `json:"addr"`
+	Via    string `json:"via,omitempty"` // 仅转发线路用：经该主机的共用 SSH 连接开 direct-tcpip 到 addr（与 tunnel 互斥）
 }
 
 // hostRoutes 返回主机规范化后的线路列表：写了 routes 就用它，否则把 tunnel/addr 当作唯一一条线路。
@@ -213,19 +214,6 @@ func Run(ctx context.Context, dir string, stdin io.Reader, stdout io.Writer) (er
 		socksAddrs[name] = s.Addr().String()
 	}
 
-	// 端口转发（可选）：本机固定端口，进来的拨到当前线路的远端地址；监听失败算启动失败
-	forwardMap := map[string]*forwardSvc{}
-	forwardOrder := []string{}
-	for _, fw := range conf.Forwards {
-		fwd := newForward(fw, tunnels)
-		if err := fwd.start(); err != nil {
-			return fmt.Errorf("转发 %q 开监听失败: %w", fw.Name, err)
-		}
-		closers = append(closers, fwd)
-		forwardMap[fw.Name] = fwd
-		forwardOrder = append(forwardOrder, fw.Name)
-	}
-
 	tok := make([]byte, 24)
 	if _, err := rand.Read(tok); err != nil {
 		return err
@@ -249,6 +237,19 @@ func Run(ctx context.Context, dir string, stdin io.Reader, stdout io.Writer) (er
 			ds = append(ds, d)
 		}
 		pool.add(h, ds)
+	}
+
+	// 端口转发（可选）：本机固定端口，进来的拨到当前线路的远端地址；监听失败算启动失败
+	forwardMap := map[string]*forwardSvc{}
+	forwardOrder := []string{}
+	for _, fw := range conf.Forwards {
+		fwd := newForward(fw, tunnels, pool)
+		if err := fwd.start(); err != nil {
+			return fmt.Errorf("转发 %q 开监听失败: %w", fw.Name, err)
+		}
+		closers = append(closers, fwd)
+		forwardMap[fw.Name] = fwd
+		forwardOrder = append(forwardOrder, fw.Name)
 	}
 
 	// 项目同步（可选）：给目标主机开一条本机线路转发口（git 走它、跟随当前线路），

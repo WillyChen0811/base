@@ -36,6 +36,7 @@ type routeView struct {
 	Label  string `json:"label"`
 	Tunnel string `json:"tunnel"`
 	Addr   string `json:"addr"`
+	Via    string `json:"via,omitempty"`
 }
 
 // routeState 是主机线路状态的快照，给 /hosts 用。
@@ -112,7 +113,7 @@ func (p *sshPool) routeInfo(host string) routeState {
 	defer e.mu.Unlock()
 	views := make([]routeView, len(e.routes))
 	for i, r := range e.routes {
-		views[i] = routeView{r.Label, r.Tunnel, r.Addr}
+		views[i] = routeView{r.Label, r.Tunnel, r.Addr, ""}
 	}
 	return routeState{views, e.active, e.preferredDown, e.preferredBack}
 }

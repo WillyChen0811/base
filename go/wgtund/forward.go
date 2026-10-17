@@ -41,6 +41,12 @@ func (fc forwardConf) validate(cfgs map[string]*wgtunnel.Config, hostNames map[s
 		if _, _, err := net.SplitHostPort(r.Addr); err != nil {
 			return fmt.Errorf("hosts.json: 转发 %q 第 %d 条线路的地址 %q 要写成 主机:端口", fc.Name, i+1, r.Addr)
 		}
+		if r.Via != "" && r.Tunnel != "" {
+			return fmt.Errorf("hosts.json: 转发 %q 第 %d 条线路的 via 与 tunnel 不能同时写", fc.Name, i+1)
+		}
+		if r.Via != "" && !hostNames[r.Via] {
+			return fmt.Errorf("hosts.json: 转发 %q 第 %d 条线路的 via 引用了不存在的主机 %q", fc.Name, i+1, r.Via)
+		}
 		if r.Tunnel != "" && cfgs[r.Tunnel] == nil {
 			return fmt.Errorf("hosts.json: 转发 %q 第 %d 条线路引用了不存在的隧道 %q", fc.Name, i+1, r.Tunnel)
 		}
@@ -83,7 +89,7 @@ type forwardSvc struct {
 }
 
 // newForward 按配置建转发（不监听）：dialers 照主机线路的建法（隧道为空则直连），label 补全照 hostRoutes。
-func newForward(fc forwardConf, tunnels map[string]*wgtunnel.Tunnel) *forwardSvc {
+func newForward(fc forwardConf, tunnels map[string]*wgtunnel.Tunnel, pool *sshPool) *forwardSvc {
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &forwardSvc{
 		name:    fc.Name,
@@ -96,7 +102,9 @@ func newForward(fc forwardConf, tunnels map[string]*wgtunnel.Tunnel) *forwardSvc
 	}
 	for i, r := range fc.Routes {
 		if r.Label == "" {
-			if r.Tunnel != "" {
+			if r.Via != "" {
+				r.Label = "经 " + r.Via
+			} else if r.Tunnel != "" {
 				r.Label = r.Tunnel
 			} else {
 				r.Label = "直连"
@@ -104,12 +112,29 @@ func newForward(fc forwardConf, tunnels map[string]*wgtunnel.Tunnel) *forwardSvc
 		}
 		s.routes[i] = r
 		var d sshterm.Dialer = &net.Dialer{Timeout: dialTimeout}
-		if r.Tunnel != "" {
+		if r.Via != "" {
+			d = &viaDialer{pool: pool, host: r.Via}
+		} else if r.Tunnel != "" {
 			d = tunnels[r.Tunnel]
 		}
 		s.dialers[i] = d
 	}
 	return s
+}
+
+// viaDialer 经主机的共用 SSH 连接拨号（direct-tcpip）：每次拨号现取连接，断了由连接池重拨，
+// 所以重连后的新转发连接自然用新连接，在途的随旧连接结束。
+type viaDialer struct {
+	pool *sshPool
+	host string
+}
+
+func (v *viaDialer) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	c, err := v.pool.conn(v.host)
+	if err != nil {
+		return nil, err
+	}
+	return c.DialContext(ctx, network, addr)
 }
 
 // start 按 listen 开监听并起接受循环；监听失败返回错误（调用方当启动失败处理）。
@@ -317,7 +342,7 @@ func (f *forwardSvc) item() forwardItem {
 	defer f.mu.Unlock()
 	views := make([]routeView, len(f.routes))
 	for i, r := range f.routes {
-		views[i] = routeView{r.Label, r.Tunnel, r.Addr}
+		views[i] = routeView{r.Label, r.Tunnel, r.Addr, r.Via}
 	}
 	return forwardItem{f.name, f.addr, f.routes[f.active].Tunnel, f.connected, f.lastErr,
 		routeState{views, f.active, f.preferredDown, f.preferredBack}}

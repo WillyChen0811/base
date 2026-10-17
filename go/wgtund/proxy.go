@@ -156,7 +156,7 @@ const (
 
 // serve 处理一条代理连接：握手 → 找转发 → 当前线路拨号 → 应答 → 转交转发的 relay。
 func (p *proxySvc) serve(c net.Conn) {
-	c.SetDeadline(time.Now().Add(10 * time.Second)) // 只管握手阶段，转发开始前清掉
+	c.SetDeadline(time.Now().Add(10 * time.Second)) // 只管握手阶段，拨号前清掉
 	dest, rep := socksHandshake(c)
 	if rep != repOK {
 		if dest != "" || rep != repFailure {
@@ -165,6 +165,7 @@ func (p *proxySvc) serve(c net.Conn) {
 		c.Close()
 		return
 	}
+	c.SetDeadline(time.Time{}) // 拨号有自己的 dialTimeout；慢线路上握手+拨号超过 10 秒也不该掐掉已拨通的连接
 	f := p.pick(dest)
 	up, gen, err := f.dialTo(dest)
 	if err != nil {
@@ -177,7 +178,6 @@ func (p *proxySvc) serve(c net.Conn) {
 		c.Close()
 		return
 	}
-	c.SetDeadline(time.Time{})
 	f.relay(c, up, gen)
 }
 

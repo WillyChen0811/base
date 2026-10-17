@@ -154,14 +154,14 @@ func (f *forwardSvc) start() error {
 		host = "127.0.0.1" // localhost 也固定绑回环 IPv4，别拿到 ::1
 	}
 	f.laddr = net.JoinHostPort(host, port)
-	if !f.tryListen() {
+	if !f.tryListen(false) {
 		go f.listenRetryLoop()
 	}
 	return nil
 }
 
 // tryListen 试一次监听；成功则起接受循环并清错误，失败记 listenErr。已 Close 视为完成（返回 true）。
-func (f *forwardSvc) tryListen() bool {
+func (f *forwardSvc) tryListen(retry bool) bool {
 	ln, err := net.Listen("tcp", f.laddr)
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -173,9 +173,16 @@ func (f *forwardSvc) tryListen() bool {
 	}
 	if err != nil {
 		f.listenErr = fmt.Sprintf("监听 %s 失败：%v", f.laddr, err)
+		sysLog.logThrottled("listen:"+f.name, f.listenErr, "转发 %s %s", f.name, f.listenErr)
 		return false
 	}
 	f.ln, f.addr, f.listenErr = ln, ln.Addr().String(), ""
+	sysLog.clearThrottle("listen:" + f.name)
+	if retry {
+		logf("转发 %s 重试监听成功：%s", f.name, f.addr)
+	} else {
+		logf("转发 %s 监听成功：%s", f.name, f.addr)
+	}
 	go f.acceptLoop(ln)
 	return true
 }
@@ -189,7 +196,7 @@ func (f *forwardSvc) listenRetryLoop() {
 		case <-f.ctx.Done():
 			return
 		}
-		if f.tryListen() {
+		if f.tryListen(true) {
 			return
 		}
 	}
@@ -209,7 +216,8 @@ func (f *forwardSvc) acceptLoop(ln net.Listener) {
 			f.ln, f.addr = nil, ""
 			f.mu.Unlock()
 			ln.Close()
-			if !f.tryListen() {
+			logf("转发 %s 监听异常退出：%v", f.name, err)
+			if !f.tryListen(true) {
 				go f.listenRetryLoop()
 			}
 			return
@@ -305,13 +313,17 @@ func (f *forwardSvc) dial() (net.Conn, int, error) {
 	f.connected = err == nil
 	if err != nil {
 		f.lastErr = err.Error()
+		sysLog.logThrottled("fwd:"+f.name, f.lastErr, "转发 %s 拨号失败（线路 %s）：%v", f.name, f.routes[idx].Label, err)
 		if idx == 0 && len(f.routes) > 1 {
-			f.preferredDown = true
+			setFlagLog(&f.preferredDown, true, "preferred_down =", "转发 "+f.name)
 		}
 	} else {
 		f.lastErr = ""
+		if sysLog.clearThrottle("fwd:" + f.name) {
+			logf("转发 %s 拨号恢复（线路 %s）", f.name, f.routes[idx].Label)
+		}
 		if idx == 0 {
-			f.preferredDown = false
+			setFlagLog(&f.preferredDown, false, "preferred_down =", "转发 "+f.name)
 		}
 	}
 	f.mu.Unlock()
@@ -328,6 +340,7 @@ func (f *forwardSvc) switchRoute(idx int) error {
 		f.mu.Unlock()
 		return &routeError{msg: fmt.Sprintf("没有第 %d 条线路", idx)}
 	}
+	logf("转发 %s 切换线路 %s → %s", f.name, f.routes[f.active].Label, f.routes[idx].Label)
 	f.active = idx
 	f.gen++ // 在途拨号走的是旧线路：完成时作废
 	f.preferredDown = false
@@ -381,7 +394,7 @@ func (f *forwardSvc) probeLoop(interval, timeout time.Duration) {
 		}
 		f.mu.Lock()
 		if f.active != 0 {
-			f.preferredBack = err == nil
+			setFlagLog(&f.preferredBack, err == nil, "preferred_back =", "转发 "+f.name)
 		}
 		f.mu.Unlock()
 	}

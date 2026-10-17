@@ -82,7 +82,7 @@ func ensureClientBundle(path string, ca *xxyica.CA, side string) error {
 			if verr := xxyica.VerifyCert(ca.Public(), cert, time.Now(), nil); verr == nil {
 				return nil
 			} else {
-				fmt.Fprintf(os.Stderr, "wgtund: 客户端 %s 的证书用当前 CA 校验不通过（%v），保留原密钥重新签发 %s\n", side, verr, path)
+				logf("客户端 %s 的证书用当前 CA 校验不通过（%v），保留原密钥重新签发 %s\n", side, verr, path)
 				cert2, err := ca.Issue(side, cert.PublicKey, xxyica.DefaultPerm(side), certValidFor, time.Now())
 				if err != nil {
 					return fmt.Errorf("重签 %s 证书失败: %w", side, err)
@@ -94,7 +94,7 @@ func ensureClientBundle(path string, ca *xxyica.CA, side string) error {
 			}
 		}
 		// 旧包读不了：救不出原密钥对，只能换新（报错文案让用户能对上现象）。
-		fmt.Fprintf(os.Stderr, "wgtund: 客户端包 %s 读不了（%v），换新密钥重新签发\n", path, lerr)
+		logf("客户端包 %s 读不了（%v），换新密钥重新签发\n", path, lerr)
 	}
 	pub, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {

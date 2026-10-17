@@ -130,6 +130,7 @@ func (p *sshPool) switchRoute(host string, idx int) error {
 		e.mu.Unlock()
 		return &routeError{msg: fmt.Sprintf("没有第 %d 条线路", idx)}
 	}
+	logf("主机 %s 切换线路 %s → %s", host, e.routes[e.active].Label, e.routes[idx].Label)
 	e.active = idx
 	e.gen++          // 在途拨号走的是旧线路：完成时作废
 	e.inflight = nil // 之后的请求不再等旧线路的拨号，直接在新线路上拨
@@ -167,7 +168,7 @@ func (p *sshPool) dialActive(ctx context.Context, host string) (net.Conn, error)
 	if err != nil && idx == 0 && multi {
 		e.mu.Lock()
 		if e.active == idx {
-			e.preferredDown = true
+			setFlagLog(&e.preferredDown, true, "preferred_down =", "主机 "+host)
 		}
 		e.mu.Unlock()
 	}
@@ -290,6 +291,7 @@ type hostConn struct {
 	preferredBack bool // 走备用期间探测到首选已恢复（只标记，由用户决定是否切回）
 	probing       bool // 已有探测协程在跑
 	gen           int  // 每次切换线路加一，用来作废切换前发起的拨号
+	dialed        bool // 拨过号了（再拨记为重拨）
 }
 
 // dialCall 是一次在途拨号，等它的人从 done 读同一个结果。
@@ -322,8 +324,15 @@ func (e *hostConn) conn() (*sshterm.Client, error) {
 	call := &dialCall{done: make(chan struct{})}
 	e.inflight = call
 	idx, gen := e.active, e.gen
+	label, redial := e.routes[idx].Label, e.dialed
+	e.dialed = true
 	e.mu.Unlock()
 
+	if redial {
+		logf("主机 %s 重拨（线路 %s）", e.h.Name, label)
+	} else {
+		logf("主机 %s 开始拨号（线路 %s）", e.h.Name, label)
+	}
 	c, err := e.dial(idx)
 
 	e.mu.Lock()
@@ -344,12 +353,15 @@ func (e *hostConn) conn() (*sshterm.Client, error) {
 	if err != nil {
 		e.connected = false
 		e.lastErr = err.Error()
+		sysLog.logThrottled("host:"+e.h.Name, err.Error(), "主机 %s 拨号失败（线路 %s）：%v", e.h.Name, label, err)
 		if idx == 0 && len(e.routes) > 1 {
-			e.preferredDown = true
+			setFlagLog(&e.preferredDown, true, "preferred_down =", "主机 "+e.h.Name)
 		}
 	} else {
+		sysLog.clearThrottle("host:" + e.h.Name)
+		logf("主机 %s 已连上（线路 %s）", e.h.Name, label)
 		if idx == 0 {
-			e.preferredDown = false
+			setFlagLog(&e.preferredDown, false, "preferred_down =", "主机 "+e.h.Name)
 		}
 		e.client = c
 		e.connected = true
@@ -413,7 +425,7 @@ func (e *hostConn) probeLoop(interval, timeout time.Duration) {
 		}
 		e.mu.Lock()
 		if e.active != 0 {
-			e.preferredBack = err == nil
+			setFlagLog(&e.preferredBack, err == nil, "preferred_back =", "主机 "+e.h.Name)
 		}
 		e.mu.Unlock()
 	}
@@ -438,6 +450,7 @@ func (e *hostConn) recordDeadLocked(c *sshterm.Client) {
 	} else {
 		e.lastErr = "连接已断开"
 	}
+	logf("主机 %s 断开（线路 %s）：%s", e.h.Name, e.routes[e.active].Label, e.lastErr)
 }
 
 // drop 丢掉 c 指向的连接（c 为 nil 时丢掉当前缓存的任意一条）。
@@ -456,5 +469,8 @@ func (e *hostConn) drop(c *sshterm.Client) {
 	}
 	if c != nil && !match {
 		c.Close() // 旧连接自己也关（幂等）
+	}
+	if c != nil && match && cur != nil {
+		logf("主机 %s 丢弃连接（操作出错，下次使用时重拨）", e.h.Name)
 	}
 }

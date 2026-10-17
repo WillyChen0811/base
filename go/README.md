@@ -12,6 +12,8 @@
 ## wgtund 助手程序
     wgtund -dir <配置目录>
 
+运行日志写到 `<配置目录>/wgtund.log`（同时输出 stderr），每行带本地时间；按天轮转为 `wgtund-YYYY-MM-DD.log`，保留 3 天，单文件超 20MB 也会轮转（同日加序号）。日志不含令牌、密钥、密码和终端内容。
+
 配置目录：
 - `tunnels/<名字>.conf`：每个文件一条隧道（wg-quick 格式，权限建议 600）。
 - `hosts.json`：

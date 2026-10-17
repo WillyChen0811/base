@@ -16,6 +16,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"time"
@@ -105,10 +106,25 @@ func loadConf(dir string) (*fileConf, error) {
 // Run 读配置目录，起隧道、SOCKS 口和 HTTP 服务；就绪后往 stdout 写一行启动信息 JSON。
 // stdin 读到 EOF 或 ctx 取消时关掉一切并返回 nil。
 func Run(ctx context.Context, dir string, stdin io.Reader, stdout io.Writer) (err error) {
+	if rl, lerr := newRotLog(dir, time.Now, logMaxSize); lerr != nil {
+		logf("日志文件打不开（只写 stderr）：%v", lerr)
+	} else {
+		defer rl.Close()
+		defer sysLog.setFile(rl)()
+	}
+	logf("wgtund 启动：%s，配置目录 %s", buildDesc(), dir)
+	reason := "未知"
+	defer func() {
+		if err != nil {
+			reason = "出错：" + err.Error()
+		}
+		logf("wgtund 退出：%s", reason)
+	}()
 	conf, err := loadConf(dir)
 	if err != nil {
 		return err
 	}
+	logf("配置：%d 台主机，%d 条转发，%d 个 SOCKS", len(conf.Hosts), len(conf.Forwards), len(conf.Socks))
 
 	var closers []io.Closer
 	defer func() {
@@ -198,10 +214,13 @@ func Run(ctx context.Context, dir string, stdin io.Reader, stdout io.Writer) (er
 	for name, cfg := range cfgs {
 		t, err := wgtunnel.Open(cfg, wgtunnel.Options{})
 		if err != nil {
+			logf("隧道 %s 启动失败：%v", name, err)
 			return fmt.Errorf("%s.conf: %w", name, err)
 		}
+		logf("隧道 %s 已启动", name)
 		closers = append(closers, t)
 		tunnels[name] = t
+		go watchHandshake(ctx, name, t)
 	}
 
 	socksAddrs := map[string]string{}
@@ -624,6 +643,13 @@ func Run(ctx context.Context, dir string, stdin io.Reader, stdout io.Writer) (er
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
+		if r.Method == http.MethodPost { // 会改状态的操作记一行（只记路径和几个无敏感内容的参数，不记令牌）
+			sw := &statusWriter{ResponseWriter: w, code: http.StatusOK}
+			mux.ServeHTTP(sw, r)
+			q := r.URL.Query()
+			logf("HTTP POST %s host=%q name=%q route=%q → %d", r.URL.Path, q.Get("host"), q.Get("name"), q.Get("route"), sw.code)
+			return
+		}
 		mux.ServeHTTP(w, r)
 	})
 	srv := &http.Server{Handler: guarded}
@@ -647,12 +673,83 @@ func Run(ctx context.Context, dir string, stdin io.Reader, stdout io.Writer) (er
 	}
 	select {
 	case <-eof:
+		reason = "stdin 关闭（父进程退出）"
 	case <-ctx.Done():
+		reason = "收到退出信号"
 	case err := <-served:
 		// HTTP 服务意外停了：整体退出，让父进程看到并重启
 		return fmt.Errorf("HTTP 服务停止: %w", err)
 	}
 	return nil
+}
+
+// statusWriter 记下响应状态码，给 POST 日志用。
+type statusWriter struct {
+	http.ResponseWriter
+	code int
+}
+
+func (s *statusWriter) WriteHeader(c int)           { s.code = c; s.ResponseWriter.WriteHeader(c) }
+func (s *statusWriter) Unwrap() http.ResponseWriter { return s.ResponseWriter }
+
+// buildDesc 返回版本/提交号（编译信息里有才有）。
+func buildDesc() string {
+	bi, ok := debug.ReadBuildInfo()
+	if !ok {
+		return "版本未知"
+	}
+	v := bi.Main.Version
+	if v == "" || v == "(devel)" {
+		v = "devel"
+	}
+	for _, s := range bi.Settings {
+		if s.Key == "vcs.revision" && len(s.Value) >= 7 {
+			v += " 提交 " + s.Value[:7]
+		}
+	}
+	return v
+}
+
+// handshakeCheck 是隧道握手巡检间隔；handshakeGrace 是启动后允许握不上手的时间，
+// handshakeStale 是握手过旧的阈值（WireGuard 约每 2 分钟重握一次）。
+var (
+	handshakeCheck = 30 * time.Second
+	handshakeGrace = 45 * time.Second
+	handshakeStale = 5 * time.Minute
+)
+
+// watchHandshake 定时看隧道对等体的握手，状态变化时记一行：未握手/握手过旧/正常。
+func watchHandshake(ctx context.Context, name string, t *wgtunnel.Tunnel) {
+	start := time.Now()
+	state := ""
+	tk := time.NewTicker(handshakeCheck)
+	defer tk.Stop()
+	for {
+		select {
+		case <-tk.C:
+		case <-ctx.Done():
+			return
+		}
+		next := "ok"
+		for _, p := range t.Stats().Peers {
+			switch {
+			case p.LastHandshake.IsZero():
+				if time.Since(start) > handshakeGrace {
+					next = "未握手"
+				}
+			case time.Since(p.LastHandshake) > handshakeStale:
+				next = "握手过旧（空闲或链路中断）"
+			}
+		}
+		if next != state && !(state == "" && next == "ok") {
+			if next == "ok" {
+				logf("隧道 %s 握手正常", name)
+			} else {
+				logf("隧道 %s 握手失败：%s", name, next)
+			}
+		}
+		state = next
+	}
 }
 
 // closerFunc 让普通函数当 io.Closer 用。

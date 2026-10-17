@@ -317,7 +317,7 @@ func startSupport(p *supportPrep, dir, knownHosts, httpAddr string, socksAddrs m
 		d, err := remoteDirOf(r.Remote)
 		if err != nil {
 			// 推导不出 Ubuntu 目录不让 wgtund 起不来：只跳过该仓库的 Mac→Ubuntu（Sync 时报错，原因留给报错用）
-			fmt.Fprintf(os.Stderr, "wgtund: support 仓库 %q：%v，Mac→Ubuntu 代码同步不可用\n", n, err)
+			logf("support 仓库 %q：%v，Mac→Ubuntu 代码同步不可用\n", n, err)
 			remoteDirErrs[n] = err.Error()
 		} else {
 			remoteDirs[n] = d
@@ -365,7 +365,7 @@ func startSupport(p *supportPrep, dir, knownHosts, httpAddr string, socksAddrs m
 	// 证书校验/消息签名接进消息接口：CA 准备失败不能拖累 wgtund 启动，
 	// 换成永远拒绝的校验器——消息接口全 401，原因打在 stderr 给人看。
 	if ca, revoked, err := prepareMsgCA(); err != nil {
-		fmt.Fprintf(os.Stderr, "wgtund: 消息 CA 准备失败: %v；证书校验用拒绝器，消息接口不可用\n", err)
+		logf("消息 CA 准备失败: %v；证书校验用拒绝器，消息接口不可用\n", err)
 		cfg.MsgAuth = denyAllVerifier()
 	} else {
 		cfg.MsgAuth = xxyica.NewVerifier(ca.Public(), revoked)

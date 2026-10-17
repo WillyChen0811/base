@@ -31,7 +31,7 @@ func main() {
 	eofCh := make(chan struct{})
 	exited := make(chan struct{})
 	go watchShutdown(ctx.Done(), eofCh, exited, shutdownGrace, func(code int) {
-		fmt.Fprintln(os.Stderr, "wgtund: 关闭超过 3 秒，强制退出")
+		wgtund.Logf("wgtund: 关闭超过 3 秒，强制退出")
 		os.Exit(code)
 	})
 	in := newEOFReader(os.Stdin, func() { close(eofCh) })

@@ -38,6 +38,7 @@
 - `exists()` 是三态：`None` 表示判不出，不能当 `False` 用
 - 固定使用 NTLM，不用 negotiate（Kerberos 在 IP 直连场景会导致 `ACCESS_DENIED`）
 - `CONNECT_TIMEOUT=10s` 是有意设置：RPC stdio 是单线程，超时太长会堵塞管道
+- `smbstorage.SMBStorage` 只是 `Storage` 到 `SMBClient` 的适配，不直接碰 `smbclient`；新能力加进 `pybase/smb/stream.py`，不要在 smbstorage 里另起一套连接/认证
 - 只有 `shares.py` 用 `pysmb`（列共享），其余都走 `smbprotocol`
 
 ### office

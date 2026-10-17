@@ -5,9 +5,10 @@
 
 - `share` 是共享名，`root` 是共享**内**的目录（可为空 = 共享根）；`Storage` 的相对路径都换算到
   `root` 下，含 `..` 或绝对路径一律 `ValueError`，跑不出 root。
-- 连接、列目录、建目录走 `SMBClient`（`connect` / `list_dir` / `mkdir`）；`SMBClient` 没有的
-  stat、流式读写、续写、删除、改名覆盖、改时间，直接用 `smbclient` 的同名函数，并共用
-  `SMBClient` 实例的连接缓存（`client._cache`），不另开会话。
+- 本模块只做 `Storage` 接口到 `SMBClient` 的适配：连接（固定 NTLM、10 秒建连超时）、认证、路径→UNC、
+  stat / 流式读写 / 续写 / replace / remove / rmdir / set_mtime / 列目录 / 建目录，全是 `SMBClient`
+  的方法（`pybase/smb/stream.py` 等），这里不直接碰 `smbclient`。本模块只管：相对路径锁在 root 下、
+  凭据来源、断线重连一次、`Entry` 转换。
 - `stat` 不存在返回 None；连接出问题抛 `OSError`，不会被当成"不存在"。
 - `available()` 已连接时只看缓存里连接的 `transport.connected`（不发请求）；未连接或已断则先做一次
   TCP 探测（超时 `min(connect_timeout, 5)` 秒），通了再 `SMBClient.connect()`，成功 True（连接留着复用）、
@@ -22,9 +23,7 @@
 
 from __future__ import annotations
 
-import errno
 import socket
-import stat as stat_mod
 import threading
 from datetime import datetime
 from pathlib import PurePosixPath
@@ -54,10 +53,9 @@ def _tcp_probe(host: str, port: int, timeout: float) -> bool:
 class SMBStorage:
     def __init__(self, host: str, share: str, root: str = "", *, user: Optional[str] = None,
                  password: Optional[str] = None, port: int = 445, connect_timeout: float = 10,
-                 client_factory: Optional[Callable[..., Any]] = None, ops: Any = None,
+                 client_factory: Optional[Callable[..., Any]] = None,
                  probe: Optional[Callable[[str, int, float], bool]] = None):
-        """`client_factory(host, share, user, password, port)` 与 `ops`（提供 `smbclient` 的
-        lstat/open_file/remove/rmdir/replace/utime）默认用真实实现，测试可替换。"""
+        """`client_factory(host, share, user, password, port)` 默认造真实 `SMBClient`，测试可替换。"""
         if not share or "/" in share or "\\" in share:
             raise ValueError(f"共享名不合法：{share!r}")
         rel = PurePosixPath((root or "").strip("/") or ".")
@@ -68,7 +66,6 @@ class SMBStorage:
         self._password = password
         self.connect_timeout = connect_timeout
         self._client_factory = client_factory
-        self._ops = ops
         self._probe = probe or _tcp_probe
         self._client: Any = None
         self._lock = threading.RLock()
@@ -97,25 +94,9 @@ class SMBStorage:
         from .smb.client import SMBClient
         return SMBClient(self.host, self.share, self.user or "", self._pw(), self.port)
 
-    def _smb(self):
-        if self._ops is not None:
-            return self._ops
-        import smbclient
-        return smbclient
-
-    def _kw(self, c, read: bool = False) -> dict:
-        kw = {"connection_cache": c._cache}
-        if read and self._ops is None:
-            from .smb.common import _READ_ACCESS
-            kw.update(share_access="rwd", desired_access=_READ_ACCESS)
-        return kw
-
     def _alive(self) -> bool:
         c = self._client
-        if c is None or not getattr(c, "_connected", False):
-            return False
-        conns = [v for v in getattr(c, "_cache", {}).values() if hasattr(v, "transport")]
-        return all(getattr(v.transport, "connected", True) for v in conns)
+        return c is not None and c.is_alive()
 
     def _drop(self) -> None:
         c, self._client = self._client, None
@@ -138,7 +119,13 @@ class SMBStorage:
                     client.disconnect()
                 except Exception:
                     pass
-                raise OSError(f"SMB 连接 {self.host}:{self.port}/{self.share} 失败：{e}") from e
+                try:
+                    from .smb.errors import smb_error      # 沿用 SMBClient 一侧的错误翻译（中文原因 + 底层码）
+                    fe = smb_error(e)
+                    why = f"{fe.user_message}（{fe.code}）" if fe.code else fe.user_message
+                except Exception:
+                    why = str(e)
+                raise OSError(f"SMB 连接 {self.host}:{self.port}/{self.share} 失败：{why}") from e
             self._client = client
             return client
 
@@ -179,23 +166,14 @@ class SMBStorage:
             raise ValueError(f"不安全的相对路径：{path!r}")
         return join(self.root, *rel.parts)
 
-    def _unc(self, client, path: str) -> str:
-        return client._unc(self._p(path))
-
     # ---- Storage ----
 
     def stat(self, path: str) -> Optional[Entry]:
         p = self._p(path)
-        try:
-            st = self._run(lambda c: self._smb().lstat(c._unc(p), connection_cache=c._cache))
-        except FileNotFoundError:
+        d = self._run(lambda c: c.stat(p))
+        if d is None:
             return None
-        except OSError as e:
-            if e.errno == errno.ENOENT:
-                return None
-            raise
-        return Entry(PurePosixPath(p).name, path, stat_mod.S_ISDIR(st.st_mode or 0),
-                     st.st_size or 0, st.st_mtime)
+        return Entry(PurePosixPath(p).name, path, d["is_dir"], d["size"], d["mtime"])
 
     def listdir(self, path: str = "") -> List[Entry]:
         p = self._p(path)
@@ -204,64 +182,36 @@ class SMBStorage:
                 for e in self._run(lambda c: c.list_dir(p))]
 
     def open_read(self, path: str) -> BinaryIO:
-        return self._run(lambda c: self._smb().open_file(self._unc(c, path), mode="rb", **self._kw(c, read=True)))
-
-    def _mkparent(self, c, path: str) -> None:
-        parent = str(PurePosixPath(self._p(path)).parent)
-        if parent != ".":
-            c.mkdir(parent)
+        p = self._p(path)
+        return self._run(lambda c: c.open_read(p))
 
     def open_write(self, path: str) -> BinaryIO:
-        def go(c):
-            self._mkparent(c, path)
-            return self._smb().open_file(self._unc(c, path), mode="wb", **self._kw(c))
-        return self._run(go)
+        p = self._p(path)
+        return self._run(lambda c: c.open_write(p))
 
     def open_resume(self, path: str, offset: int) -> BinaryIO:
-        """见 `Storage.open_resume`。已存在：`r+b` 打开、截断到 `offset`、定位；不存在且 `offset==0` 新建。"""
+        """见 `Storage.open_resume`。"""
         if offset < 0:
             raise ValueError(f"offset 不能为负：{offset}")
-
-        def go(c):
-            unc = self._unc(c, path)
-            try:
-                f = self._smb().open_file(unc, mode="r+b", **self._kw(c))
-            except OSError as e:
-                if not (isinstance(e, FileNotFoundError) or e.errno == errno.ENOENT) or offset:
-                    raise
-                self._mkparent(c, path)
-                return self._smb().open_file(unc, mode="wb", **self._kw(c))
-            try:
-                size = f.seek(0, 2)
-                if offset > size:
-                    raise ValueError(f"{path} 只有 {size} 字节，无法从 {offset} 续写")
-                f.truncate(offset)
-                f.seek(offset)
-            except BaseException:
-                try:
-                    f.close()
-                except Exception:
-                    pass
-                raise
-            return f
-        return self._run(go)
+        p = self._p(path)
+        return self._run(lambda c: c.open_resume(p, offset))
 
     def replace(self, src: str, dst: str) -> None:
-        self._run(lambda c: self._smb().replace(self._unc(c, src), self._unc(c, dst), **self._kw(c)))
+        s, d = self._p(src), self._p(dst)
+        self._run(lambda c: c.replace(s, d))
 
     def remove(self, path: str) -> None:
-        self._run(lambda c: self._smb().remove(self._unc(c, path), **self._kw(c)))
+        p = self._p(path)
+        self._run(lambda c: c.remove(p))
 
     def rmdir(self, path: str) -> None:
-        def go(c):
-            if c.list_dir(self._p(path)):    # 不依赖服务端对非空目录的报错码
-                raise OSError(errno.ENOTEMPTY, "目录非空", path)
-            self._smb().rmdir(self._unc(c, path), **self._kw(c))
-        self._run(go)
+        p = self._p(path)
+        self._run(lambda c: c.rmdir(p))
 
     def set_mtime(self, path: str, mtime: float) -> None:
+        p = self._p(path)
         try:
-            self._run(lambda c: self._smb().utime(self._unc(c, path), times=(mtime, mtime), **self._kw(c)))
+            self._run(lambda c: c.set_mtime(p, mtime))
         except OSError:
             if not self._alive():
                 raise                        # 断线要报；单纯服务端不让改就算了（尽力而为）

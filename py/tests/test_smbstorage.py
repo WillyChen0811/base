@@ -16,7 +16,6 @@ from pybase.fileops import copy_file_resumable  # noqa: E402
 from pybase.smbstorage import SMBStorage, set_credential_provider  # noqa: E402
 from pybase.storage import LocalStorage  # noqa: E402
 
-PREFIX = "\\\\srv\\share\\"
 
 
 class FakeConn:
@@ -56,6 +55,54 @@ class FakeClient:
         os.makedirs(os.path.join(self.base, path), exist_ok=True)
         return True
 
+    def is_alive(self):
+        return self._connected and all(v.transport.connected for v in self._cache.values())
+
+    def _l(self, path):
+        return os.path.join(self.base, path)
+
+    def stat(self, path):
+        try:
+            st = os.lstat(self._l(path))
+        except FileNotFoundError:
+            return None
+        d = os.path.isdir(self._l(path))
+        return {"is_dir": d, "size": 0 if d else st.st_size, "mtime": st.st_mtime}
+
+    def open_read(self, path):
+        return open(self._l(path), "rb")
+
+    def open_write(self, path):
+        os.makedirs(os.path.dirname(self._l(path)), exist_ok=True)
+        return open(self._l(path), "wb")
+
+    def open_resume(self, path, offset):
+        # 偏移语义由真实 SMBClient 的测试（test_smb_stream）覆盖；这里只要能续写
+        if not os.path.exists(self._l(path)):
+            if offset:
+                raise FileNotFoundError(path)
+            return self.open_write(path)
+        f = open(self._l(path), "r+b")
+        size = f.seek(0, 2)
+        if offset > size:
+            f.close()
+            raise ValueError("补洞")
+        f.truncate(offset)
+        f.seek(offset)
+        return f
+
+    def replace(self, a, b):
+        os.replace(self._l(a), self._l(b))
+
+    def remove(self, path):
+        os.remove(self._l(path))
+
+    def rmdir(self, path):
+        os.rmdir(self._l(path))
+
+    def set_mtime(self, path, mtime):
+        os.utime(self._l(path), (mtime, mtime))
+
     def list_dir(self, path=""):
         import datetime
         out = []
@@ -67,57 +114,25 @@ class FakeClient:
         return out
 
 
-class FakeOps:
-    """替身 smbclient 模块：UNC -> 本地目录。"""
-
-    def __init__(self, base):
-        self.base = base
-        self.seen = []
-
-    def _l(self, unc):
-        assert unc.startswith("\\\\srv\\share"), unc
-        self.seen.append(unc)
-        return os.path.join(self.base, unc[len("\\\\srv\\share"):].replace("\\", "/").lstrip("/"))
-
-    def lstat(self, unc, **kw):
-        return os.lstat(self._l(unc))
-
-    def open_file(self, unc, mode="rb", **kw):
-        return open(self._l(unc), mode)
-
-    def remove(self, unc, **kw):
-        os.remove(self._l(unc))
-
-    def rmdir(self, unc, **kw):
-        os.rmdir(self._l(unc))
-
-    def replace(self, a, b, **kw):
-        os.replace(self._l(a), self._l(b))
-
-    def utime(self, unc, times=None, **kw):
-        os.utime(self._l(unc), times)
-
-
 @pytest.fixture
 def env(tmp_path):
     base = tmp_path / "share"
     base.mkdir()
     state = {"up": True, "connects": 0}
-    ops = FakeOps(str(base))
     made = []
 
     def make(root="", **kw):
         s = SMBStorage("srv", "share", root, user="u", password="pw", client_factory=lambda h, sh, u, p, port: FakeClient(
-            h, sh, u, p, port, base=str(base), state=state), ops=ops, probe=lambda h, p, t: state["up"], **kw)
+            h, sh, u, p, port, base=str(base), state=state), probe=lambda h, p, t: state["up"], **kw)
         made.append(s)
         return s
-    yield make, base, state, ops
+    yield make, base, state
     for s in made:
         s.close()
 
 
 def test_读写往返_自动建上级目录(env):
-    make, base, _, _ = env
+    make, base, _ = env
     st = make("proj")
     with st.open_write("a/b/c.txt") as f:
         f.write(b"hello")
@@ -131,19 +146,8 @@ def test_读写往返_自动建上级目录(env):
     assert st.stat("") .is_dir                                          # root 本身
 
 
-def test_unc路径换算(env):
-    make, base, _, ops = env
-    st = make("p/q")
-    (base / "p/q/x").mkdir(parents=True)
-    st.stat("x/y.bin")
-    assert ops.seen[-1] == PREFIX + "p\\q\\x\\y.bin"
-    st2 = make("")
-    st2.stat("z")
-    assert ops.seen[-1] == PREFIX + "z"
-
-
 def test_listdir相对root(env):
-    make, base, _, _ = env
+    make, base, _ = env
     st = make("r")
     (base / "r/d").mkdir(parents=True)
     (base / "r/d/f").write_bytes(b"12")
@@ -174,7 +178,7 @@ def test_root含点点被拒():
 
 
 def test_open_resume偏移语义(env):
-    make, base, _, _ = env
+    make, base, _ = env
     st = make("r")
     # 不存在 + offset=0：新建，自动建目录
     with st.open_resume("d/f", 0) as f:
@@ -201,7 +205,7 @@ def test_open_resume偏移语义(env):
 
 
 def test_replace_remove_rmdir_set_mtime(env):
-    make, base, _, _ = env
+    make, base, _ = env
     st = make("r")
     for n, c in (("a", b"1"), ("b", b"2")):
         with st.open_write(n) as f:
@@ -222,7 +226,7 @@ def test_replace_remove_rmdir_set_mtime(env):
 
 
 def test_available_从未连接主动连一次并复用(env):
-    make, _, state, _ = env
+    make, _, state = env
     st = make()
     assert st._client is None
     assert st.available()
@@ -231,7 +235,7 @@ def test_available_从未连接主动连一次并复用(env):
 
 
 def test_available_连不上为False不抛异常(env):
-    make, _, state, _ = env
+    make, _, state = env
     st = make()
     state["up"] = False
     assert not st.available()
@@ -240,7 +244,7 @@ def test_available_连不上为False不抛异常(env):
 
 
 def test_available_连接已断会重连(env):
-    make, _, state, _ = env
+    make, _, state = env
     st = make()
     assert st.available()
     st._client._cache["srv:445"].transport.connected = False      # 模拟 TCP 断了
@@ -252,7 +256,7 @@ def test_available_连接已断会重连(env):
 
 
 def test_连不上操作抛OSError_不当作不存在(env):
-    make, _, state, _ = env
+    make, _, state = env
     st = make()
     state["up"] = False
     with pytest.raises(OSError):
@@ -305,7 +309,7 @@ def test_真实SMBClient拿到的凭据():
 
 
 def test_copy_file_resumable_本地到SMB_断点续传(env, tmp_path):
-    make, base, _, _ = env
+    make, base, _ = env
     src = LocalStorage(tmp_path / "src")
     (tmp_path / "src").mkdir()
     data = os.urandom(100)

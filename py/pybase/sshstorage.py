@@ -25,7 +25,6 @@ from typing import BinaryIO, List, Optional
 
 import paramiko
 
-from . import socks5
 from .storage import Entry, join
 
 
@@ -85,9 +84,7 @@ class SSHStorage:
                     client.load_host_keys(known)
                 client.set_missing_host_key_policy(
                     paramiko.AutoAddPolicy() if self.trust_unknown else paramiko.RejectPolicy())
-                # 设了进程级代理就一律经代理（域名原样交给代理），连不上直接报错，不回落直连
-                sock = socks5.connect_via_proxy(self.host, self.port, t_out)
-                client.connect(self.host, port=self.port, username=self.user, sock=sock,
+                client.connect(self.host, port=self.port, username=self.user,
                                key_filename=self.key_filename, allow_agent=True, look_for_keys=True,
                                timeout=t_out, banner_timeout=t_out, auth_timeout=t_out)
                 sftp = client.open_sftp()

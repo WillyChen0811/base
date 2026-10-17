@@ -1,4 +1,4 @@
-"""pybase.socks5 与 SSHStorage 经代理：桩 SOCKS5 服务断言收到的是域名、拒绝/连不上不回落直连。"""
+"""pybase.socks5（SOCKS5 客户端）：桩 SOCKS5 服务断言收到的是域名、拒绝/连不上不回落直连。"""
 
 import os
 import socket
@@ -12,9 +12,6 @@ sys.path.insert(0, REPO)
 
 from pybase import socks5  # noqa: E402
 
-pytest.importorskip("paramiko")
-from test_sshstorage import env  # noqa: E402,F401
-from pybase.sshstorage import SSHStorage  # noqa: E402
 
 
 class Stub:
@@ -136,50 +133,6 @@ def test_代理拒绝_报错():
             socks5.connect_via_proxy("ubuntu1st", 22, 3)
     finally:
         stub.stop()
-
-
-def test_ssh经代理读写_收到的是域名(env):  # noqa: F811
-    make, remote, srv, tmp = env
-    stub = Stub(forward=("127.0.0.1", srv.port))
-    try:
-        socks5.set_proxy(stub.addr)
-        st = SSHStorage("ubuntu1st", "/", port=22, key_filename=str(tmp / "id_rsa"),
-                        trust_unknown=True, connect_timeout=5)
-        assert st.available()
-        st.close()
-    finally:
-        stub.stop()
-    assert stub.seen and stub.seen[0] == (3, "ubuntu1st", 22)
-
-
-def test_ssh代理拒绝_不回落直连(env):
-    make, remote, srv, tmp = env
-    stub = Stub(reply=5)
-    try:
-        socks5.set_proxy(stub.addr)
-        # 目标端口就是真能直连的 SFTP 服务：若回落直连就会连上
-        st = SSHStorage("127.0.0.1", "/", port=srv.port, key_filename=str(tmp / "id_rsa"),
-                        trust_unknown=True, connect_timeout=5)
-        assert st.available() is False
-        with pytest.raises(OSError, match="拒绝"):
-            st.listdir("")
-    finally:
-        stub.stop()
-    assert stub.seen
-
-
-def test_ssh代理连不上_不回落直连(env):
-    make, remote, srv, tmp = env
-    dead = socket.socket()
-    dead.bind(("127.0.0.1", 0))
-    port = dead.getsockname()[1]
-    dead.close()
-    socks5.set_proxy("127.0.0.1:%d" % port)
-    st = SSHStorage("127.0.0.1", "/", port=srv.port, key_filename=str(tmp / "id_rsa"),
-                    trust_unknown=True, connect_timeout=5)
-    assert st.available() is False
-    with pytest.raises(OSError, match="代理"):
-        st.listdir("")
 
 
 def test_子进程经环境变量继承代理():

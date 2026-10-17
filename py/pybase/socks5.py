@@ -1,4 +1,4 @@
-"""最小 SOCKS5 客户端 + 进程级代理设置。
+"""最小 SOCKS5 客户端 + 进程级代理设置（全局接管见 netglobal，它复用这里的握手）。
 
 wgtund 的程序级接管口（无认证、CONNECT）。域名**原样**交给代理（ATYP=3），本机不解析；
 设了代理就一律经代理，代理连不上或拒绝时抛 `OSError`，**绝不回落直连**。
@@ -59,6 +59,33 @@ def _recv(s: socket.socket, n: int) -> bytes:
     return buf
 
 
+def handshake(s: socket.socket, host: str, port: int) -> None:
+    """在已连到代理的套接字上做 SOCKS5 握手 + CONNECT；成功后 s 就是到 host:port 的通道。
+    域名原样发给代理。失败抛 OSError（调用方负责关套接字）。超时沿用 s 当前的设置。"""
+    s.sendall(b"\x05\x01\x00")
+    ver, method = _recv(s, 2)
+    if ver != 5 or method != 0:
+        raise OSError(f"代理不接受无认证方式（回复 {ver},{method}）")
+    try:
+        addr = b"\x01" + socket.inet_pton(socket.AF_INET, host)
+    except OSError:
+        try:
+            addr = b"\x04" + socket.inet_pton(socket.AF_INET6, host)
+        except OSError:
+            name = host.encode("idna") if not host.isascii() else host.encode()
+            if len(name) > 255:
+                raise OSError(f"主机名过长：{host!r}")
+            addr = b"\x03" + bytes([len(name)]) + name
+    s.sendall(b"\x05\x01\x00" + addr + struct.pack(">H", port))
+    ver, rep, _, atyp = _recv(s, 4)
+    if ver != 5:
+        raise OSError("代理回复不是 SOCKS5")
+    if rep != 0:
+        raise OSError(f"代理拒绝连接 {host}:{port}：{_REPLY.get(rep, rep)}")
+    skip = _recv(s, 1)[0] if atyp == 3 else {1: 4, 4: 16}.get(atyp, 0)
+    _recv(s, skip + 2)  # 绑定地址 + 端口，用不上
+
+
 def connect(proxy: Tuple[str, int], host: str, port: int, timeout: float = 10) -> socket.socket:
     """经 SOCKS5 代理连 host:port，域名原样发给代理。失败抛 OSError。"""
     try:
@@ -66,30 +93,7 @@ def connect(proxy: Tuple[str, int], host: str, port: int, timeout: float = 10) -
     except OSError as e:
         raise OSError(f"连不上本机代理 {proxy[0]}:{proxy[1]}：{e}") from e
     try:
-        s.sendall(b"\x05\x01\x00")
-        ver, method = _recv(s, 2)
-        if ver != 5 or method != 0:
-            raise OSError(f"代理不接受无认证方式（回复 {ver},{method}）")
-        try:
-            ip = socket.inet_pton(socket.AF_INET, host)
-            addr = b"\x01" + ip
-        except OSError:
-            try:
-                ip = socket.inet_pton(socket.AF_INET6, host)
-                addr = b"\x04" + ip
-            except OSError:
-                name = host.encode("idna") if not host.isascii() else host.encode()
-                if len(name) > 255:
-                    raise OSError(f"主机名过长：{host!r}")
-                addr = b"\x03" + bytes([len(name)]) + name
-        s.sendall(b"\x05\x01\x00" + addr + struct.pack(">H", port))
-        ver, rep, _, atyp = _recv(s, 4)
-        if ver != 5:
-            raise OSError("代理回复不是 SOCKS5")
-        if rep != 0:
-            raise OSError(f"代理拒绝连接 {host}:{port}：{_REPLY.get(rep, rep)}")
-        skip = _recv(s, 1)[0] if atyp == 3 else {1: 4, 4: 16}.get(atyp, 0)
-        _recv(s, skip + 2)  # 绑定地址 + 端口，用不上
+        handshake(s, host, port)
         s.settimeout(None)
         return s
     except BaseException:

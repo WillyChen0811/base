@@ -138,3 +138,22 @@ def test_所有候选都被拒_抛出(env):
     with pytest.raises(OSError) as ei:
         _copy(src, dst, name, ResumeState(chunk=CH))
     assert is_name_rejected(ei.value)
+
+
+def test_最后一块不足整块且已写完_续传直接转正(env):
+    """旧实现 offset=n*chunk 会越过文件末尾（如 10 字节、块 8：两块都在时算成 16），open_resume 抛 ValueError。"""
+    src, dst, tmp = env
+    data = DATA[:2 * CH + 3]                      # 最后一块只有 3 字节
+    (tmp / "s" / "n.bin").write_bytes(data)
+    state = ResumeState(chunk=CH)
+    with pytest.raises(Boom):
+        _copy(src, dst, "n.bin", state, _stop_at(2))   # 第 2 块（最后一块）写完并记录哈希后中断
+    assert len(state.chunks) == 3
+    part = [f for f in os.listdir(tmp / "d")]
+    assert len(part) == 1 and (tmp / "d" / part[0]).stat().st_size == len(data)
+
+    idxs = []
+    r = _copy(src, dst, "n.bin", state, lambda d, i, s: idxs.append(i))
+    assert r.status == "copied" and idxs == []          # 没有再写任何块
+    assert (tmp / "d" / "n.bin").read_bytes() == data
+    assert os.listdir(tmp / "d") == ["n.bin"]

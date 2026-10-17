@@ -242,7 +242,7 @@ def copy_file_resumable(src: Storage, src_path: str, dst: Storage, dst_path: str
         n = _verified_chunks(dst, parts[pi], st, size)
         del st.chunks[n:]
 
-        offset = n * chunk
+        offset = min(n * chunk, size)       # 最后一块不足整块且已写完时，n*chunk 会越过文件末尾
         with src.open_read(src_path) as reader:
             writer, pi, woff = open_part(dst, parts, pi, offset)
             if woff != offset:                  # 临时名被拒换了名：新名上从头写

@@ -14,8 +14,17 @@
   ``paused`` 的保持。
 - 多进程：同一个库可以有多个进程各开一个队列，用 PG 会话级 advisory lock 抢 worker 资格，
   只有一个在跑；抢不到的进程只提交/查询，并每隔几秒再试一次（worker 进程挂了会有人接手）。
-- Storage 以可序列化的规格存库：``local:/abs/root``、``ssh://[user@]host[:port]/abs/root?key=钥匙文件``，
-  **凭据不进库**，只存钥匙路径。
+- Storage 以可序列化的规格存库：``local:/abs/root``、``ssh://[user@]host[:port]/abs/root?key=钥匙文件``、
+  ``smb://[user@]host[:port]/share/root``，**凭据不进库**：SSH 只存钥匙路径，SMB 的密码由
+  ``pybase.smbstorage.set_credential_provider`` 注册的回调在连接时提供。
+- **优先级**：``submit(..., priority=0)``，数字越大越先；同优先级先到先得（``id`` 序）。
+  约定：用户主动要求的同步用最高优先级（如 100），放入用 50，后台自动同步用 0 且受空闲闸控制。
+  **抢占**：worker 每写完一块（以及项与项之间）检查有没有**更高优先级**的 queued 任务，有就把当前任务
+  置回 ``queued``（进度保留），去跑高优先级的；高优先级的跑完，调度自然回到它，从断点续传。
+  **空闲闸**：构造参数 ``busy`` / ``idle_threshold``（缺省 0）。``priority < idle_threshold`` 的任务只在
+  ``busy()`` 为 False 时才开始/继续；跑着时 ``busy()`` 变 True，写完当前块就让出（置回 ``queued``，进度保留）。
+  ``busy()`` 抛异常按"繁忙"处理。``priority >= idle_threshold`` 的任务不受闸控制。
+  ``set_priority(task_id, n)`` 可改未结束任务的优先级（例如用户把后台任务提为立即同步）。
 
 状态：任务 ``queued/running/paused/waiting/done/failed/cancelled``；
 项 ``pending/running/done/failed/cancelled``。
@@ -40,6 +49,11 @@ from .fileops import RESUME_CHUNK, RESUME_SUFFIX, ResumeState, copy_file_resumab
 from .retry import wait_until
 from .storage import LocalStorage, Storage
 
+# 供调用方引用的约定优先级（只是建议值，任意整数都行）
+PRIORITY_USER = 100        # 用户主动要求的同步
+PRIORITY_INGEST = 50       # 放入
+PRIORITY_BACKGROUND = 0    # 后台自动同步（配合 busy / idle_threshold 受空闲闸控制）
+
 logger = logging.getLogger(__name__)
 
 TASK_STATES = ("queued", "running", "paused", "waiting", "done", "failed", "cancelled")
@@ -53,6 +67,7 @@ tasks_table = Table(
     Column("id", Integer, primary_key=True, autoincrement=True),
     Column("title", Text, nullable=False, server_default=""),
     Column("status", String(16), nullable=False, server_default="queued"),
+    Column("priority", Integer, nullable=False, server_default="0"),
     Column("error", Text),
     Column("created_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
     Column("updated_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
@@ -95,6 +110,7 @@ def create_schema(engine) -> None:
     with engine.begin() as conn:
         conn.execute(text("SELECT pg_advisory_xact_lock(hashtext(:k))"), {"k": SCHEMA_LOCK_NAME})
         db.create_table(conn, tasks_table)
+        db.add_column(conn, "transfer_tasks", "priority", Integer, nullable=False, default=0)   # 老表补列
         db.create_table(conn, items_table)
         db.create_table(conn, chunks_table)
         db.create_index(conn, "transfer_items", ["task_id", "seq"], name="transfer_items_task_idx")
@@ -116,7 +132,7 @@ def _esc(s: str) -> str:
 
 
 def storage_to_spec(storage: Storage) -> str:
-    """Storage -> 可存库的字符串。支持 LocalStorage 与 SSHStorage；凭据不进规格，只带钥匙文件路径。"""
+    """Storage -> 可存库的字符串。支持 LocalStorage、SSHStorage 与 SMBStorage；凭据不进规格，只带钥匙文件路径。"""
     if isinstance(storage, LocalStorage):
         spec = "local:" + _esc(str(storage.root.absolute()))
         if storage.mount_point is not None:
@@ -134,6 +150,12 @@ def storage_to_spec(storage: Storage) -> str:
         if storage.key_filename:
             spec += "?" + urlencode({"key": storage.key_filename})
         return spec
+    try:
+        from .smbstorage import SMBStorage, smb_spec
+    except ImportError:
+        SMBStorage = None  # type: ignore[assignment]
+    if SMBStorage is not None and isinstance(storage, SMBStorage):
+        return smb_spec(storage)
     raise ValueError(f"这种 Storage 不能序列化：{storage!r}")
 
 
@@ -150,6 +172,9 @@ def storage_from_spec(spec: str) -> Storage:
         key = parse_qs(u.query).get("key", [None])[0]
         return SSHStorage(u.hostname, unquote(u.path) or "/", user=unquote(u.username) if u.username else None,
                           port=u.port or 22, key_filename=key)
+    if spec.startswith("smb://"):
+        from .smbstorage import smb_from_spec
+        return smb_from_spec(spec)
     raise ValueError(f"不认识的 Storage 规格：{spec!r}")
 
 
@@ -187,7 +212,8 @@ class TransferQueue:
     （只提交/查询）。时间参数（秒）：`idle_poll` worker 空闲时轮询库的间隔（跨进程提交靠它发现）；
     `lock_poll` 没抢到 worker 资格时重试的间隔；`wait_initial`/`wait_cap` 断线等待的起始与封顶间隔
     （每轮翻倍）；`error_retry` 库出错后的退避；`max_retries` 连接没断却反复失败时放弃的次数。
-    `storage_factory(spec)` 默认 `storage_from_spec`，测试可换。
+    `storage_factory(spec)` 默认 `storage_from_spec`，测试可换。`busy` / `idle_threshold`：空闲闸，
+    见模块文档（`busy` 为 None 则不设闸）。
     """
 
     def __init__(self, engine, *, notifier: Optional[Callable[[dict], None]] = None,
@@ -195,7 +221,8 @@ class TransferQueue:
                  idle_poll: float = 1.0, lock_poll: float = 5.0,
                  wait_initial: float = 2.0, wait_cap: float = 60.0,
                  error_retry: float = 5.0, max_retries: int = 3,
-                 storage_factory: Callable[[str], Storage] = storage_from_spec):
+                 storage_factory: Callable[[str], Storage] = storage_from_spec,
+                 busy: Optional[Callable[[], bool]] = None, idle_threshold: int = 0):
         _require_pg(engine)
         self.engine = engine
         self.notifier = notifier
@@ -204,6 +231,7 @@ class TransferQueue:
         self.wait_initial, self.wait_cap = wait_initial, wait_cap
         self.error_retry, self.max_retries = error_retry, max_retries
         self._factory = storage_factory
+        self.busy, self.idle_threshold = busy, idle_threshold
         self._storages: Dict[str, Storage] = {}
         self._wake = threading.Event()
         self._closed = threading.Event()
@@ -252,8 +280,10 @@ class TransferQueue:
 
     # ---- 对外 API ----
 
-    def submit(self, title: str, items: Sequence[Union[TransferItem, Tuple[Any, str, Any, str]]]) -> int:
-        """提交一批文件，立即返回 task_id。源/目标只存规格，此刻不连接。"""
+    def submit(self, title: str, items: Sequence[Union[TransferItem, Tuple[Any, str, Any, str]]],
+               priority: int = 0) -> int:
+        """提交一批文件，立即返回 task_id。源/目标只存规格，此刻不连接。
+        `priority` 越大越先，同优先级先到先得；更高优先级的任务会抢占正在传的低优先级任务。"""
         rows = []
         for seq, it in enumerate(items):
             if not isinstance(it, TransferItem):
@@ -263,7 +293,7 @@ class TransferQueue:
         if not rows:
             raise ValueError("没有要传的文件")
         with self.engine.begin() as conn:
-            tid = conn.execute(insert(tasks_table).values(title=title, status="queued")
+            tid = conn.execute(insert(tasks_table).values(title=title, status="queued", priority=int(priority))
                                .returning(T.id)).scalar_one()
             conn.execute(insert(items_table), [dict(r, task_id=tid) for r in rows])
         self._emit("task", tid, "queued")
@@ -323,6 +353,15 @@ class TransferQueue:
                              .values(status="cancelled", updated_at=func.now()))
         return ok
 
+    def set_priority(self, task_id: int, priority: int) -> bool:
+        """改未结束任务的优先级；返回是否生效。"""
+        with self.engine.begin() as conn:
+            n = conn.execute(update(tasks_table).where(and_(T.id == task_id, T.status.in_(_ACTIVE)))
+                             .values(priority=int(priority), updated_at=func.now())).rowcount
+        if n:
+            self._wake.set()
+        return bool(n)
+
     def _set_status(self, task_id: int, status: str, from_states: Sequence[str]) -> bool:
         with self.engine.begin() as conn:
             n = conn.execute(update(tasks_table).where(and_(T.id == task_id, T.status.in_(list(from_states))))
@@ -381,12 +420,12 @@ class TransferQueue:
                 if self._need_recover:
                     self._recover()
                     self._need_recover = False
-                tid = self._claim()
-                if tid is None:
+                got = self._claim()
+                if got is None:
                     self._wake.wait(self.idle_poll)
                     self._wake.clear()
                     continue
-                self._run_task(tid)
+                self._run_task(*got)
             except SQLAlchemyError:
                 logger.exception("传输队列访问数据库出错，稍后重试")
                 self._need_recover = True       # 手上那个任务可能还挂在 running
@@ -407,17 +446,51 @@ class TransferQueue:
         for tid in ids:
             self._emit("task", tid, "queued", recovered=True)
 
-    def _claim(self) -> Optional[int]:
+    def _is_busy(self) -> bool:
+        if self.busy is None:
+            return False
+        try:
+            return bool(self.busy())
+        except Exception:
+            logger.debug("busy() 抛了异常，按繁忙处理", exc_info=True)
+            return True
+
+    def _claim(self) -> Optional[Tuple[int, int]]:
+        """取优先级最高（同级最早）且过得了空闲闸的 queued 任务，置 running，返回 (id, priority)。"""
+        q = select(T.id, T.priority).where(T.status == "queued")
+        if self.busy is not None and self._is_busy():
+            q = q.where(T.priority >= self.idle_threshold)
         with self.engine.begin() as conn:
-            tid = conn.execute(select(T.id).where(T.status == "queued").order_by(T.id).limit(1)).scalar()
-            if tid is None:
+            row = conn.execute(q.order_by(T.priority.desc(), T.id).limit(1)).first()
+            if row is None:
                 return None
+            tid, prio = row
             n = conn.execute(update(tasks_table).where(and_(T.id == tid, T.status == "queued"))
                              .values(status="running", error=None, updated_at=func.now())).rowcount
         if not n:
             return None
         self._emit("task", tid, "running")
-        return tid
+        return tid, prio
+
+    def _should_yield(self, prio: int) -> bool:
+        """当前任务该让出吗：自己被空闲闸挡住（繁忙），或有更高优先级的 queued 任务在等。"""
+        busy: Optional[bool] = None
+        if self.busy is not None and prio < self.idle_threshold:
+            busy = self._is_busy()
+            if busy:
+                return True
+        with self.engine.connect() as conn:
+            top = conn.execute(select(func.max(T.priority)).where(T.status == "queued")).scalar()
+        if top is None or top <= prio:
+            return False
+        if self.busy is None or top >= self.idle_threshold:
+            return True
+        if busy is None:
+            busy = self._is_busy()
+        return not busy
+
+    def _yield_task(self, tid: int) -> None:
+        self._guard_set(tid, "queued", "running")
 
     def _task_status(self, tid: int) -> Optional[str]:
         with self.engine.connect() as conn:
@@ -438,14 +511,17 @@ class TransferQueue:
             s = self._storages[spec] = self._factory(spec)
         return s
 
-    def _run_task(self, tid: int) -> None:
+    def _run_task(self, tid: int, prio: int = 0) -> None:
         with self.engine.connect() as conn:
             items = conn.execute(select(items_table).where(and_(I.task_id == tid, I.status.in_(("pending", "running"))))
                                  .order_by(I.seq)).all()
         for row in items:
             if self._closed.is_set():
                 return
-            outcome = self._run_item(tid, dict(row._mapping))
+            if self._should_yield(prio):
+                self._yield_task(tid)
+                return
+            outcome = self._run_item(tid, dict(row._mapping), prio)
             if outcome == "stopped":
                 return
         with self.engine.connect() as conn:
@@ -459,8 +535,8 @@ class TransferQueue:
         with self.engine.begin() as conn:
             conn.execute(update(items_table).where(I.id == item_id).values(updated_at=func.now(), **values))
 
-    def _run_item(self, tid: int, item: dict) -> str:
-        """传一项，返回 'done' / 'failed' / 'stopped'（任务被暂停/取消/关闭）。连接问题在这里循环等待，不返回。"""
+    def _run_item(self, tid: int, item: dict, prio: int = 0) -> str:
+        """传一项，返回 'done' / 'failed' / 'stopped'（任务被暂停/取消/关闭/让出）。连接问题在这里循环等待，不返回。"""
         iid = item["id"]
         src_spec, dst_spec = item["src_spec"], item["dst_spec"]
         part = item["dst_path"] + RESUME_SUFFIX
@@ -485,6 +561,8 @@ class TransferQueue:
                 status = conn.execute(select(T.status).where(T.id == tid)).scalar()
             if self._closed.is_set() or status != "running":
                 raise TransferInterrupted()
+            if self._should_yield(prio):
+                raise _Yield()
 
         while True:
             if stop_now():
@@ -498,6 +576,9 @@ class TransferQueue:
                 res = copy_file_resumable(src, item["src_path"], dst, item["dst_path"], part_path=part,
                                           chunk=state.chunk, progress=progress, state=state)
             except TransferInterrupted:
+                return self._stopped(tid, iid)
+            except _Yield:
+                self._yield_task(tid)           # 先置回 queued，项随后回 pending（进度已落库）
                 return self._stopped(tid, iid)
             except SQLAlchemyError:
                 raise
@@ -600,6 +681,10 @@ class TransferQueue:
             self.notifier({"type": kind, "task_id": task_id, "status": status, "time": time.time(), **info})
         except Exception:
             logger.debug("notifier 抛了异常，已忽略", exc_info=True)
+
+
+class _Yield(Exception):
+    """内部：有更高优先级任务或空闲闸关了，当前任务让出（进度保留）。"""
 
 
 class _Disconnected(Exception):

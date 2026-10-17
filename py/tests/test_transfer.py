@@ -362,3 +362,144 @@ def test_审计量与块数无关_块表不审计(env):
 def test_重复建表_第二个队列不报错(env):
     make, *_ = env
     make(start=False), make(start=False)
+
+
+# ---------------------------------------------------------------- 优先级与空闲闸
+
+def _seq(events, tid):
+    return [e["status"] for e in events if e["type"] == "task" and e["task_id"] == tid]
+
+
+def test_同优先级先到先得_高优先级先跑(env):
+    make, src, dst, tmp, _ = env
+    for n in "abc":
+        (tmp / f"s/{n}.bin").write_bytes(b"x" * 16)
+    events = []
+    q = make(start=False, notifier=events.append)
+    ta = q.submit("a", [(src, "a.bin", dst, "a.bin")])
+    tb = q.submit("b", [(src, "b.bin", dst, "b.bin")])
+    tc = q.submit("c", [(src, "c.bin", dst, "c.bin")], priority=5)
+    q.start()
+    until(lambda: all(status(q, t) == "done" for t in (ta, tb, tc)))
+    order = [e["task_id"] for e in events if e["type"] == "task" and e["status"] == "running"]
+    assert order == [tc, ta, tb]
+
+
+def test_高优先级抢占低优先级_低的之后续完(env):
+    make, src, dst, tmp, pg = env
+    (tmp / "s/low.bin").write_bytes(DATA)
+    (tmp / "s/high.bin").write_bytes(b"h" * 16)
+    dst.delay = 0.02
+    events = []
+    q = make(notifier=events.append)
+    low = q.submit("low", [(src, "low.bin", dst, "low.bin")], priority=0)
+    until(lambda: q.task_detail(low)["items"][0]["done_bytes"] >= 24)
+    high = q.submit("high", [(src, "high.bin", dst, "high.bin")], priority=100)
+    until(lambda: status(q, high) == "done")
+    until(lambda: status(q, low) == "done")
+    assert (tmp / "d/low.bin").read_bytes() == DATA and (tmp / "d/high.bin").read_bytes() == b"h" * 16
+    assert _seq(events, low) == ["queued", "running", "queued", "running", "done"]   # 被让出过一次、回来续传
+    assert _seq(events, high) == ["queued", "running", "done"]
+    # 低优先级是接着传的，不是从头：高优先级跑的时候它的进度没被清零
+    order = [(e["task_id"], e["status"]) for e in events if e["type"] == "task"]
+    assert order.index((low, "queued")) < order.index((high, "running")) < order.index((high, "done")) \
+        < len(order) - order[::-1].index((low, "running")) - 1
+
+
+def test_同优先级不抢占(env):
+    make, src, dst, tmp, _ = env
+    (tmp / "s/a.bin").write_bytes(DATA)
+    (tmp / "s/b.bin").write_bytes(b"b" * 8)
+    dst.delay = 0.01
+    events = []
+    q = make(notifier=events.append)
+    a = q.submit("a", [(src, "a.bin", dst, "a.bin")], priority=7)
+    until(lambda: q.task_detail(a)["items"][0]["done_bytes"] >= 8)
+    b = q.submit("b", [(src, "b.bin", dst, "b.bin")], priority=7)
+    until(lambda: status(q, b) == "done")
+    assert _seq(events, a) == ["queued", "running", "done"]
+
+
+def test_空闲闸_繁忙不动_空闲后续完(env):
+    make, src, dst, tmp, _ = env
+    (tmp / "s/a.bin").write_bytes(DATA)
+    flag = [True]
+    q = make(busy=lambda: flag[0], idle_threshold=10)
+    t = q.submit("bg", [(src, "a.bin", dst, "a.bin")], priority=0)
+    time.sleep(0.5)
+    d = q.task_detail(t)
+    assert d["status"] == "queued" and d["items"][0]["done_bytes"] == 0
+    # 不受闸的高优先级照跑
+    (tmp / "s/u.bin").write_bytes(b"u" * 8)
+    u = q.submit("user", [(src, "u.bin", dst, "u.bin")], priority=100)
+    until(lambda: status(q, u) == "done")
+    assert status(q, t) == "queued"
+    flag[0] = False
+    until(lambda: status(q, t) == "done")
+    assert (tmp / "d/a.bin").read_bytes() == DATA
+
+
+def test_空闲闸_跑到一半变忙会让出_空闲再续完(env):
+    make, src, dst, tmp, _ = env
+    (tmp / "s/a.bin").write_bytes(DATA)
+    dst.delay = 0.02
+    flag = [False]
+    q = make(busy=lambda: flag[0], idle_threshold=10)
+    t = q.submit("bg", [(src, "a.bin", dst, "a.bin")], priority=0)
+    until(lambda: q.task_detail(t)["items"][0]["done_bytes"] >= 24)
+    flag[0] = True
+    until(lambda: status(q, t) == "queued")
+    until(lambda: q.task_detail(t)["items"][0]["status"] == "pending")
+    frozen = q.task_detail(t)["items"][0]["done_bytes"]
+    assert 24 <= frozen < len(DATA)
+    time.sleep(0.3)
+    assert q.task_detail(t)["items"][0]["done_bytes"] == frozen      # 真停了，进度保留
+    flag[0] = False
+    until(lambda: status(q, t) == "done")
+    assert (tmp / "d/a.bin").read_bytes() == DATA
+
+
+def test_busy抛异常按繁忙处理(env):
+    make, src, dst, tmp, _ = env
+    (tmp / "s/a.bin").write_bytes(b"a" * 16)
+    state = {"boom": True}
+
+    def busy():
+        if state["boom"]:
+            raise RuntimeError("探测失败")
+        return False
+    q = make(busy=busy, idle_threshold=1)
+    t = q.submit("bg", [(src, "a.bin", dst, "a.bin")])
+    time.sleep(0.4)
+    assert status(q, t) == "queued"
+    state["boom"] = False
+    until(lambda: status(q, t) == "done")
+
+
+def test_set_priority(env):
+    make, src, dst, tmp, _ = env
+    (tmp / "s/a.bin").write_bytes(b"a" * 16)
+    flag = [True]
+    q = make(busy=lambda: flag[0], idle_threshold=10)
+    t = q.submit("bg", [(src, "a.bin", dst, "a.bin")])
+    time.sleep(0.2)
+    assert status(q, t) == "queued"
+    assert q.set_priority(t, 100)
+    until(lambda: status(q, t) == "done")
+    assert not q.set_priority(t, 1)          # 已结束
+
+
+def test_已有表补priority列(env):
+    make, src, dst, tmp, pg = env
+    q0 = make(start=False)
+    q0.submit("old", [(src, "x", dst, "x")])
+    with pg.begin() as c:
+        c.execute(text("ALTER TABLE transfer_tasks DROP COLUMN priority"))
+    from pybase.transfer import create_schema
+    create_schema(pg)
+    create_schema(pg)                         # 幂等
+    with pg.connect() as c:
+        row = c.execute(text("SELECT priority FROM transfer_tasks")).all()
+    assert [r[0] for r in row] == [0]         # 老任务默认 0
+    t = q0.submit("new", [(src, "y", dst, "y")], priority=50)
+    assert q0.task_detail(t)["priority"] == 50

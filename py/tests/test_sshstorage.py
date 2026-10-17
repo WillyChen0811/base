@@ -310,18 +310,55 @@ def test_set_mtime(env):
 def test_断线后available为False_下次操作自动重连(env):
     make, remote, srv, _ = env
     st = make()
-    assert not st.available()                        # 还没连过
+    assert st._sftp is None                          # 还没连过
     (remote / "f").write_bytes(b"abc")
     assert st.stat("f").size == 3
     assert st.available()
     srv.drop_clients()
     for _ in range(100):
-        if not st.available():
+        if not st._alive():
             break
         threading.Event().wait(0.05)
-    assert not st.available()
+    assert not st._alive()
     assert st.stat("f").size == 3                    # 自动重连
     assert st.available()
+
+
+def test_从未连接_available主动连一次并复用(env):
+    make, remote, srv, _ = env
+    st = make()
+    assert st._sftp is None
+    assert st.available()                            # 不用先做别的操作
+    sftp = st._sftp
+    assert sftp is not None
+    assert st.available() and st._sftp is sftp       # 复用，不重连
+    (remote / "f").write_bytes(b"x")
+    assert st.stat("f").size == 1
+
+
+def test_断线后available主动重连(env):
+    make, remote, srv, _ = env
+    st = make()
+    st.stat("")
+    srv.drop_clients()
+    for _ in range(100):
+        if not st._alive():
+            break
+        threading.Event().wait(0.05)
+    assert not st._alive()
+    assert st.available()                            # 服务还在，available 自己连回来
+    assert st._alive()
+
+
+def test_连不上_available_False且不抛异常且很快(env):
+    import time
+    make, remote, srv, _ = env
+    st = make()
+    st.connect_timeout = 30
+    srv.stop()
+    t0 = time.monotonic()
+    assert not st.available()
+    assert time.monotonic() - t0 < 8                 # 超时封顶 5 秒，不是 30
 
 
 def test_服务停了_操作抛OSError_available不抛(env):
@@ -330,10 +367,10 @@ def test_服务停了_操作抛OSError_available不抛(env):
     st.stat("")
     srv.stop()
     for _ in range(100):
-        if not st.available():
+        if not st._alive():
             break
         threading.Event().wait(0.05)
-    assert not st.available()
+    assert not st.available()                        # 想连但服务停了
     with pytest.raises(OSError):
         st.stat("f")                                 # 连不上不能当"不存在"
     assert not st.available()
@@ -352,7 +389,7 @@ def test_上下文管理器关闭(env):
     with make() as st:
         st.stat("")
         assert st.available()
-    assert not st.available()
+    assert st._sftp is None and st._client is None   # 已关闭
 
 
 def test_copy_file_本地与SSH互拷_校验(env):

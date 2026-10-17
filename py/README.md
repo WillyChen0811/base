@@ -36,8 +36,11 @@
 - `pybase.storage`：存储接口 `Storage`（相对 posix 路径；`available`/`stat`/`listdir`/读写/原子改名/删除），
   把"连到哪"（本地盘、挂载的网络盘、SMB 协议、HTTPS…，以及其下的 WireGuard/NetBird 等隧道）和上层的读写、核对、
   续传逻辑解耦；自带 `LocalStorage`（本地目录与任何已挂载网络盘，可要求挂载点在挂才算可用），新通道照接口实现即可；另有 `read_bytes`/`as_memory_file`（读进内存，BytesIO 可直接交给 python-docx/openpyxl/`pybase.sheets`，不落盘，可限 `max_bytes`）和 `materialize`（必须要真实路径时用：本地盘给原路径，其他通道临时拷进内存盘，退出即删）
-- `pybase.sshstorage`：`SSHStorage`，经 SFTP 读写远端目录（`pip install "pybase[ssh]"`）；路径锁在 root 下，断线后下次操作自动重连，
+- `pybase.sshstorage`：`SSHStorage`，经 SFTP 读写远端目录（`pip install "pybase[ssh]"`）；路径锁在 root 下，`available()` 未连接/已断时会主动连一次（超时 ≤5 秒，成功后复用，失败 False 不抛异常），断线后下次操作自动重连，
   未知主机默认拒绝
+- `pybase.smbstorage`：`SMBStorage`，基于 `SMBClient` 读写共享内某目录（`pip install "pybase[smb]"`）；`root` 是共享内目录，路径锁在 root 下，
+  `available()` 未连接时先 TCP 探测再连一次（超时 ≤5 秒，不抛异常），断线后下次操作自动重连；规格 `smb://[user@]host[:port]/share/root`，
+  **密码不进库**，由构造参数或 `set_credential_provider(fn)` 注册的回调 `fn(host, share, user, port)` 提供
 - `pybase.fileops`：两端都是 `Storage` 的拷贝 `copy_file`（临时文件转正；`verify` 开关默认关、只比大小，开了边拷边哈希
   并读回核对；目标已有不同内容报 `conflict` 不覆盖）、`copy_file_resumable`（块级断点续传：按块写临时文件、每块
   回调进度；续传时截到最后确认块的边界并读回核对，不对就退一块；写完整体核对逐块 sha256，源被改则从头来）、`delete_confirmed`（调用方核对通过才删）、`prune_empty_dirs`
@@ -45,8 +48,10 @@
   task_id，任务与进度存 `transfer_tasks`/`transfer_items`，块哈希存 `transfer_chunks`（任务与项挂行级审计，进度列和块表不审计，审计量与文件大小无关）；单 worker 线程串行执行，断线（`OSError`/
   `available()` 为假）任务置 `waiting`，用 `wait_until` 间隔递增（封顶 60 秒）等两端恢复后从断点自动续传；冲突、源不存在、
   权限等非连接错误该项 `failed`、任务继续；进程重启时 `running`/`waiting` 自动回 `queued` 续传（`paused` 保持）；
-  多进程靠 PG advisory lock 只让一个有 worker，其余只提交/查询并定时重试接手。另有 `pause`/`resume`/`cancel`、
-  `list_tasks`/`task_detail`、`notifier` 回调；Storage 序列化成 `local:/abs/root` / `ssh://[user@]host[:port]/abs/root?key=钥匙路径`
+  多进程靠 PG advisory lock 只让一个有 worker，其余只提交/查询并定时重试接手。**优先级**：`submit(..., priority=0)`，越大越先、同级先到先得，worker 每写完一块检查有无更高优先级的 queued 任务，有就让出（进度保留）、高的跑完自动回来续传；
+  约定用户主动同步 100、放入 50、后台自动同步 0。**空闲闸**：构造参数 `busy()` + `idle_threshold`，`priority < idle_threshold` 的任务只在 `busy()` 为 False 时开始/继续，
+  跑着变忙则写完当前块让出（`busy` 抛异常按繁忙）；`set_priority` 可改未结束任务的优先级；老库的 `transfer_tasks` 自动补 `priority` 列。另有 `pause`/`resume`/`cancel`、
+  `list_tasks`/`task_detail`、`notifier` 回调；Storage 序列化成 `local:/abs/root` / `ssh://[user@]host[:port]/abs/root?key=钥匙路径` / `smb://[user@]host[:port]/share/root`
   （`storage_to_spec`/`storage_from_spec`，凭据不进库）。`Storage` 为此新增 `open_resume(path, offset)`
 - `pybase.retry`：`wait_until`（等资源回来，间隔由调用方给）、`retry_call`（资源断着的时间不计入重试次数）
 - `pybase.inventory`：经 `Storage` 列目录树清单（跳过规则由调用方给，列不动的目录单独上报），按"相对路径+大小"

@@ -5,8 +5,10 @@
 - `root` 是远端**绝对路径**；`Storage` 的相对路径都换算到它下面，含 `..` 或绝对路径
   一律 `ValueError`，跑不出 root。
 - `stat` 不存在返回 None；连接出问题抛 `OSError`，不会被当成"不存在"。
-- `available()` 只看 SSH 通道是否还活着（`transport.is_active()`），不发请求、不抛异常；
-  连接断了不会自己恢复，但**下一次操作会自动重连一次**（再失败才抛 `OSError`）。
+- `available()` 已连接时只看 `transport.is_active()`（不发请求）；未连接或已断则**尝试连一次**
+  （超时取 `min(connect_timeout, 5)` 秒），成功 True（连接留着复用）、失败 False，从不抛异常。
+  所以从未用过的 SSHStorage 也能直接被传输队列等待恢复逻辑探活。
+  操作本身遇到断线同样会自动重连一次（再失败才抛 `OSError`）。
 - 认证走 ssh-agent 与 `~/.ssh` 下的默认钥匙，也可用 `key_filename` 指定；
   主机公钥核对 `~/.ssh/known_hosts`，未知主机默认拒绝。
 - 已经打开的读写句柄不跟着重连：断线时它们报错，由上层重试（见 `pybase.retry`）。
@@ -69,7 +71,8 @@ class SSHStorage:
                 pass
         self._sftp = self._client = None
 
-    def _connect(self) -> paramiko.SFTPClient:
+    def _connect(self, timeout: Optional[float] = None) -> paramiko.SFTPClient:
+        t_out = self.connect_timeout if timeout is None else timeout
         with self._lock:
             if self._sftp is not None and self._alive():
                 return self._sftp
@@ -83,8 +86,7 @@ class SSHStorage:
                     paramiko.AutoAddPolicy() if self.trust_unknown else paramiko.RejectPolicy())
                 client.connect(self.host, port=self.port, username=self.user,
                                key_filename=self.key_filename, allow_agent=True, look_for_keys=True,
-                               timeout=self.connect_timeout, banner_timeout=self.connect_timeout,
-                               auth_timeout=self.connect_timeout)
+                               timeout=t_out, banner_timeout=t_out, auth_timeout=t_out)
                 sftp = client.open_sftp()
             except (paramiko.SSHException, EOFError, OSError) as e:
                 client.close()
@@ -98,7 +100,10 @@ class SSHStorage:
 
     def available(self) -> bool:
         try:
-            return self._alive()
+            if self._alive():
+                return True
+            self._connect(timeout=min(self.connect_timeout, 5))
+            return True
         except Exception:
             return False
 

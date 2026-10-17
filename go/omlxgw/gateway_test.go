@@ -87,6 +87,7 @@ func newGW(t *testing.T, up *fakeUp, mod func(*Config)) (*Gateway, *httptest.Ser
 	}
 	ts := httptest.NewServer(g.Handler())
 	t.Cleanup(ts.Close)
+	t.Cleanup(g.Close)
 	return g, ts, path
 }
 

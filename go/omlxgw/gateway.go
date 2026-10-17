@@ -26,6 +26,8 @@ type Gateway struct {
 	logger *log.Logger
 	listen string
 	up     string
+	waker  *waker
+	keeper *keeper
 }
 
 // New 用已校验的配置创建网关。cfgPath 为空则 PUT /gw/config 只改内存。logw 为日志输出（nil 用 stderr）。
@@ -38,16 +40,19 @@ func New(cfg *Config, cfgPath string, logw io.Writer) (*Gateway, error) {
 		logw = os.Stderr
 	}
 	g := &Gateway{path: cfgPath, sched: newScheduler(cfg), logger: log.New(logw, "", 0), listen: cfg.Listen, up: cfg.Upstream}
+	g.waker = newWaker(cfg.Upstream, g.logger)
+	g.keeper = newKeeper(func() *KeepAwakeConfig { return g.sched.config().KeepAwake }, g.logger)
+	base := &http.Transport{
+		Proxy:               nil,
+		DialContext:         (&net.Dialer{Timeout: 10 * time.Second}).DialContext,
+		DisableCompression:  true,
+		MaxIdleConnsPerHost: 16,
+		IdleConnTimeout:     60 * time.Second,
+	}
 	g.proxy = &httputil.ReverseProxy{
 		Rewrite:       func(pr *httputil.ProxyRequest) { pr.SetURL(target) },
 		FlushInterval: -1,
-		Transport: &http.Transport{
-			Proxy:               nil,
-			DialContext:         (&net.Dialer{Timeout: 10 * time.Second}).DialContext,
-			DisableCompression:  true,
-			MaxIdleConnsPerHost: 16,
-			IdleConnTimeout:     60 * time.Second,
-		},
+		Transport:     &wakeTransport{base: base, g: g},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
 			if r.Context().Err() != nil {
 				if sw, ok := w.(*statusWriter); ok {
@@ -55,11 +60,18 @@ func New(cfg *Config, cfgPath string, logw io.Writer) (*Gateway, error) {
 				}
 				return
 			}
+			if strings.HasPrefix(err.Error(), "Studio 没叫醒") {
+				writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
+				return
+			}
 			writeJSON(w, http.StatusBadGateway, map[string]string{"error": "上游错误: " + err.Error()})
 		},
 	}
 	return g, nil
 }
+
+// Close 停止防睡循环并杀掉其子进程。
+func (g *Gateway) Close() { g.keeper.close() }
 
 // Handler 返回 HTTP 处理器。
 func (g *Gateway) Handler() http.Handler {
@@ -141,6 +153,21 @@ func (g *Gateway) handleProxy(w http.ResponseWriter, r *http.Request) {
 		g.logReq(model, prio, client, t1.Sub(t0), time.Since(t1), sw.status)
 	}()
 	_ = e
+	g.keeper.activity()
+	if wc := cfg.Wake; wc != nil {
+		if err := g.waker.ensure(r.Context(), wc, false); err != nil {
+			if r.Context().Err() == nil {
+				writeJSON(sw, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
+			} else {
+				sw.status = 499
+			}
+			return
+		}
+		if body != nil {
+			r.GetBody = func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewReader(body)), nil }
+		}
+		r = r.WithContext(context.WithValue(r.Context(), wakeCtxKey{}, true))
+	}
 	g.proxy.ServeHTTP(sw, r)
 }
 
@@ -158,7 +185,7 @@ func (g *Gateway) handleStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	run, q := g.sched.status()
-	writeJSON(w, 200, map[string]any{"running": run, "queued": q})
+	writeJSON(w, 200, map[string]any{"running": run, "queued": q, "studio": g.waker.status(), "keepawake": g.keeper.status()})
 }
 
 func (g *Gateway) handleConfig(w http.ResponseWriter, r *http.Request) {
@@ -204,6 +231,8 @@ func Run(ctx context.Context, cfgPath string, logw io.Writer) error {
 	if err != nil {
 		return err
 	}
+	g.keeper.start()
+	defer g.Close()
 	ln, err := net.Listen("tcp", cfg.Listen)
 	if err != nil {
 		return err

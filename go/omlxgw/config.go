@@ -24,6 +24,22 @@ type Config struct {
 	Models          map[string]ModelRule `json:"models"`
 	DefaultModel    ModelRule            `json:"default_model"`
 	MaxTotal        int                  `json:"max_total"`
+	Wake            *WakeConfig          `json:"wake,omitempty"`
+	KeepAwake       *KeepAwakeConfig     `json:"keepawake,omitempty"`
+}
+
+// WakeConfig 控制上游睡着时的唤醒（省略则关闭）。
+type WakeConfig struct {
+	Host           string `json:"host"`
+	KnockPorts     []int  `json:"knock_ports"`
+	MaxWaitSeconds int    `json:"max_wait_seconds"`
+}
+
+// KeepAwakeConfig 控制有活时的防睡命令（省略则关闭）。
+type KeepAwakeConfig struct {
+	Command        []string `json:"command"`
+	RefreshSeconds int      `json:"refresh_seconds"`
+	IdleSeconds    int      `json:"idle_seconds"`
 }
 
 func (c *Config) applyDefaults() {
@@ -32,6 +48,17 @@ func (c *Config) applyDefaults() {
 	}
 	if c.MaxTotal == 0 {
 		c.MaxTotal = 16
+	}
+	if c.Wake != nil && c.Wake.MaxWaitSeconds == 0 {
+		c.Wake.MaxWaitSeconds = 120
+	}
+	if k := c.KeepAwake; k != nil {
+		if k.RefreshSeconds == 0 {
+			k.RefreshSeconds = 240
+		}
+		if k.IdleSeconds == 0 {
+			k.IdleSeconds = 600
+		}
 	}
 	if c.Models == nil {
 		c.Models = map[string]ModelRule{}
@@ -63,6 +90,27 @@ func (c *Config) Validate() error {
 	for name, r := range c.Models {
 		if r.MaxConcurrent < 1 {
 			return fmt.Errorf("models[%s].max_concurrent 须 >= 1", name)
+		}
+	}
+	if w := c.Wake; w != nil {
+		if w.Host == "" {
+			return fmt.Errorf("wake.host 不能为空")
+		}
+		for _, p := range w.KnockPorts {
+			if p < 1 || p > 65535 {
+				return fmt.Errorf("wake.knock_ports 含无效端口 %d", p)
+			}
+		}
+		if w.MaxWaitSeconds < 1 {
+			return fmt.Errorf("wake.max_wait_seconds 须 >= 1")
+		}
+	}
+	if k := c.KeepAwake; k != nil {
+		if len(k.Command) == 0 || k.Command[0] == "" {
+			return fmt.Errorf("keepawake.command 不能为空")
+		}
+		if k.RefreshSeconds < 1 || k.IdleSeconds < 1 {
+			return fmt.Errorf("keepawake.refresh_seconds、idle_seconds 须 >= 1")
 		}
 	}
 	return nil

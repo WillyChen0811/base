@@ -9,6 +9,7 @@ wgtund 的程序级接管口（无认证、CONNECT）。域名**原样**交给�
 
 from __future__ import annotations
 
+import os
 import socket
 import struct
 import threading
@@ -16,28 +17,36 @@ from typing import Optional, Tuple
 
 _lock = threading.Lock()
 _proxy: Optional[Tuple[str, int]] = None
+ENV = "PYBASE_SOCKS5_PROXY"   # set_proxy 同步写进环境变量，子进程（如对话里跑的 skill 脚本）继承后同样经代理
 
 _REPLY = {1: "代理服务器故障", 2: "规则不允许", 3: "网络不可达", 4: "主机不可达",
           5: "目标拒绝连接", 6: "TTL 过期", 7: "不支持的命令", 8: "不支持的地址类型"}
 
 
+def _parse(addr: str) -> Tuple[str, int]:
+    host, sep, port = addr.rpartition(":")
+    if not sep or not host or not port.isdigit():
+        raise ValueError(f"代理地址应为 host:port：{addr!r}")
+    return host.strip("[]"), int(port)
+
+
 def set_proxy(addr: Optional[str]) -> None:
-    """addr 形如 "127.0.0.1:11080"；空值取消。"""
+    """addr 形如 "127.0.0.1:11080"；空值取消。同时写/删环境变量 ENV。"""
     global _proxy
     if not addr:
         with _lock:
             _proxy = None
+            os.environ.pop(ENV, None)
         return
-    host, sep, port = addr.rpartition(":")
-    if not sep or not host or not port.isdigit():
-        raise ValueError(f"代理地址应为 host:port：{addr!r}")
+    p = _parse(addr)
     with _lock:
-        _proxy = (host.strip("[]"), int(port))
+        _proxy = p
+        os.environ[ENV] = addr
 
 
 def get_proxy() -> Optional[str]:
     with _lock:
-        return f"{_proxy[0]}:{_proxy[1]}" if _proxy else None
+        return f"{_proxy[0]}:{_proxy[1]}" if _proxy else (os.environ.get(ENV) or None)
 
 
 def _recv(s: socket.socket, n: int) -> bytes:
@@ -92,6 +101,8 @@ def connect_via_proxy(host: str, port: int, timeout: float = 10) -> Optional[soc
     """已设代理则经代理建连接；未设返回 None（调用方自行直连）。"""
     with _lock:
         proxy = _proxy
+    if proxy is None and os.environ.get(ENV):     # 子进程：父进程设的代理经环境变量传下来
+        proxy = _parse(os.environ[ENV])
     if proxy is None:
         return None
     return connect(proxy, host, port, timeout)

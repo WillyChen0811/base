@@ -180,3 +180,20 @@ def test_ssh代理连不上_不回落直连(env):
     assert st.available() is False
     with pytest.raises(OSError, match="代理"):
         st.listdir("")
+
+
+def test_子进程经环境变量继承代理():
+    import subprocess
+    stub = Stub()
+    try:
+        socks5.set_proxy(stub.addr)
+        assert os.environ[socks5.ENV] == stub.addr
+        code = "from pybase import socks5; s = socks5.connect_via_proxy('ubuntu1st', 22, 3); print(s is not None)"
+        env = dict(os.environ, PYTHONPATH=os.path.join(os.path.dirname(__file__), ".."))
+        out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=20, env=env)
+        assert out.stdout.strip() == "True", out.stderr
+    finally:
+        socks5.set_proxy(None)
+        stub.stop()
+    assert stub.seen == [(3, "ubuntu1st", 22)]
+    assert socks5.ENV not in os.environ

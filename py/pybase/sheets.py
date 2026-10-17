@@ -12,7 +12,7 @@ import os
 from typing import BinaryIO, List, Optional, Tuple, Union
 
 # 入口都接受路径或二进制文件对象（BytesIO 等）。给文件对象时扩展名取自
-# 对象的 `.name`（`pybase.memfile.as_memory_file` 返回的 BytesIO 已带），
+# 对象的 `.name`（`pybase.storage.as_memory_file` 返回的 BytesIO 已带），
 # 没有 name 就用 `ext=` 参数指定。
 Source = Union[str, "os.PathLike[str]", BinaryIO]
 

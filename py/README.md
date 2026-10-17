@@ -38,7 +38,7 @@
   续传逻辑解耦；自带 `LocalStorage`（本地目录与任何已挂载网络盘，可要求挂载点在挂才算可用），新通道照接口实现即可；另有 `read_bytes`/`as_memory_file`（读进内存，BytesIO 可直接交给 python-docx/openpyxl/`pybase.sheets`，不落盘，可限 `max_bytes`）和 `materialize`（必须要真实路径时用：本地盘给原路径，其他通道临时拷进内存盘，退出即删）
 - `pybase.sshstorage`：`SSHStorage`，经 SFTP 读写远端目录（`pip install "pybase[ssh]"`）；路径锁在 root 下，`available()` 未连接/已断时会主动连一次（超时 ≤5 秒，成功后复用，失败 False 不抛异常），断线后下次操作自动重连，
   未知主机默认拒绝
-- `pybase.smbstorage`：`SMBStorage`，基于 `SMBClient` 读写共享内某目录（`pip install "pybase[smb]"`）；`root` 是共享内目录，路径锁在 root 下，
+- `pybase.smbstorage`：`SMBStorage`，基于 `SMBClient`（连接、认证、读写全走它的 `stream.py` 等方法）读写共享内某目录（`pip install "pybase[smb]"`）；`root` 是共享内目录，路径锁在 root 下，
   `available()` 未连接时先 TCP 探测再连一次（超时 ≤5 秒，不抛异常），断线后下次操作自动重连；规格 `smb://[user@]host[:port]/share/root`，
   **密码不进库**，由构造参数或 `set_credential_provider(fn)` 注册的回调 `fn(host, share, user, port)` 提供
 - `pybase.fileops`：两端都是 `Storage` 的拷贝 `copy_file`（临时文件转正；`verify` 开关默认关、只比大小，开了边拷边哈希

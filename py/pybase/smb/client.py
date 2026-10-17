@@ -8,6 +8,7 @@
 | `listing.py` | 列目录、遍历、存在性 |
 | `download.py` | 下载、远端流式哈希 |
 | `upload.py` | 建目录、上传（原子替换 + 时间戳）、重命名 |
+| `stream.py` | 单文件细粒度操作：stat、流式读写、续写、replace/remove/rmdir/set_mtime |
 | `shares.py` | 列共享（全包唯一还用 pysmb 的地方） |
 
 `SMBClient` 的对外方法签名与返回结构不变，业务代码不受拆分影响；
@@ -22,12 +23,13 @@ from .common import CONNECT_TIMEOUT
 from .download import DownloadMixin
 from .listing import ListingMixin
 from .shares import list_shares            # noqa: F401  （对外再导出，勿删）
+from .stream import StreamMixin
 from .upload import UploadMixin
 
 logger = logging.getLogger(__name__)
 
 
-class SMBClient(ListingMixin, DownloadMixin, UploadMixin):
+class SMBClient(ListingMixin, DownloadMixin, UploadMixin, StreamMixin):
     """SMB 客户端 (基于 smbprotocol/smbclient，支持 SMB3 加密与保留修改时间)
 
     对外方法签名与返回结构与旧 pysmb 版保持一致，业务代码无需改动。
@@ -114,6 +116,13 @@ class SMBClient(ListingMixin, DownloadMixin, UploadMixin):
             pass
         self._connected = False
         self._ensured_dirs.clear()
+
+    def is_alive(self) -> bool:
+        """已连接，且缓存里每条会话的 TCP 传输仍在。**不发请求**，便宜，可反复调用。"""
+        if not self._connected:
+            return False
+        conns = [v for v in self._cache.values() if hasattr(v, "transport")]
+        return all(getattr(v.transport, "connected", True) for v in conns)
 
     def _ensure_connection(self):
         """确保已注册会话；未连接则连接。失效连接由上传重试中的 disconnect+重连兜底。"""

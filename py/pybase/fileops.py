@@ -27,8 +27,10 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass, field
-from typing import Callable, Iterable, List, Optional, Union
+from typing import Callable, Iterable, List, Optional, Sequence, Union
 
+from .resumepart import (RESUME_SHORT_SUFFIX, RESUME_SUFFIX, drop_parts, find_part,  # noqa: F401
+                         open_part, stat_part)
 from .storage import Storage, parent
 
 CHUNK = 4 * 1024 * 1024
@@ -127,7 +129,6 @@ def copy_file(src: Storage, src_path: str, dst: Storage, dst_path: str, *,
 
 
 RESUME_CHUNK = 8 * 1024 * 1024
-RESUME_SUFFIX = ".xferq.part"
 _MTIME_EPS = 1e-3
 
 
@@ -192,7 +193,8 @@ def _chunk_hashes(storage: Storage, path: str, chunk: int) -> List[str]:
 
 
 def copy_file_resumable(src: Storage, src_path: str, dst: Storage, dst_path: str, *,
-                        part_path: str, chunk: int = RESUME_CHUNK,
+                        part_path: str, part_fallbacks: Sequence[str] = (),
+                        chunk: int = RESUME_CHUNK,
                         progress: Optional[Callable[[int, int, str], None]] = None,
                         state: Optional[ResumeState] = None,
                         preserve_mtime: bool = True) -> CopyResult:
@@ -206,12 +208,15 @@ def copy_file_resumable(src: Storage, src_path: str, dst: Storage, dst_path: str
     - 写完整体核对：全部块的 sha256（续传前的块用 `state` 里记的，新写的边读边算）与目标读回的
       逐块哈希必须一致，另外源的大小/修改时间要与开始时一致（变了就从头来一遍，仍变则放弃）。
     - 目标已存在：大小与逐块哈希都一致算 `already-present`，否则 `conflict`，**不覆盖**。
+    - `part_fallbacks`：临时名被服务端拒绝（名字过长/非法）时依次改用的备选路径。续传时按
+      `part_path`、备选的顺序找已存在的临时文件，所以同一目标每次传入的序列必须相同。
     - 返回 `CopyResult`，`status` 在 `copy_file` 的基础上多一个 `source-changed`（源在拷贝期间一直在变）。
       I/O 错误原样抛出，调用方带着 `state` 再调就是续传。
     """
     if chunk < 1:
         raise ValueError("chunk 至少为 1")
     st = state if state is not None else ResumeState(chunk=chunk)
+    parts = [part_path, *part_fallbacks]
 
     def result(status, size=0):
         return CopyResult(status, src_path, dst_path, size, None, True)
@@ -229,30 +234,36 @@ def copy_file_resumable(src: Storage, src_path: str, dst: Storage, dst_path: str
             if existing.is_dir or existing.size != size:
                 return result("conflict", size)
             if _chunk_hashes(dst, dst_path, chunk) == _chunk_hashes(src, src_path, chunk):
-                _drop(dst, part_path)
+                drop_parts(dst, parts)
                 return result("already-present", size)
             return result("conflict", size)
 
-        n = _verified_chunks(dst, part_path, st, size)
+        pi = find_part(dst, parts)
+        n = _verified_chunks(dst, parts[pi], st, size)
         del st.chunks[n:]
 
         offset = n * chunk
-        with src.open_read(src_path) as reader, dst.open_resume(part_path, offset) as writer:
-            if offset:
-                reader.seek(offset)
-            idx = n
-            while offset < size:
-                block = _read_full(reader, chunk)
-                if len(block) != min(chunk, size - offset):
-                    break                       # 源比开始时短了：下面的复查会发现
-                sha = hashlib.sha256(block).hexdigest()
-                writer.write(block)
-                writer.flush()
-                offset += len(block)
-                st.chunks.append(sha)
-                if progress:
-                    progress(offset, idx, sha)
-                idx += 1
+        with src.open_read(src_path) as reader:
+            writer, pi, woff = open_part(dst, parts, pi, offset)
+            if woff != offset:                  # 临时名被拒换了名：新名上从头写
+                offset, n = woff, 0
+                del st.chunks[:]
+            with writer:
+                if offset:
+                    reader.seek(offset)
+                idx = n
+                while offset < size:
+                    block = _read_full(reader, chunk)
+                    if len(block) != min(chunk, size - offset):
+                        break                       # 源比开始时短了：下面的复查会发现
+                    sha = hashlib.sha256(block).hexdigest()
+                    writer.write(block)
+                    writer.flush()
+                    offset += len(block)
+                    st.chunks.append(sha)
+                    if progress:
+                        progress(offset, idx, sha)
+                    idx += 1
 
         again = src.stat(src_path)
         if (again is None or again.size != size
@@ -260,30 +271,25 @@ def copy_file_resumable(src: Storage, src_path: str, dst: Storage, dst_path: str
                     and abs(again.mtime - entry.mtime) > _MTIME_EPS)
                 or offset != size):
             st.reset()
-            _drop(dst, part_path)
+            drop_parts(dst, parts)
             if attempt == 0:
                 continue
             return result("source-changed", size)
 
-        got = dst.stat(part_path)
-        if got is None or got.size != size or _chunk_hashes(dst, part_path, chunk) != st.chunks:
+        got = dst.stat(parts[pi])
+        if got is None or got.size != size or _chunk_hashes(dst, parts[pi], chunk) != st.chunks:
             st.reset()
-            _drop(dst, part_path)
+            drop_parts(dst, parts)
             return result("copy-differs", size)
 
         if dst.stat(dst_path) is not None:      # 写的期间目标被别人放了东西：不覆盖
-            _drop(dst, part_path)
+            drop_parts(dst, parts)
             return result("conflict", size)
         if preserve_mtime and entry.mtime is not None:
-            dst.set_mtime(part_path, entry.mtime)
-        dst.replace(part_path, dst_path)
+            dst.set_mtime(parts[pi], entry.mtime)
+        dst.replace(parts[pi], dst_path)
         return result("copied", size)
     return result("source-changed")             # 不可达
-
-
-def _drop(storage: Storage, path: str) -> None:
-    if storage.stat(path) is not None:
-        storage.remove(path)
 
 
 def _verified_chunks(dst: Storage, part_path: str, st: ResumeState, size: int) -> int:
@@ -291,7 +297,7 @@ def _verified_chunks(dst: Storage, part_path: str, st: ResumeState, size: int) -
     n = len(st.chunks)
     if n == 0:
         return 0
-    have = dst.stat(part_path)
+    have = stat_part(dst, part_path)
     have_size = have.size if have is not None and not have.is_dir else -1
     while n > 0:
         start = (n - 1) * st.chunk

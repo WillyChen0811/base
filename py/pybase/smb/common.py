@@ -8,6 +8,8 @@ import os
 from datetime import datetime
 from typing import List, Optional
 
+from ..tmpname import tmp_names
+
 # NtStatus：判定“服务端嫌文件名不合法”这一种失败，见 _is_name_rejected
 from smbprotocol.exceptions import NtStatus
 from smbprotocol.open import FilePipePrinterAccessMask
@@ -35,23 +37,8 @@ _EPOCH_FILETIME = 116444736000000000
 
 
 def _tmp_names(name: str) -> List[str]:
-    """同目录临时文件名的候选，按优先级排列。
-
-    首选**追加** .wsu（原名完整保留，残留临时文件一眼能看出是哪个文件传断了）。但文件名
-    上限按 UTF-8 字节算，贴着 255 字节上限的中文名追加后缀会被服务端以
-    STATUS_OBJECT_NAME_INVALID 整个拒掉（连文件都建不出来）。备选把扩展名**换成** .wsu，
-    临时名恒不长于最终名，多长的原名都放得下（丢掉原扩展名无影响，因为临时名只在传输中间
-    存在，传完就 replace 成原名）。
-
-    不预判长度、只在服务端真的拒绝时才降级（见 upload_file）：各家服务器上限口径不一样，
-    照某一台的规则预先截名字会误伤别处。
-    """
-    names = [name + _TMP_SUFFIX]
-    stem, _ext = os.path.splitext(name)
-    # 无扩展名（含 .gitignore 这类纯点名）时备选与首选相同，没有降级余地
-    if stem and stem != name:
-        names.append(stem + _TMP_SUFFIX)
-    return names
+    """同目录临时文件名候选（规则见 pybase.tmpname）：先追加 .wsu，被拒再换扩展名为 .wsu。"""
+    return tmp_names(name, _TMP_SUFFIX)
 
 
 def _is_name_rejected(exc: Exception) -> bool:

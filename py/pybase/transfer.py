@@ -45,7 +45,8 @@ from sqlalchemy import (BigInteger, Column, DateTime, Float, ForeignKey, Integer
 from sqlalchemy.exc import SQLAlchemyError
 
 from . import db
-from .fileops import RESUME_CHUNK, RESUME_SUFFIX, ResumeState, copy_file_resumable
+from .fileops import RESUME_CHUNK, ResumeState, copy_file_resumable
+from .resumepart import drop_parts, resume_part_paths
 from .retry import wait_until
 from .storage import LocalStorage, Storage
 
@@ -539,7 +540,7 @@ class TransferQueue:
         """传一项，返回 'done' / 'failed' / 'stopped'（任务被暂停/取消/关闭/让出）。连接问题在这里循环等待，不返回。"""
         iid = item["id"]
         src_spec, dst_spec = item["src_spec"], item["dst_spec"]
-        part = item["dst_path"] + RESUME_SUFFIX
+        parts = resume_part_paths(item["dst_path"])
         with self.engine.connect() as conn:
             shas = [r[0] for r in conn.execute(
                 select(C.sha256).where(C.item_id == iid).order_by(C.idx))]
@@ -573,7 +574,8 @@ class TransferQueue:
                     raise _Disconnected()
                 self._item_update(iid, status="running", attempts=item["attempts"] + 1)
                 item["attempts"] += 1
-                res = copy_file_resumable(src, item["src_path"], dst, item["dst_path"], part_path=part,
+                res = copy_file_resumable(src, item["src_path"], dst, item["dst_path"],
+                                          part_path=parts[0], part_fallbacks=parts[1:],
                                           chunk=state.chunk, progress=progress, state=state)
             except TransferInterrupted:
                 return self._stopped(tid, iid)
@@ -634,8 +636,7 @@ class TransferQueue:
             if row is not None:
                 try:
                     dst = self._storage(row[0])
-                    if dst.stat(row[1] + RESUME_SUFFIX) is not None:
-                        dst.remove(row[1] + RESUME_SUFFIX)
+                    drop_parts(dst, resume_part_paths(row[1]))
                 except Exception:
                     logger.debug("清理临时文件失败", exc_info=True)
         else:

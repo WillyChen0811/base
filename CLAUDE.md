@@ -34,7 +34,7 @@
 
 ### smb
 - `upload_file` 的 `mtime`/`atime`/`birthtime` 由调用方在定版时 stat 好传入，函数内部不能再读本地文件
-- 上传必须走临时文件（`.wsu`）+ `replace` 原子替换；临时名被拒时降级为替换扩展名（见 `common._tmp_names`）
+- 上传必须走临时文件（`.wsu`）+ `replace` 原子替换；临时名被拒时降级为替换扩展名（见 `common._tmp_names`）；规则在 `pybase/tmpname.py`，传输队列续传临时名（`.xferq.part`，降级为 `.xfq`）同理，清理一律认 `resumepart.is_resume_part`
 - `exists()` 是三态：`None` 表示判不出，不能当 `False` 用
 - 固定使用 NTLM，不用 negotiate（Kerberos 在 IP 直连场景会导致 `ACCESS_DENIED`）
 - `CONNECT_TIMEOUT=10s` 是有意设置：RPC stdio 是单线程，超时太长会堵塞管道

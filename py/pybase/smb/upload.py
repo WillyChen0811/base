@@ -9,7 +9,7 @@
   255 字节上限时，追加后缀会被整个拒掉。
 
 混入方需要提供 `_ensure_connection()` / `_unc()` / `_safe_delete()` /
-`disconnect()` / `_cache` / `_ensured_dirs` / `_encrypted`。
+`disconnect()` / `_cache` / `_kw` / `_ensured_dirs` / `_encrypted`。
 """
 
 import logging
@@ -51,7 +51,7 @@ class UploadMixin:
         if path in self._ensured_dirs:
             return True
 
-        smbclient.makedirs(self._unc(path), exist_ok=True, connection_cache=self._cache)
+        smbclient.makedirs(self._unc(path), exist_ok=True, **self._kw)
 
         # 记录本次已确认的目录（含各级父目录），加速后续同目录文件上传
         prefix = ""
@@ -125,7 +125,7 @@ class UploadMixin:
                 written = 0
                 last_report = 0
                 with open(local_path, "rb") as src, \
-                        smbclient.open_file(tmp_unc, mode="wb", connection_cache=self._cache) as dst:
+                        smbclient.open_file(tmp_unc, mode="wb", **self._kw) as dst:
                     while True:
                         chunk = src.read(_UPLOAD_CHUNK)
                         if not chunk:
@@ -140,14 +140,14 @@ class UploadMixin:
                                 pass
 
                 # 校验大小，防止截断
-                st_remote = smbclient.stat(tmp_unc, connection_cache=self._cache)
+                st_remote = smbclient.stat(tmp_unc, **self._kw)
                 if st_remote.st_size != local_size:
                     raise IOError(
                         f"上传大小不一致: 本地 {local_size} 字节, 远程 {st_remote.st_size} 字节"
                     )
 
                 # 原子替换（覆盖已存在目标）
-                smbclient.replace(tmp_unc, target_unc, connection_cache=self._cache)
+                smbclient.replace(tmp_unc, target_unc, **self._kw)
 
                 # 完整复制源文件时间信息（创建/访问/修改），像 Windows 复制那样保留。
                 # 用 _set_basic_information 一次设全（utime 只能设访问/修改，无法设创建时间）；
@@ -159,7 +159,7 @@ class UploadMixin:
                         creation_time=create_ft,
                         last_access_time=_ft_from_ns(use_atime_ns),
                         last_write_time=_ft_from_ns(use_mtime_ns),
-                        connection_cache=self._cache,
+                        **self._kw,
                     )
                 except Exception as e:
                     logger.warning(f"设置远程文件时间信息失败（忽略）{target_unc}: {e}")
@@ -234,6 +234,6 @@ class UploadMixin:
         """重命名远程文件或目录（目标已存在时报错，不覆盖）"""
         self._ensure_connection()
         smbclient.rename(
-            self._unc(path), self._unc(new_path), connection_cache=self._cache
+            self._unc(path), self._unc(new_path), **self._kw
         )
         return True

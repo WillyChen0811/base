@@ -9,7 +9,7 @@
 读句柄一律走 `_READ_ACCESS` + 共享读写删（与 `download_file` 同一套，避开根目录 ACL 不授 EA 读权限
 导致的 ACCESS_DENIED，也不阻塞别的进程）。
 
-混入方需要提供 `_ensure_connection()` / `_unc()` / `mkdir()` / `list_dir()` / `_cache` / `_ensured_dirs`。
+混入方需要提供 `_ensure_connection()` / `_unc()` / `mkdir()` / `list_dir()` / `_cache` / `_kw` / `_ensured_dirs`。
 """
 
 import errno
@@ -37,7 +37,7 @@ class StreamMixin:
         self._ensure_connection()
         rel = (path or "").strip("/")
         try:
-            st = smbclient.lstat(self._unc(rel), connection_cache=self._cache)
+            st = smbclient.lstat(self._unc(rel), **self._kw)
         except OSError as e:
             if _is_missing(e):
                 return None
@@ -59,14 +59,14 @@ class StreamMixin:
         self._ensure_connection()
         return smbclient.open_file(
             self._unc(path), mode="rb", share_access="rwd",
-            desired_access=_READ_ACCESS, connection_cache=self._cache,
+            desired_access=_READ_ACCESS, **self._kw,
         )
 
     def open_write(self, path: str) -> BinaryIO:
         """新建/截断写入，上级目录不存在自动建。"""
         self._ensure_connection()
         self._mkparent(path)
-        return smbclient.open_file(self._unc(path), mode="wb", connection_cache=self._cache)
+        return smbclient.open_file(self._unc(path), mode="wb", **self._kw)
 
     def open_resume(self, path: str, offset: int) -> BinaryIO:
         """从 `offset` 处接着写：已存在则 `r+b` 打开、截断到 `offset` 并定位；不存在且
@@ -77,12 +77,12 @@ class StreamMixin:
         self._ensure_connection()
         unc = self._unc(path)
         try:
-            f = smbclient.open_file(unc, mode="r+b", connection_cache=self._cache)
+            f = smbclient.open_file(unc, mode="r+b", **self._kw)
         except OSError as e:
             if not _is_missing(e) or offset:
                 raise
             self._mkparent(path)
-            return smbclient.open_file(unc, mode="wb", connection_cache=self._cache)
+            return smbclient.open_file(unc, mode="wb", **self._kw)
         try:
             size = f.seek(0, 2)
             if offset > size:
@@ -100,12 +100,12 @@ class StreamMixin:
     def replace(self, src: str, dst: str) -> None:
         """改名并**覆盖**已存在的 `dst`（`rename` 则不覆盖）。"""
         self._ensure_connection()
-        smbclient.replace(self._unc(src), self._unc(dst), connection_cache=self._cache)
+        smbclient.replace(self._unc(src), self._unc(dst), **self._kw)
 
     def remove(self, path: str) -> None:
         """删文件。"""
         self._ensure_connection()
-        smbclient.remove(self._unc(path), connection_cache=self._cache)
+        smbclient.remove(self._unc(path), **self._kw)
 
     def rmdir(self, path: str) -> None:
         """只删空目录，非空抛 `OSError(ENOTEMPTY)`（先自己列一遍，不依赖服务端对非空目录的报错码）。"""
@@ -113,14 +113,14 @@ class StreamMixin:
         rel = (path or "").strip("/")
         if self.list_dir(rel):
             raise OSError(errno.ENOTEMPTY, "目录非空", path)
-        smbclient.rmdir(self._unc(rel), connection_cache=self._cache)
+        smbclient.rmdir(self._unc(rel), **self._kw)
         # 目录没了，mkdir 的"已确认"缓存里也要去掉，否则之后往里写会跳过重建
         self._ensured_dirs = {d for d in self._ensured_dirs if d != rel and not d.startswith(rel + "/")}
 
     def set_mtime(self, path: str, mtime: float) -> None:
         """把访问/修改时间都设成 `mtime`（epoch 秒）。"""
         self._ensure_connection()
-        smbclient.utime(self._unc(path), times=(mtime, mtime), connection_cache=self._cache)
+        smbclient.utime(self._unc(path), times=(mtime, mtime), **self._kw)
 
     def _mkparent(self, path: str) -> None:
         parent = (path or "").strip("/").rpartition("/")[0]

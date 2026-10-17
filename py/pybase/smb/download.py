@@ -3,7 +3,7 @@
 `hash_file` 存在的理由是归档里躺着几 GB 的录屏——那种文件不能走
 `download_file` 的"一次读进内存"。
 
-混入方需要提供 `_ensure_connection()` / `_unc()` / `_cache`。
+混入方需要提供 `_ensure_connection()` / `_unc()` / `_kw`。
 """
 
 import hashlib
@@ -22,7 +22,7 @@ class DownloadMixin:
         unc = self._unc(path)
         with smbclient.open_file(
             unc, mode="rb", share_access="rwd",
-            desired_access=_READ_ACCESS, connection_cache=self._cache,
+            desired_access=_READ_ACCESS, **self._kw,
         ) as f:
             return f.read()
 
@@ -37,7 +37,7 @@ class DownloadMixin:
         h = hashlib.new(algo)
         with smbclient.open_file(
             unc, mode="rb", share_access="rwd",
-            desired_access=_READ_ACCESS, connection_cache=self._cache,
+            desired_access=_READ_ACCESS, **self._kw,
         ) as f:
             while True:
                 block = f.read(chunk)

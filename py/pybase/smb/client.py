@@ -72,6 +72,12 @@ class SMBClient(ListingMixin, DownloadMixin, UploadMixin, StreamMixin):
         base = f"\\\\{self.address}\\{self.share}"
         return f"{base}\\{rel}" if rel else base
 
+    @property
+    def _kw(self) -> dict:
+        """所有 smbclient 带路径的文件调用统一展开它：连接缓存 + 端口。
+        smbclient 查会话时 port 默认 445，经转发端口（如 1445）连接时不带就找不到会话。"""
+        return {"connection_cache": self._cache, "port": self.port}
+
     # ---------- 连接 ----------
 
     def connect(self) -> bool:
@@ -132,6 +138,6 @@ class SMBClient(ListingMixin, DownloadMixin, UploadMixin, StreamMixin):
     def _safe_delete(self, unc: str):
         """尽力删除远程文件，忽略不存在等错误"""
         try:
-            smbclient.remove(unc, connection_cache=self._cache)
+            smbclient.remove(unc, **self._kw)
         except Exception as e:
             logger.debug(f"删除远程文件忽略 {unc}: {e}")

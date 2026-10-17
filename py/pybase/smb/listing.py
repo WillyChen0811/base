@@ -3,7 +3,7 @@
 `SMBClient` 的一半（见 `client.py` 的组装）。**只读、不写**：`list_dir` /
 `walk` / `scan` / `exists` 全是"服务器上有什么"这一类问题，写入在 `upload.py`。
 
-混入方需要提供 `_ensure_connection()` / `_unc()` / `_cache`。
+混入方需要提供 `_ensure_connection()` / `_unc()` / `_kw`。
 """
 
 import logging
@@ -34,7 +34,7 @@ class ListingMixin:
 
         try:
             for entry in smbclient.scandir(
-                unc, connection_cache=self._cache, desired_access=_READ_ACCESS
+                unc, **self._kw, desired_access=_READ_ACCESS
             ):
                 if entry.name in (".", ".."):
                     continue
@@ -134,7 +134,7 @@ class ListingMixin:
         """
         self._ensure_connection()
         try:
-            return smbpath.exists(self._unc(path), connection_cache=self._cache)
+            return smbpath.exists(self._unc(path), **self._kw)
         except Exception as exc:                              # noqa: BLE001
             logger.warning(f"判断远端路径是否存在失败，这次判不出来 {path}: {exc}")
             return None

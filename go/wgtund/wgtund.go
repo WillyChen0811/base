@@ -239,13 +239,13 @@ func Run(ctx context.Context, dir string, stdin io.Reader, stdout io.Writer) (er
 		pool.add(h, ds)
 	}
 
-	// 端口转发（可选）：本机固定端口，进来的拨到当前线路的远端地址；监听失败算启动失败
+	// 端口转发（可选）：本机固定端口，进来的拨到当前线路的远端地址；监听失败只记在该转发上并后台重试，不影响启动
 	forwardMap := map[string]*forwardSvc{}
 	forwardOrder := []string{}
 	for _, fw := range conf.Forwards {
 		fwd := newForward(fw, tunnels, pool)
-		if err := fwd.start(); err != nil {
-			return fmt.Errorf("转发 %q 开监听失败: %w", fw.Name, err)
+		if err := fwd.start(); err != nil { // 只有 listen 写法错（配置错误）；端口占用等在 start 内部隔离重试
+			return fmt.Errorf("转发 %q 的 listen 无效: %w", fw.Name, err)
 		}
 		closers = append(closers, fwd)
 		forwardMap[fw.Name] = fwd

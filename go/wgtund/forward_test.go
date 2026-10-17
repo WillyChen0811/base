@@ -675,25 +675,110 @@ func TestForwardCloseStopsAllGoroutines(t *testing.T) {
 	waitNoFwdGoroutines(t, 3*time.Second)
 }
 
-// P2 补充：监听端口被占用时 start 返回错误，不能谎报起来了。
-func TestForwardStartPortOccupied(t *testing.T) {
-	// 直接占住一个系统给的回环端口并持有到测试结束：
-	// 不用 freeAddr 那种「先释放再抢回」，那中间端口可能被别的进程抢走。
+func fastRetry(t *testing.T) {
+	old := forwardListenRetry
+	forwardListenRetry = 30 * time.Millisecond
+	t.Cleanup(func() { forwardListenRetry = old })
+}
+
+func waitFwdCond(t *testing.T, cond func() bool, what string) {
+	t.Helper()
+	for i := 0; i < 200; i++ {
+		if cond() {
+			return
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	t.Fatalf("超时未达成: %s", what)
+}
+
+// 端口被占：start 不报错，该转发带错误，释放后在重试周期内恢复。
+func TestForwardStartPortOccupiedRetries(t *testing.T) {
+	fastRetry(t)
 	hold, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { hold.Close() })
 	addr := hold.Addr().String()
+	u := startFwdUpstream(t, "A")
 	f := newForward(forwardConf{Name: "busy", Listen: addr,
-		Routes: []routeConf{{Label: "直连", Addr: "10.99.0.1:8192"}}}, nil, nil)
+		Routes: []routeConf{{Label: "直连", Addr: u.addr()}}}, nil, nil)
 	t.Cleanup(func() { f.Close() })
-	if err := f.start(); err == nil {
-		t.Fatal("监听端口被占用时 start 应返回错误")
+	if err := f.start(); err != nil {
+		t.Fatalf("端口被占不应让 start 失败: %v", err)
 	}
-	if v := f.item(); v.Listen != "" {
-		t.Errorf("监听失败不应报告监听地址: %+v", v)
+	if v := f.item(); v.Listen != "" || !strings.Contains(v.Error, "监听 "+addr+" 失败") {
+		t.Fatalf("应带监听错误: %+v", v)
 	}
+	hold.Close()
+	waitFwdCond(t, func() bool { v := f.item(); return v.Listen == addr && v.Error == "" }, "释放端口后恢复")
+	c := dialFwd(t, addr)
+	io.WriteString(c, "ping\n")
+	if l, err := bufio.NewReader(c).ReadString('\n'); err != nil || l != "A:ping\n" {
+		t.Errorf("恢复后转发 = %q, %v", l, err)
+	}
+}
+
+// accept 出错退出：只记错误并重新监听。
+func TestForwardAcceptErrorRecovers(t *testing.T) {
+	fastRetry(t)
+	u := startFwdUpstream(t, "A")
+	f := newForward(forwardConf{Name: "x", Listen: "127.0.0.1:0",
+		Routes: []routeConf{{Label: "直连", Addr: u.addr()}}}, nil, nil)
+	t.Cleanup(func() { f.Close() })
+	if err := f.start(); err != nil {
+		t.Fatal(err)
+	}
+	f.mu.Lock()
+	f.laddr = f.addr // 让重监听回到同一个实际端口
+	ln := f.ln
+	f.mu.Unlock()
+	ln.Close() // 模拟 accept 出错（f.closed 仍为 false）
+	waitFwdCond(t, func() bool { f.mu.Lock(); defer f.mu.Unlock(); return f.ln != nil && f.ln != ln }, "accept 出错后重新监听")
+	c := dialFwd(t, f.item().Listen)
+	io.WriteString(c, "ping\n")
+	if l, err := bufio.NewReader(c).ReadString('\n'); err != nil || l != "A:ping\n" {
+		t.Errorf("恢复后转发 = %q, %v", l, err)
+	}
+	if v := f.item(); v.Error != "" {
+		t.Errorf("恢复后错误应清空: %+v", v)
+	}
+}
+
+// wgtund 层：端口被占时照常启动，其他转发可用，该转发带错误，释放后恢复。
+func TestForwardBusyPortDoesNotBreakWgtund(t *testing.T) {
+	fastRetry(t)
+	hold, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { hold.Close() })
+	busy := hold.Addr().String()
+	u := startFwdUpstream(t, "A")
+	f := newFixture(t, func(cfg map[string]any) {
+		addFwd(cfg, fwdConf("busy", busy, fwdRoute("内网", "", u.addr())),
+			fwdConf("ok", "127.0.0.1:0", fwdRoute("内网", "", u.addr())))
+	})
+	st, _, _ := run(t, f.dir)
+	byName := func() map[string]forwardView {
+		m := map[string]forwardView{}
+		for _, v := range forwardsOf(t, st) {
+			m[v.Name] = v
+		}
+		return m
+	}
+	m := byName()
+	if !strings.Contains(m["busy"].Error, "监听 "+busy+" 失败") || m["ok"].Error != "" || m["ok"].Listen == "" {
+		t.Fatalf("/forwards = %+v", m)
+	}
+	c := dialFwd(t, m["ok"].Listen)
+	io.WriteString(c, "ping\n")
+	if l, err := bufio.NewReader(c).ReadString('\n'); err != nil || l != "A:ping\n" {
+		t.Errorf("其他转发 = %q, %v", l, err)
+	}
+	hold.Close()
+	waitFwdCond(t, func() bool { v := byName()["busy"]; return v.Listen == busy && v.Error == "" }, "释放端口后恢复")
 }
 
 // (e) 配置校验：不合规一律启动失败

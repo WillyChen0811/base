@@ -81,6 +81,8 @@ type forwardSvc struct {
 	active        int  // 当前线路下标，启动总是 0
 	connected     bool // 最近一次拨号是否成功（还没拨过为 false）
 	lastErr       string
+	listenErr     string                // 监听失败/异常的原因（优先于 lastErr 显示），重新监听成功后清空
+	laddr         string                // 规整后的监听地址
 	preferredDown bool                  // 首选线路连不上（只标记，不自动切换）
 	preferredBack bool                  // 走备用期间探测到首选已恢复（只标记，由用户决定是否切回）
 	probing       bool                  // 已有探测协程在跑
@@ -137,7 +139,12 @@ func (v *viaDialer) DialContext(ctx context.Context, network, addr string) (net.
 	return c.DialContext(ctx, network, addr)
 }
 
-// start 按 listen 开监听并起接受循环；监听失败返回错误（调用方当启动失败处理）。
+// forwardListenRetry 是监听失败后的重试间隔（测试里改小）。
+var forwardListenRetry = 10 * time.Second
+
+// start 校验 listen 写法（写错返回错误，属配置错误）并开监听。运行时环境问题（端口被占等）不返回错误：
+// 记进 listenErr（/forwards 该项的 error）并在后台每 forwardListenRetry 重试，成功后清掉；
+// 一条转发的监听问题绝不影响 wgtund 和其他线路。
 func (f *forwardSvc) start() error {
 	host, port, err := net.SplitHostPort(f.listen)
 	if err != nil {
@@ -146,22 +153,66 @@ func (f *forwardSvc) start() error {
 	if host != "127.0.0.1" {
 		host = "127.0.0.1" // localhost 也固定绑回环 IPv4，别拿到 ::1
 	}
-	ln, err := net.Listen("tcp", net.JoinHostPort(host, port))
-	if err != nil {
-		return err
+	f.laddr = net.JoinHostPort(host, port)
+	if !f.tryListen() {
+		go f.listenRetryLoop()
 	}
-	f.mu.Lock()
-	f.ln, f.addr = ln, ln.Addr().String()
-	f.mu.Unlock()
-	go f.acceptLoop(ln)
 	return nil
+}
+
+// tryListen 试一次监听；成功则起接受循环并清错误，失败记 listenErr。已 Close 视为完成（返回 true）。
+func (f *forwardSvc) tryListen() bool {
+	ln, err := net.Listen("tcp", f.laddr)
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.closed {
+		if ln != nil {
+			ln.Close()
+		}
+		return true
+	}
+	if err != nil {
+		f.listenErr = fmt.Sprintf("监听 %s 失败：%v", f.laddr, err)
+		return false
+	}
+	f.ln, f.addr, f.listenErr = ln, ln.Addr().String(), ""
+	go f.acceptLoop(ln)
+	return true
+}
+
+func (f *forwardSvc) listenRetryLoop() {
+	t := time.NewTicker(forwardListenRetry)
+	defer t.Stop()
+	for {
+		select {
+		case <-t.C:
+		case <-f.ctx.Done():
+			return
+		}
+		if f.tryListen() {
+			return
+		}
+	}
 }
 
 func (f *forwardSvc) acceptLoop(ln net.Listener) {
 	for {
 		c, err := ln.Accept()
 		if err != nil {
-			return // 监听已关闭（退出或 Close）
+			f.mu.Lock()
+			if f.closed {
+				f.mu.Unlock()
+				return // Close 关的监听
+			}
+			// 运行中 accept 出错：只记这条转发的错误，释放旧监听并重新监听
+			f.listenErr = fmt.Sprintf("监听 %s 异常退出：%v", f.laddr, err)
+			f.ln, f.addr = nil, ""
+			f.mu.Unlock()
+			ln.Close()
+			if !f.tryListen() {
+				go f.listenRetryLoop()
+			}
+			return
 		}
 		go f.serve(c)
 	}
@@ -344,7 +395,11 @@ func (f *forwardSvc) item() forwardItem {
 	for i, r := range f.routes {
 		views[i] = routeView{r.Label, r.Tunnel, r.Addr, r.Via}
 	}
-	return forwardItem{f.name, f.addr, f.routes[f.active].Tunnel, f.connected, f.lastErr,
+	errMsg := f.lastErr
+	if f.listenErr != "" {
+		errMsg = f.listenErr
+	}
+	return forwardItem{f.name, f.addr, f.routes[f.active].Tunnel, f.connected, errMsg,
 		routeState{views, f.active, f.preferredDown, f.preferredBack}}
 }
 

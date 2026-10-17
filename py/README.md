@@ -39,7 +39,15 @@
 - `pybase.sshstorage`：`SSHStorage`，经 SFTP 读写远端目录（`pip install "pybase[ssh]"`）；路径锁在 root 下，断线后下次操作自动重连，
   未知主机默认拒绝
 - `pybase.fileops`：两端都是 `Storage` 的拷贝 `copy_file`（临时文件转正；`verify` 开关默认关、只比大小，开了边拷边哈希
-  并读回核对；目标已有不同内容报 `conflict` 不覆盖）、`delete_confirmed`（调用方核对通过才删）、`prune_empty_dirs`
+  并读回核对；目标已有不同内容报 `conflict` 不覆盖）、`copy_file_resumable`（块级断点续传：按块写临时文件、每块
+  回调进度；续传时截到最后确认块的边界并读回核对，不对就退一块；写完整体核对逐块 sha256，源被改则从头来）、`delete_confirmed`（调用方核对通过才删）、`prune_empty_dirs`
+- `pybase.transfer`：持久化后台传输队列（需 `pybase[db,postgres]`，PostgreSQL）。`TransferQueue.submit` 立即返回
+  task_id，任务与逐块进度存 `transfer_tasks`/`transfer_items`（挂行级审计）；单 worker 线程串行执行，断线（`OSError`/
+  `available()` 为假）任务置 `waiting`，用 `wait_until` 间隔递增（封顶 60 秒）等两端恢复后从断点自动续传；冲突、源不存在、
+  权限等非连接错误该项 `failed`、任务继续；进程重启时 `running`/`waiting` 自动回 `queued` 续传（`paused` 保持）；
+  多进程靠 PG advisory lock 只让一个有 worker，其余只提交/查询并定时重试接手。另有 `pause`/`resume`/`cancel`、
+  `list_tasks`/`task_detail`、`notifier` 回调；Storage 序列化成 `local:/abs/root` / `ssh://[user@]host[:port]/abs/root?key=钥匙路径`
+  （`storage_to_spec`/`storage_from_spec`，凭据不进库）。`Storage` 为此新增 `open_resume(path, offset)`
 - `pybase.retry`：`wait_until`（等资源回来，间隔由调用方给）、`retry_call`（资源断着的时间不计入重试次数）
 - `pybase.inventory`：经 `Storage` 列目录树清单（跳过规则由调用方给，列不动的目录单独上报），按"相对路径+大小"
   再"同名+大小"两级比对；只看元数据，不是内容证明

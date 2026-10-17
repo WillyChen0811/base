@@ -182,6 +182,38 @@ class SSHStorage:
             return f
         return self._run(go)
 
+    def open_resume(self, path: str, offset: int) -> BinaryIO:
+        """见 `Storage.open_resume`。已存在：`r+b` 打开、截断到 `offset`、定位；不存在且 `offset==0` 新建。"""
+        if offset < 0:
+            raise ValueError(f"offset 不能为负：{offset}")
+        p = self._p(path)
+
+        def go(sftp):
+            try:
+                f = sftp.open(p, "r+b")
+            except OSError as e:
+                if e.errno != errno.ENOENT or offset:
+                    raise
+                self._makedirs(sftp, str(PurePosixPath(p).parent))
+                f = sftp.open(p, "wb")
+                f.set_pipelined(True)
+                return f
+            try:
+                size = f.stat().st_size or 0
+                if offset > size:
+                    raise ValueError(f"{path} 只有 {size} 字节，无法从 {offset} 续写")
+                f.truncate(offset)
+                f.seek(offset)
+                f.set_pipelined(True)
+            except BaseException:
+                try:
+                    f.close()
+                except Exception:
+                    pass
+                raise
+            return f
+        return self._run(go)
+
     def replace(self, src: str, dst: str) -> None:
         a, b = self._p(src), self._p(dst)
 

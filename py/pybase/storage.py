@@ -51,6 +51,11 @@ class Storage(Protocol):
     def open_write(self, path: str) -> BinaryIO:
         """新建/截断写入；上级目录不存在由实现负责建。"""
 
+    def open_resume(self, path: str, offset: int) -> BinaryIO:
+        """从 `offset` 字节处接着写：打开已存在的文件、截断到 `offset` 并定位过去；
+        文件不存在且 `offset == 0` 时新建（上级目录自动建）。文件不存在而 `offset > 0`
+        抛 `FileNotFoundError`；文件比 `offset` 短抛 `ValueError`（不能凭空补洞）。"""
+
     def replace(self, src: str, dst: str) -> None:
         """原子改名（覆盖 `dst`）。上层用它把临时文件转正。"""
 
@@ -128,6 +133,28 @@ class LocalStorage:
         p = self._p(path)
         p.parent.mkdir(parents=True, exist_ok=True)
         return open(p, "wb")
+
+    def open_resume(self, path: str, offset: int) -> BinaryIO:
+        if offset < 0:
+            raise ValueError(f"offset 不能为负：{offset}")
+        p = self._p(path)
+        try:
+            f = open(p, "r+b")
+        except FileNotFoundError:
+            if offset:
+                raise
+            p.parent.mkdir(parents=True, exist_ok=True)
+            return open(p, "wb")
+        try:
+            size = f.seek(0, os.SEEK_END)
+            if offset > size:
+                raise ValueError(f"{path} 只有 {size} 字节，无法从 {offset} 续写")
+            f.truncate(offset)
+            f.seek(offset)
+        except BaseException:
+            f.close()
+            raise
+        return f
 
     def replace(self, src: str, dst: str) -> None:
         os.replace(self._p(src), self._p(dst))

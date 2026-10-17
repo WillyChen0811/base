@@ -25,6 +25,11 @@ class _Handle(paramiko.SFTPHandle):
             return paramiko.SFTPServer.convert_errno(e.errno)
 
     def chattr(self, attr):
+        try:
+            if attr.st_size is not None:
+                self.writefile.truncate(attr.st_size)
+        except (OSError, ValueError) as e:
+            return paramiko.SFTPServer.convert_errno(getattr(e, "errno", None) or 5)
         return paramiko.SFTP_OK
 
 
@@ -111,6 +116,8 @@ class _SFTP(paramiko.SFTPServerInterface):
 
     def chattr(self, path, attr):
         try:
+            if attr.st_size is not None:
+                os.truncate(self._r(path), attr.st_size)
             if attr.st_mtime is not None:
                 os.utime(self._r(path), (attr.st_atime or attr.st_mtime, attr.st_mtime))
         except OSError as e:
@@ -367,3 +374,39 @@ def test_copy_file_本地与SSH互拷_校验(env):
     r = copy_file(st, "up/a.bin", local, "back/a.bin", verify=True)
     assert r.status == "copied"
     assert (tmp / "loc/back/a.bin").read_bytes() == data
+
+
+def test_open_resume_截断后从断点接着写(env):
+    make, remote, _, _ = env
+    st = make()
+    with st.open_resume("a/b/p.bin", 0) as f:            # 不存在且 offset=0：新建、自动建目录
+        f.write(b"0123456789")
+    assert (remote / "a/b/p.bin").read_bytes() == b"0123456789"
+    with st.open_resume("a/b/p.bin", 4) as f:            # 截到 4，从 4 写
+        f.write(b"XY")
+    assert (remote / "a/b/p.bin").read_bytes() == b"0123XY"
+    with pytest.raises(OSError):
+        st.open_resume("a/b/none.bin", 5)                # 不存在却要从中间续
+    with pytest.raises(ValueError):
+        st.open_resume("a/b/p.bin", 100)                 # 文件比 offset 短
+
+
+def test_copy_file_resumable_本地到SSH_断点续传(env):
+    from pybase.fileops import ResumeState, copy_file_resumable
+    make, remote, _, tmp_path = env
+    (tmp_path / "loc").mkdir()
+    data = os.urandom(5000)
+    (tmp_path / "loc" / "f.bin").write_bytes(data)
+    src, dst = LocalStorage(tmp_path / "loc"), make()
+    state = ResumeState(chunk=512)
+
+    def cb(done, idx, sha):
+        if idx == 4:
+            raise RuntimeError("断")
+    with pytest.raises(RuntimeError):
+        copy_file_resumable(src, "f.bin", dst, "o/f.bin", part_path="o/f.bin.part", chunk=512,
+                            progress=cb, state=state)
+    assert len(state.chunks) == 5
+    r = copy_file_resumable(src, "f.bin", dst, "o/f.bin", part_path="o/f.bin.part", chunk=512, state=state)
+    assert r.status == "copied" and (remote / "o/f.bin").read_bytes() == data
+    assert not (remote / "o/f.bin.part").exists()

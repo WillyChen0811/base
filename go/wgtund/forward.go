@@ -62,6 +62,7 @@ type forwardItem struct {
 	Connected bool   `json:"connected"`
 	Error     string `json:"error"`
 	routeState
+	Traffic trafficView `json:"traffic"`
 }
 
 // forwardSvc 是一条带多线路的本机端口转发。
@@ -88,6 +89,8 @@ type forwardSvc struct {
 	probing       bool                  // 已有探测协程在跑
 	gen           int                   // 每次切换线路加一，用来作废切换前发起的拨号
 	conns         map[net.Conn]struct{} // 已建立的转发连接（两端都在里面，切换时一起关）
+
+	tc *trafficCounter // 流量计数（拨号器已包一层，含经 via 的）
 }
 
 // newForward 按配置建转发（不监听）：dialers 照主机线路的建法（隧道为空则直连），label 补全照 hostRoutes。
@@ -101,6 +104,7 @@ func newForward(fc forwardConf, tunnels map[string]*wgtunnel.Tunnel, pool *sshPo
 		ctx:     ctx,
 		cancel:  cancel,
 		conns:   map[net.Conn]struct{}{},
+		tc:      newTrafficCounter(),
 	}
 	for i, r := range fc.Routes {
 		if r.Label == "" {
@@ -119,7 +123,7 @@ func newForward(fc forwardConf, tunnels map[string]*wgtunnel.Tunnel, pool *sshPo
 		} else if r.Tunnel != "" {
 			d = tunnels[r.Tunnel]
 		}
-		s.dialers[i] = d
+		s.dialers[i] = &countDialer{d, s.tc}
 	}
 	return s
 }
@@ -413,7 +417,7 @@ func (f *forwardSvc) item() forwardItem {
 		errMsg = f.listenErr
 	}
 	return forwardItem{f.name, f.addr, f.routes[f.active].Tunnel, f.connected, errMsg,
-		routeState{views, f.active, f.preferredDown, f.preferredBack}}
+		routeState{views, f.active, f.preferredDown, f.preferredBack}, f.tc.view()}
 }
 
 // Close 停监听、作废在途拨号并关掉所有已转发的连接；可重复调用。

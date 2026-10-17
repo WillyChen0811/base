@@ -243,6 +243,9 @@ func Run(ctx context.Context, dir string, stdin io.Reader, stdout io.Writer) (er
 	for _, h := range conf.Hosts {
 		hosts[h.Name] = h
 	}
+	// 流量统计：主机与转发各记字节，每秒采样（见 traffic.go）
+	hub := newTrafficHub()
+	go hub.run(ctx)
 	// 每台主机共用一条 SSH 连接，第一次用到时才拨号
 	pool := newSSHPool(knownHostsCb)
 	closers = append(closers, pool)
@@ -253,7 +256,7 @@ func Run(ctx context.Context, dir string, stdin io.Reader, stdout io.Writer) (er
 			if r.Tunnel != "" {
 				d = tunnels[r.Tunnel]
 			}
-			ds = append(ds, d)
+			ds = append(ds, &countDialer{d, hub.host(h.Name)})
 		}
 		pool.add(h, ds)
 	}
@@ -266,6 +269,7 @@ func Run(ctx context.Context, dir string, stdin io.Reader, stdout io.Writer) (er
 		if err := fwd.start(); err != nil { // 只有 listen 写法错（配置错误）；端口占用等在 start 内部隔离重试
 			return fmt.Errorf("转发 %q 的 listen 无效: %w", fw.Name, err)
 		}
+		hub.forward(fw.Name, fwd.tc)
 		closers = append(closers, fwd)
 		forwardMap[fw.Name] = fwd
 		forwardOrder = append(forwardOrder, fw.Name)
@@ -368,6 +372,7 @@ func Run(ctx context.Context, dir string, stdin io.Reader, stdout io.Writer) (er
 		Connected bool   `json:"connected"`
 		Error     string `json:"error"`
 		routeState
+		Traffic trafficView `json:"traffic"`
 	}
 	itemOf := func(h hostConf) hostItem {
 		connected, lastErr := pool.info(h.Name)
@@ -376,8 +381,9 @@ func Run(ctx context.Context, dir string, stdin io.Reader, stdout io.Writer) (er
 		if rs.Active >= 0 && rs.Active < len(rs.Routes) {
 			tunnel = rs.Routes[rs.Active].Tunnel // 当前线路的隧道
 		}
-		return hostItem{h.Name, tunnel, connected, lastErr, rs}
+		return hostItem{h.Name, tunnel, connected, lastErr, rs, hub.host(h.Name).view()}
 	}
+	mux.HandleFunc("/traffic", hub.serveHTTP)
 	mux.HandleFunc("/hosts", func(w http.ResponseWriter, r *http.Request) {
 		list := []hostItem{}
 		for _, h := range conf.Hosts {

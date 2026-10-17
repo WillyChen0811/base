@@ -11,7 +11,7 @@
 - `pybase.ramdisk`：内存级临时盘生命周期管理，支持同名同路径的多进程共享
 - `pybase.aiclient`：OpenAI 兼容客户端（`LlmClient`：chat.completions 与 embeddings）
 - `pybase.docx`：docx 格式属性写入（`oxml`）与模板渲染（`render`）
-- `pybase.sheets`：表格文件读取（`.xlsx`/`.xls`/`.csv`），统一读成 `[[str]]`，不做类型推断
+- `pybase.sheets`：表格文件读取（`.xlsx`/`.xls`/`.csv`，路径或二进制文件对象均可），统一读成 `[[str]]`，不做类型推断
 - `pybase.smb`：SMB/WebDAV/File Station 三通道文件抓取 + SMB 客户端（连接、列目录、下载、上传、共享枚举）
 - `pybase.crypto`：基于 Fernet 的密码加密/解密（`PasswordEncryption`，不带项目默认值）
 - `pybase.cdpnet`：Chrome DevTools Protocol 网络事件的纯映射/判断函数
@@ -35,7 +35,7 @@
   地址分类、TCP 探测；`monitor` 采集接口/路由/DNS/代理/VPN/NetBird/mihomo/自定义目标，SQLite 记录并检测变化
 - `pybase.storage`：存储接口 `Storage`（相对 posix 路径；`available`/`stat`/`listdir`/读写/原子改名/删除），
   把"连到哪"（本地盘、挂载的网络盘、SMB 协议、HTTPS…，以及其下的 WireGuard/NetBird 等隧道）和上层的读写、核对、
-  续传逻辑解耦；自带 `LocalStorage`（本地目录与任何已挂载网络盘，可要求挂载点在挂才算可用），新通道照接口实现即可
+  续传逻辑解耦；自带 `LocalStorage`（本地目录与任何已挂载网络盘，可要求挂载点在挂才算可用），新通道照接口实现即可；另有 `read_bytes`/`as_memory_file`（读进内存，BytesIO 可直接交给 python-docx/openpyxl/`pybase.sheets`，不落盘，可限 `max_bytes`）和 `materialize`（必须要真实路径时用：本地盘给原路径，其他通道临时拷进内存盘，退出即删）
 - `pybase.fileops`：两端都是 `Storage` 的拷贝 `copy_file`（临时文件转正；`verify` 开关默认关、只比大小，开了边拷边哈希
   并读回核对；目标已有不同内容报 `conflict` 不覆盖）、`delete_confirmed`（调用方核对通过才删）、`prune_empty_dirs`
 - `pybase.retry`：`wait_until`（等资源回来，间隔由调用方给）、`retry_call`（资源断着的时间不计入重试次数）

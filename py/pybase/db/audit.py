@@ -10,7 +10,8 @@
   ``current_setting(key, true)`` 读，没设就是 null；写入方在事务里用 ``set_audit_context``
   设置（``SET LOCAL`` 语义，随事务结束失效）。
 - 触发器名固定为 ``pybase_audit``；重复安装只更新触发器参数，不重复挂、不动已有审计数据。
-- 值没变的 UPDATE（改前 == 改后）不记。
+- 值没变的 UPDATE（改前 == 改后）不记；安装时给 ``ignore_columns``，则只有这些列变了的 UPDATE 也不记
+  （高频进度列用，避免审计膨胀）。同一张表改了忽略列后重装即生效。
 - 卸载只摘触发器，审计表与函数保留。
 """
 
@@ -41,6 +42,13 @@ def _ident(name: str) -> str:
     return '"' + name + '"'
 
 
+def _check_idents(names: Iterable[str]) -> List[str]:
+    out = list(names)
+    for n in out:
+        _ident(n)
+    return out
+
+
 def _check_keys(keys: Iterable[str]) -> List[str]:
     out = list(keys)
     for k in out:
@@ -50,7 +58,7 @@ def _check_keys(keys: Iterable[str]) -> List[str]:
 
 
 def install_audit(bind: Bind, tables: Sequence[str], *, schema: str = DEFAULT_SCHEMA,
-                  context_keys: Sequence[str] = ()) -> bool:
+                  context_keys: Sequence[str] = (), ignore_columns: Sequence[str] = ()) -> bool:
     """给 ``tables``（public 等默认 search_path 下的表）挂审计触发器，幂等。
 
     Returns:
@@ -63,6 +71,7 @@ def install_audit(bind: Bind, tables: Sequence[str], *, schema: str = DEFAULT_SC
     keys = _check_keys(context_keys)
     s = _ident(schema)
     ctx_arg = ",".join(keys)
+    ign_arg = ",".join(_check_idents(ignore_columns))
     with connection_of(bind) as conn:
         conn.execute(text("SELECT pg_advisory_xact_lock(hashtext('pybase_audit_install'))"))
         insp = inspect(conn)
@@ -94,6 +103,7 @@ def install_audit(bind: Bind, tables: Sequence[str], *, schema: str = DEFAULT_SC
             DECLARE
                 pk_cols text[] := string_to_array(coalesce(TG_ARGV[0], ''), ',');
                 ctx_keys text[] := string_to_array(coalesce(TG_ARGV[1], ''), ',');
+                ign_cols text[] := string_to_array(coalesce(TG_ARGV[2], ''), ',');
                 row_j jsonb;
                 old_j jsonb;
                 new_j jsonb;
@@ -104,7 +114,7 @@ def install_audit(bind: Bind, tables: Sequence[str], *, schema: str = DEFAULT_SC
             BEGIN
                 IF TG_OP <> 'INSERT' THEN old_j := to_jsonb(OLD); END IF;
                 IF TG_OP <> 'DELETE' THEN new_j := to_jsonb(NEW); END IF;
-                IF TG_OP = 'UPDATE' AND old_j = new_j THEN
+                IF TG_OP = 'UPDATE' AND (old_j - ign_cols) = (new_j - ign_cols) THEN
                     RETURN NULL;
                 END IF;
                 row_j := coalesce(new_j, old_j);
@@ -130,7 +140,8 @@ def install_audit(bind: Bind, tables: Sequence[str], *, schema: str = DEFAULT_SC
         for t, pk in plans:
             q = _ident(t)
             conn.execute(text(f"DROP TRIGGER IF EXISTS {TRIGGER_NAME} ON {q}"))
-            args = "'" + pk.replace("'", "''") + "','" + ctx_arg.replace("'", "''") + "'"
+            args = ("'" + pk.replace("'", "''") + "','" + ctx_arg.replace("'", "''")
+                    + "','" + ign_arg.replace("'", "''") + "'")
             conn.execute(text(
                 f"CREATE TRIGGER {TRIGGER_NAME} AFTER INSERT OR UPDATE OR DELETE "
                 f"ON {q} FOR EACH ROW EXECUTE FUNCTION {s}.{_FUNC}({args})"))

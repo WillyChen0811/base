@@ -42,7 +42,7 @@
   并读回核对；目标已有不同内容报 `conflict` 不覆盖）、`copy_file_resumable`（块级断点续传：按块写临时文件、每块
   回调进度；续传时截到最后确认块的边界并读回核对，不对就退一块；写完整体核对逐块 sha256，源被改则从头来）、`delete_confirmed`（调用方核对通过才删）、`prune_empty_dirs`
 - `pybase.transfer`：持久化后台传输队列（需 `pybase[db,postgres]`，PostgreSQL）。`TransferQueue.submit` 立即返回
-  task_id，任务与逐块进度存 `transfer_tasks`/`transfer_items`（挂行级审计）；单 worker 线程串行执行，断线（`OSError`/
+  task_id，任务与进度存 `transfer_tasks`/`transfer_items`，块哈希存 `transfer_chunks`（任务与项挂行级审计，进度列和块表不审计，审计量与文件大小无关）；单 worker 线程串行执行，断线（`OSError`/
   `available()` 为假）任务置 `waiting`，用 `wait_until` 间隔递增（封顶 60 秒）等两端恢复后从断点自动续传；冲突、源不存在、
   权限等非连接错误该项 `failed`、任务继续；进程重启时 `running`/`waiting` 自动回 `queued` 续传（`paused` 保持）；
   多进程靠 PG advisory lock 只让一个有 worker，其余只提交/查询并定时重试接手。另有 `pause`/`resume`/`cancel`、

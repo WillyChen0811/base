@@ -3,7 +3,7 @@
 需要 extra：``pybase[db,postgres]``（任务与进度存 PostgreSQL）；SSH 端点再加 ``pybase[ssh]``。
 
 - 任务与逐项进度存在 ``transfer_tasks`` / ``transfer_items`` 两张表（``create_schema`` 建表，
-  并挂 ``pybase.db`` 的行级审计）。**库是唯一的真相**：暂停/取消直接写库，worker 每块读一次状态。
+  ``transfer_chunks`` 存各块 sha256；任务与项挂 ``pybase.db`` 的行级审计，其中项上高频的进度列不进审计，块表不审计）。**库是唯一的真相**：暂停/取消直接写库，worker 每块读一次状态。
 - ``TransferQueue.submit`` 立即返回 task_id；后台 worker 线程**串行**执行任务，任务内逐项传，
   每项用 ``fileops.copy_file_resumable`` 按块拷，每块写完把进度（已传字节、各块 sha256）落库。
 - 断线：某项因 ``OSError`` 失败且两端有一端 ``available()`` 为假（或错误本身不像本地问题），
@@ -32,8 +32,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tupl
 from urllib.parse import parse_qs, quote, unquote, urlencode, urlsplit
 
 from sqlalchemy import (BigInteger, Column, DateTime, Float, ForeignKey, Integer, MetaData,
-                        String, Table, Text, and_, func, insert, select, text, update)
-from sqlalchemy.dialects.postgresql import JSONB
+                        String, Table, Text, and_, delete, func, insert, select, text, update)
 from sqlalchemy.exc import SQLAlchemyError
 
 from . import db
@@ -71,13 +70,23 @@ items_table = Table(
     Column("mtime", Float(53)),
     Column("chunk_size", Integer),
     Column("done_bytes", BigInteger, nullable=False, server_default="0"),
-    Column("chunks", JSONB, nullable=False, server_default="[]"),
     Column("status", String(16), nullable=False, server_default="pending"),
     Column("error", Text),
     Column("attempts", Integer, nullable=False, server_default="0"),
     Column("updated_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
 )
+# 块哈希单独成表，只插入（续传回退时删超出的行）。**不挂审计**：它是纯进度数据，每块一行，
+# 审计只会把同样的内容再存一遍；item 上的状态/错误/尝试次数变化照常审计。
+chunks_table = Table(
+    "transfer_chunks", _meta,
+    Column("item_id", Integer, ForeignKey("transfer_items.id", ondelete="CASCADE"), primary_key=True),
+    Column("idx", Integer, primary_key=True, autoincrement=False),
+    Column("sha256", String(64), nullable=False),
+)
 T, I = tasks_table.c, items_table.c
+C = chunks_table.c
+# transfer_items 上这些列每块都会变，只改它们的 UPDATE 不进审计
+_PROGRESS_COLS = ("done_bytes", "updated_at")
 
 
 def create_schema(engine) -> None:
@@ -87,10 +96,12 @@ def create_schema(engine) -> None:
         conn.execute(text("SELECT pg_advisory_xact_lock(hashtext(:k))"), {"k": SCHEMA_LOCK_NAME})
         db.create_table(conn, tasks_table)
         db.create_table(conn, items_table)
+        db.create_table(conn, chunks_table)
         db.create_index(conn, "transfer_items", ["task_id", "seq"], name="transfer_items_task_idx")
     have = set(db.audited_tables(engine))
     if not {"transfer_tasks", "transfer_items"} <= have:   # 已挂就不重装（重装要短暂锁表）
-        db.install_audit(engine, ["transfer_tasks", "transfer_items"])
+        db.install_audit(engine, ["transfer_tasks"])
+        db.install_audit(engine, ["transfer_items"], ignore_columns=_PROGRESS_COLS)
 
 
 def _require_pg(engine) -> None:
@@ -453,18 +464,24 @@ class TransferQueue:
         iid = item["id"]
         src_spec, dst_spec = item["src_spec"], item["dst_spec"]
         part = item["dst_path"] + RESUME_SUFFIX
+        with self.engine.connect() as conn:
+            shas = [r[0] for r in conn.execute(
+                select(C.sha256).where(C.item_id == iid).order_by(C.idx))]
         state = ResumeState(size=item["size"], mtime=item["mtime"],
-                            chunk=item["chunk_size"] or self.chunk, chunks=list(item["chunks"] or []))
+                            chunk=item["chunk_size"] or self.chunk, chunks=shas)
         retries = 0
 
         def stop_now() -> bool:
             return self._closed.is_set() or self._task_status(tid) != "running"
 
         def progress(done: int, idx: int, sha: str) -> None:
+            vals = dict(done_bytes=done, updated_at=func.now())
+            if idx == 0:                # 从头开始：记下源的快照（只此一次，进度更新不碰这些列）
+                vals.update(size=state.size, mtime=state.mtime, chunk_size=state.chunk)
             with self.engine.begin() as conn:
-                conn.execute(update(items_table).where(I.id == iid).values(
-                    size=state.size, mtime=state.mtime, chunk_size=state.chunk, done_bytes=done,
-                    chunks=list(state.chunks), updated_at=func.now()))
+                conn.execute(delete(chunks_table).where(and_(C.item_id == iid, C.idx >= idx)))
+                conn.execute(insert(chunks_table).values(item_id=iid, idx=idx, sha256=sha))
+                conn.execute(update(items_table).where(I.id == iid).values(**vals))
                 status = conn.execute(select(T.status).where(T.id == tid)).scalar()
             if self._closed.is_set() or status != "running":
                 raise TransferInterrupted()
@@ -515,7 +532,9 @@ class TransferQueue:
             retries += 1
             if retries > self.max_retries:
                 return self._fail_item(iid, f"反复失败：{res.status}")
-            self._item_update(iid, chunks=[], done_bytes=0)
+            with self.engine.begin() as conn:
+                conn.execute(delete(chunks_table).where(C.item_id == iid))
+            self._item_update(iid, done_bytes=0)
 
     def _fail_item(self, iid: int, msg: str) -> str:
         self._item_update(iid, status="failed", error=msg)

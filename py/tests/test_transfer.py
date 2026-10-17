@@ -126,6 +126,11 @@ def env(pg, tmp_path):
         q.close()
 
 
+def n_chunks(pg, item_id):
+    with pg.connect() as c:
+        return c.execute(text("SELECT count(*) FROM transfer_chunks WHERE item_id=:i"), {"i": item_id}).scalar()
+
+
 def status(q, tid):
     return q.task_detail(tid)["status"]
 
@@ -147,7 +152,7 @@ def test_规格往返_凭据不进库(tmp_path):
 
 
 def test_基本流程_提交立即返回_传完done(env):
-    make, src, dst, tmp, _ = env
+    make, src, dst, tmp, pg = env
     (tmp / "s/a.bin").write_bytes(DATA)
     (tmp / "s/b.bin").write_bytes(b"bb")
     events = []
@@ -157,7 +162,7 @@ def test_基本流程_提交立即返回_传完done(env):
     assert (tmp / "d/o/a.bin").read_bytes() == DATA and (tmp / "d/o/b.bin").read_bytes() == b"bb"
     d = q.task_detail(tid)
     assert [i["status"] for i in d["items"]] == ["done", "done"]
-    assert d["items"][0]["done_bytes"] == len(DATA) and len(d["items"][0]["chunks"]) == 25
+    assert d["items"][0]["done_bytes"] == len(DATA) and n_chunks(pg, d["items"][0]["id"]) == 25
     row = q.list_tasks()[0]
     assert row["n_items"] == 2 and row["done_items"] == 2 and row["done_bytes"] == len(DATA) + 2
     assert [e["status"] for e in events if e["type"] == "task"][:3] == ["queued", "running", "done"]
@@ -176,14 +181,14 @@ def test_持久化_新实例还看得到任务并自动传完(env):
 
 
 def test_重启恢复_running残留自动续传_从断点接着(env):
-    make, src, dst, tmp, _ = env
+    make, src, dst, tmp, pg = env
     (tmp / "s/a.bin").write_bytes(DATA)
     dst.cut_after = 80
     q1 = make()
     tid = q1.submit("断", [(src, "a.bin", dst, "a.bin")])
     until(lambda: status(q1, tid) == "waiting")
     item = q1.task_detail(tid)["items"][0]
-    assert item["done_bytes"] == 80 and len(item["chunks"]) == 10
+    assert item["done_bytes"] == 80 and n_chunks(pg, item["id"]) == 10
     q1.close()                                    # 进程"死"在 waiting
     dst.up = True
     src.seeks.clear()
@@ -331,8 +336,27 @@ def test_审计表有记录(env):
     assert tasks[0]["op"] == "INSERT" and tasks[0]["new_row"]["title"] == "审计"
     assert tasks[-1]["new_row"]["status"] == "done"
     items = db.query_audit(pg, table="transfer_items", limit=10000)
-    assert items[0]["op"] == "INSERT" and len(items) > 25     # 每块进度都有记录
-    assert all(r["application_name"] == "xfer-test" for r in items)
+    assert items[0]["op"] == "INSERT" and all(r["application_name"] == "xfer-test" for r in items)
+
+
+def test_审计量与块数无关_块表不审计(env):
+    make, src, dst, tmp, pg = env
+    big = os.urandom(50 * CH)                       # 50 块
+    (tmp / "s/big.bin").write_bytes(big)
+    (tmp / "s/small.bin").write_bytes(b"x" * CH)    # 1 块
+    q = make()
+    t1 = q.submit("大", [(src, "big.bin", dst, "big.bin")])
+    until(lambda: status(q, t1) == "done")
+    t2 = q.submit("小", [(src, "small.bin", dst, "small.bin")])
+    until(lambda: status(q, t2) == "done")
+    ids = [q.task_detail(t)["items"][0]["id"] for t in (t1, t2)]
+    assert n_chunks(pg, ids[0]) == 50
+    rows = db.query_audit(pg, table="transfer_items", limit=10000)
+    per = {i: [r for r in rows if r["pk"]["id"] == i] for i in ids}
+    assert len(per[ids[0]]) == len(per[ids[1]]) <= 5     # 只随状态变化次数，和块数无关
+    assert all("sha256" not in (r["new_row"] or {}) for r in rows)
+    assert db.query_audit(pg, table="transfer_chunks") == []
+    assert "transfer_chunks" not in db.audited_tables(pg)
 
 
 def test_重复建表_第二个队列不报错(env):

@@ -158,3 +158,16 @@ def test_sqlite返回不支持(tmp_path):
     with eng.connect() as c:
         names = [r[0] for r in c.execute(text("SELECT name FROM sqlite_master"))]
     assert not any("audit" in n or "row_log" in n for n in names)
+
+
+def test_ignore_columns_只改忽略列的UPDATE不记(pg):
+    assert db.install_audit(pg, ["plans"], ignore_columns=["n"]) is True
+    with pg.begin() as c:
+        c.execute(text("INSERT INTO plans (name, n) VALUES ('a', 1)"))
+    with pg.begin() as c:
+        c.execute(text("UPDATE plans SET n=2 WHERE id=1"))        # 只动忽略列：不记
+    with pg.begin() as c:
+        c.execute(text("UPDATE plans SET name='b', n=3 WHERE id=1"))   # 连带别的列：记
+    assert [r["op"] for r in db.query_audit(pg, table="plans")] == ["INSERT", "UPDATE"]
+    with pytest.raises(ValueError):
+        db.install_audit(pg, ["plans"], ignore_columns=["n; drop"])

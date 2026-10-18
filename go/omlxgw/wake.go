@@ -187,13 +187,14 @@ type keeper struct {
 	unit   time.Duration
 	tick   time.Duration
 
-	mu      sync.Mutex
-	lastAct time.Time
-	lastRun time.Time
-	procs   map[*exec.Cmd]struct{}
-	closed  bool
-	stop    chan struct{}
-	wg      sync.WaitGroup
+	mu       sync.Mutex
+	lastAct  time.Time
+	inflight int // 在途请求数，大于 0 时不算空闲
+	lastRun  time.Time
+	procs    map[*exec.Cmd]struct{}
+	closed   bool
+	stop     chan struct{}
+	wg       sync.WaitGroup
 }
 
 func newKeeper(cfgf func() *KeepAwakeConfig, logger *log.Logger) *keeper {
@@ -201,8 +202,20 @@ func newKeeper(cfgf func() *KeepAwakeConfig, logger *log.Logger) *keeper {
 		procs: map[*exec.Cmd]struct{}{}, stop: make(chan struct{})}
 }
 
-func (k *keeper) activity() {
+// begin 请求开始：在途 +1 并刷新活动时间。
+func (k *keeper) begin() {
 	k.mu.Lock()
+	k.inflight++
+	k.lastAct = time.Now()
+	k.mu.Unlock()
+}
+
+// end 请求结束：在途 -1 并刷新活动时间，长请求结束后仍有一个空闲窗口。
+func (k *keeper) end() {
+	k.mu.Lock()
+	if k.inflight > 0 {
+		k.inflight--
+	}
 	k.lastAct = time.Now()
 	k.mu.Unlock()
 }
@@ -232,7 +245,7 @@ func (k *keeper) step() {
 	k.mu.Lock()
 	defer k.mu.Unlock()
 	now := time.Now()
-	if k.closed || k.lastAct.IsZero() || now.Sub(k.lastAct) >= time.Duration(cfg.IdleSeconds)*k.unit {
+	if k.closed || (k.inflight == 0 && (k.lastAct.IsZero() || now.Sub(k.lastAct) >= time.Duration(cfg.IdleSeconds)*k.unit)) {
 		return
 	}
 	if !k.lastRun.IsZero() && now.Sub(k.lastRun) < time.Duration(cfg.RefreshSeconds)*k.unit {
@@ -282,6 +295,6 @@ func (k *keeper) status() map[string]any {
 	if !k.lastRun.IsZero() {
 		started = time.Since(k.lastRun).Seconds()
 	}
-	active := cfg != nil && !k.lastAct.IsZero() && time.Since(k.lastAct) < time.Duration(cfg.IdleSeconds)*k.unit
+	active := cfg != nil && (k.inflight > 0 || (!k.lastAct.IsZero() && time.Since(k.lastAct) < time.Duration(cfg.IdleSeconds)*k.unit))
 	return map[string]any{"active": active, "last_started_ago_seconds": started, "running": len(k.procs)}
 }

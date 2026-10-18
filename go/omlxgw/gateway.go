@@ -148,12 +148,13 @@ func (g *Gateway) handleProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	t1 := time.Now()
+	g.keeper.begin()
 	defer func() {
+		g.keeper.end()
 		release()
 		g.logReq(model, prio, client, t1.Sub(t0), time.Since(t1), sw.status)
 	}()
 	_ = e
-	g.keeper.activity()
 	if wc := cfg.Wake; wc != nil {
 		if err := g.waker.ensure(r.Context(), wc, false); err != nil {
 			if r.Context().Err() == nil {

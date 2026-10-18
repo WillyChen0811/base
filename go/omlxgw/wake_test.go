@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -224,5 +225,33 @@ func TestConfigWakeValidate(t *testing.T) {
 	c, err := ParseConfig([]byte(`{"listen":"127.0.0.1:1","upstream":"http://x:1","wake":{"host":"h"},"keepawake":{"command":["a"]}}`))
 	if err != nil || c.Wake.MaxWaitSeconds != 120 || c.KeepAwake.RefreshSeconds != 240 || c.KeepAwake.IdleSeconds != 600 {
 		t.Fatalf("%v %+v", err, c)
+	}
+}
+
+// 长请求在途期间，即使超过 idle 也要持续续期；结束后再给一个空闲窗口。
+func TestKeepAwakeInflight(t *testing.T) {
+	dir := t.TempDir()
+	cnt := filepath.Join(dir, "cnt")
+	kc := &KeepAwakeConfig{Command: []string{"sh", "-c", "echo x >> " + cnt + "; sleep 30"}, RefreshSeconds: 20, IdleSeconds: 60}
+	k := newKeeper(func() *KeepAwakeConfig { return kc }, log.New(io.Discard, "", 0))
+	k.unit = time.Millisecond
+	k.tick = 5 * time.Millisecond
+	k.start()
+	defer k.close()
+	lines := func() int {
+		b, _ := os.ReadFile(cnt)
+		return strings.Count(string(b), "x")
+	}
+	k.begin()
+	time.Sleep(300 * time.Millisecond) // 远超 idle 60ms
+	if n := lines(); n < 5 || k.status()["active"] != true {
+		t.Fatalf("在途期间续期不足: %d 次 status=%v", n, k.status())
+	}
+	k.end()
+	time.Sleep(250 * time.Millisecond)
+	n1 := lines()
+	time.Sleep(150 * time.Millisecond)
+	if lines() != n1 || k.status()["active"] != false {
+		t.Fatal("请求结束并空闲后仍在续期")
 	}
 }

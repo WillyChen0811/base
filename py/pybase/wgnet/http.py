@@ -1,4 +1,4 @@
-"""显式 HTTP/HTTPS：http.client 的连接类，底层 socket 来自 wgnet.tcp。不依赖 requests，不跟随重定向。"""
+"""显式 HTTP/HTTPS：http.client 的连接类，底层 socket 来自 wgnet.tcp。不依赖 requests；像 urllib 一样跟随重定向（最多 5 次）。"""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ import http.client
 import json
 import ssl
 from typing import Dict, Optional, Tuple
-from urllib.parse import urlsplit
+from urllib.parse import urljoin, urlsplit
 
 from .tcp import tcp
 
@@ -70,10 +70,28 @@ class Response:
         self.close()
 
 
+_REDIRECT = (301, 302, 303, 307, 308)
+MAX_REDIRECTS = 5
+
+
 def request(method: str, url: str, headers: Optional[Dict[str, str]] = None, body=None,
             timeout: float = 30, stream: bool = False, context: Optional[ssl.SSLContext] = None) -> Response:
     """发一次请求。stream=False 先读完 body 并关连接；stream=True 由调用方 read()/close()。
-    context 只用于 https（缺省系统证书校验）。"""
+    context 只用于 https（缺省系统证书校验）。跟随重定向同 urllib：303 及 POST 遇 301/302 改 GET 去掉正文，
+    307/308 原样重发。"""
+    for _ in range(MAX_REDIRECTS + 1):
+        r = _once(method, url, headers, body, timeout, stream, context)
+        loc = r.headers.get("Location")
+        if r.status not in _REDIRECT or not loc:
+            return r
+        r.close()
+        url = urljoin(url, loc)
+        if r.status == 303 or (r.status in (301, 302) and method.upper() == "POST"):
+            method, body = "GET", None
+    raise OSError(f"重定向超过 {MAX_REDIRECTS} 次：{url}")
+
+
+def _once(method, url, headers, body, timeout, stream, context) -> Response:
     u = urlsplit(url)
     if u.scheme not in ("http", "https") or not u.hostname:
         raise ValueError(f"只支持 http/https URL：{url!r}")
@@ -83,6 +101,7 @@ def request(method: str, url: str, headers: Optional[Dict[str, str]] = None, bod
     else:
         conn = _Conn(u.hostname, port, timeout=timeout)
     target = (u.path or "/") + (f"?{u.query}" if u.query else "")
+    r = None
     try:
         conn.request(method.upper(), target, body=body, headers=headers or {})
         r = Response(conn, conn.getresponse())
@@ -90,6 +109,8 @@ def request(method: str, url: str, headers: Optional[Dict[str, str]] = None, bod
             r.body
         return r
     except BaseException:
+        if r is not None:
+            r.close()       # 套接字可能归响应持有（Connection: close），只关连接关不到
         conn.close()
         raise
 

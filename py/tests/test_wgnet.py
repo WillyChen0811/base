@@ -264,3 +264,44 @@ def test_子进程经环境变量继承():
     finally:
         stub.stop()
     assert stub.seen == [(3, "ubuntu1st", 22)]
+
+
+def _redirect_server():
+    import http.server
+    import threading as _t
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def _go(self):
+            n = int(self.headers.get("Content-Length") or 0)
+            if n:
+                self.rfile.read(n)
+            if self.path == "/a":
+                self.send_response(302); self.send_header("Location", "/b"); self.send_header("Content-Length", "0"); self.end_headers()
+            elif self.path == "/p":
+                self.send_response(303); self.send_header("Location", "/b"); self.send_header("Content-Length", "0"); self.end_headers()
+            elif self.path == "/loop":
+                self.send_response(302); self.send_header("Location", "/loop"); self.send_header("Content-Length", "0"); self.end_headers()
+            else:
+                b = f"{self.command} {self.path}".encode()
+                self.send_response(200); self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b)
+
+        do_GET = do_POST = _go
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+    _t.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv
+
+
+def test_http_跟随重定向():
+    srv = _redirect_server()
+    base = f"http://127.0.0.1:{srv.server_address[1]}"
+    try:
+        assert wgnet.http.get(base + "/a").body == b"GET /b"
+        assert wgnet.http.post(base + "/p", b"x").body == b"GET /b"      # 303 改 GET
+        with pytest.raises(OSError, match="重定向超过"):
+            wgnet.http.get(base + "/loop")
+    finally:
+        srv.shutdown()

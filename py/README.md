@@ -127,7 +127,7 @@ pip install -e "./py[all]"
 |---|---|---|
 | `docx` | python-docx | `pybase.docx.oxml` |
 | `sheets` | openpyxl, xlrd | `pybase.sheets` |
-| `smb` | smbprotocol, pysmb, requests, urllib3 | `pybase.smb` |
+| `smb` | cryptography, pyspnego, pyasn1, requests, urllib3（smbprotocol/pysmb 已拷进 `pybase/_vendor`） | `pybase.smb` |
 | `crypto` | cryptography | `pybase.crypto` |
 | `office` | requests | `pybase.office`（`WordPdfClient`，跨平台部分） |
 | `office-word` | pywin32（仅 Windows） | `pybase.office.word` 的 Word COM 驱动 |

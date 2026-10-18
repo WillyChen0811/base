@@ -39,7 +39,7 @@
 - 固定使用 NTLM，不用 negotiate（Kerberos 在 IP 直连场景会导致 `ACCESS_DENIED`）
 - `CONNECT_TIMEOUT=10s` 是有意设置：RPC stdio 是单线程，超时太长会堵塞管道
 - `smbstorage.SMBStorage` 只是 `Storage` 到 `SMBClient` 的适配，不直接碰 `smbclient`；新能力加进 `pybase/smb/stream.py`，不要在 smbstorage 里另起一套连接/认证
-- 只有 `shares.py` 用 `pysmb`（列共享），其余都走 `smbprotocol`
+- 只有 `shares.py` 用 `pysmb`（列共享），其余都走 `smbprotocol`；两库已整库拷进 `py/pybase/_vendor`（`py/scripts/vendor_smb.py` 生成，外连已换成 wgnet，勿手改）
 
 ### office
 - 只放基础能力（协议、客户端、Word COM 驱动）；服务编排和部署在独立项目 `../wordpdf`，协议改动两边一起改

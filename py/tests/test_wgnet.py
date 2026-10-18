@@ -135,7 +135,12 @@ def test_本机目的不经代理():
     assert stub.seen == []
 
 
+def test_缺省非strict():
+    assert not wgnet.is_strict()
+
+
 def test_strict_没配置报错不直连():
+    wgnet.configure(None, strict=True)
     with pytest.raises(OSError, match="没有配置"):
         wgnet.tcp("example.invalid", 80, 1)
 
@@ -239,6 +244,7 @@ def test_udp_本机目的直发():
 
 
 def test_udp_strict没配置报错():
+    wgnet.configure(None, strict=True)
     with pytest.raises(OSError, match="没有配置"):
         wgnet.udp().sendto(b"x", ("dns.lan", 53))
 
@@ -251,10 +257,10 @@ def test_子进程经环境变量继承():
         out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=20,
                              env=dict(os.environ, PYTHONPATH=REPO))
         assert out.stdout.strip() == "ok", out.stderr
-        env = {k: v for k, v in os.environ.items() if not k.startswith("PYBASE_WGNET")}
+        wgnet.configure(None, strict=True)        # 父进程 strict 但没有代理口：子进程同样拒绝直连
         out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=20,
-                             env=dict(env, PYTHONPATH=REPO))
-        assert "没有配置" in out.stderr          # 没继承到环境变量的子进程 strict 报错
+                             env=dict(os.environ, PYTHONPATH=REPO))
+        assert "没有配置" in out.stderr
     finally:
         stub.stop()
     assert stub.seen == [(3, "ubuntu1st", 22)]

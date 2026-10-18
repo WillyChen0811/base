@@ -14,7 +14,7 @@ ENV_STRICT = "PYBASE_WGNET_STRICT"
 
 _lock = threading.Lock()
 _proxy: Optional[Tuple[str, int]] = None
-_strict: Optional[bool] = None      # None = 取环境变量，再缺省 True
+_strict: Optional[bool] = None      # None = 取环境变量，再缺省 False（没有 wgtund 的 pybase 使用者照常直连；XXYI 显式开 strict）
 
 
 def configure(proxy: Optional[str] = "127.0.0.1:11080", strict: bool = True) -> None:
@@ -42,7 +42,7 @@ def is_strict() -> bool:
     with _lock:
         if _strict is not None:
             return _strict
-    return os.environ.get(ENV_STRICT, "1").strip().lower() not in ("0", "false", "no", "")
+    return os.environ.get(ENV_STRICT, "0").strip().lower() not in ("0", "false", "no", "")
 
 
 def is_local(host: str) -> bool:

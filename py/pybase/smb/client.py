@@ -24,6 +24,7 @@ from .download import DownloadMixin
 from .listing import ListingMixin
 from .shares import list_shares            # noqa: F401  （对外再导出，勿删）
 from .stream import StreamMixin
+from .transport import ensure_connection
 from .upload import UploadMixin
 
 logger = logging.getLogger(__name__)
@@ -88,6 +89,7 @@ class SMBClient(ListingMixin, DownloadMixin, UploadMixin, StreamMixin):
         # 默认的 negotiate 在部分机器会先试 Kerberos，而 Kerberos 无法用于 IP 目标
         # （无 SPN），会导致 STATUS_ACCESS_DENIED。
         try:
+            self._wg_connect()
             smbclient.register_session(
                 self.address, username=user, password=pwd, port=self.port,
                 encrypt=True, auth_protocol="ntlm", connection_cache=self._cache,
@@ -104,6 +106,7 @@ class SMBClient(ListingMixin, DownloadMixin, UploadMixin, StreamMixin):
                 smbclient.delete_session(self.address, port=self.port, connection_cache=self._cache)
             except Exception:
                 pass
+            self._wg_connect()
             smbclient.register_session(
                 self.address, username=user, password=pwd, port=self.port,
                 encrypt=False, auth_protocol="ntlm", connection_cache=self._cache,
@@ -113,6 +116,10 @@ class SMBClient(ListingMixin, DownloadMixin, UploadMixin, StreamMixin):
         self._connected = True
         logger.info(f"SMB 连接成功: {self.address}/{self.share} 加密={self._encrypted}")
         return True
+
+    def _wg_connect(self):
+        """底层 TCP 经 wgnet.tcp 建好放进缓存，register_session 复用它（见 transport.py）。"""
+        ensure_connection(self._cache, self.address, self.port, CONNECT_TIMEOUT)
 
     def disconnect(self):
         """断开连接（关闭本实例缓存的会话）"""

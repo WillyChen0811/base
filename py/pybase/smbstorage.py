@@ -23,13 +23,13 @@
 
 from __future__ import annotations
 
-import socket
 import threading
 from datetime import datetime
 from pathlib import PurePosixPath
 from typing import Any, BinaryIO, Callable, List, Optional
 from urllib.parse import quote, unquote, urlsplit
 
+from . import wgnet
 from .storage import Entry, join
 
 CredentialProvider = Callable[[str, str, Optional[str], int], Optional[str]]
@@ -44,8 +44,8 @@ def set_credential_provider(fn: Optional[CredentialProvider]) -> None:
 
 def _tcp_probe(host: str, port: int, timeout: float) -> bool:
     try:
-        with socket.create_connection((host, port), timeout=timeout):
-            return True
+        wgnet.tcp(host, port, timeout).close()
+        return True
     except OSError:
         return False
 

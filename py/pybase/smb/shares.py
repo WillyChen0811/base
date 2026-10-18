@@ -9,7 +9,7 @@ import logging
 import socket
 from typing import Dict, List
 
-from smb.SMBConnection import SMBConnection
+from .transport import WgSMBConnection as SMBConnection
 
 logger = logging.getLogger(__name__)
 

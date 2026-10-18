@@ -14,10 +14,13 @@ HTTPS 证书都来自每台服务器各自的配置：
 失败统一抛 errors.FetchError（带用户友好文案 + 底层原始码）。
 """
 
+import base64
+import json
 import logging
+import ssl
+from urllib.parse import urlencode
 
-import requests
-import urllib3
+from .. import wgnet
 
 from .errors import FetchError, webdav_http_error, webdav_exception, filestation_error
 
@@ -29,8 +32,31 @@ _HTTP_TIMEOUT = 60
 _DEFAULT_WEBDAV_PORT = 5006
 _DEFAULT_FILESTATION_PORT = 5001
 
-# 关闭证书校验时 urllib3 会刷大量告警，内网自签场景静默掉
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+
+class _Resp:
+    """requests.Response 的最小替身：只含本模块用到的 status_code / headers / content / json()。"""
+
+    def __init__(self, r):
+        self.status_code, self.headers, self.content = r.status, r.headers, r.body
+
+    def json(self):
+        return json.loads(self.content.decode("utf-8"))
+
+
+def _get(url, params=None, auth=None, verify=False, timeout=_HTTP_TIMEOUT) -> _Resp:
+    """GET，底层经 wgnet.http（线路、DNS 由 wgtund 决定）；不校验证书时用不验证的 SSL 上下文。"""
+    if params:
+        url += ("&" if "?" in url else "?") + urlencode(params)
+    headers = {}
+    if auth:
+        headers["Authorization"] = "Basic " + base64.b64encode(f"{auth[0]}:{auth[1]}".encode()).decode()
+    ctx = None
+    if not verify:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+    return _Resp(wgnet.http.get(url, headers, timeout=timeout, context=ctx))
 
 
 def _rel(path: str) -> str:
@@ -48,7 +74,7 @@ def fetch_webdav(server: dict, path: str) -> bytes:
     rel = _rel(path)
     url = f"https://{server['address']}:{port}/{server['share']}/{rel}"
     try:
-        r = requests.get(
+        r = _get(
             url,
             auth=(server.get("username") or "", server.get("password") or ""),
             verify=_verify(server), timeout=_HTTP_TIMEOUT,
@@ -76,7 +102,7 @@ def fetch_filestation(server: dict, path: str) -> bytes:
 
     # 登录
     try:
-        login = requests.get(f"{base}/auth.cgi", params={
+        login = _get(f"{base}/auth.cgi", params={
             "api": "SYNO.API.Auth", "version": "3", "method": "login",
             "account": server.get("username") or "", "passwd": server.get("password") or "",
             "session": "FileStation", "format": "sid",
@@ -91,7 +117,7 @@ def fetch_filestation(server: dict, path: str) -> bytes:
     sid = login["data"]["sid"]
 
     try:
-        r = requests.get(f"{base}/entry.cgi", params={
+        r = _get(f"{base}/entry.cgi", params={
             "api": "SYNO.FileStation.Download", "version": "2", "method": "download",
             "path": fs_path, "mode": "download", "_sid": sid,
         }, verify=verify, timeout=_HTTP_TIMEOUT)
@@ -111,7 +137,7 @@ def fetch_filestation(server: dict, path: str) -> bytes:
         raise filestation_error(code, section)
     finally:
         try:
-            requests.get(f"{base}/auth.cgi", params={
+            _get(f"{base}/auth.cgi", params={
                 "api": "SYNO.API.Auth", "version": "1", "method": "logout",
                 "session": "FileStation", "_sid": sid,
             }, verify=verify, timeout=10)

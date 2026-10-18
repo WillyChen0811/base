@@ -168,6 +168,7 @@ def test_is_alive():
 def test_connect固定ntlm与建连超时(monkeypatch):
     seen = []
     monkeypatch.setattr(client_mod.smbclient, "register_session", lambda addr, **kw: seen.append(kw))
+    monkeypatch.setattr(client_mod, "ensure_connection", lambda *a, **k: None)   # 传输层另有 test_smb_wgnet 覆盖
     cl = SMBClient("srv", "share", "u", "p")
     cl.connect()
     assert seen[0]["auth_protocol"] == "ntlm" and seen[0]["connection_timeout"] == client_mod.CONNECT_TIMEOUT

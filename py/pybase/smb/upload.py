@@ -18,9 +18,9 @@ import tempfile
 from datetime import datetime
 from typing import Callable, Dict, Optional
 
-import smbclient
+from .._vendor import smbclient
 # _set_basic_information：一次设全文件时间（创建/访问/修改），utime 只能设访问/修改
-from smbclient._os import _set_basic_information
+from .._vendor.smbclient._os import _set_basic_information
 
 from .common import (
     _PROGRESS_THROTTLE,

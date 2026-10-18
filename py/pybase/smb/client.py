@@ -17,7 +17,7 @@
 
 import logging
 
-import smbclient
+from .._vendor import smbclient
 
 from .common import CONNECT_TIMEOUT
 from .download import DownloadMixin
@@ -30,7 +30,7 @@ logger = logging.getLogger(__name__)
 
 
 class SMBClient(ListingMixin, DownloadMixin, UploadMixin, StreamMixin):
-    """SMB 客户端 (基于 smbprotocol/smbclient，支持 SMB3 加密与保留修改时间)
+    """SMB 客户端 (基于 pybase._vendor 里的 smbprotocol/smbclient（外连已换成 wgnet），支持 SMB3 加密与保留修改时间)
 
     对外方法签名与返回结构与旧 pysmb 版保持一致，业务代码无需改动。
     每个实例持有独立的 connection_cache，相互隔离（主线程扫描与后台上传线程互不干扰）。

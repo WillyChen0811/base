@@ -8,7 +8,7 @@
 
 import hashlib
 
-import smbclient
+from .._vendor import smbclient
 
 from .common import _READ_ACCESS
 

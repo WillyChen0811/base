@@ -6,8 +6,9 @@
 import json
 import logging
 from typing import Any, Dict, Optional
-from urllib.request import urlopen, Request
-from urllib.error import URLError, HTTPError
+import http.client
+
+from .. import wgnet
 
 logger = logging.getLogger(__name__)
 
@@ -20,6 +21,10 @@ class RPCClient:
         self.timeout = timeout
         self._request_id = 0
 
+    def _post(self, payload):
+        return wgnet.http.post(self.endpoint, json.dumps(payload).encode("utf-8"),
+                               {"Content-Type": "application/json"}, timeout=self.timeout)
+
     def call(self, method: str, **params) -> Any:
         """调用 RPC 方法（如 method="tableTemplate.get"），失败抛 RPCError。"""
         self._request_id += 1
@@ -31,18 +36,14 @@ class RPCClient:
         }
 
         try:
-            req = Request(
-                self.endpoint,
-                data=json.dumps(request_body).encode('utf-8'),
-                headers={"Content-Type": "application/json"},
-                method="POST",
-            )
-            with urlopen(req, timeout=self.timeout) as resp:
-                response = json.loads(resp.read().decode('utf-8'))
-        except HTTPError as e:
-            raise RPCError(-32000, f"HTTP error: {e.code} {e.reason}")
-        except URLError as e:
-            raise RPCError(-32000, f"Connection error: {e.reason}")
+            with self._post(request_body) as resp:
+                if resp.status >= 400:
+                    raise RPCError(-32000, f"HTTP error: {resp.status} {resp.reason}")
+                response = resp.json()
+        except RPCError:
+            raise
+        except (OSError, http.client.HTTPException) as e:
+            raise RPCError(-32000, f"Connection error: {e}")
         except json.JSONDecodeError as e:
             raise RPCError(-32700, f"Invalid JSON response: {e}")
 
@@ -65,15 +66,13 @@ class RPCClient:
             })
 
         try:
-            req = Request(
-                self.endpoint,
-                data=json.dumps(requests).encode('utf-8'),
-                headers={"Content-Type": "application/json"},
-                method="POST",
-            )
-            with urlopen(req, timeout=self.timeout) as resp:
-                responses = json.loads(resp.read().decode('utf-8'))
-        except (HTTPError, URLError, json.JSONDecodeError) as e:
+            with self._post(requests) as resp:
+                if resp.status >= 400:
+                    raise RPCError(-32000, f"Batch request failed: HTTP {resp.status} {resp.reason}")
+                responses = resp.json()
+        except RPCError:
+            raise
+        except (OSError, http.client.HTTPException, json.JSONDecodeError) as e:
             raise RPCError(-32000, f"Batch request failed: {e}")
 
         results = []

@@ -25,6 +25,7 @@ from typing import BinaryIO, List, Optional
 
 import paramiko
 
+from . import wgnet
 from .storage import Entry, join
 
 
@@ -78,18 +79,23 @@ class SSHStorage:
                 return self._sftp
             self._drop()
             client = paramiko.SSHClient()
+            sock = None
             try:
                 known = os.path.expanduser("~/.ssh/known_hosts")
                 if os.path.exists(known):
                     client.load_host_keys(known)
                 client.set_missing_host_key_policy(
                     paramiko.AutoAddPolicy() if self.trust_unknown else paramiko.RejectPolicy())
-                client.connect(self.host, port=self.port, username=self.user,
+                sock = wgnet.tcp(self.host, self.port, t_out)     # 经 wgtund；host key 仍按主机名核对
+                sock.settimeout(t_out)
+                client.connect(self.host, port=self.port, username=self.user, sock=sock,
                                key_filename=self.key_filename, allow_agent=True, look_for_keys=True,
                                timeout=t_out, banner_timeout=t_out, auth_timeout=t_out)
                 sftp = client.open_sftp()
             except (paramiko.SSHException, EOFError, OSError) as e:
                 client.close()
+                if sock is not None:
+                    sock.close()
                 raise OSError(f"SSH 连接 {self.host}:{self.port} 失败：{e}") from e
             self._client, self._sftp = client, sftp
             return sftp

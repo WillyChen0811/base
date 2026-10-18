@@ -77,6 +77,8 @@ type fileConf struct {
 	Support        *supportConf      `json:"support"`
 	Projsync       *projsyncConf     `json:"projsync"`
 	Forwards       []forwardConf     `json:"forwards"`
+	Proxy          string            `json:"proxy"`         // 可选：SOCKS5 代理口（回环），按各转发的 target 规则选线路
+	ProxyDefault   string            `json:"proxy_default"` // 没命中规则的目的：direct（默认）或某条转发的名字
 }
 
 func expand(p string) string {
@@ -197,6 +199,9 @@ func Run(ctx context.Context, dir string, stdin io.Reader, stdout io.Writer) (er
 			return err
 		}
 	}
+	if err := validateProxy(conf); err != nil {
+		return err
+	}
 	prep, err := prepareSupport(conf, dir)
 	if err != nil {
 		return err
@@ -273,6 +278,20 @@ func Run(ctx context.Context, dir string, stdin io.Reader, stdout io.Writer) (er
 		closers = append(closers, fwd)
 		forwardMap[fw.Name] = fwd
 		forwardOrder = append(forwardOrder, fw.Name)
+	}
+
+	// 代理口（可选）：SOCKS5，按 CONNECT 目的找 target 相同的转发；监听失败只记错并重试，不影响启动
+	var proxy *proxySvc
+	if conf.Proxy != "" {
+		proxy = newProxy(conf.Proxy, conf.ProxyDefault, forwardMap)
+		if d := proxy.direct; d != nil { // 「其他（直连）」当一条只有直连线路的转发登记，流量和状态照常显示
+			hub.forward(d.name, d.tc)
+			closers = append(closers, d)
+			forwardMap[d.name] = d
+			forwardOrder = append(forwardOrder, d.name)
+		}
+		proxy.start()
+		closers = append(closers, proxy)
 	}
 
 	// 项目同步（可选）：给目标主机开一条本机线路转发口（git 走它、跟随当前线路），
@@ -629,7 +648,11 @@ func Run(ctx context.Context, dir string, stdin io.Reader, stdout io.Writer) (er
 			}
 			out[name] = tun{ps}
 		}
-		writeJSON(w, map[string]any{"tunnels": out})
+		res := map[string]any{"tunnels": out}
+		if proxy != nil {
+			res["proxy"] = proxy.status()
+		}
+		writeJSON(w, res)
 	})
 	mux.Handle("/term", sshterm.Handler(open, sshterm.BridgeOptions{OriginPatterns: conf.AllowedOrigins}))
 
@@ -663,7 +686,11 @@ func Run(ctx context.Context, dir string, stdin io.Reader, stdout io.Writer) (er
 	go func() { served <- srv.Serve(ln) }()
 	closers = append(closers, srv)
 
-	info, _ := json.Marshal(map[string]any{"http": ln.Addr().String(), "token": token, "socks": socksAddrs})
+	infoMap := map[string]any{"http": ln.Addr().String(), "token": token, "socks": socksAddrs}
+	if proxy != nil {
+		infoMap["proxy"] = proxy.status()
+	}
+	info, _ := json.Marshal(infoMap)
 	if _, err := fmt.Fprintf(stdout, "%s\n", info); err != nil {
 		return err
 	}

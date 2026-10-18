@@ -8,9 +8,9 @@ embeddings:批量文本转向量,按返回的 index 排回请求顺序(部分实
 """
 import json
 import threading
-import urllib.error
-import urllib.request
 from typing import Callable, List, Optional
+
+from . import wgnet
 
 
 class AiCanceled(Exception):
@@ -23,6 +23,14 @@ class AiRequestError(Exception):
 
 def _join_endpoint(base_url: str, path: str) -> str:
     return f"{(base_url or '').rstrip('/')}/{(path or '').lstrip('/')}"
+
+
+def _http_error(response) -> str:
+    try:
+        detail = response.body[:2000].decode("utf-8", errors="replace")[:300]
+    except Exception:
+        detail = ""
+    return f"AI 接口返回 {response.status}: {detail or response.reason}"
 
 
 class LlmClient:
@@ -83,30 +91,18 @@ class LlmClient:
         headers = {"Content-Type": "application/json"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
-        request = urllib.request.Request(
-            self.embeddings_endpoint,
-            data=json.dumps(body).encode("utf-8"),
-            headers=headers,
-            method="POST",
-        )
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                data = json.loads(response.read().decode("utf-8"))
-        except urllib.error.HTTPError as exc:
-            detail = ""
-            try:
-                detail = exc.read().decode("utf-8", errors="replace")[:300]
-            except Exception:
-                pass
-            raise AiRequestError(
-                f"AI 接口返回 {exc.code}: {detail or exc.reason}"
-            ) from exc
-        except urllib.error.URLError as exc:
-            raise AiRequestError(
-                f"无法连接 AI 接口 {self.embeddings_endpoint}: {exc.reason}"
-            ) from exc
+            with wgnet.http.post(self.embeddings_endpoint, json.dumps(body).encode("utf-8"), headers,
+                                 timeout=self.timeout) as response:
+                if response.status >= 400:
+                    raise AiRequestError(_http_error(response))
+                data = response.json()
+        except AiRequestError:
+            raise
         except TimeoutError as exc:
             raise AiRequestError(f"AI 接口 {self.embeddings_endpoint} 响应超时") from exc
+        except OSError as exc:
+            raise AiRequestError(f"无法连接 AI 接口 {self.embeddings_endpoint}: {exc}") from exc
 
         items = data.get("data") or []
         if len(items) != len(texts):
@@ -139,36 +135,26 @@ class LlmClient:
         headers = {"Content-Type": "application/json"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
-        request = urllib.request.Request(
-            self.endpoint,
-            data=json.dumps(body).encode("utf-8"),
-            headers=headers,
-            method="POST",
-        )
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+            with wgnet.http.post(self.endpoint, json.dumps(body).encode("utf-8"), headers,
+                                 timeout=self.timeout, stream=bool(on_delta)) as response:
+                if response.status >= 400:
+                    raise AiRequestError(_http_error(response))
                 if on_delta:
                     return self._read_stream(response, on_delta, cancel_event)
-                data = json.loads(response.read().decode("utf-8"))
+                data = response.json()
                 return (
                     (data.get("choices") or [{}])[0]
                     .get("message", {})
                     .get("content", "")
                     or ""
                 )
-        except urllib.error.HTTPError as exc:
-            detail = ""
-            try:
-                detail = exc.read().decode("utf-8", errors="replace")[:300]
-            except Exception:
-                pass
-            raise AiRequestError(
-                f"AI 接口返回 {exc.code}: {detail or exc.reason}"
-            ) from exc
-        except urllib.error.URLError as exc:
-            raise AiRequestError(f"无法连接 AI 接口 {self.endpoint}: {exc.reason}") from exc
+        except AiRequestError:
+            raise
         except TimeoutError as exc:
             raise AiRequestError(f"AI 接口 {self.endpoint} 响应超时") from exc
+        except OSError as exc:
+            raise AiRequestError(f"无法连接 AI 接口 {self.endpoint}: {exc}") from exc
 
     def _read_stream(self, response, on_delta, cancel_event) -> str:
         """逐行解析 SSE,拼出完整文本并逐 delta 回调"""

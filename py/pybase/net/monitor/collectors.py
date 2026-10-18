@@ -11,10 +11,9 @@ import concurrent.futures
 import json
 import platform
 import re
-import urllib.error
-import urllib.request
 from typing import Optional, Sequence
 
+from ... import wgnet
 from ..diag import classify_address, env_proxies, looks_proxied, route_of, tcp_probe
 from ...media._proc import MediaError, ToolNotFoundError, resolve_tool, run
 
@@ -414,12 +413,17 @@ def collect_netbird(netbird_path: Optional[str] = None, *, timeout: float = _TIM
 # ---------- mihomo / clash ----------
 
 
+class _HttpStatus(Exception):
+    def __init__(self, code: int, reason: str) -> None:
+        super().__init__(f"HTTP {code}：{reason}")
+
+
 def _mihomo_get(base_url: str, path: str, secret: Optional[str], timeout: float) -> dict:
-    req = urllib.request.Request(base_url.rstrip("/") + path)
-    if secret:
-        req.add_header("Authorization", f"Bearer {secret}")
-    with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 - 调用方给的本地/内网地址
-        return json.loads(resp.read().decode("utf-8"))
+    headers = {"Authorization": f"Bearer {secret}"} if secret else {}
+    with wgnet.http.get(base_url.rstrip("/") + path, headers, timeout=timeout) as resp:
+        if resp.status >= 400:
+            raise _HttpStatus(resp.status, resp.reason)
+        return resp.json()
 
 
 def collect_mihomo(base_url: str, secret: Optional[str] = None, *, timeout: float = _TIMEOUT_DEFAULT) -> dict:
@@ -433,9 +437,7 @@ def collect_mihomo(base_url: str, secret: Optional[str] = None, *, timeout: floa
         version = _mihomo_get(base_url, "/version", secret, timeout)
         configs = _mihomo_get(base_url, "/configs", secret, timeout)
         connections = _mihomo_get(base_url, "/connections", secret, timeout)
-    except urllib.error.HTTPError as exc:
-        return _fail(f"HTTP {exc.code}：{exc.reason}")
-    except (urllib.error.URLError, OSError, json.JSONDecodeError, TimeoutError) as exc:
+    except (_HttpStatus, OSError, json.JSONDecodeError) as exc:
         return _fail(str(exc))
 
     conns = connections.get("connections") or []

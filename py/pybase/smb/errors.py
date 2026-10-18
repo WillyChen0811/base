@@ -96,11 +96,11 @@ def webdav_http_error(status: int) -> FetchError:
 
 
 def webdav_exception(exc: Exception) -> FetchError:
-    """WebDAV 请求过程抛出的 requests/网络异常。"""
+    """WebDAV 请求过程抛出的网络异常（wgnet.http / 标准库）。"""
     name = type(exc).__name__
-    if name in ("ConnectTimeout", "ReadTimeout", "Timeout"):
+    if name in ("ConnectTimeout", "ReadTimeout", "Timeout", "TimeoutError", "timeout"):
         return FetchError("连接服务器超时", name)
-    if name in ("ConnectionError", "SSLError"):
+    if name in ("ConnectionError", "SSLError", "ConnectionRefusedError", "OSError", "SSLCertVerificationError"):
         return FetchError("无法连接（端口未开，或 WebDAV 套件未启用）", name)
     return FetchError(f"取文件失败：未知错误（WebDAV {name}）", f"{name}: {exc}")
 

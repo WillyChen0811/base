@@ -5,7 +5,6 @@ package wgtund
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -20,7 +19,8 @@ import (
 // forwardConf 是 hosts.json 里 forwards 的一条：在本机 listen 上监听，经 routes 的当前线路到 addr。
 type forwardConf struct {
 	Name   string      `json:"name"`
-	Listen string      `json:"listen"`
+	Listen string      `json:"listen"` // 可选：本机回环口；只给 target 的转发不开本机口
+	Target []string    `json:"target"` // 可选：proxy 口的匹配规则（IP、CIDR 或域名，可带 :端口），命中的连接走本转发的当前线路拨到程序请求的真实目的
 	Routes []routeConf `json:"routes"`
 }
 
@@ -30,9 +30,19 @@ func (fc forwardConf) validate(cfgs map[string]*wgtunnel.Config, hostNames map[s
 	if fc.Name == "" || hostNames[fc.Name] {
 		return fmt.Errorf("hosts.json: 转发名 %q 为空或与主机重名", fc.Name)
 	}
-	host, _, err := net.SplitHostPort(fc.Listen)
-	if err != nil || (host != "127.0.0.1" && !strings.EqualFold(host, "localhost")) {
-		return fmt.Errorf("hosts.json: 转发 %q 的监听地址 %q 必须是回环地址（127.0.0.1 或 localhost）的 主机:端口", fc.Name, fc.Listen)
+	if fc.Listen == "" && len(fc.Target) == 0 {
+		return fmt.Errorf("hosts.json: 转发 %q 的 listen 和 target 至少写一个", fc.Name)
+	}
+	if fc.Listen != "" {
+		host, _, err := net.SplitHostPort(fc.Listen)
+		if err != nil || (host != "127.0.0.1" && !strings.EqualFold(host, "localhost")) {
+			return fmt.Errorf("hosts.json: 转发 %q 的监听地址 %q 必须是回环地址（127.0.0.1 或 localhost）的 主机:端口", fc.Name, fc.Listen)
+		}
+	}
+	for _, t := range fc.Target {
+		if _, err := parseRule(t); err != nil {
+			return fmt.Errorf("hosts.json: 转发 %q 的 target: %w", fc.Name, err)
+		}
 	}
 	if len(fc.Routes) == 0 {
 		return fmt.Errorf("hosts.json: 转发 %q 没有 routes（至少 1 条线路）", fc.Name)
@@ -56,11 +66,12 @@ func (fc forwardConf) validate(cfgs map[string]*wgtunnel.Config, hostNames map[s
 
 // forwardItem 是 /forwards 的一项；字段名与 /hosts 的一项一致（网页的线路条当同一种数据渲染），多了 listen。
 type forwardItem struct {
-	Name      string `json:"name"`
-	Listen    string `json:"listen"`
-	Tunnel    string `json:"tunnel"`
-	Connected bool   `json:"connected"`
-	Error     string `json:"error"`
+	Name      string   `json:"name"`
+	Listen    string   `json:"listen"`
+	Target    []string `json:"target"`
+	Tunnel    string   `json:"tunnel"`
+	Connected bool     `json:"connected"`
+	Error     string   `json:"error"`
 	routeState
 	Traffic trafficView `json:"traffic"`
 }
@@ -69,6 +80,7 @@ type forwardItem struct {
 type forwardSvc struct {
 	name    string
 	listen  string
+	target  []string // proxy 口的匹配规则（原样，给状态显示）
 	routes  []routeConf
 	dialers []sshterm.Dialer // 与 routes 一一对应（隧道或直连）
 
@@ -99,6 +111,7 @@ func newForward(fc forwardConf, tunnels map[string]*wgtunnel.Tunnel, pool *sshPo
 	s := &forwardSvc{
 		name:    fc.Name,
 		listen:  fc.Listen,
+		target:  fc.Target,
 		routes:  make([]routeConf, len(fc.Routes)),
 		dialers: make([]sshterm.Dialer, len(fc.Routes)),
 		ctx:     ctx,
@@ -121,7 +134,8 @@ func newForward(fc forwardConf, tunnels map[string]*wgtunnel.Tunnel, pool *sshPo
 		if r.Via != "" {
 			d = &viaDialer{pool: pool, host: r.Via}
 		} else if r.Tunnel != "" {
-			d = tunnels[r.Tunnel]
+			t := tunnels[r.Tunnel]
+			d = &dnsGuard{r.Tunnel, t, t.HasDNS}
 		}
 		s.dialers[i] = &countDialer{d, s.tc}
 	}
@@ -150,6 +164,9 @@ var forwardListenRetry = 10 * time.Second
 // 记进 listenErr（/forwards 该项的 error）并在后台每 forwardListenRetry 重试，成功后清掉；
 // 一条转发的监听问题绝不影响 wgtund 和其他线路。
 func (f *forwardSvc) start() error {
+	if f.listen == "" {
+		return nil // 只给 target 的转发不开本机口，连接全从 proxy 口进来
+	}
 	host, port, err := net.SplitHostPort(f.listen)
 	if err != nil {
 		return err
@@ -239,6 +256,11 @@ func (f *forwardSvc) serve(c net.Conn) {
 		c.Close()
 		return
 	}
+	f.relay(c, up, gen)
+}
+
+// relay 登记 c/up 并双向拷贝到两边都结束（端口转发与 proxy 口共用）。
+func (f *forwardSvc) relay(c, up net.Conn, gen int) {
 	if !f.track(gen, c, up) {
 		return // 已 Close，或拨完还没登记这段时间里切了线路：track 把两边都关了，旧线路不开始转发
 	}
@@ -290,51 +312,6 @@ func (f *forwardSvc) untrack(cs ...net.Conn) {
 		delete(f.conns, c)
 	}
 	f.mu.Unlock()
-}
-
-// dial 在当前线路上拨到远端 addr（超时 dialTimeout），成败都记进状态给 /forwards；
-// 拨号期间用户切了线路（gen 变了）就把这条旧线路的连接关掉（同主机 conn 的防护）。
-// 同时返回拨号所属的代际 gen，交给 track 在同一把锁里验过再登记——堵住「dial 已返回、
-// track 未登记」的窗口（那期间 switchRoute 关不到这条还没进集合的连接）。
-func (f *forwardSvc) dial() (net.Conn, int, error) {
-	f.mu.Lock()
-	idx, gen := f.active, f.gen
-	addr, d := f.routes[idx].Addr, f.dialers[idx]
-	f.mu.Unlock()
-
-	ctx, cancel := context.WithTimeout(f.ctx, dialTimeout)
-	defer cancel()
-	c, err := d.DialContext(ctx, "tcp", addr)
-
-	f.mu.Lock()
-	if f.gen != gen {
-		f.mu.Unlock()
-		if c != nil {
-			c.Close()
-		}
-		return nil, gen, errors.New("线路已切换，请重试")
-	}
-	f.connected = err == nil
-	if err != nil {
-		f.lastErr = err.Error()
-		sysLog.logThrottled("fwd:"+f.name, f.lastErr, "转发 %s 拨号失败（线路 %s）：%v", f.name, f.routes[idx].Label, err)
-		if idx == 0 && len(f.routes) > 1 {
-			setFlagLog(&f.preferredDown, true, "preferred_down =", "转发 "+f.name)
-		}
-	} else {
-		f.lastErr = ""
-		if sysLog.clearThrottle("fwd:" + f.name) {
-			logf("转发 %s 拨号恢复（线路 %s）", f.name, f.routes[idx].Label)
-		}
-		if idx == 0 {
-			setFlagLog(&f.preferredDown, false, "preferred_down =", "转发 "+f.name)
-		}
-	}
-	f.mu.Unlock()
-	if err != nil && c != nil {
-		c.Close() // 自写 Dialer 万一返回了半连接也别漏
-	}
-	return c, gen, err
 }
 
 // switchRoute 切到第 idx 条线路：清状态并关掉当前所有已转发的连接（之后的新连接走新线路）。
@@ -416,7 +393,7 @@ func (f *forwardSvc) item() forwardItem {
 	if f.listenErr != "" {
 		errMsg = f.listenErr
 	}
-	return forwardItem{f.name, f.addr, f.routes[f.active].Tunnel, f.connected, errMsg,
+	return forwardItem{f.name, f.addr, f.target, f.routes[f.active].Tunnel, f.connected, errMsg,
 		routeState{views, f.active, f.preferredDown, f.preferredBack}, f.tc.view()}
 }
 

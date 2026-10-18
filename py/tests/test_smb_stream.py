@@ -11,7 +11,7 @@ import types
 import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-pytest.importorskip("smbclient")
+pytest.importorskip("pybase._vendor.smbclient")
 
 from pybase.smb import client as client_mod, stream  # noqa: E402
 from pybase.smb.client import SMBClient  # noqa: E402

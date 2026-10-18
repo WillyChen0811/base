@@ -235,3 +235,45 @@ func TestDialTimeout(t *testing.T) {
 		t.Errorf("等了 %v 才返回", time.Since(start))
 	}
 }
+
+// 经隧道的 UDP：DialContext("udp") 往返，域名目的用隧道 DNS 解析（代理口的 UDP 转发依赖这条）
+func TestTunnelUDPDial(t *testing.T) {
+	a, b := pair(t, "10.33.0.1", "10.33.0.2", "10.33.0.1")
+	dns, err := a.ListenPacket("udp", "10.33.0.1:53")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { dns.Close() })
+	go serveDNS(dns, "svc.home.lan.", [4]byte{10, 33, 0, 1})
+	echo, err := a.ListenPacket("udp", "10.33.0.1:7000")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { echo.Close() })
+	go func() {
+		buf := make([]byte, 1500)
+		for {
+			n, from, err := echo.ReadFrom(buf)
+			if err != nil {
+				return
+			}
+			echo.WriteTo(append([]byte("A:"), buf[:n]...), from)
+		}
+	}()
+	for _, addr := range []string{"10.33.0.1:7000", "svc.home.lan:7000"} {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		c, err := b.DialContext(ctx, "udp", addr)
+		cancel()
+		if err != nil {
+			t.Fatalf("经隧道 UDP 拨 %s: %v", addr, err)
+		}
+		c.SetDeadline(time.Now().Add(10 * time.Second))
+		c.Write([]byte("hi"))
+		buf := make([]byte, 100)
+		n, err := c.Read(buf)
+		c.Close()
+		if err != nil || string(buf[:n]) != "A:hi" {
+			t.Errorf("%s 回包 = %q, %v", addr, buf[:n], err)
+		}
+	}
+}

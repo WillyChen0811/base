@@ -77,8 +77,8 @@ from .errors import (
 )
 from .word import WordCOMConverter, WordConverter
 
-# `client` 模块顶层 import requests——只装 `pybase[office-word]`（跑 Word COM，
-# 不碰 HTTP 客户端）的调用方不该被迫装它。WordPdfClient/ConvertResult 走
+# `client` 模块走 wgnet.http——只装 `pybase[office-word]`（跑 Word COM，
+# 不碰 HTTP 客户端）的调用方不该被迫加载它。WordPdfClient/ConvertResult 走
 # 模块级 __getattr__ 延迟到真正用到时才 import .client，`from pybase.office
 # import WordPdfClient` 这个既有写法不用改。
 def __getattr__(name: str):

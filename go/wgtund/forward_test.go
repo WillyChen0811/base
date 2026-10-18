@@ -425,7 +425,7 @@ func TestForwardSwitchRoute(t *testing.T) {
 	}
 }
 
-// (d) 首选连不上：标 preferred_down 记 error，不自动切换
+// (d) 首选连不上：标 preferred_down 记 error，不自动切换选中线路（本次连接改走备用）
 func TestForwardPreferredDownIsOnlyMarked(t *testing.T) {
 	dead := freeAddr(t)
 	b := startFwdUpstream(t, "B")
@@ -437,20 +437,19 @@ func TestForwardPreferredDownIsOnlyMarked(t *testing.T) {
 	if fs[0].Active != 0 || fs[0].PreferredDown || fs[0].Connected {
 		t.Fatalf("启动时 = %+v", fs[0])
 	}
-	// 连转发口：上游拨不通，两端都会被关掉
+	// 连转发口：首选拨不通，本次连接改走备用（能通），选中线路与标记不变
 	c, err := net.DialTimeout("tcp", fs[0].Listen, 5*time.Second)
 	if err != nil {
 		t.Fatal(err) // 监听本身是开着的
 	}
 	defer c.Close()
-	// 必须是确定的断连（且很快），不能拿读超时当"已关闭"
-	readClosed(t, c, 2*time.Second)
+	c.SetDeadline(time.Now().Add(5 * time.Second))
+	if l := askOnce(t, c, "hi"); l != "B:hi\n" {
+		t.Errorf("本次连接应改走备用线路，回程 = %q", l)
+	}
 	v := waitFwd(t, st, func(v forwardView) bool { return v.Error != "" })
 	if !v.PreferredDown || v.Connected || v.Active != 0 || v.PreferredBack {
 		t.Errorf("首选不通应只标记不切换: %+v", v)
-	}
-	if b.count() != 0 {
-		t.Errorf("不该自动用到备用线路: %d", b.count())
 	}
 }
 

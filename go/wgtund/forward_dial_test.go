@@ -7,6 +7,7 @@ import (
 	"sync"
 	"syscall"
 	"testing"
+	"time"
 )
 
 // failDialer 总是拨号失败（假装系统那条网没开），并记下被要求拨的目的。
@@ -61,6 +62,9 @@ func TestForwardDialFallbackListen(t *testing.T) {
 	if it.Active != 0 || !it.PreferredDown || it.Connected || it.Error == "" {
 		t.Errorf("状态 = active %d preferredDown %v connected %v error %q（选中线路不变、仍记首选失败）",
 			it.Active, it.PreferredDown, it.Connected, it.Error)
+	}
+	for i := 0; i < 200 && f.tc.view().UpTotal == 0; i++ { // 计数在拷贝协程里记，比回程稍晚
+		time.Sleep(10 * time.Millisecond)
 	}
 	if v := f.tc.view(); v.UpTotal == 0 {
 		t.Errorf("流量没计在该转发上: %+v", v)

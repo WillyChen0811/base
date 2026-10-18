@@ -93,32 +93,10 @@ def _serve_conn(stub, c):
 Stub._serve = lambda self, c: _serve_conn(self, c)
 
 
-@pytest.fixture(autouse=True)
-def _reset():
-    socks5.set_proxy(None)
-    yield
-    socks5.set_proxy(None)
-
-
-def test_设置与取消():
-    assert socks5.get_proxy() is None
-    socks5.set_proxy("127.0.0.1:11080")
-    assert socks5.get_proxy() == "127.0.0.1:11080"
-    socks5.set_proxy("")
-    assert socks5.get_proxy() is None
-    with pytest.raises(ValueError):
-        socks5.set_proxy("nonsense")
-
-
-def test_没设代理返回None():
-    assert socks5.connect_via_proxy("example.invalid", 22) is None
-
-
 def test_域名原样发给代理_不是IP():
     stub = Stub()
     try:
-        socks5.set_proxy(stub.addr)
-        s = socks5.connect_via_proxy("ubuntu1st", 22, 3)
+        s = socks5.connect(socks5.parse_addr(stub.addr), "ubuntu1st", 22, 3)
         s.close()
     finally:
         stub.stop()
@@ -128,25 +106,13 @@ def test_域名原样发给代理_不是IP():
 def test_代理拒绝_报错():
     stub = Stub(reply=2)
     try:
-        socks5.set_proxy(stub.addr)
         with pytest.raises(OSError, match="拒绝"):
-            socks5.connect_via_proxy("ubuntu1st", 22, 3)
+            socks5.connect(socks5.parse_addr(stub.addr), "ubuntu1st", 22, 3)
     finally:
         stub.stop()
 
 
-def test_子进程经环境变量继承代理():
-    import subprocess
-    stub = Stub()
-    try:
-        socks5.set_proxy(stub.addr)
-        assert os.environ[socks5.ENV] == stub.addr
-        code = "from pybase import socks5; s = socks5.connect_via_proxy('ubuntu1st', 22, 3); print(s is not None)"
-        env = dict(os.environ, PYTHONPATH=os.path.join(os.path.dirname(__file__), ".."))
-        out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=20, env=env)
-        assert out.stdout.strip() == "True", out.stderr
-    finally:
-        socks5.set_proxy(None)
-        stub.stop()
-    assert stub.seen == [(3, "ubuntu1st", 22)]
-    assert socks5.ENV not in os.environ
+def test_地址解析():
+    assert socks5.parse_addr("127.0.0.1:11080") == ("127.0.0.1", 11080)
+    with pytest.raises(ValueError):
+        socks5.parse_addr("nonsense")

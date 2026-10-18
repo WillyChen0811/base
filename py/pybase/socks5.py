@@ -1,55 +1,29 @@
-"""最小 SOCKS5 客户端 + 进程级代理设置（全局接管见 netglobal，它复用这里的握手）。
+"""最小 SOCKS5 客户端握手（wgtund 程序级代理口：无认证，CONNECT / UDP ASSOCIATE）。
 
-wgtund 的程序级接管口（无认证、CONNECT）。域名**原样**交给代理（ATYP=3），本机不解析；
-设了代理就一律经代理，代理连不上或拒绝时抛 `OSError`，**绝不回落直连**。
-
-    set_proxy("127.0.0.1:11080")   # 设；传空/None 取消
-    sock = connect_via_proxy(host, port, timeout)   # 未设代理时返回 None
+只做协议，不持有任何全局状态；使用方请走 `pybase.wgnet`。
+域名**原样**交给代理（ATYP=3），本机不解析；代理拒绝或中途断开抛 `OSError`。
 """
 
 from __future__ import annotations
 
-import os
 import socket
 import struct
-import threading
-from typing import Optional, Tuple
+from typing import Tuple
 
-_lock = threading.Lock()
-_proxy: Optional[Tuple[str, int]] = None
-ENV = "PYBASE_SOCKS5_PROXY"   # set_proxy 同步写进环境变量，子进程（如对话里跑的 skill 脚本）继承后同样经代理
+CONNECT, UDP_ASSOCIATE = 1, 3
 
 _REPLY = {1: "代理服务器故障", 2: "规则不允许", 3: "网络不可达", 4: "主机不可达",
           5: "目标拒绝连接", 6: "TTL 过期", 7: "不支持的命令", 8: "不支持的地址类型"}
 
 
-def _parse(addr: str) -> Tuple[str, int]:
+def parse_addr(addr: str) -> Tuple[str, int]:
     host, sep, port = addr.rpartition(":")
     if not sep or not host or not port.isdigit():
         raise ValueError(f"代理地址应为 host:port：{addr!r}")
     return host.strip("[]"), int(port)
 
 
-def set_proxy(addr: Optional[str]) -> None:
-    """addr 形如 "127.0.0.1:11080"；空值取消。同时写/删环境变量 ENV。"""
-    global _proxy
-    if not addr:
-        with _lock:
-            _proxy = None
-            os.environ.pop(ENV, None)
-        return
-    p = _parse(addr)
-    with _lock:
-        _proxy = p
-        os.environ[ENV] = addr
-
-
-def get_proxy() -> Optional[str]:
-    with _lock:
-        return f"{_proxy[0]}:{_proxy[1]}" if _proxy else (os.environ.get(ENV) or None)
-
-
-def _recv(s: socket.socket, n: int) -> bytes:
+def recv_exact(s: socket.socket, n: int) -> bytes:
     buf = b""
     while len(buf) < n:
         chunk = s.recv(n - len(buf))
@@ -59,13 +33,8 @@ def _recv(s: socket.socket, n: int) -> bytes:
     return buf
 
 
-def handshake(s: socket.socket, host: str, port: int) -> None:
-    """在已连到代理的套接字上做 SOCKS5 握手 + CONNECT；成功后 s 就是到 host:port 的通道。
-    域名原样发给代理。失败抛 OSError（调用方负责关套接字）。超时沿用 s 当前的设置。"""
-    s.sendall(b"\x05\x01\x00")
-    ver, method = _recv(s, 2)
-    if ver != 5 or method != 0:
-        raise OSError(f"代理不接受无认证方式（回复 {ver},{method}）")
+def encode_addr(host: str, port: int) -> bytes:
+    """ATYP + 地址 + 端口；IP 字面量按 IP，其余一律当域名原样发。"""
     try:
         addr = b"\x01" + socket.inet_pton(socket.AF_INET, host)
     except OSError:
@@ -76,14 +45,43 @@ def handshake(s: socket.socket, host: str, port: int) -> None:
             if len(name) > 255:
                 raise OSError(f"主机名过长：{host!r}")
             addr = b"\x03" + bytes([len(name)]) + name
-    s.sendall(b"\x05\x01\x00" + addr + struct.pack(">H", port))
-    ver, rep, _, atyp = _recv(s, 4)
+    return addr + struct.pack(">H", port)
+
+
+def decode_addr(buf: bytes, off: int = 0) -> Tuple[str, int, int]:
+    """从 buf[off:] 解 ATYP+地址+端口，返回 (host, port, 下一个偏移)。"""
+    atyp = buf[off]
+    off += 1
+    if atyp == 1:
+        host, off = socket.inet_ntoa(buf[off:off + 4]), off + 4
+    elif atyp == 4:
+        host, off = socket.inet_ntop(socket.AF_INET6, buf[off:off + 16]), off + 16
+    elif atyp == 3:
+        n = buf[off]
+        host, off = buf[off + 1:off + 1 + n].decode("utf-8", "replace"), off + 1 + n
+    else:
+        raise OSError(f"未知地址类型 {atyp}")
+    return host, struct.unpack(">H", buf[off:off + 2])[0], off + 2
+
+
+def negotiate(s: socket.socket, cmd: int, host: str, port: int) -> Tuple[str, int]:
+    """在已连到代理的套接字上握手并发 cmd，返回代理回复里的绑定地址。失败抛 OSError（调用方负责关套接字）。"""
+    s.sendall(b"\x05\x01\x00")
+    ver, method = recv_exact(s, 2)
+    if ver != 5 or method != 0:
+        raise OSError(f"代理不接受无认证方式（回复 {ver},{method}）")
+    s.sendall(bytes([5, cmd, 0]) + encode_addr(host, port))
+    ver, rep, _, atyp = recv_exact(s, 4)
     if ver != 5:
         raise OSError("代理回复不是 SOCKS5")
     if rep != 0:
-        raise OSError(f"代理拒绝连接 {host}:{port}：{_REPLY.get(rep, rep)}")
-    skip = _recv(s, 1)[0] if atyp == 3 else {1: 4, 4: 16}.get(atyp, 0)
-    _recv(s, skip + 2)  # 绑定地址 + 端口，用不上
+        raise OSError(f"代理拒绝 {host}:{port}：{_REPLY.get(rep, rep)}")
+    rest = recv_exact(s, {1: 4, 4: 16}.get(atyp, 0) + 2) if atyp != 3 else None
+    if atyp == 3:
+        n = recv_exact(s, 1)
+        rest = n + recv_exact(s, n[0] + 2)
+    bhost, bport, _ = decode_addr(bytes([atyp]) + rest)
+    return bhost, bport
 
 
 def connect(proxy: Tuple[str, int], host: str, port: int, timeout: float = 10) -> socket.socket:
@@ -93,20 +91,9 @@ def connect(proxy: Tuple[str, int], host: str, port: int, timeout: float = 10) -
     except OSError as e:
         raise OSError(f"连不上本机代理 {proxy[0]}:{proxy[1]}：{e}") from e
     try:
-        handshake(s, host, port)
+        negotiate(s, CONNECT, host, port)
         s.settimeout(None)
         return s
     except BaseException:
         s.close()
         raise
-
-
-def connect_via_proxy(host: str, port: int, timeout: float = 10) -> Optional[socket.socket]:
-    """已设代理则经代理建连接；未设返回 None（调用方自行直连）。"""
-    with _lock:
-        proxy = _proxy
-    if proxy is None and os.environ.get(ENV):     # 子进程：父进程设的代理经环境变量传下来
-        proxy = _parse(os.environ[ENV])
-    if proxy is None:
-        return None
-    return connect(proxy, host, port, timeout)

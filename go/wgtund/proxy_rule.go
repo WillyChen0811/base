@@ -90,17 +90,34 @@ func (r proxyRule) score(host string, port int) int {
 	return ones*2 + bonus
 }
 
+// alias 报告规则是否「精确的 主机:端口」（单个 IP 或域名，且带端口）：这种 target 是转发的别名，
+// 命中后拨线路自己的 addr（与 listen 口同一行为）；CIDR 和不带端口的规则仍拨请求目的。
+func (r proxyRule) alias() bool {
+	if r.port == 0 {
+		return false
+	}
+	if r.ipnet == nil {
+		return true
+	}
+	ones, bits := r.ipnet.Mask.Size()
+	return ones == bits
+}
+
 // pick 选出目的 主机:端口 该走的转发：规则里最具体的一条，没命中则 proxy_default。
-func (p *proxySvc) pick(dest string) *forwardSvc {
+// 同时返回交给 dialTo 的拨号目的：别名规则为空（用线路的 addr），其余原样是请求目的。
+func (p *proxySvc) pick(dest string) (*forwardSvc, string) {
 	host, ps, _ := net.SplitHostPort(dest)
 	port, _ := strconv.Atoi(ps)
-	best, bestScore := p.dflt, -1
+	best, bestScore, target := p.dflt, -1, dest
 	for _, r := range p.rules {
 		if sc := r.score(host, port); sc > bestScore {
-			best, bestScore = r.fwd, sc
+			best, bestScore, target = r.fwd, sc, dest
+			if r.alias() {
+				target = ""
+			}
 		}
 	}
-	return best
+	return best, target
 }
 
 // validateProxy 校验 proxy 口（只许回环）、各转发的 target 规则互不重复、proxy_default 有效。

@@ -1,6 +1,6 @@
 // proxy.go：程序级接管的入口——回环上的 SOCKS5 代理口（无认证，支持 CONNECT 和 UDP ASSOCIATE（见 proxy_udp.go），地址类型 IPv4/域名/IPv6）。
 // 程序照常写真实地址，收到 CONNECT 目的 D 后按各转发的 target 规则选最具体的一条（见 proxy_rule.go），
-// 用它的当前线路拨到 D 本身，复用转发的登记、流量统计和切线路关连接；没命中任何规则走 proxy_default：
+// 用它的当前线路拨到 D 本身（target 是精确 主机:端口 时它是该转发的别名，改拨线路的 addr），复用转发的登记、流量统计和切线路关连接；没命中任何规则走 proxy_default：
 // direct（默认，计入「其他（直连）」）或某条转发的名字。域名不先解析，交给最终拨号的那条线路解析。
 package wgtund
 
@@ -170,8 +170,8 @@ func (p *proxySvc) serve(c net.Conn) {
 		p.serveUDP(c) // 请求里的目的只是客户端将用的源地址，不用
 		return
 	}
-	f := p.pick(dest)
-	up, gen, err := f.dialTo(dest)
+	f, target := p.pick(dest)
+	up, gen, err := f.dialTo(target)
 	if err != nil {
 		socksReply(c, dialRep(err))
 		c.Close()

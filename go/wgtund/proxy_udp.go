@@ -126,8 +126,8 @@ func (a *udpAssoc) readLoop() {
 			continue // 分片或头不合法：丢
 		}
 		key := udpKey{src.String(), dest}
-		f := a.p.pick(dest)
-		s := a.sockFor(key, f, dest, append([]byte(nil), buf[:hdrLen]...), src)
+		f, target := a.p.pick(dest)
+		s := a.sockFor(key, f, target, append([]byte(nil), buf[:hdrLen]...), src)
 		if s == nil {
 			continue
 		}
@@ -138,7 +138,7 @@ func (a *udpAssoc) readLoop() {
 }
 
 // sockFor 取 key 对应的出站套接字；没有、或线路已切换就按转发当前线路新建。失败返回 nil（已记错）。
-func (a *udpAssoc) sockFor(key udpKey, f *forwardSvc, dest string, hdr []byte, src netip.AddrPort) *udpSock {
+func (a *udpAssoc) sockFor(key udpKey, f *forwardSvc, target string, hdr []byte, src netip.AddrPort) *udpSock {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if s := a.socks[key]; s != nil {
@@ -148,7 +148,7 @@ func (a *udpAssoc) sockFor(key udpKey, f *forwardSvc, dest string, hdr []byte, s
 		delete(a.socks, key)
 		s.conn.Close()
 	}
-	conn, gen, err := f.dialUDP(dest)
+	conn, gen, err := f.dialUDP(target)
 	if err != nil {
 		return nil
 	}
@@ -214,12 +214,15 @@ func (f *forwardSvc) curGen() int {
 	return f.gen
 }
 
-// dialUDP 在当前线路上建到 dest 的 UDP 套接字（计流量；经 SSH 的线路不支持，失败原因记进 error）。
+// dialUDP 在当前线路上建到 dest（空则线路自己的 addr，同 dialTo）的 UDP 套接字（计流量；经 SSH 的线路不支持，失败原因记进 error）。
 func (f *forwardSvc) dialUDP(dest string) (net.Conn, int, error) {
 	f.mu.Lock()
 	idx, gen := f.active, f.gen
 	r, d := f.routes[idx], f.dialers[idx]
 	f.mu.Unlock()
+	if dest == "" {
+		dest = r.Addr
+	}
 	var c net.Conn
 	var err error
 	if r.Via != "" {

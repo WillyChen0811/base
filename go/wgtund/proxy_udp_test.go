@@ -270,3 +270,19 @@ func TestProxyUDPSwitchRoute(t *testing.T) {
 		t.Errorf("切线路后回包 = %q", got)
 	}
 }
+
+// 精确 主机:端口 的 target 是别名：UDP 也拨线路自己的 addr，回包头仍是客户端请求的目的
+func TestProxyUDPAliasDialsRouteAddr(t *testing.T) {
+	f, d := udpFwd(t, "x", []string{"ubuntu1st:53", "10.9.0.0/16"}, udpEcho(t, "A"))
+	addr, _ := startProxy(t, "", f)
+	_, u := associate(t, addr)
+	if got, ok := udpAsk(t, u, "ubuntu1st", 53, "a", 3*time.Second); !ok || got != "A:a" {
+		t.Errorf("别名回包 = %q, %v", got, ok)
+	}
+	if got, ok := udpAsk(t, u, "10.9.1.1", 53, "b", 3*time.Second); !ok || got != "A:b" {
+		t.Errorf("CIDR 回包 = %q, %v", got, ok)
+	}
+	if g := d.got(); len(g) != 2 || g[0] != "udp x:1" || g[1] != "udp 10.9.1.1:53" {
+		t.Errorf("线路拨的目的 = %v", g)
+	}
+}

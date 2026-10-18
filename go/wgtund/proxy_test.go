@@ -109,7 +109,8 @@ func connectOK(t *testing.T, proxy, host string, port int) net.Conn {
 	return c
 }
 
-// 命中规则：走该转发的当前线路，线路连到的是程序请求的真实目的（IPv4 与域名），流量计在该转发上
+// 命中规则：走该转发的当前线路，流量计在该转发上；精确 主机:端口 的 target 是别名（拨线路 addr），
+// 不带端口的规则仍拨程序请求的真实目的（域名不先解析）
 func TestProxyRuleUsesCurrentRouteToRealDest(t *testing.T) {
 	a := startFwdUpstream(t, "A")
 	f, ds := recFwd(t, "smb", []string{"10.116.7.250:445", "Intra.Example"}, a)
@@ -123,10 +124,15 @@ func TestProxyRuleUsesCurrentRouteToRealDest(t *testing.T) {
 	if l := askOnce(t, c2, "yo"); l != "A:yo\n" {
 		t.Errorf("域名回程 = %q", l)
 	}
-	if g := ds[0].got(); len(g) != 2 || g[0] != "10.116.7.250:445" || g[1] != "intra.example:8080" {
+	if g := ds[0].got(); len(g) != 2 || g[0] != "route-addr:1" || g[1] != "intra.example:8080" {
 		t.Errorf("线路拨的目的 = %v（域名不该被先解析）", g)
 	}
-	if v := f.tc.view(); v.UpTotal != 6 || v.DownTotal != 10 { // 上行 3+3，下行 5+5
+	// 上行 3+3，下行 5+5；计数在拷贝协程里记，比回程到达稍晚，轮询等齐
+	deadline := time.Now().Add(2 * time.Second)
+	for f.tc.view().UpTotal < 6 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if v := f.tc.view(); v.UpTotal != 6 || v.DownTotal != 10 {
 		t.Errorf("流量计数 = %+v", v)
 	}
 }
@@ -272,5 +278,27 @@ func TestProxyTunnelWithoutDNSRejectsDomain(t *testing.T) {
 	connectOK(t, addr, "10.116.7.250", 445) // IP 目的照常
 	if len(ds[0].got()) != 1 {
 		t.Errorf("IP 目的应拨出: %v", ds[0].got())
+	}
+}
+
+// CIDR 规则和带端口的 CIDR 不是别名：仍拨程序请求的真实目的；精确域名:端口 是别名
+func TestProxyAliasOnlyForExactHostPort(t *testing.T) {
+	a := startFwdUpstream(t, "A")
+	f, ds := recFwd(t, "x", []string{"10.1.0.0/16", "10.2.0.0/16:80", "10.3.3.3", "ubuntu1st:22"}, a)
+	addr, _ := startProxy(t, "", f)
+	for _, d := range []struct {
+		host string
+		port int
+	}{{"10.1.2.3", 22}, {"10.2.2.2", 80}, {"10.3.3.3", 9}, {"Ubuntu1st", 22}} {
+		c := connectOK(t, addr, d.host, d.port)
+		askOnce(t, c, "x")
+		c.Close()
+	}
+	want := []string{"10.1.2.3:22", "10.2.2.2:80", "10.3.3.3:9", "route-addr:1"}
+	g := ds[0].got()
+	for i := range want {
+		if len(g) != len(want) || g[i] != want[i] {
+			t.Fatalf("线路拨的目的 = %v，期望 %v", g, want)
+		}
 	}
 }

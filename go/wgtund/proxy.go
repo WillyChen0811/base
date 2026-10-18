@@ -1,4 +1,4 @@
-// proxy.go：程序级接管的入口——回环上的 SOCKS5 代理口（无认证，只支持 CONNECT，地址类型 IPv4/域名/IPv6）。
+// proxy.go：程序级接管的入口——回环上的 SOCKS5 代理口（无认证，支持 CONNECT 和 UDP ASSOCIATE（见 proxy_udp.go），地址类型 IPv4/域名/IPv6）。
 // 程序照常写真实地址，收到 CONNECT 目的 D 后按各转发的 target 规则选最具体的一条（见 proxy_rule.go），
 // 用它的当前线路拨到 D 本身，复用转发的登记、流量统计和切线路关连接；没命中任何规则走 proxy_default：
 // direct（默认，计入「其他（直连）」）或某条转发的名字。域名不先解析，交给最终拨号的那条线路解析。
@@ -157,7 +157,7 @@ const (
 // serve 处理一条代理连接：握手 → 找转发 → 当前线路拨号 → 应答 → 转交转发的 relay。
 func (p *proxySvc) serve(c net.Conn) {
 	c.SetDeadline(time.Now().Add(10 * time.Second)) // 只管握手阶段，拨号前清掉
-	dest, rep := socksHandshake(c)
+	dest, cmd, rep := socksHandshake(c)
 	if rep != repOK {
 		if dest != "" || rep != repFailure {
 			socksReply(c, rep)
@@ -166,6 +166,10 @@ func (p *proxySvc) serve(c net.Conn) {
 		return
 	}
 	c.SetDeadline(time.Time{}) // 拨号有自己的 dialTimeout；慢线路上握手+拨号超过 10 秒也不该掐掉已拨通的连接
+	if cmd == cmdUDPAssociate {
+		p.serveUDP(c) // 请求里的目的只是客户端将用的源地址，不用
+		return
+	}
 	f := p.pick(dest)
 	up, gen, err := f.dialTo(dest)
 	if err != nil {
@@ -196,16 +200,16 @@ func dialRep(err error) byte {
 	return repFailure
 }
 
-// socksHandshake 完成方法协商并读 CONNECT 请求，返回目的 主机:端口；失败返回应答码
+// socksHandshake 完成方法协商并读 CONNECT / UDP ASSOCIATE 请求，返回目的 主机:端口和命令；失败返回应答码
 // （dest 为空且 rep==repFailure 表示协议已乱，不必回应答）。
-func socksHandshake(c net.Conn) (string, byte) {
+func socksHandshake(c net.Conn) (string, byte, byte) {
 	h := make([]byte, 2)
 	if _, err := io.ReadFull(c, h); err != nil || h[0] != 5 {
-		return "", repFailure
+		return "", 0, repFailure
 	}
 	methods := make([]byte, h[1])
 	if _, err := io.ReadFull(c, methods); err != nil {
-		return "", repFailure
+		return "", 0, repFailure
 	}
 	noAuth := false
 	for _, m := range methods {
@@ -213,45 +217,45 @@ func socksHandshake(c net.Conn) (string, byte) {
 	}
 	if !noAuth {
 		c.Write([]byte{5, 0xff})
-		return "", repFailure
+		return "", 0, repFailure
 	}
 	if _, err := c.Write([]byte{5, 0}); err != nil {
-		return "", repFailure
+		return "", 0, repFailure
 	}
 	r := make([]byte, 4)
 	if _, err := io.ReadFull(c, r); err != nil || r[0] != 5 {
-		return "", repFailure
+		return "", 0, repFailure
 	}
 	var host string
 	switch r[3] {
 	case 1, 4:
 		ip := make([]byte, map[byte]int{1: 4, 4: 16}[r[3]])
 		if _, err := io.ReadFull(c, ip); err != nil {
-			return "", repFailure
+			return "", 0, repFailure
 		}
 		host = net.IP(ip).String()
 	case 3:
 		l := make([]byte, 1)
 		if _, err := io.ReadFull(c, l); err != nil {
-			return "", repFailure
+			return "", 0, repFailure
 		}
 		name := make([]byte, l[0])
 		if _, err := io.ReadFull(c, name); err != nil {
-			return "", repFailure
+			return "", 0, repFailure
 		}
 		host = string(name)
 	default:
-		return "x", repAtypNotSupp
+		return "x", 0, repAtypNotSupp
 	}
 	pb := make([]byte, 2)
 	if _, err := io.ReadFull(c, pb); err != nil {
-		return "", repFailure
+		return "", 0, repFailure
 	}
 	dest := net.JoinHostPort(host, strconv.Itoa(int(pb[0])<<8|int(pb[1])))
-	if r[1] != 1 {
-		return dest, repCmdNotSupp
+	if r[1] != 1 && r[1] != cmdUDPAssociate {
+		return dest, r[1], repCmdNotSupp
 	}
-	return dest, repOK
+	return dest, r[1], repOK
 }
 
 // socksReply 写应答（绑定地址固定填 0.0.0.0:0，客户端用不到）。

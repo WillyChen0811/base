@@ -55,13 +55,17 @@
   ```
   适合远端服务只听 127.0.0.1 的情况，流量全程走 SSH 加密。SSH 断开重连后新进来的连接用新连接，在途的随旧连接结束；
   `/forwards` 的线路项多带 `via` 字段（未用时省略）。
-- 程序级接管（可选）：顶层 `proxy` 在回环上开 SOCKS5 口（无认证，只支持 CONNECT；IPv4/域名），程序照常写真实地址，
+- 程序级接管（可选）：顶层 `proxy` 在回环上开 SOCKS5 口（无认证，支持 CONNECT 和 UDP ASSOCIATE；IPv4/域名），程序照常写真实地址，
   由 wgtund 按线路选路。转发的 `target`（数组，每条是 IP、CIDR 或域名，可带 `:端口`）是匹配规则，命中多条取最具体的
   （精确 IP > 长前缀 > 短前缀，带端口的优先）；命中后用该转发的当前线路拨到请求的真实目的（不是 route 里的 addr）。
   没命中的走 `proxy_default`：`direct`（缺省，流量计入 `/forwards` 里名为「其他（直连）」的项）或某条转发的名字。
   `listen` 可省（只给 `target` 的转发不开本机口）；`listen` 的端口转发仍拨 route 的 addr。
   域名不预先解析：直连在本机解析，隧道线路用该隧道 conf 的 `DNS=` 在隧道内解析（没配则失败并在转发 `error` 写明，不回落本机），
   `via` 线路原样交给 SSH 对端解析。代理口地址在启动信息和 `/status` 的 `proxy` 字段。
+  UDP（SOCKS5 UDP ASSOCIATE，`proxy_udp.go`）：每条控制连接开一个回环 UDP 中继口，客户端数据报带标准 UDP 头（FRAG≠0 丢弃），
+  规则选转发与 TCP 相同；隧道线路由隧道 netstack 发（域名用隧道 DNS，没配则丢包并记 `error`），直连本机发，
+  `via` 线路带不了 UDP（丢包，`error` 写「经 SSH 的线路不支持 UDP」）。出站套接字按「客户端源地址+目的」复用、空闲 60 秒回收，
+  控制连接断开即关中继口；UDP 流量计入对应转发（或「其他（直连）」）。
   ```json
   "proxy": "127.0.0.1:1080", "proxy_default": "direct",
   "forwards": [{"name": "smb", "target": ["10.116.7.250:445", "10.116.0.0/16"],

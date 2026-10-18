@@ -305,3 +305,24 @@ def test_http_跟随重定向():
             wgnet.http.get(base + "/loop")
     finally:
         srv.shutdown()
+
+
+def test_http_错误响应正文卡住_仍报状态码():
+    import threading as _t
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+
+    def serve():
+        c, _ = srv.accept()
+        c.recv(65536)
+        c.sendall(b"HTTP/1.1 503 Busy\r\nContent-Length: 100\r\n\r\npartial")   # 说好 100 字节只发 7 字节然后卡住
+        _t.Event().wait(3)
+        c.close()
+
+    _t.Thread(target=serve, daemon=True).start()
+    try:
+        r = wgnet.http.get(f"http://127.0.0.1:{srv.getsockname()[1]}/", timeout=1)
+        assert r.status == 503
+    finally:
+        srv.close()

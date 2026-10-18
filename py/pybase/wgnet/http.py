@@ -106,7 +106,14 @@ def _once(method, url, headers, body, timeout, stream, context) -> Response:
         conn.request(method.upper(), target, body=body, headers=headers or {})
         r = Response(conn, conn.getresponse())
         if not stream:
-            r.body
+            if r.status >= 400:
+                try:
+                    r.body
+                except (OSError, http.client.HTTPException):   # 错误响应的正文读不全也照样交出状态码，别报成连接错误
+                    r._body = b""
+                    r.close()
+            else:
+                r.body
         return r
     except BaseException:
         if r is not None:

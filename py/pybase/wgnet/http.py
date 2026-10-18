@@ -46,6 +46,7 @@ class Response:
         return self._body
 
     def close(self) -> None:
+        self._resp.close()      # Connection: close / HTTP/1.0 时套接字归响应持有，只关连接关不到
         self._conn.close()
 
     def __enter__(self):

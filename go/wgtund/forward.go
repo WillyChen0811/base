@@ -5,7 +5,6 @@ package wgtund
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -313,57 +312,6 @@ func (f *forwardSvc) untrack(cs ...net.Conn) {
 		delete(f.conns, c)
 	}
 	f.mu.Unlock()
-}
-
-// dial 在当前线路上拨到线路的远端 addr；dialTo 可指定另一个目的（proxy 口用：线路只决定怎么出去）。
-func (f *forwardSvc) dial() (net.Conn, int, error) { return f.dialTo("") }
-
-// dialTo 在当前线路上拨到 dest（空则用线路自己的 addr；超时 dialTimeout），成败都记进状态给 /forwards；
-// 拨号期间用户切了线路（gen 变了）就把这条旧线路的连接关掉（同主机 conn 的防护）。
-// 同时返回拨号所属的代际 gen，交给 track 在同一把锁里验过再登记——堵住「dial 已返回、
-// track 未登记」的窗口（那期间 switchRoute 关不到这条还没进集合的连接）。
-func (f *forwardSvc) dialTo(dest string) (net.Conn, int, error) {
-	f.mu.Lock()
-	idx, gen := f.active, f.gen
-	addr, d := f.routes[idx].Addr, f.dialers[idx]
-	f.mu.Unlock()
-	if dest != "" {
-		addr = dest
-	}
-
-	ctx, cancel := context.WithTimeout(f.ctx, dialTimeout)
-	defer cancel()
-	c, err := d.DialContext(ctx, "tcp", addr)
-
-	f.mu.Lock()
-	if f.gen != gen {
-		f.mu.Unlock()
-		if c != nil {
-			c.Close()
-		}
-		return nil, gen, errors.New("线路已切换，请重试")
-	}
-	f.connected = err == nil
-	if err != nil {
-		f.lastErr = err.Error()
-		sysLog.logThrottled("fwd:"+f.name, f.lastErr, "转发 %s 拨号失败（线路 %s）：%v", f.name, f.routes[idx].Label, err)
-		if idx == 0 && len(f.routes) > 1 {
-			setFlagLog(&f.preferredDown, true, "preferred_down =", "转发 "+f.name)
-		}
-	} else {
-		f.lastErr = ""
-		if sysLog.clearThrottle("fwd:" + f.name) {
-			logf("转发 %s 拨号恢复（线路 %s）", f.name, f.routes[idx].Label)
-		}
-		if idx == 0 {
-			setFlagLog(&f.preferredDown, false, "preferred_down =", "转发 "+f.name)
-		}
-	}
-	f.mu.Unlock()
-	if err != nil && c != nil {
-		c.Close() // 自写 Dialer 万一返回了半连接也别漏
-	}
-	return c, gen, err
 }
 
 // switchRoute 切到第 idx 条线路：清状态并关掉当前所有已转发的连接（之后的新连接走新线路）。

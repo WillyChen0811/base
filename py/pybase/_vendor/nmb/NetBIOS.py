@@ -1,3 +1,4 @@
+# 注意：本文件已被 pybase 修改，不是原版（import 路径与外连改动见 pybase/_vendor/PATCHES.md）。
 
 from pybase import wgnet
 import os, logging, random, socket, time, select

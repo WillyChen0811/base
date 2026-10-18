@@ -1,3 +1,4 @@
+# 注意：本文件已被 pybase 修改，不是原版（import 路径与外连改动见 pybase/_vendor/PATCHES.md）。
 import os, sys, socket, urllib.request, urllib.error, urllib.parse, mimetypes, email, tempfile
 from urllib.parse import (unwrap, unquote, splittype, splithost, quote,
      splitport, splittag, splitattr, splituser, splitpasswd, splitvalue)

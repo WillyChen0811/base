@@ -68,6 +68,9 @@ PLAIN_IMPORT = [("import smbclient.path\n", "from pybase._vendor.smbclient impor
 FORBIDDEN = [r"socket\.create_connection", r"socket\.socket\(", r"\.connect\(\s*\(", r"\bsocket\.fromfd\b"]
 
 
+MARK = "# 注意：本文件已被 pybase 修改，不是原版（import 路径与外连改动见 pybase/_vendor/PATCHES.md）。\n"
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--site-packages", help="源码所在目录，缺省取已安装的 smbclient 所在处")
@@ -92,6 +95,7 @@ def main() -> int:
 
     # 1) 包内 import 指向拷贝
     n_imp = 0
+    altered = set()     # 改过的文件：最后在开头标明是修改版（pysmb 的 zlib 许可证要求）
     for f in VENDOR.rglob("*.py"):
         if f.parent == VENDOR:
             continue
@@ -103,6 +107,7 @@ def main() -> int:
         n_imp += k
         if new != text:
             f.write_text(new, encoding="utf-8")
+            altered.add(f)
     left = [str(f.relative_to(VENDOR)) for f in VENDOR.rglob("*.py")
             if re.search(r"^\s*(import|from)\s+(smbprotocol|smbclient|smb|nmb)\b", f.read_text(encoding="utf-8"), re.M)]
     if left:
@@ -118,12 +123,22 @@ def main() -> int:
             print(f"{rel}：期望 {expect} 处，实际 {text.count(old)} 处（库版本变了？）\n--- {old!r}", file=sys.stderr)
             return 1
         f.write_text(text.replace(old, new), encoding="utf-8")
+        altered.add(f)
         rows.append((rel, kind, expect, note))
     for rel in sorted(NEEDS_WG):
         f = VENDOR / rel
         lines = f.read_text(encoding="utf-8").splitlines(keepends=True)
         idx = next(i for i, l in enumerate(lines) if re.match(r"(import|from)\s", l))
         lines.insert(idx, WG_IMPORT)
+        f.write_text("".join(lines), encoding="utf-8")
+
+    for f in altered:   # 标明修改版：放在第一行之后，不挤掉 shebang/编码声明的位置要求
+        lines = f.read_text(encoding="utf-8").splitlines(keepends=True)
+        mark = MARK
+        at = 1 if lines and (lines[0].startswith("#!") or "coding" in lines[0]) else 0
+        if at == 1 and len(lines) > 1 and "coding" in lines[1]:
+            at = 2
+        lines.insert(at, mark)
         f.write_text("".join(lines), encoding="utf-8")
 
     # 3) 自检

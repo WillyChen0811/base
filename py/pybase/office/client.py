@@ -1,18 +1,19 @@
-"""Word→PDF 转换服务的客户端 —— 跨平台，纯 requests。
+"""Word→PDF 转换服务的客户端 —— 跨平台，经 wgnet.http。
 
 输入输出都是 bytes，不落盘：docx 字节直接作为请求体发出，PDF 字节直接从响应体
 读回。协议细节（query 参数、错误 JSON 格式、错误码含义）见 `pybase.office`
 模块文档字符串。
 """
 
+import http.client
 import json
 import logging
 import time
 from dataclasses import dataclass, field
 from typing import Optional
-from urllib.parse import unquote
+from urllib.parse import unquote, urlencode
 
-import requests
+from .. import wgnet
 
 from .errors import (
     AuthenticationError,
@@ -91,17 +92,17 @@ class WordPdfClient:
         while True:
             attempt += 1
             try:
-                resp = requests.post(
-                    url, params=params, data=docx_bytes,
-                    headers=self._headers(), timeout=self.timeout,
+                resp = wgnet.http.post(
+                    f"{url}?{urlencode(params)}", docx_bytes,
+                    self._headers(), timeout=self.timeout,
                 )
-            except requests.Timeout as e:
+            except TimeoutError as e:
                 # 客户端本地等到没等到——不重试：如果是服务端卡住了，重试大概率
                 # 还是卡住（队列里排在后面）；如果只是网络抖了一下，交给下面
                 # 的 RequestException 分支处理更合适，Timeout 单独判是为了不
                 # 把它误判成"连不上"从而做无意义的重试消耗调用方的耐心。
                 raise ConversionTimeoutError(f"客户端等待超时（{self.timeout}s 未收到响应）: {e}") from e
-            except requests.RequestException as e:
+            except (OSError, http.client.HTTPException) as e:
                 if attempt <= self.max_retries:
                     logger.warning(
                         "连接 office 服务失败，%.1fs 后重试(%d/%d): %s",
@@ -111,18 +112,18 @@ class WordPdfClient:
                     continue
                 raise ConnectionUnavailableError(f"连不上 office 服务 {self.endpoint}: {e}") from e
 
-            if resp.status_code == 200:
+            if resp.status == 200:
                 page_count = 0
                 try:
                     page_count = int(resp.headers.get("X-Page-Count", 0) or 0)
                 except ValueError:
                     pass
                 warnings = self._parse_warnings(resp)
-                return ConvertResult(pdf_bytes=resp.content, page_count=page_count, warnings=warnings)
+                return ConvertResult(pdf_bytes=resp.body, page_count=page_count, warnings=warnings)
 
             error_code, message = self._parse_error(resp)
 
-            if resp.status_code == 503 and attempt <= self.max_retries:
+            if resp.status == 503 and attempt <= self.max_retries:
                 logger.warning(
                     "office 服务繁忙(503)，%.1fs 后重试(%d/%d): %s",
                     self.retry_interval, attempt, self.max_retries, message,
@@ -130,17 +131,17 @@ class WordPdfClient:
                 time.sleep(self.retry_interval)
                 continue
 
-            raise self._map_error(resp.status_code, error_code, message)
+            raise self._map_error(resp.status, error_code, message)
 
     def health(self) -> dict:
         url = f"{self.endpoint}/health"
         try:
-            resp = requests.get(url, headers=self._headers(), timeout=self.timeout)
-        except requests.RequestException as e:
+            resp = wgnet.http.get(url, self._headers(), timeout=self.timeout)
+        except (OSError, http.client.HTTPException) as e:
             raise ConnectionUnavailableError(f"连不上 office 服务 {self.endpoint}: {e}") from e
-        if resp.status_code != 200:
+        if resp.status != 200:
             error_code, message = self._parse_error(resp)
-            raise self._map_error(resp.status_code, error_code, message)
+            raise self._map_error(resp.status, error_code, message)
         return resp.json()
 
     @staticmethod
@@ -149,7 +150,7 @@ class WordPdfClient:
             body = resp.json()
             return body.get("error", "unknown"), body.get("message", resp.text)
         except ValueError:
-            return "unknown", (resp.text or f"HTTP {resp.status_code}")
+            return "unknown", (resp.text or f"HTTP {resp.status}")
 
     @staticmethod
     def _parse_warnings(resp) -> list:

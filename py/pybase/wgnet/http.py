@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import http.client
+import json
 import ssl
 from typing import Dict, Optional, Tuple
 from urllib.parse import urlsplit
@@ -44,6 +45,19 @@ class Response:
             self._body = self.read()
             self.close()
         return self._body
+
+    def readline(self) -> bytes:
+        return self._resp.readline()
+
+    def __iter__(self):
+        return iter(self._resp)
+
+    def json(self):
+        return json.loads(self.body.decode("utf-8"))
+
+    @property
+    def text(self) -> str:
+        return self.body.decode("utf-8", errors="replace")
 
     def close(self) -> None:
         self._resp.close()      # Connection: close / HTTP/1.0 时套接字归响应持有，只关连接关不到

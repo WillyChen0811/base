@@ -36,9 +36,7 @@ smb = [
 crypto = [
     "cryptography>=44.0.0",
 ]
-office = [
-    "requests>=2.31.0",
-]
+office = []
 office-word = [
     "pywin32>=306; sys_platform == 'win32'",
 ]

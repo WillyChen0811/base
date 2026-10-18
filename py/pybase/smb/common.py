@@ -11,8 +11,8 @@ from typing import List, Optional
 from ..tmpname import tmp_names
 
 # NtStatus：判定“服务端嫌文件名不合法”这一种失败，见 _is_name_rejected
-from smbprotocol.exceptions import NtStatus
-from smbprotocol.open import FilePipePrinterAccessMask
+from .._vendor.smbprotocol.exceptions import NtStatus
+from .._vendor.smbprotocol.open import FilePipePrinterAccessMask
 
 # 建连超时（秒）。smbprotocol 默认 60，而 connect() 在加密握手失败时会原样重试一次
 # 非加密，一台不可达的服务器最坏能卡满 2×60 秒；RPC 是 stdio 单线程，这段卡顿会

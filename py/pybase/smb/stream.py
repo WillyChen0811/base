@@ -16,7 +16,7 @@ import errno
 import stat as stat_mod
 from typing import BinaryIO, Dict, Optional
 
-import smbclient
+from .._vendor import smbclient
 
 from .common import _READ_ACCESS, _dt_iso
 

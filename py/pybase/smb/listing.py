@@ -9,8 +9,8 @@
 import logging
 from typing import Callable, Dict, Generator, List, Optional
 
-import smbclient
-import smbclient.path as smbpath
+from .._vendor import smbclient
+from .._vendor.smbclient import path as smbpath
 
 from .common import _FILE_ATTRIBUTE_DIRECTORY, _READ_ACCESS, _dt_iso
 

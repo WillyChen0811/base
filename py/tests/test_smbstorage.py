@@ -299,7 +299,7 @@ def test_密码来源_参数优先_其次回调():
 
 
 def test_真实SMBClient拿到的凭据():
-    pytest.importorskip("smbclient")
+    pytest.importorskip("pybase._vendor.smbclient")
     set_credential_provider(lambda *a: "pw")
     try:
         c = SMBStorage("h", "s", user="u")._make_client()
@@ -337,5 +337,5 @@ def test_copy_file_resumable_本地到SMB_断点续传(env, tmp_path):
 @pytest.mark.skipif(not (shutil.which("smbd") and os.environ.get("PYBASE_SMBD_TEST")),
                     reason="集成测试需要本机 smbd 与 smbprotocol，并设 PYBASE_SMBD_TEST=1；本机未满足，已由替身覆盖")
 def test_集成_本机smbd():
-    pytest.importorskip("smbclient")
+    pytest.importorskip("pybase._vendor.smbclient")
     pytest.skip("需自行配置 smbd 共享后补全地址与凭据")

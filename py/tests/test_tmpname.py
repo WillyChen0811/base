@@ -33,7 +33,7 @@ def test_候选规则():
 
 
 def test_smb_tmp_names_沿用同一规则():
-    pytest.importorskip("smbprotocol")
+    pytest.importorskip("pybase._vendor.smbprotocol")
     from pybase.smb.common import _tmp_names
     assert _tmp_names("a.docx") == ["a.docx.wsu", "a.wsu"]
 

@@ -1,7 +1,7 @@
 """经 SMB 访问共享内的某个目录的 `Storage` 实现，建立在 `pybase.smb.SMBClient` 之上。
 
-依赖 smbprotocol：`pip install "pybase[smb]"`（本模块 import 时不加载它，第一次连接才加载，
-所以没装 smb 也能 import、序列化规格）。
+SMB 库已拷进 `pybase/_vendor`；它们的第三方依赖用 `pip install "pybase[smb]"`（本模块 import 时不加载，
+第一次连接才加载，所以没装 smb 也能 import、序列化规格）。
 
 - `share` 是共享名，`root` 是共享**内**的目录（可为空 = 共享根）；`Storage` 的相对路径都换算到
   `root` 下，含 `..` 或绝对路径一律 `ValueError`，跑不出 root。

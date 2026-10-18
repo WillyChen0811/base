@@ -26,8 +26,10 @@ sheets = [
     "xlrd>=2.0.1",
 ]
 smb = [
-    "smbprotocol>=1.10.0",
-    "pysmb>=1.2.9",
+    # smbprotocol / pysmb 本身已整库拷进 pybase/_vendor，这里只装它们的第三方依赖
+    "cryptography>=44.0.0",
+    "pyspnego",
+    "pyasn1",
     "requests>=2.31.0",
     "urllib3>=2.0.0",
 ]

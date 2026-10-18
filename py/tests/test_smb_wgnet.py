@@ -1,5 +1,5 @@
-"""SMB 传输层经 wgnet.tcp：配了代理时三个入口（smbprotocol 会话 / pysmb 列共享 / 端口探测 / HTTP 取文件）
-对桩 SOCKS5 报的都是真实目的地址；没配时照旧系统直连。"""
+"""SMB 库已整库拷进 pybase._vendor 且外连换成 wgnet：配了代理时各入口（smbclient 会话与断线重连 /
+pysmb 列共享 / NetBIOS UDP / 端口探测 / HTTP 取文件）对桩 SOCKS5 报的都是真实目的地址；没配时照旧系统直连。"""
 
 import os
 import socket
@@ -15,7 +15,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from pybase import smbstorage, wgnet          # noqa: E402
 from pybase.smb import http_fetch             # noqa: E402
 from pybase.smb.client import SMBClient, list_shares   # noqa: E402
-from pybase.smb.transport import WgConnection, WgTcp, ensure_connection   # noqa: E402
+from pybase._vendor import smbclient               # noqa: E402
+from pybase._vendor.smbprotocol.transport import Tcp   # noqa: E402
 from test_socks5 import Stub                  # noqa: E402
 
 
@@ -54,16 +55,61 @@ def test_smb会话经代理_域名原样(refusing_proxy):
     assert _hosts(refusing_proxy)[0] == ("nas.corp.example", 1445)
 
 
-def test_缓存里的连接是WgConnection(refusing_proxy):
-    cache = {}
+def test_断线后smbclient自己重连也经代理(refusing_proxy):
+    """缓存里是条已断开的连接：register_session 会自己 new Connection 重连，这条路径也必须走 wgnet。"""
+    class Dead:
+        class transport:
+            connected = False
+    cache = {"10.1.2.3:445": Dead()}
     with pytest.raises(ValueError, match="Failed to connect"):
-        ensure_connection(cache, "10.1.2.3", 445, 3)
-    assert not cache and _hosts(refusing_proxy) == [("10.1.2.3", 445)]
-    conn = WgConnection(b"0" * 16, "10.1.2.3", 445)
-    assert isinstance(conn.transport, type(None))
-    from smbprotocol.transport import Tcp
-    conn.transport = Tcp("10.1.2.3", 445, 3)          # 库内部这样赋值
-    assert isinstance(conn.transport, WgTcp)
+        smbclient.register_session("10.1.2.3", username="u", password="p", port=445,
+                                   connection_cache=cache, connection_timeout=3)
+    assert _hosts(refusing_proxy) == [("10.1.2.3", 445)]
+
+
+def test_Tcp直接建连经代理(refusing_proxy):
+    t = Tcp("nas.corp.example", 445, 3)
+    with pytest.raises(ValueError, match="Failed to connect"):
+        t.connect()
+    assert _hosts(refusing_proxy) == [("nas.corp.example", 445)]
+
+
+def test_NetBIOS的UDP经wgnet():
+    from pybase._vendor.nmb.NetBIOS import NetBIOS
+    srv = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    srv.bind(("127.0.0.1", 0))
+    srv.settimeout(3)
+    nb = NetBIOS(broadcast=False)
+    try:
+        assert nb.queryIPForName("127.0.0.1", port=srv.getsockname()[1], timeout=0.3) is None
+        data, _ = srv.recvfrom(1024)
+        assert len(data) > 12
+    finally:
+        nb.close()
+        srv.close()
+
+
+def test_导入pybase_smb不加载site_packages里的原版():
+    import subprocess
+    code = ("import sys, pybase.smb, pybase.smb.client, pybase.smbstorage;"
+            "bad=[m for m in sys.modules if m.split('.')[0] in ('smbprotocol','smbclient','smb','nmb')];"
+            "print(bad); sys.exit(1 if bad else 0)")
+    r = subprocess.run([sys.executable, "-c", code], cwd=REPO, capture_output=True, text=True)
+    assert r.returncode == 0, r.stdout + r.stderr
+
+
+def test_vendor拷贝里没有外连用的socket():
+    import re
+    root = os.path.join(REPO, "pybase", "_vendor")
+    pat = re.compile(r"socket\.create_connection|socket\.socket\(")
+    bad = []
+    for d, _, fs in os.walk(root):
+        for f in fs:
+            if f.endswith(".py"):
+                for i, line in enumerate(open(os.path.join(d, f), encoding="utf-8"), 1):
+                    if pat.search(line) and not line.lstrip().startswith("#"):
+                        bad.append(f"{f}:{i}")
+    assert not bad, bad
 
 
 def test_pysmb列共享经代理(refusing_proxy):
@@ -88,7 +134,7 @@ def test_没配代理照旧系统直连():
     srv.bind(("127.0.0.1", 0))
     srv.listen(1)
     port = srv.getsockname()[1]
-    t = WgTcp("127.0.0.1", port, 3)
+    t = Tcp("127.0.0.1", port, 3)
     t.connect()
     assert t.connected
     t.close()

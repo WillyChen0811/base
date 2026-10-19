@@ -16,8 +16,10 @@ import (
 // keepalive 参数；测试里调小。
 var (
 	keepAliveInterval = 15 * time.Second
-	keepAliveTimeout  = 10 * time.Second
-	keepAliveMaxFails = 3 // 连续这么多次请求出错才判定断开；单次超过 keepAliveTimeout 无响应立即判定
+	// 单次请求超过 keepAliveTimeout 无响应立即判定断开。程序内隧道会成串丢包、偶尔卡十几秒，
+	// 10 秒会把卡顿误判成断线、踢掉终端；放宽到 60 秒，真断线最晚约 75 秒发现（传输出错仍立即发现）。
+	keepAliveTimeout  = 60 * time.Second
+	keepAliveMaxFails = 3 // 连续这么多次请求出错才判定断开
 )
 
 // failCounter 统计连续失败：成功清零，达到 max 次连续失败返回 true。

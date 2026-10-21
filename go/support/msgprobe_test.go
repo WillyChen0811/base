@@ -204,3 +204,34 @@ func TestProbeGoneExpire(t *testing.T) {
 		t.Error("会话还在的 gone 不该清")
 	}
 }
+
+// PeersKick（界面轮询用）不等核对：探测卡住时立即返回当前状态，核对完成后的结果下一次可见。
+func TestPeersKickDoesNotWait(t *testing.T) {
+	f, _ := newProbeFixture()
+	release := make(chan struct{})
+	f.hub.cfg.PaneProbe = func(context.Context, string) (PaneInfo, error) {
+		<-release
+		return PaneInfo{Exists: false}, nil
+	}
+	ackPeer(t, f.hub, "mac:codex1", PeerBusy)
+
+	done := make(chan map[string]PeerState, 1)
+	go func() { done <- f.hub.PeersKick() }()
+	select {
+	case peers := <-done:
+		if peers["mac:codex1"] != PeerBusy {
+			t.Fatalf("核对没完成前应返回原状态，实际 %q", peers["mac:codex1"])
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("PeersKick 不该等探测")
+	}
+
+	close(release)
+	deadline := time.Now().Add(2 * time.Second)
+	for f.hub.Peers()["mac:codex1"] != PeerGone {
+		if time.Now().After(deadline) {
+			t.Fatalf("后台核对完成后应记 gone，实际 %q", f.hub.Peers()["mac:codex1"])
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}

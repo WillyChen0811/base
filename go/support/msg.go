@@ -1395,26 +1395,42 @@ func (h *Hub) hasPendingToLocked(addr string) bool {
 }
 
 // PeersChecked 先逐个核对对端表里各地址的会话（并发，整体受 ctx 限制），再返回对端状态表。
-// 列对端（GET /msg、/msg/who）用它，不用裸的 Peers。
+// 要当场准确的地方（/msg/who）用它；界面轮询用 PeersKick，不等核对。
 func (h *Hub) PeersChecked(ctx context.Context) map[string]PeerState {
-	if h.cfg.PaneProbe != nil {
-		h.mu.Lock()
-		addrs := make([]string, 0, len(h.peers))
-		for a := range h.peers {
-			addrs = append(addrs, a)
-		}
-		h.mu.Unlock()
-		var wg sync.WaitGroup
-		for _, a := range addrs {
-			wg.Add(1)
-			go func(a string) {
-				defer wg.Done()
-				h.checkPeer(ctx, a)
-			}(a)
-		}
-		wg.Wait()
+	var wg sync.WaitGroup
+	for _, a := range h.peerAddrs() {
+		wg.Add(1)
+		go func(a string) {
+			defer wg.Done()
+			h.checkPeer(ctx, a)
+		}(a)
+	}
+	wg.Wait()
+	return h.Peers()
+}
+
+// PeersKick 在后台核对各地址（结果下一次轮询可见），立即返回当前对端状态表：
+// GET /msg 被界面频繁轮询，不能每次都等 Ubuntu 那边的 SSH 探测（线路慢时会卡到 probeTimeout）。
+// 节流由 checkPeer 自己做，重复触发不会重复查。
+func (h *Hub) PeersKick() map[string]PeerState {
+	for _, a := range h.peerAddrs() {
+		go h.checkPeer(context.Background(), a)
 	}
 	return h.Peers()
+}
+
+// peerAddrs 是对端表里的地址；没配 PaneProbe 时为空（不核对）。
+func (h *Hub) peerAddrs() []string {
+	if h.cfg.PaneProbe == nil {
+		return nil
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	addrs := make([]string, 0, len(h.peers))
+	for a := range h.peers {
+		addrs = append(addrs, a)
+	}
+	return addrs
 }
 
 // kindLabel 是消息类型在终端里的中文说法。

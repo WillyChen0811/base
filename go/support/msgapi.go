@@ -171,7 +171,7 @@ func (s *Service) msgList(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"messages":   s.hub.List(),
 		"auto_until": autoUntilUnix(s.hub),
-		"peers":      s.hub.PeersChecked(r.Context()),
+		"peers":      s.hub.PeersKick(),
 		"link_down":  s.hub.LinkDown(),
 	})
 }

@@ -34,6 +34,7 @@ class _ScriptedServer:
     def __init__(self, responses):
         self.responses = list(responses)
         self.requests = []  # 记录每次请求的 path + 解析后的 body
+        self.headers = []  # 每次请求的请求头，跟 requests 一一对应
         port = _free_port()
         self.port = port
         self.httpd = http.server.HTTPServer(("127.0.0.1", port), self._make_handler())
@@ -59,6 +60,7 @@ class _ScriptedServer:
                 except json.JSONDecodeError:
                     parsed = None
                 outer.requests.append((self.path, parsed))
+                outer.headers.append(dict(self.headers))
                 if not outer.responses:
                     self.send_response(500)
                     self.end_headers()
@@ -104,6 +106,27 @@ def test_chat_json_mode_falls_back_on_error():
         assert len(server.requests) == 2
         assert "response_format" in server.requests[0][1]
         assert "response_format" not in server.requests[1][1]
+    finally:
+        server.stop()
+
+
+def test_extra_headers_sent_on_chat_and_embed():
+    server = _ScriptedServer(
+        [
+            _json_response(200, {"choices": [{"message": {"content": "hi"}}]}),
+            _json_response(200, {"data": [{"index": 0, "embedding": [0.1]}]}),
+        ]
+    )
+    try:
+        client = LlmClient(server.base_url, api_key="k",
+                           headers={"X-Xxyi-Priority": "9", "Content-Type": "text/plain"})
+        client.chat([{"role": "user", "content": "hello"}], json_mode=False)
+        client.embed(["a"])
+        for sent in server.headers:
+            assert sent["X-Xxyi-Priority"] == "9"
+            assert sent["Authorization"] == "Bearer k"
+            # 附加头不能把正文类型改掉
+            assert sent["Content-Type"] == "application/json"
     finally:
         server.stop()
 

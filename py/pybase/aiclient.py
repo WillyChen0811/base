@@ -45,6 +45,7 @@ class LlmClient:
         temperature: float = 0.2,
         timeout: float = 600,
         embeddings_path: str = "/v1/embeddings",
+        headers: Optional[dict] = None,
     ):
         if not base_url:
             raise AiRequestError("AI 接口地址未配置,请到 AI 设置页填写")
@@ -55,6 +56,8 @@ class LlmClient:
         self.model = model or None
         self.temperature = temperature
         self.timeout = timeout
+        # 每个请求都带上的附加请求头，如 oMLX 网关的 X-Xxyi-Priority / X-Xxyi-Client
+        self.headers = dict(headers or {})
 
     def chat(
         self,
@@ -88,9 +91,7 @@ class LlmClient:
         use_model = model or self.model
         if use_model:
             body["model"] = use_model
-        headers = {"Content-Type": "application/json"}
-        if self.api_key:
-            headers["Authorization"] = f"Bearer {self.api_key}"
+        headers = self._headers()
         try:
             with wgnet.http.post(self.embeddings_endpoint, json.dumps(body).encode("utf-8"), headers,
                                  timeout=self.timeout) as response:
@@ -117,6 +118,12 @@ class LlmClient:
 
     # ---------- 内部 ----------
 
+    def _headers(self) -> dict:
+        headers = {**self.headers, "Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        return headers
+
     @staticmethod
     def _check_cancel(cancel_event):
         if cancel_event is not None and cancel_event.is_set():
@@ -132,9 +139,7 @@ class LlmClient:
             body["model"] = self.model
         if json_mode:
             body["response_format"] = {"type": "json_object"}
-        headers = {"Content-Type": "application/json"}
-        if self.api_key:
-            headers["Authorization"] = f"Bearer {self.api_key}"
+        headers = self._headers()
         try:
             with wgnet.http.post(self.endpoint, json.dumps(body).encode("utf-8"), headers,
                                  timeout=self.timeout, stream=bool(on_delta)) as response:

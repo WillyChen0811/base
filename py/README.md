@@ -9,7 +9,7 @@
 
 - `pybase.rpc`：JSON-RPC 客户端/服务端底座（FastAPI 路由 / HTTP handler / stdio 三种服务端 + urllib 客户端）
 - `pybase.ramdisk`：内存级临时盘生命周期管理，支持同名同路径的多进程共享
-- `pybase.aiclient`：OpenAI 兼容客户端（`LlmClient`：chat.completions 与 embeddings）
+- `pybase.aiclient`：OpenAI 兼容客户端（`LlmClient`：chat.completions 与 embeddings；`headers` 给每个请求加附加头，如 oMLX 网关的 `X-Xxyi-Priority`）
 - `pybase.docx`：docx 格式属性写入（`oxml`）与模板渲染（`render`）
 - `pybase.sheets`：表格文件读取（`.xlsx`/`.xls`/`.csv`，路径或二进制文件对象均可），统一读成 `[[str]]`，不做类型推断
 - `pybase.smb`：SMB/WebDAV/File Station 三通道文件抓取 + SMB 客户端（连接、列目录、下载、上传、共享枚举）

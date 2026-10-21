@@ -389,7 +389,15 @@ func TestMacToolsBranchSchema(t *testing.T) {
 func TestMacToolBranchRequestBody(t *testing.T) {
 	var f fakeMac
 	srv := httptest.NewServer(macRunHandler(&f, http.StatusOK, func(r *http.Request) any {
-		return map[string]any{"exit_code": 0, "timed_out": false, "seconds": 1.0, "tail": "ok"}
+		// 新版服务端：带 branch 时输出首行是"分支 <branch> @ <提交>，目录 …"
+		reqs := f.reqList()
+		var body map[string]any
+		_ = json.Unmarshal(reqs[len(reqs)-1].body, &body)
+		tail := "ok"
+		if b, _ := body["branch"].(string); b != "" {
+			tail = "分支 " + b + " @ 0123456789ab，目录 /w/.xxyi-branch-build\nok"
+		}
+		return map[string]any{"exit_code": 0, "timed_out": false, "seconds": 1.0, "tail": tail}
 	}))
 	defer srv.Close()
 	useEndpoint(t, srv.URL)
@@ -436,5 +444,23 @@ func TestMacToolBranchRequestBody(t *testing.T) {
 	}
 	if f.count() != n {
 		t.Errorf("非法 branch 不该发请求")
+	}
+}
+
+// 旧版服务端不认识 branch、静默编当前检出的分支（输出里没有"分支 … @"首行）：结果作废、报错，不能当成编过了。
+func TestMacToolBranchOldServer(t *testing.T) {
+	var f fakeMac
+	srv := httptest.NewServer(macRunHandler(&f, http.StatusOK, func(r *http.Request) any {
+		return map[string]any{"exit_code": 0, "timed_out": false, "seconds": 1.0, "tail": "Build complete!"}
+	}))
+	defer srv.Close()
+	useEndpoint(t, srv.URL)
+
+	text, isErr := macTextResult(t, "mac_build", map[string]any{"branch": "feat/x"})
+	if !isErr || !strings.Contains(text, "不支持 branch") {
+		t.Errorf("旧服务端忽略 branch 应报错：isErr=%v %q", isErr, text)
+	}
+	if text, isErr := macTextResult(t, "mac_build", map[string]any{}); isErr {
+		t.Errorf("不带 branch 照常：%q", text)
 	}
 }

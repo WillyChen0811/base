@@ -203,6 +203,10 @@ func macExecRun(ctx context.Context, action, repo, name, branch string) (string,
 	if err := json.Unmarshal(b, &r); err != nil {
 		return "", fmt.Errorf("Mac 端 run 响应格式不对：%w", err)
 	}
+	// 旧版服务端不认识 branch 会静默忽略、编当前检出的分支：没有"分支 <branch> @"首行就当没编成
+	if branch != "" && !strings.HasPrefix(r.Tail, "分支 "+branch+" @ ") {
+		return "", errors.New("Mac 端不支持 branch（编的是当前检出的分支，结果作废），需先更新 Mac 上的 wgtund")
+	}
 	head := fmt.Sprintf("退出码 %d，用时 %.1fs", r.ExitCode, r.Seconds)
 	if r.TimedOut {
 		head += "（超时被终止）"

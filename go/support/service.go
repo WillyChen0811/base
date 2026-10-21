@@ -53,6 +53,8 @@ type Config struct {
 	MsgSign func([]byte) []byte
 	// MsgCapture 抓接收方终端画面（失败报告用），透传给 Hub；nil = 报告不带画面。
 	MsgCapture func(ctx context.Context, addr string) (string, error)
+	// MsgPaneProbe 核对地址对应的 tmux 会话还在不在、前台是什么，透传给 Hub；nil = 不核对。
+	MsgPaneProbe func(ctx context.Context, addr string) (PaneInfo, error)
 }
 
 // Status 是协助服务的状态快照。
@@ -167,6 +169,7 @@ func NewService(cfg Config, remote Remote) *Service {
 		StorePath: cfg.MsgStorePath,
 		Sign:      cfg.MsgSign,
 		Capture:   cfg.MsgCapture,
+		PaneProbe: cfg.MsgPaneProbe,
 	})
 	return s
 }

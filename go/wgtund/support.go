@@ -360,6 +360,7 @@ func startSupport(p *supportPrep, dir, knownHosts, httpAddr string, socksAddrs m
 		MsgSync:      bridge.Sync,
 		MsgDeliver:   bridge.Deliver,
 		MsgCapture:   bridge.Capture,
+		MsgPaneProbe: bridge.Probe,
 		MsgStorePath: filepath.Join(dir, "msg-store.json"),
 	}
 	// 证书校验/消息签名接进消息接口：CA 准备失败不能拖累 wgtund 启动，

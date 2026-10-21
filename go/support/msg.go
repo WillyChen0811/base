@@ -55,6 +55,9 @@ const (
 	PeerBusy PeerState = "busy"
 	PeerIdle PeerState = "idle"
 	PeerGone PeerState = "gone"
+	// PeerOther（非 Claude）只由 Hub 核对会话时得出：会话还在，但前台程序不是 Claude
+	// （如 codex、shell），没有钩子给忙闲，所以既不是 busy 也不是 idle。钩子不能上报它。
+	PeerOther PeerState = "other"
 )
 
 // 消息类型：KindRequest 要对方做事并回复，KindReply 是对某条请求的回复，
@@ -314,7 +317,30 @@ type HubConfig struct {
 	// Sign 用 XXYI CA 私钥给消息签名（入参是 xxyica.MessageSigningBytes 的原文）；
 	// nil = 不签名（Message.Sig 为空）。凡经 Send/系统通知入库的消息都入库前签。
 	Sign func([]byte) []byte
+	// PaneProbe 查 addr 对应 tmux 会话还在不在、前台程序是什么（Mac 本地会话查本机
+	// tmux -L xxyi，Ubuntu 会话经 SSH 查）；nil = 不核对。查不到（线路不通、超时、tmux
+	// 报了别的错）必须返回 error，Hub 在 error 时保持状态不变，绝不当成会话不存在。
+	PaneProbe func(ctx context.Context, addr string) (PaneInfo, error)
 }
+
+// PaneInfo 是 PaneProbe 的结果：Exists=false 表示会话确实不存在；
+// Prog 是活动窗格的前台程序名（pane_current_command）。
+type PaneInfo struct {
+	Exists bool
+	Prog   string
+}
+
+// IsClaudeProg 判断前台程序名是不是 Claude：claude、node，或形如版本号（2.1.141）的名字
+// （与注入门禁 wgtund deliverCmd 同一规则）。
+func IsClaudeProg(prog string) bool {
+	prog = strings.TrimSpace(prog)
+	if prog == "claude" || prog == "node" {
+		return true
+	}
+	return versionProg.MatchString(prog)
+}
+
+var versionProg = regexp.MustCompile(`^[0-9]+(\.[0-9]+)+$`)
 
 // Hub 是消息中转队列，并发安全；网络与 git 由 cfg 注入。
 // cfg.StorePath 非空时把消息/对端状态等落盘（见 msgstore.go），空则纯内存。
@@ -347,6 +373,8 @@ type Hub struct {
 	lastProbe   time.Time // 上一次放探测消息的时间
 	peers       map[string]PeerState
 	peerAt      map[string]time.Time // 对端状态最近一次变化的时间（busy 失联判定用）
+	peerProg    map[string]string    // 核对会话时看到的前台程序名（不落盘）；other 且是 codex 才可送
+	lastProbe5  map[string]time.Time // 各地址最近一次核对会话的时间（节流，不落盘）
 	peerSeq     map[string]uint64    // 对端状态版本号：送达期间有新上报就不覆盖对方状态
 	injectedAt  map[string]time.Time // 注入成功、开始等对方确认的时间（AckTimeout 起算点）
 	ackSeq      map[string]uint64    // 注入前的对端基准（取自 ackBase）；钩子 busy 上报的编号大于它才算确认
@@ -404,6 +432,8 @@ func NewHub(cfg HubConfig) *Hub {
 		stageFails:    make(map[string]int),
 		peers:         make(map[string]PeerState),
 		peerAt:        make(map[string]time.Time),
+		peerProg:      make(map[string]string),
+		lastProbe5:    make(map[string]time.Time),
 		peerSeq:       make(map[string]uint64),
 		injectedAt:    make(map[string]time.Time),
 		ackSeq:        make(map[string]uint64),
@@ -669,6 +699,9 @@ func (h *Hub) peerReadyLocked(addr string) bool {
 		return true
 	case PeerBusy:
 		return h.now().Sub(h.peerAt[addr]) > busyStale
+	case PeerOther:
+		// 没有钩子给忙闲：Codex 注入门禁放行，照常送；shell 等不放行，按住
+		return h.peerProg[addr] == "codex"
 	default: // gone、没上报过
 		return false
 	}
@@ -1265,6 +1298,125 @@ func (h *Hub) Peers() map[string]PeerState {
 	return out
 }
 
+const (
+	// probeThrottle：同一地址两次核对会话的最短间隔。
+	probeThrottle = 5 * time.Second
+	// probeTimeout：单次核对的时限，超时按查询失败处理（状态不变）。
+	probeTimeout = 5 * time.Second
+	// goneExpire：gone 且会话确实不存在超过这么久、又没有待送消息，就从对端表里清掉。
+	goneExpire = 24 * time.Hour
+)
+
+// checkPeer 核对 addr 的 tmux 会话（经 cfg.PaneProbe），按结果修正对端状态：
+//   - 会话不存在：走 SetState(gone)（正等确认的 injected 消息退回 queued）；
+//     已经 gone 超过 goneExpire 且没有 queued/injected 消息，则从表里清掉；
+//   - 会话在、前台不是 Claude：busy/idle 改成 other（gone 保持不动，免得与送达时的
+//     「不是 Claude」判定来回翻）；前台是 Claude 而状态还是 other，改成 busy 等钩子校正；
+//   - 查询失败（线路不通、超时、tmux 别的错）：什么都不动。
+//
+// 只核对表里已有的地址；同一地址 probeThrottle 内不重复查；查询期间对端有新上报（版本号变了）
+// 就丢弃本次结果。必须在锁外调用。
+func (h *Hub) checkPeer(ctx context.Context, addr string) {
+	if h.cfg.PaneProbe == nil {
+		return
+	}
+	h.mu.Lock()
+	st, ok := h.peers[addr]
+	now := h.now()
+	if !ok || (!h.lastProbe5[addr].IsZero() && now.Sub(h.lastProbe5[addr]) < probeThrottle) {
+		h.mu.Unlock()
+		return
+	}
+	h.lastProbe5[addr] = now // 失败也算一次，免得连环重查
+	seq0 := h.peerSeq[addr]
+	h.mu.Unlock()
+
+	pctx, cancel := context.WithTimeout(ctx, probeTimeout)
+	info, err := h.cfg.PaneProbe(pctx, addr)
+	cancel()
+	if err != nil || ctx.Err() != nil {
+		return
+	}
+
+	h.mu.Lock()
+	if h.peerSeq[addr] != seq0 {
+		h.mu.Unlock()
+		return
+	}
+	changed := false
+	switch {
+	case !info.Exists:
+		if st == PeerGone && h.now().Sub(h.peerAt[addr]) > goneExpire && !h.hasPendingToLocked(addr) {
+			delete(h.peers, addr)
+			delete(h.peerAt, addr)
+			delete(h.peerSeq, addr)
+			delete(h.peerProg, addr)
+			delete(h.lastProbe5, addr)
+			h.markDirtyLocked()
+			h.mu.Unlock()
+			h.persist()
+			return
+		}
+		h.mu.Unlock()
+		if st != PeerGone {
+			_ = h.SetState(addr, PeerGone)
+		}
+		return
+	case IsClaudeProg(info.Prog):
+		if st == PeerOther {
+			h.setPeerLocked(addr, PeerBusy)
+			changed = true
+		}
+	default:
+		h.peerProg[addr] = strings.TrimSpace(info.Prog)
+		if st == PeerBusy || st == PeerIdle {
+			h.setPeerLocked(addr, PeerOther)
+			changed = true
+		}
+	}
+	if !changed {
+		h.mu.Unlock()
+		return
+	}
+	wake := h.flipWakeupLocked() // other 可送时要叫醒等待取件的 TakeOutbox
+	h.mu.Unlock()
+	close(wake)
+	h.persist()
+}
+
+// hasPendingToLocked 报告是否还有发给 addr、没结束的消息（queued/injected）。调用方须持锁。
+func (h *Hub) hasPendingToLocked(addr string) bool {
+	for _, m := range h.msgs {
+		if m.To == addr && (m.State == MsgQueued || m.State == MsgInjected) {
+			return true
+		}
+	}
+	return false
+}
+
+// PeersChecked 先逐个核对对端表里各地址的会话（并发，整体受 ctx 限制），再返回对端状态表。
+// 列对端（GET /msg、/msg/who）用它，不用裸的 Peers。
+func (h *Hub) PeersChecked(ctx context.Context) map[string]PeerState {
+	if h.cfg.PaneProbe != nil {
+		h.mu.Lock()
+		addrs := make([]string, 0, len(h.peers))
+		for a := range h.peers {
+			addrs = append(addrs, a)
+		}
+		h.mu.Unlock()
+		var wg sync.WaitGroup
+		for _, a := range addrs {
+			wg.Add(1)
+			go func(a string) {
+				defer wg.Done()
+				h.checkPeer(ctx, a)
+			}(a)
+		}
+		wg.Wait()
+	}
+	return h.Peers()
+}
+
 // kindLabel 是消息类型在终端里的中文说法。
 func kindLabel(kind string) string {
 	switch kind {
@@ -1781,6 +1933,9 @@ func (h *Hub) Pump(ctx context.Context) {
 		return queue[i].Created.Before(queue[j].Created)
 	})
 
+	// 送之前先核对各收件地址的会话还在不在（会话被 kill 没有钩子上报，不核对就一直 busy）
+	h.probePending(ctx, queue)
+
 	for _, m := range queue {
 		if ctx.Err() != nil {
 			return
@@ -1788,6 +1943,37 @@ func (h *Hub) Pump(ctx context.Context) {
 		h.pumpOne(ctx, m.ID)
 	}
 	h.markOverdueReplies() // 送达后一直没人回复的请求：标 overdue 并通知原发件人
+}
+
+// probePending 核对队列里各收件地址，以及正等确认的 injected 消息的收件地址（各查一次）。
+func (h *Hub) probePending(ctx context.Context, queue []Message) {
+	if h.cfg.PaneProbe == nil {
+		return
+	}
+	seen := make(map[string]bool)
+	var addrs []string
+	add := func(a string) {
+		if !seen[a] {
+			seen[a] = true
+			addrs = append(addrs, a)
+		}
+	}
+	for _, m := range queue {
+		add(m.To)
+	}
+	h.mu.Lock()
+	for _, m := range h.msgs {
+		if m.State == MsgInjected {
+			add(m.To)
+		}
+	}
+	h.mu.Unlock()
+	for _, a := range addrs {
+		if ctx.Err() != nil {
+			return
+		}
+		h.checkPeer(ctx, a)
+	}
 }
 
 // CheckTimers 只推进"靠时钟到期"的消息：injected 的确认超时（ack 阶段）与请求

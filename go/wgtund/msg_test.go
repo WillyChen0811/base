@@ -715,3 +715,64 @@ func TestMsgBridgeCapture(t *testing.T) {
 		t.Fatalf("Capture 连接错误应标 ErrLinkDown，得到 %v", err)
 	}
 }
+
+// Probe：ubuntu: 走 SSH 的 display-message，mac: 走本机 -L xxyi；
+// 只有 tmux 明确说没有会话/没有服务才算不存在，其余失败一律返回 error。
+func TestMsgBridgeProbe(t *testing.T) {
+	ctx := context.Background()
+	var ucmds []string
+	var urun = func(out string, code int) func(context.Context, string) ([]byte, int, error) {
+		return func(_ context.Context, cmd string) ([]byte, int, error) {
+			ucmds = append(ucmds, cmd)
+			return []byte(out), code, nil
+		}
+	}
+	b := &msgBridge{run: urun("codex\n", 0)}
+	info, err := b.Probe(ctx, "ubuntu:s")
+	if err != nil || !info.Exists || info.Prog != "codex" {
+		t.Fatalf("存在应返回前台程序，得到 %+v %v", info, err)
+	}
+	if len(ucmds) != 1 || !strings.Contains(ucmds[0], "display-message") || !strings.Contains(ucmds[0], "=s:") {
+		t.Errorf("命令不对：%v", ucmds)
+	}
+	for _, msg := range []string{"can't find session: s", "no server running on /tmp/tmux-1000/default", "error connecting to /tmp/x (No such file or directory)"} {
+		b = &msgBridge{run: urun(msg, 1)}
+		info, err = b.Probe(ctx, "ubuntu:s")
+		if err != nil || info.Exists {
+			t.Errorf("%q 应判不存在，得到 %+v %v", msg, info, err)
+		}
+	}
+	b = &msgBridge{run: urun("protocol error", 1)}
+	if _, err = b.Probe(ctx, "ubuntu:s"); err == nil {
+		t.Error("别的 tmux 错误应返回 error，不能当不存在")
+	}
+	if _, err = (&msgBridge{run: connErrRun}).Probe(ctx, "ubuntu:s"); !errors.Is(err, support.ErrLinkDown) {
+		t.Errorf("连接错误应标 ErrLinkDown，得到 %v", err)
+	}
+
+	// mac: 本机，用 -L xxyi
+	var largs []string
+	b = &msgBridge{localTmux: func(_ context.Context, args ...string) ([]byte, int, error) {
+		largs = args
+		return []byte("claude\n"), 0, nil
+	}}
+	info, err = b.Probe(ctx, "mac:codex1")
+	if err != nil || !info.Exists || info.Prog != "claude" {
+		t.Fatalf("mac 存在，得到 %+v %v", info, err)
+	}
+	if got := strings.Join(largs, " "); !strings.Contains(got, "-L xxyi") || !strings.Contains(got, "=codex1:") {
+		t.Errorf("mac 应查 -L xxyi 的 =codex1:，得到 %q", got)
+	}
+	b = &msgBridge{localTmux: func(context.Context, ...string) ([]byte, int, error) {
+		return []byte("no server running on /private/tmp/tmux-501/xxyi\n"), 1, nil
+	}}
+	if info, err = b.Probe(ctx, "mac:codex1"); err != nil || info.Exists {
+		t.Errorf("mac 没服务应判不存在，得到 %+v %v", info, err)
+	}
+	b = &msgBridge{localTmux: func(context.Context, ...string) ([]byte, int, error) {
+		return nil, -1, errors.New("找不到本机 tmux")
+	}}
+	if _, err = b.Probe(ctx, "mac:codex1"); err == nil {
+		t.Error("跑不起来 tmux 应返回 error")
+	}
+}

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"os/exec"
 	"strconv"
 	"strings"
 	"sync"
@@ -29,9 +30,91 @@ type msgBridge struct {
 	remoteDir    map[string]string       // 仓库名 → Ubuntu 上的仓库目录
 	remoteDirErr map[string]string       // 仓库名 → 推导 Ubuntu 目录失败的原因（报错时直接说清）
 	gitEnv       []string
-	lock         func(name string) *sync.Mutex                              // support.Service 的同仓库锁；服务没建好时为 nil
-	run          func(ctx context.Context, cmd string) ([]byte, int, error) // 在 Ubuntu 执行，返回输出和退出码
-	write        func(ctx context.Context, path string, data []byte) error  // 在 Ubuntu 写文件（相对家目录，自动建父目录，权限 0600）
+	lock         func(name string) *sync.Mutex                                  // support.Service 的同仓库锁；服务没建好时为 nil
+	run          func(ctx context.Context, cmd string) ([]byte, int, error)     // 在 Ubuntu 执行，返回输出和退出码
+	write        func(ctx context.Context, path string, data []byte) error      // 在 Ubuntu 写文件（相对家目录，自动建父目录，权限 0600）
+	localTmux    func(ctx context.Context, args ...string) ([]byte, int, error) // 在本机跑 tmux（输出合并 stderr）；nil 用 runLocalTmux
+}
+
+// macTmuxSocket 是 Mac 本地会话所在的专用 tmux 服务器（tmux -L），与 Swift 端 XxyiCore.tmuxSocket 一致。
+const macTmuxSocket = "xxyi"
+
+// runLocalTmux 在本机跑 tmux，返回合并后的输出和退出码；tmux 找不到、起不来、被 ctx 打断返回 error。
+func runLocalTmux(ctx context.Context, args ...string) ([]byte, int, error) {
+	bin := ""
+	for _, p := range []string{"/opt/homebrew/bin/tmux", "/usr/local/bin/tmux", "/usr/bin/tmux"} {
+		if st, err := os.Stat(p); err == nil && !st.IsDir() {
+			bin = p
+			break
+		}
+	}
+	if bin == "" {
+		p, err := exec.LookPath("tmux")
+		if err != nil {
+			return nil, -1, errors.New("找不到本机 tmux")
+		}
+		bin = p
+	}
+	out, err := exec.CommandContext(ctx, bin, args...).CombinedOutput()
+	if err == nil {
+		return out, 0, nil
+	}
+	var ee *exec.ExitError
+	if errors.As(err, &ee) && ctx.Err() == nil {
+		return out, ee.ExitCode(), nil
+	}
+	return nil, -1, err
+}
+
+// Probe 核对 addr 的 tmux 会话还在不在、前台程序是什么：
+// mac:<会话> 查本机专用服务器（-L xxyi），ubuntu:<会话> 经 SSH 查 Ubuntu 的系统 tmux。
+// 只有 tmux 明确说「没有这个会话/没有服务」才算不存在；线路不通标 ErrLinkDown，
+// 其余任何失败（超时、tmux 别的报错、输出不认识）都返回 error，Hub 据此保持状态不变。
+func (b *msgBridge) Probe(ctx context.Context, addr string) (support.PaneInfo, error) {
+	var (
+		session string
+		out     []byte
+		code    int
+		err     error
+	)
+	switch {
+	case strings.HasPrefix(addr, "mac:"):
+		session = strings.TrimPrefix(addr, "mac:")
+		if err := tmux.ValidTarget(session); err != nil {
+			return support.PaneInfo{}, err
+		}
+		run := b.localTmux
+		if run == nil {
+			run = runLocalTmux
+		}
+		out, code, err = run(ctx, "-u", "-L", macTmuxSocket, "display-message", "-p", "-t", "="+session+":", "#{pane_current_command}")
+		if err != nil {
+			return support.PaneInfo{}, err
+		}
+	case strings.HasPrefix(addr, "ubuntu:"):
+		session = strings.TrimPrefix(addr, "ubuntu:")
+		cmd, cerr := tmux.PaneCommandCommand(session)
+		if cerr != nil {
+			return support.PaneInfo{}, cerr
+		}
+		ctx, cancel := context.WithTimeout(ctx, msgRunTimeout)
+		defer cancel()
+		out, code, err = b.run(ctx, cmd)
+		if err != nil {
+			return support.PaneInfo{}, fmt.Errorf("连不上 Ubuntu: %w", errors.Join(support.ErrLinkDown, err))
+		}
+	default:
+		return support.PaneInfo{}, fmt.Errorf("地址 %q 无法核对", addr)
+	}
+	text := strings.TrimSpace(string(out))
+	switch {
+	case code == 0:
+		return support.PaneInfo{Exists: true, Prog: text}, nil
+	case tmux.NotFound(text) || tmux.NoServer(text):
+		return support.PaneInfo{}, nil
+	default:
+		return support.PaneInfo{}, fmt.Errorf("核对 %s 失败（退出码 %d）：%s", addr, code, text)
+	}
 }
 
 // msgSyncErr 把 git 同步错误翻译成消息窗口里给人看的一句话；

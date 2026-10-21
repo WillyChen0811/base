@@ -171,7 +171,7 @@ func (s *Service) msgList(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"messages":   s.hub.List(),
 		"auto_until": autoUntilUnix(s.hub),
-		"peers":      s.hub.Peers(),
+		"peers":      s.hub.PeersChecked(r.Context()),
 		"link_down":  s.hub.LinkDown(),
 	})
 }
@@ -466,7 +466,7 @@ func (s *Service) msgWho(w http.ResponseWriter, r *http.Request) {
 	if _, ok := s.certCheck(w, r, body); !ok {
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"peers": s.hub.Peers()})
+	writeJSON(w, http.StatusOK, map[string]any{"peers": s.hub.PeersChecked(r.Context())})
 }
 
 // mountMsgLocal 把本机的消息接口挂进 LocalHandler 的 mux。

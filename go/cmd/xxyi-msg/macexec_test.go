@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -354,5 +355,86 @@ func TestMacToolConnError(t *testing.T) {
 	text, isErr := macTextResult(t, "mac_screenshot", map[string]any{})
 	if !isErr || !strings.Contains(text, "连不上") {
 		t.Errorf("关掉的远端该报连不上：%q isError=%v", text, isErr)
+	}
+}
+
+// 编译类四个工具的 schema 都有可选 branch（string，不在 required 里）；git_status/install/screenshot/logs 没有。
+func TestMacToolsBranchSchema(t *testing.T) {
+	withBranch := map[string]bool{"mac_build": true, "mac_selftest": true, "mac_build_app": true, "mac_node_test": true}
+	for _, tool := range mcpMacTools {
+		name := tool["name"].(string)
+		schema := tool["inputSchema"].(map[string]any)
+		props := schema["properties"].(map[string]any)
+		bp, has := props["branch"].(map[string]any)
+		if has != withBranch[name] {
+			t.Errorf("%s 的 branch 属性 has=%v，期望 %v", name, has, withBranch[name])
+			continue
+		}
+		if !has {
+			continue
+		}
+		if bp["type"] != "string" || !strings.Contains(fmt.Sprint(bp["description"]), ".xxyi-branch-build") {
+			t.Errorf("%s 的 branch 定义不对：%v", name, bp)
+		}
+		if req, _ := schema["required"].([]string); slices.Contains(req, "branch") {
+			t.Errorf("%s 的 branch 不该必填：%v", name, req)
+		}
+		if !strings.Contains(fmt.Sprint(tool["description"]), "branch") {
+			t.Errorf("%s 描述应提到 branch", name)
+		}
+	}
+}
+
+// 带 branch 的调用把它写进 /exec/run 请求体；不带就不出现该字段；非法分支名在本地拒，不发请求。
+func TestMacToolBranchRequestBody(t *testing.T) {
+	var f fakeMac
+	srv := httptest.NewServer(macRunHandler(&f, http.StatusOK, func(r *http.Request) any {
+		return map[string]any{"exit_code": 0, "timed_out": false, "seconds": 1.0, "tail": "ok"}
+	}))
+	defer srv.Close()
+	useEndpoint(t, srv.URL)
+
+	cases := []struct {
+		tool string
+		args map[string]any
+	}{
+		{"mac_build", map[string]any{"branch": "feat/x"}},
+		{"mac_selftest", map[string]any{"branch": "feat/x"}},
+		{"mac_build_app", map[string]any{"branch": "feat/x"}},
+		{"mac_node_test", map[string]any{"name": "unit", "branch": "feat/x"}},
+	}
+	for i, c := range cases {
+		if text, isErr := macTextResult(t, c.tool, c.args); isErr {
+			t.Fatalf("%s 报错：%q", c.tool, text)
+		}
+		var body map[string]any
+		if err := json.Unmarshal(f.reqList()[i].body, &body); err != nil {
+			t.Fatal(err)
+		}
+		if body["branch"] != "feat/x" {
+			t.Errorf("%s 请求体缺 branch：%v", c.tool, body)
+		}
+	}
+
+	n := f.count()
+	if _, isErr := macTextResult(t, "mac_build", map[string]any{}); isErr {
+		t.Fatal("不带 branch 不该报错")
+	}
+	var body map[string]any
+	if err := json.Unmarshal(f.reqList()[n].body, &body); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := body["branch"]; ok {
+		t.Errorf("不带 branch 时请求体不该有该字段：%v", body)
+	}
+
+	n = f.count()
+	for _, bad := range []any{"a..b", "-x", "feat/", "a b", "x@{1}", "tail.lock", 5} {
+		if _, isErr := macTextResult(t, "mac_build", map[string]any{"branch": bad}); !isErr {
+			t.Errorf("branch=%v 应在本地被拒", bad)
+		}
+	}
+	if f.count() != n {
+		t.Errorf("非法 branch 不该发请求")
 	}
 }

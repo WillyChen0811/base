@@ -245,3 +245,65 @@ func TestBuildSpecUnknownAction(t *testing.T) {
 		}
 	}
 }
+
+// TestBuildSpecRootOverride：RootOverride 非空时编译类动作改在覆盖根下取目录/脚本（home 下的 xxyi 不参与），
+// git_status 带覆盖报错；覆盖根不存在、mac 是指向根外的符号链接都报错。
+func TestBuildSpecRootOverride(t *testing.T) {
+	home := newFakeHome(t) // home 下的 xxyi 故意与覆盖根不同，证明没落回去
+	other := t.TempDir()
+	for _, d := range []string{filepath.Join(other, "mac"), filepath.Join(other, "tests", "js")} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(other, "mac", "build.sh"), []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(other, "tests", "js", "unit.test.js"), []byte("// t\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	realOther, err := filepath.EvalSymlinks(other)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := Params{RootOverride: other}
+
+	for _, action := range []string{ActionSwiftBuild, ActionSelftest, ActionBuildApp} {
+		spec, err := BuildSpec(action, p, home)
+		if err != nil {
+			t.Fatalf("%s: %v", action, err)
+		}
+		if spec.Dir != filepath.Join(realOther, "mac") {
+			t.Errorf("%s Dir = %q，应在覆盖根的 mac 下", action, spec.Dir)
+		}
+		if action == ActionBuildApp && spec.Argv[0] != filepath.Join(realOther, "mac", "build.sh") {
+			t.Errorf("build_app Argv = %v", spec.Argv)
+		}
+	}
+	spec, err := BuildSpec(ActionNodeTest, Params{RootOverride: other, Name: "unit"}, home)
+	if err != nil {
+		t.Fatalf("node_test: %v", err)
+	}
+	if spec.Dir != realOther && spec.Dir != other {
+		t.Errorf("node_test Dir = %q，应是覆盖根", spec.Dir)
+	}
+
+	if _, err := BuildSpec(ActionGitStatus, Params{Repo: "xxyi", RootOverride: other}, home); err == nil {
+		t.Error("git_status 带覆盖根应报错")
+	}
+	if _, err := BuildSpec(ActionSwiftBuild, Params{Repo: "base", RootOverride: other}, home); err == nil {
+		t.Error("覆盖根也不能放过别的仓库名")
+	}
+	if _, err := BuildSpec(ActionSwiftBuild, Params{RootOverride: filepath.Join(other, "nope")}, home); err == nil {
+		t.Error("覆盖根不存在应报错")
+	}
+
+	// 覆盖根里的 mac 是指向根外的符号链接 → 被 ResolveInRepo 挡住。
+	bad := t.TempDir()
+	if err := os.Symlink(t.TempDir(), filepath.Join(bad, "mac")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := BuildSpec(ActionSwiftBuild, Params{RootOverride: bad}, home); err == nil {
+		t.Error("mac 指向覆盖根外应报错")
+	}
+}

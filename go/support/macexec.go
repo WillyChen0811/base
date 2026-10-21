@@ -60,8 +60,10 @@ func (s *Service) mountMacExecRemote(mux *http.ServeMux) {
 	mux.HandleFunc("/exec/install", only(http.MethodPost, s.execInstall))
 }
 
-// execRun 是 POST /exec/run {action, repo, name}：同步执行到结束，
+// execRun 是 POST /exec/run {action, repo, name, branch}：同步执行到结束，
 // 返回 {exit_code, timed_out, seconds, tail}。忙 409，参数/路径错 400，没跑成 502。
+// branch 可选，只对编译类动作有意义：给了就在专用 worktree 里 fetch 检出该分支再跑，不切换主工作区
+// （见 macexec_branch.go），tail 最前面加一行"分支 … @ 提交，目录 …"；git_status 带 branch 报 400。
 // 会话结束（guard 绑定的 ctx 取消）时 macexec.Run 会杀掉整个进程组。
 func (s *Service) execRun(w http.ResponseWriter, r *http.Request) {
 	body, err := io.ReadAll(io.LimitReader(r.Body, maxExecRunBodyBytes+1))
@@ -79,6 +81,7 @@ func (s *Service) execRun(w http.ResponseWriter, r *http.Request) {
 		Action string `json:"action"`
 		Repo   string `json:"repo"`
 		Name   string `json:"name"`
+		Branch string `json:"branch"`
 	}
 	call := macexecCall{API: "run"}
 	if err := json.Unmarshal(body, &req); err != nil {
@@ -88,7 +91,7 @@ func (s *Service) execRun(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, http.StatusBadRequest, "正文不是合法 JSON")
 		return
 	}
-	call.Action, call.Repo, call.Name = req.Action, req.Repo, req.Name
+	call.Action, call.Repo, call.Name, call.Branch = req.Action, req.Repo, req.Name, req.Branch
 
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -98,7 +101,51 @@ func (s *Service) execRun(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, http.StatusInternalServerError, "找不到用户目录")
 		return
 	}
-	spec, err := macexec.BuildSpec(req.Action, macexec.Params{Repo: req.Repo, Name: req.Name}, home)
+	params := macexec.Params{Repo: req.Repo, Name: req.Name}
+	header := ""
+	if req.Branch != "" {
+		if req.Action == macexec.ActionGitStatus {
+			// 不能悄悄忽略调用方的选择
+			call.Result = "bad_request"
+			call.Error = "git_status 不支持 branch"
+			macexecRecord(call)
+			errJSON(w, http.StatusBadRequest, "git_status 不支持 branch")
+			return
+		}
+		if req.Repo != "" && req.Repo != xxyiRepoName {
+			call.Result = "bad_request"
+			call.Error = "branch 只用于 xxyi 仓库"
+			macexecRecord(call)
+			errJSON(w, http.StatusBadRequest, "branch 只用于 xxyi 仓库")
+			return
+		}
+		// 专用 worktree 只有一个槽位：准备（checkout/clean）与动作执行整段持有，别人拿不到就按忙处理。
+		if !branchBuildMu.TryLock() {
+			call.Result = "busy"
+			macexecRecord(call)
+			errJSON(w, http.StatusConflict, "专用分支编译目录正被使用")
+			return
+		}
+		defer branchBuildMu.Unlock()
+		ctx, cancel := context.WithTimeout(r.Context(), syncTimeout)
+		dir, commit, err := s.prepareBranchWorktree(ctx, req.Branch)
+		cancel()
+		if err != nil {
+			status := http.StatusBadGateway
+			var be *branchError
+			if errors.As(err, &be) {
+				status = be.status
+			}
+			call.Result = "branch_failed"
+			call.Error = err.Error()
+			macexecRecord(call)
+			errJSON(w, status, err.Error())
+			return
+		}
+		params.RootOverride = dir
+		header = "分支 " + req.Branch + " @ " + commit[:12] + "，目录 " + dir
+	}
+	spec, err := macexec.BuildSpec(req.Action, params, home)
 	if err != nil {
 		call.Result = "bad_request"
 		call.Error = err.Error()
@@ -123,11 +170,15 @@ func (s *Service) execRun(w http.ResponseWriter, r *http.Request) {
 		call.ExitCode = &exit
 		call.TimedOut = res.TimedOut
 		macexecRecord(call)
+		tail := res.Tail
+		if header != "" {
+			tail = header + "\n" + tail
+		}
 		writeJSON(w, http.StatusOK, map[string]any{
 			"exit_code": res.ExitCode,
 			"timed_out": res.TimedOut,
 			"seconds":   res.Seconds,
-			"tail":      res.Tail,
+			"tail":      tail,
 		})
 	}
 }
@@ -386,6 +437,7 @@ type macexecCall struct {
 	Action   string `json:"action,omitempty"`
 	Repo     string `json:"repo,omitempty"`
 	Name     string `json:"name,omitempty"`
+	Branch   string `json:"branch,omitempty"`
 	Result   string `json:"result"`
 	Error    string `json:"error,omitempty"`
 	ExitCode *int   `json:"exit_code,omitempty"`

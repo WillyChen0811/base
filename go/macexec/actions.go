@@ -38,10 +38,13 @@ var nodeTestNamePattern = regexp.MustCompile(`^[a-z0-9_]+$`)
 
 // Params 是 BuildSpec 的输入，对应 HTTP /exec/run 的 {action, repo, name}：
 // Repo 仓库名（仅 git_status 有意义），
-// Name 是 tests/js 下的 node 测试文件名（不含 .test.js 后缀，仅 node_test 用）。
+// Name 是 tests/js 下的 node 测试文件名（不含 .test.js 后缀，仅 node_test 用），
+// RootOverride 非空时编译类动作改以它为 xxyi 仓库根（专用 worktree，由调用方准备好；
+// 仍经 ResolveInRepo 校验），git_status 不接受。
 type Params struct {
-	Repo string `json:"repo"`
-	Name string `json:"name"`
+	Repo         string `json:"repo"`
+	Name         string `json:"name"`
+	RootOverride string `json:"root_override"`
 }
 
 // BuildSpec 把动作 + 参数拼成可直接交给 Run 的 Spec；
@@ -51,6 +54,9 @@ type Params struct {
 func BuildSpec(action string, p Params, home string) (Spec, error) {
 	switch action {
 	case ActionGitStatus:
+		if p.RootOverride != "" {
+			return Spec{}, fmt.Errorf("git_status 不支持仓库根覆盖")
+		}
 		root, err := RepoRoot(home, p.Repo, DefaultRepos)
 		if err != nil {
 			return Spec{}, err
@@ -62,19 +68,19 @@ func BuildSpec(action string, p Params, home string) (Spec, error) {
 			Timeout: gitStatusTimeout,
 		}, nil
 	case ActionSwiftBuild:
-		dir, err := xxyiMacDir(home, p.Repo)
+		dir, err := xxyiMacDir(home, p)
 		if err != nil {
 			return Spec{}, err
 		}
 		return Spec{Action: action, Dir: dir, Argv: []string{"swift", "build"}, Timeout: swiftTimeout}, nil
 	case ActionSelftest:
-		dir, err := xxyiMacDir(home, p.Repo)
+		dir, err := xxyiMacDir(home, p)
 		if err != nil {
 			return Spec{}, err
 		}
 		return Spec{Action: action, Dir: dir, Argv: []string{"swift", "run", "xxyi-selftest"}, Timeout: swiftTimeout}, nil
 	case ActionBuildApp:
-		dir, err := xxyiMacDir(home, p.Repo)
+		dir, err := xxyiMacDir(home, p)
 		if err != nil {
 			return Spec{}, err
 		}
@@ -91,7 +97,7 @@ func BuildSpec(action string, p Params, home string) (Spec, error) {
 		}
 		return Spec{Action: action, Dir: dir, Argv: []string{script}, Timeout: buildAppTimeout}, nil
 	case ActionNodeTest:
-		root, err := xxyiRepoRoot(home, p.Repo)
+		root, err := xxyiRepoRoot(home, p)
 		if err != nil {
 			return Spec{}, err
 		}
@@ -124,18 +130,29 @@ func BuildSpec(action string, p Params, home string) (Spec, error) {
 }
 
 // xxyiRepoRoot 取编译类动作的仓库根：动作固定作用于 xxyi，
-// 调用方传了别的仓库名直接报错（不能悄悄忽略调用方的选择）。
-func xxyiRepoRoot(home, repo string) (string, error) {
-	if repo != "" && repo != xxyiRepo {
-		return "", fmt.Errorf("该动作固定作用于 %q 仓库，收到 %q", xxyiRepo, repo)
+// 调用方传了别的仓库名直接报错（不能悄悄忽略调用方的选择）；
+// RootOverride 非空就用它（须是已存在的目录），否则取 <home>/xxyi-work/xxyi。
+func xxyiRepoRoot(home string, p Params) (string, error) {
+	if p.Repo != "" && p.Repo != xxyiRepo {
+		return "", fmt.Errorf("该动作固定作用于 %q 仓库，收到 %q", xxyiRepo, p.Repo)
 	}
-	return RepoRoot(home, xxyiRepo, DefaultRepos)
+	if p.RootOverride == "" {
+		return RepoRoot(home, xxyiRepo, DefaultRepos)
+	}
+	st, err := os.Stat(p.RootOverride)
+	if err != nil {
+		return "", fmt.Errorf("仓库根覆盖目录不可用 %q: %w", p.RootOverride, err)
+	}
+	if !st.IsDir() {
+		return "", fmt.Errorf("仓库根覆盖路径不是目录: %q", p.RootOverride)
+	}
+	return p.RootOverride, nil
 }
 
 // xxyiMacDir 取编译类动作的工作目录：ResolveInRepo 解析 <xxyi 仓库根>/mac，
 // 挡住 mac 本身是指向仓库外的符号链接；解析结果须存在且是目录。
-func xxyiMacDir(home, repo string) (string, error) {
-	root, err := xxyiRepoRoot(home, repo)
+func xxyiMacDir(home string, p Params) (string, error) {
+	root, err := xxyiRepoRoot(home, p)
 	if err != nil {
 		return "", err
 	}

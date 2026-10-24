@@ -61,3 +61,32 @@ def test_rejects(toy, cmd):
 def test_eval_names():
     src = "A = ('a', 'b')\nB = ('c',)\nC = (*A, 'd', *B)\n"
     assert client.eval_names(src, ["C"]) == ["a", "b", "d", "c"]
+
+
+def test_make_bundle_from_worktree(tmp_path):
+    main = tmp_path / "main"
+    main.mkdir()
+    subprocess.run(["git", "init", "-q", str(main)], check=True)
+    (main / "a.txt").write_text("a")
+    _git(main, "add", "-A")
+    _git(main, "commit", "-qm", "i")
+    wt = tmp_path / "wt"
+    _git(main, "worktree", "add", "-q", "-b", "side", str(wt))
+    (wt / "b.txt").write_text("b")
+    _git(wt, "add", "-A")
+    _git(wt, "commit", "-qm", "w")
+    sha = client.resolve(wt, "HEAD")
+    before = _refs(wt)
+    data = client.make_bundle(wt, sha, [])
+    assert _refs(wt) == before          # 不往源仓库写 ref
+    b = tmp_path / "x.bundle"
+    b.write_bytes(data)
+    dst = tmp_path / "dst.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(dst)], check=True)
+    subprocess.run(["git", "-C", str(dst), "fetch", "-q", str(b), f"refs/testhost/{sha}:refs/testhost/{sha}"],
+                   check=True)
+    assert client.resolve(dst, f"refs/testhost/{sha}") == sha
+
+
+def _refs(d):
+    return subprocess.run(["git", "-C", str(d), "for-each-ref"], capture_output=True, check=True).stdout

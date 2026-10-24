@@ -24,6 +24,7 @@ python client.py clean runs [--keep N] | run <id> | envs | snapshots | repos
   （如 base）没写 `--repo` 时按描述的相对路径自动加入，`--commit-of base=main` 可改版本（缺省描述里的 ref）。
 - `--workdir` 是 Mac 上 `runs/<id>/src/` 下的子目录，即被测仓库在 Mac 上的名字；测试文件相对它。
 - 快照：缺省按环境描述里的 `snapshots`（`paths_from` 从仓库里的 Python 文件读路径常量，不复制）；
+  环境描述里快照带 `repo_env` 时（指向本机某仓库的环境变量），该仓库另按 `<键>-src` 整库同步到 Mac，测试里可对它 git show/archive。
   也可 `--snapshot 名=仓库@commit:路径1,路径2` 或 `:@清单文件`。快照名 = `名-commit前10位-路径清单hash`，同名跳过。
 - `-n` 缺省取 Mac 核数（至多 16）；网关 `127.0.0.1:18192/gw/status` 的 running 非空时减半（至少 2）；给了 -n 就照给的。
 - 地址/账户/钥匙：`--host`/`TESTHOST_SSH`（缺省 omlxwake@192.168.147.196）、`--key`/`TESTHOST_KEY`（缺省 ~/.ssh/xxyi_testhost）。
@@ -33,6 +34,8 @@ python client.py clean runs [--keep N] | run <id> | envs | snapshots | repos
 
 `python`、`pip`（决定环境 hash，自动补 pytest、pytest-xdist）、`repos`、`pythonpath`（相对工作子目录，进 PYTHONPATH）、
 `env`（`{run}` 换成 run 目录，`{snapshot:键}` 换成快照目录）、`snapshots`。不用 `-e ../base/py`（可编辑安装会绑死某个 run 的路径），改用 pythonpath。
+prepare 会在环境的 site-packages 里写 `testhost_extra.pth`，把环境变量 `TESTHOST_PYPATH`（同 pythonpath）并进 sys.path，
+这样子进程清空 PYTHONPATH 后仍能 import pybase。
 
 ## Mac 端动作
 

@@ -75,7 +75,9 @@ def resolve(repo, ref):
 def make_bundle(repo, sha, have):
     """增量 bundle：排除 Mac 上已有且本地也有的 commit。要给 bundle 一个 ref，临时建一条再删。"""
     ref = f"refs/testhost/{sha}"
-    gd = git(repo, "rev-parse", "--absolute-git-dir").decode().strip()
+    # worktree 的 gitdir 没有对象库，要取共用仓库（--git-common-dir，可能是相对 repo 的路径）
+    gd = git(repo, "rev-parse", "--git-common-dir").decode().strip()
+    gd = str((Path(repo) / gd).resolve())
     with tempfile.TemporaryDirectory() as tmp:     # 临时仓库借对象库，不往源仓库写任何 ref
         t = Path(tmp) / "t.git"
         git(Path(tmp), "init", "-q", "--bare", str(t))

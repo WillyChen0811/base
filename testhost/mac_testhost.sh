@@ -6,7 +6,7 @@ TH="${TESTHOST_HOME:-$HOME/xxyi-testhost}"
 export PATH="$TH/miniforge/bin:${PATH:-/usr/bin:/bin}:/usr/bin:/bin:/usr/sbin:/sbin"
 PY="$TH/miniforge/bin/python"; [ -x "$PY" ] || PY=python3
 CONDA="$TH/miniforge/bin/conda"; [ -x "$CONDA" ] || CONDA=conda
-VERSION=1
+VERSION=2
 mkdir -p "$TH"/{bin,repos,snapshots,envs,runs,dl} 2>/dev/null
 
 jstr() { printf '%s' "$1" | tr '\n\t' '  ' | sed 's/\\/\\\\/g; s/"/\\"/g'; }
@@ -188,18 +188,35 @@ a_prepare() {
     "$rid" "$hash" "$reused" "$res" $((SECONDS - t0))
 }
 
-# run <run_id> <工作子目录> [-n N] [-k 表达式] [-m 标记] <测试文件...>：后台跑，立即返回
+# plugin <run_id> <文件名.py>：stdin 是外挂文件，落到 runs/<id>/plugins/（prepare 之后、run 之前）
+a_plugin() {
+  local rid="${1:-}" f="${2:-}"; safe "$rid" || fail "run_id 不合法"
+  [[ "$f" =~ ^[A-Za-z0-9_]{1,60}\.py$ ]] || fail "外挂文件名只许 [A-Za-z0-9_] 加 .py"
+  local R="$TH/runs/$rid"; [ -d "$R/src" ] || fail "没有 $rid，先 prepare"
+  guard_th; ! alive "$R" || [ -e "$R/out/exit" ] || fail "run 正在跑"
+  mkdir -p "$R/plugins"; rm -f "$R/plugins/$f"
+  cat >"$R/plugins/$f"
+  printf '{"success":true,"plugin":"%s"}\n' "$f"
+}
+
+# run <run_id> <工作子目录> [-n N] [-k 表达式] [-m 标记] [--plugin 模块]... [--plugin-env K=V]... <测试文件...>：后台跑，立即返回
 a_run() {
   local rid="${1:-}" wd="${2:-}"; safe "$rid" || fail "run_id 不合法"; saferel "$wd" || fail "工作子目录不合法"
   shift 2
-  local R="$TH/runs/$rid" n= k= m= files=()
+  local R="$TH/runs/$rid" n= k= m= files=() plugs=() penv=() x
   [ -d "$R/src/$wd" ] || fail "没有 $rid/src/${wd}，先 prepare"
   while [ $# -gt 0 ]; do
     case "$1" in
       -n) isint "${2:-}" && [ "$2" -ge 1 ] && [ "$2" -le 64 ] || fail "-n 要 1..64"; n="$2"; shift 2;;
       -k) k="${2:-}"; case "$k" in ''|-*) fail "-k 值不合法";; esac; shift 2;;
       -m) m="${2:-}"; case "$m" in ''|-*) fail "-m 值不合法";; esac; shift 2;;
-      -*) fail "不许的选项：${1}（只放行 -n -k -m）";;
+      --plugin) [[ "${2:-}" =~ ^[A-Za-z0-9_]{1,60}$ ]] || fail "--plugin 模块名只许 [A-Za-z0-9_]"
+        [ -f "$R/plugins/$2.py" ] && [ ! -L "$R/plugins/$2.py" ] || fail "外挂 $2 没上传（plugin 动作）"
+        plugs+=("$2"); shift 2;;
+      --plugin-env) [[ "${2:-}" =~ ^[A-Za-z_][A-Za-z0-9_]{0,60}=[^[:cntrl:]]*$ ]] || fail "--plugin-env 要 KEY=VALUE"
+        case "${2%%=*}" in PATH|HOME|TMPDIR|PYTHON*|TESTHOST_*|LD_*|DYLD_*|CMDPROTO_RAMDISK_ROOT) fail "--plugin-env 不许改 ${2%%=*}";; esac
+        x="${2#*=}"; penv+=("${2%%=*}=${x//\{run\}/$R}"); shift 2;;
+      -*) fail "不许的选项：${1}（只放行 -n -k -m --plugin --plugin-env）";;
       *) saferel "$1" || fail "测试路径不合法：$1"; files+=("$1"); shift;;
     esac
   done
@@ -212,13 +229,20 @@ a_run() {
     q=$(cd "$R/src/$wd/$p" 2>/dev/null && pwd -P) || fail "pythonpath 不存在：$p"
     case "$q" in "$R"/src/*) pp="$pp${pp:+:}$q";; *) fail "pythonpath 逃出了 run 目录：$p";; esac
   done <"$R/pythonpath"
+  if [ ${#plugs[@]} -gt 0 ]; then
+    q=$(cd "$R/plugins" 2>/dev/null && pwd -P) || fail "没有 plugins 目录"
+    [ "$q" = "$(cd "$R" && pwd -P)/plugins" ] || fail "plugins 目录逃出了 run 目录"
+    pp="$q${pp:+:}$pp"
+  fi
   local ev=(HOME="$R/home" TMPDIR="$R/tmp" CMDPROTO_RAMDISK_ROOT="$R/ramdisk" PYTHONPATH="$pp" TESTHOST_PYPATH="$pp"
             PATH="$E/bin:$PATH" PYTHONUNBUFFERED=1 PYTHONUTF8=1 TESTHOST_RUN_ID="$rid")
   while IFS= read -r p; do [ -n "$p" ] && ev+=("$p"); done <"$R/envvars"
+  ev+=(${penv[@]+"${penv[@]}"})
   local cmd=("$E/bin/python" -m pytest -p no:cacheprovider -v -rfE --junitxml="$R/out/junit.xml")
   [ -n "$n" ] && [ "$n" -gt 1 ] && cmd+=(-n "$n")
   [ -n "$k" ] && cmd+=(-k "$k")
   [ -n "$m" ] && cmd+=(-m "$m")
+  for x in ${plugs[@]+"${plugs[@]}"}; do cmd+=(-p "$x"); done
   cmd+=("${files[@]}")
   date +%s >"$R/out/start"
   ( cd "$R/src/$wd" && nohup env -i "${ev[@]}" bash -c 'rc=0; "$@" || rc=$?; date +%s >"$0.end"; echo $rc >"$0"' \
@@ -226,21 +250,42 @@ a_run() {
   printf '{"success":true,"run_id":"%s","started":true,"workers":%s}\n' "$rid" "${n:-1}"
 }
 
-count_log() { local c; c=$(grep -cE " $1( |\$)" "$R/out/log" 2>/dev/null); echo "${c:-0}"; }
+# 日志计数：只数顶层 pytest 的结果行。xdist 下 `[gw3] [ 12%] FAILED x.py::t`，单进程 `x.py::t FAILED  [ 12%]`；
+# 内层子进程 pytest 的输出只会出现在末尾 FAILURES/ERRORS 报告的 Captured 段里，读到该段标题就停。
+log_counts() {
+  awk '
+    /^=+ (FAILURES|ERRORS) =+$/ { exit }
+    /^\[gw[0-9]+\] \[ *[0-9]+%\] (PASSED|FAILED|SKIPPED) / {
+      l = $0; sub(/^\[gw[0-9]+\] \[ *[0-9]+%\] /, "", l); split(l, a, " "); c[a[1]]++; next }
+    /^[^ ]+::.* (PASSED|FAILED|SKIPPED)( .*)? +\[ *[0-9]+%\]$/ {
+      match($0, / (PASSED|FAILED|SKIPPED)( |$)/); l = substr($0, RSTART + 1, RLENGTH - 1); split(l, a, " "); c[a[1]]++ }
+    END { printf "%d %d %d\n", c["PASSED"], c["FAILED"], c["SKIPPED"] }' "$1" 2>/dev/null
+}
+# 跑完以 junit 为准；读不到才用日志。输出 "通过 失败 跳过"
+junit_counts() {
+  "$PY" -c 'import sys, xml.etree.ElementTree as E
+r = E.parse(sys.argv[1]).getroot()
+ss = [r] if r.tag == "testsuite" else list(r)
+g = lambda k: sum(int(float(s.get(k, 0))) for s in ss)
+t, f, e, k = g("tests"), g("failures"), g("errors"), g("skipped")
+print(t - f - e - k, f + e, k)' "$1" 2>/dev/null
+}
 
 a_status() {
   local rid="${1:-}"; safe "$rid" || fail "run_id 不合法"
   R="$TH/runs/$rid"; [ -d "$R/out" ] || fail "没有这个 run"
-  local state=prepared ex=null now st=0 en p f s pct
+  local state=prepared ex=null now st=0 en p f s pct cnt=
   if [ -e "$R/out/exit" ]; then state=finished; ex=$(cat "$R/out/exit")
   elif alive "$R"; then state=running
   elif [ -e "$R/out/pid" ]; then state=dead; fi
   now=$(date +%s); st=$(cat "$R/out/start" 2>/dev/null || echo "$now"); en=$(cat "$R/out/exit.end" 2>/dev/null || echo "$now")
-  p=$(count_log PASSED); f=$(count_log FAILED); s=$(count_log SKIPPED)
+  [ "$state" = finished ] && [ -s "$R/out/junit.xml" ] && cnt=$(junit_counts "$R/out/junit.xml")
+  [ -n "$cnt" ] || cnt=$(log_counts "$R/out/log")
+  read -r p f s <<<"${cnt:-0 0 0}"
   pct=$(grep -oE '\[ *[0-9]+%\]' "$R/out/log" 2>/dev/null | tail -1 | tr -dc '0-9')
   printf '{"success":true,"run_id":"%s","state":"%s","finished":%s,"exit":%s,"passed":%s,"failed":%s,"skipped":%s,"percent":%s,"elapsed":%s}\n' \
     "$rid" "$state" "$([ "$state" = running ] || [ "$state" = prepared ] && echo false || echo true)" "$ex" \
-    "$p" "${f:-0}" "$s" "${pct:-0}" $((en - st))
+    "${p:-0}" "${f:-0}" "${s:-0}" "${pct:-0}" $((en - st))
 }
 
 # fetch <run_id>：junit、日志尾部、退出码打成 tar 输出
@@ -250,6 +295,19 @@ a_fetch() {
   tail -n 400 "$o/log" >"$o/log.tail" 2>/dev/null
   local fs=() x; for x in junit.xml log.tail exit exit.end start; do [ -e "$o/$x" ] && fs+=("$x"); done
   tar -c -C "$o" -f - "${fs[@]}"
+}
+
+# fetchx <run_id>：run 目录里外挂等写出的文件（run 目录顶层、out/ 里非内置的普通文件），tar 输出，成员名相对 run 目录
+a_fetchx() {
+  safe "${1:-}" || fail "run_id 不合法"
+  local R="$TH/runs/$1"; [ -d "$R/out" ] || fail "没有这个 run"
+  local x
+  for x in "$R"/* "$R"/out/*; do
+    [ -f "$x" ] && [ ! -L "$x" ] || continue
+    case "${x#"$R"/}" in pythonpath|envvars|envhash|spec.err|out/log|out/log.tail|out/pid|out/exit|out/exit.end|out/start|out/junit.xml) continue;; esac
+    [ "$(wc -c <"$x")" -le 52428800 ] || continue
+    printf '%s\n' "${x#"$R"/}"
+  done | tar -c -C "$R" -T - -f -
 }
 
 wipe_dir() { guard_th; find "$TH/$1" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null; }
@@ -286,6 +344,8 @@ case "${ARGS[0]:-}" in
   run) a_run "${ARGS[@]:1}";;
   status) a_status "${ARGS[@]:1}";;
   fetch) a_fetch "${ARGS[@]:1}";;
+  fetchx) a_fetchx "${ARGS[@]:1}";;
+  plugin) a_plugin "${ARGS[@]:1}";;
   clean) a_clean "${ARGS[@]:1}";;
   *) fail "不认识的动作：${ARGS[0]:-（空）}"; ;;
 esac

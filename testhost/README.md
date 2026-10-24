@@ -13,7 +13,8 @@ python client.py ping                 # 在线、核数、负载、在跑 run �
 python client.py push-tool            # 把 mac_testhost.sh 推到 Mac（改了入口就推）
 python client.py run --repo <本地路径>[=<名>] ... [--commit-of 名=commit或分支] \
        --workdir <名> [-n N] [-k 表达式] [-m 标记] <测试文件...>
-python client.py status <run_id> | result <run_id> | inventory
+       [--plugin 外挂.py]... [--plugin-file 配套.py]... [--plugin-env KEY=VALUE]... [--out-dir 目录]
+python client.py status <run_id> | result <run_id> [--out-dir 目录] | fetch <run_id> --out-dir 目录 | inventory
 python client.py clean runs [--keep N] | run <id> | envs | snapshots | repos
 ```
 
@@ -27,6 +28,12 @@ python client.py clean runs [--keep N] | run <id> | envs | snapshots | repos
   环境描述里快照带 `repo_env` 时（指向本机某仓库的环境变量），该仓库另按 `<键>-src` 整库同步到 Mac，测试里可对它 git show/archive。
   也可 `--snapshot 名=仓库@commit:路径1,路径2` 或 `:@清单文件`。快照名 = `名-commit前10位-路径清单hash`，同名跳过。
 - `-n` 缺省取 Mac 核数（至多 16）；网关 `127.0.0.1:18192/gw/status` 的 running 非空时减半（至少 2）；给了 -n 就照给的。
+- 外挂（导测试用例表等）：`--plugin x.py`（可多次）随 run 上传到 Mac `runs/<id>/plugins/`，该目录进 PYTHONPATH，pytest 加 `-p x`；
+  `--plugin-file` 只上传配套文件（如 caseplug_child.py），不加载；`--plugin-env KEY=VALUE` 传给外挂，值里 `{run}` 换成 `runs/<id>`
+  （如 `CASE_OUT={run}/cases.json`）。外挂按单进程设计，用了 `--plugin` 而没给 `-n` 时缺省 `-n 1`。
+  `--out-dir` 在跑完后把 run 目录顶层与 `out/` 里外挂写出的普通文件（单个 ≤50MB，内置文件除外）取回本地；`fetch`/`result --out-dir` 可事后单取。
+  导表例：`--plugin caseplug.py --plugin-file caseplug_child.py --plugin-env 'CASE_OUT={run}/cases.json' --out-dir out/ <测试文件>`。
+  Mac 端校验：模块名只许 `[A-Za-z0-9_]`，文件只能在本 run 的 plugins 目录（不认软链），`--plugin-env` 不许改 PATH/HOME/TMPDIR/PYTHON*/TESTHOST_*/LD_*/DYLD_*。
 - 地址/账户/钥匙：`--host`/`TESTHOST_SSH`（缺省 omlxwake@192.168.147.196）、`--key`/`TESTHOST_KEY`（缺省 ~/.ssh/xxyi_testhost）。
   ssh 开了连接复用（控制套接字在 ~/.cache/xxyi-testhost）。
 
@@ -39,7 +46,7 @@ prepare 会在环境的 site-packages 里写 `testhost_extra.pth`，把环境变
 
 ## Mac 端动作
 
-固定动作，参数全校验（名字只许 `[A-Za-z0-9._-]`，路径不许 `..`/绝对路径，pytest 只放行 `-n -k -m`）：
+固定动作，参数全校验（名字只许 `[A-Za-z0-9._-]`，路径不许 `..`/绝对路径，pytest 只放行 `-n -k -m --plugin --plugin-env`）：
 
 | 动作 | 作用 |
 |---|---|
@@ -49,9 +56,11 @@ prepare 会在环境的 site-packages 里写 `testhost_extra.pth`，把环境变
 | `sync <repo>` | stdin 是 bundle，refs/testhost/<sha> 并入 repos/<repo>.git |
 | `snapshot <名>` | stdin 是 tar，解到 snapshots/<名>/（已存在跳过） |
 | `prepare <id> <repo>=<commit>... [--env 路径] [--snap 键=名]` | git archive 检出到 runs/<id>/src/<repo>；按描述 hash 建/复用 envs/<hash>；输出 JSON |
-| `run <id> <子目录> [-n N] [-k] [-m] <文件...>` | nohup 后台跑 pytest -v，立即返回 |
-| `status <id>` | state（prepared/running/finished/dead）、已跑通过/失败/跳过、百分比、退出码 |
+| `run <id> <子目录> [-n N] [-k] [-m] [--plugin 模块] [--plugin-env K=V] <文件...>` | nohup 后台跑 pytest -v，立即返回 |
+| `status <id>` | state（prepared/running/finished/dead）、已跑通过/失败/跳过（进行中数日志里顶层 pytest 的结果行，不数内层子进程 pytest 的输出；结束后以 junit 为准）、百分比、退出码 |
+| `plugin <id> <名.py>` | stdin 是外挂文件，落到 runs/<id>/plugins/（prepare 后、run 前） |
 | `fetch <id>` | tar：junit.xml、log.tail、exit、start |
+| `fetchx <id>` | tar：外挂写在 run 目录顶层与 out/ 里的普通文件 |
 | `clean runs [--keep N] / run <id> / envs / snapshots / repos` | 手动清理，只删 ~/xxyi-testhost 下；有 run 在跑时不清缓存 |
 
 ## 目录（~/xxyi-testhost）

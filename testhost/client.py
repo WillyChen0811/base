@@ -5,6 +5,7 @@ import argparse
 import ast
 import hashlib
 import json
+import re
 import os
 import shlex
 import subprocess
@@ -239,6 +240,23 @@ def summarize(tr, rid):
     return code
 
 
+def fetch_extras(tr, rid, out_dir):
+    """把外挂等在 run 目录里写出的文件取回 out_dir（只取普通文件，名字取末段，不信 tar 里的路径）。"""
+    data = tr.call(f"fetchx {rid}", raw=True)
+    out = Path(out_dir).expanduser()
+    out.mkdir(parents=True, exist_ok=True)
+    got = []
+    with tarfile.open(fileobj=io.BytesIO(data)) as tf:
+        for m in tf.getmembers():
+            name = Path(m.name).name
+            if not m.isfile() or not name or name.startswith("."):
+                continue
+            (out / name).write_bytes(tf.extractfile(m).read())
+            got.append(name)
+    print(f"取回 {len(got)} 个外挂产出文件到 {out}：{', '.join(got) if got else '（无）'}")
+    return got
+
+
 def wait(tr, rid, timeout, interval=15):
     t0, bad = time.time(), 0
     while True:
@@ -264,6 +282,16 @@ def cmd_run(tr, a):
     repos, desc, snaps, repos_src = plan(a)
     ping = tr.call("ping")
     n = a.n
+    plugs = [Path(x).expanduser() for x in a.plugin]
+    helpers = [Path(x).expanduser() for x in a.plugin_file]
+    for f in plugs + helpers:
+        if not f.is_file() or not re.fullmatch(r"[A-Za-z0-9_]+\.py", f.name):
+            raise THError(f"外挂文件不合法（要存在，文件名只许 [A-Za-z0-9_] 加 .py）：{f}")
+    for kv in a.plugin_env:
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", kv, re.S):
+            raise THError(f"--plugin-env 要 KEY=VALUE：{kv}")
+    if n is None and plugs:
+        n = 1      # 外挂（如 caseplug）按单进程设计，没指定 -n 就单进程
     if n is None:
         n = min(int(ping["ncpu"]), 16)
         if gateway_busy():
@@ -280,14 +308,24 @@ def cmd_run(tr, a):
     log("prepare（首次建环境较慢）")
     pr = tr.call(" ".join(shlex.quote(x) for x in pc))
     log(f"环境 {pr['env']}（{'复用' if pr['env_reused'] else '新建'}），用时 {pr['seconds']}s")
+    for f in plugs + helpers:
+        tr.call(f"plugin {rid} {f.name}", stdin=f.read_bytes())
+        log(f"外挂 {f.name} 已上传")
     rc = ["run", rid, a.workdir, "-n", str(n)]
+    for f in plugs:
+        rc += ["--plugin", f.stem]
+    for kv in a.plugin_env:
+        rc += ["--plugin-env", kv]
     for flag, v in (("-k", a.k), ("-m", a.m)):
         if v:
             rc += [flag, v]
     tr.call(" ".join(shlex.quote(x) for x in rc + a.tests))
     log(f"已开跑 {rid}（Ctrl-C 不会停远端，之后 python client.py result {rid}）")
     wait(tr, rid, a.timeout)
-    return summarize(tr, rid)
+    code = summarize(tr, rid)
+    if a.out_dir:
+        fetch_extras(tr, rid, a.out_dir)
+    return code
 
 
 def main(argv=None):
@@ -302,6 +340,10 @@ def main(argv=None):
         s = sp.add_parser(nm)
         s.add_argument("run_id")
         s.add_argument("--timeout", type=int, default=3600)
+        s.add_argument("--out-dir", help="把 run 目录里外挂写出的文件取回到这里")
+    f = sp.add_parser("fetch", help="只取回外挂写出的文件（run 须已结束）")
+    f.add_argument("run_id")
+    f.add_argument("--out-dir", required=True)
     c = sp.add_parser("clean")
     c.add_argument("rest", nargs=argparse.REMAINDER)
     r = sp.add_parser("run")
@@ -315,6 +357,13 @@ def main(argv=None):
     r.add_argument("-k")
     r.add_argument("-m")
     r.add_argument("--timeout", type=int, default=3600)
+    r.add_argument("--plugin", action="append", default=[], metavar="本地.py",
+                   help="pytest 外挂，随 run 上传并 -p 加载（可多次；没给 -n 时缺省 -n 1）")
+    r.add_argument("--plugin-file", action="append", default=[], metavar="本地.py",
+                   help="外挂的配套文件，只上传到同一目录，不加载")
+    r.add_argument("--plugin-env", action="append", default=[], metavar="KEY=VALUE",
+                   help="外挂用的环境变量，值里 {run} 展开为 runs/<id>")
+    r.add_argument("--out-dir", help="结束后把外挂写在 run 目录里的文件取回到这里")
     r.add_argument("tests", nargs="+")
     a = ap.parse_args(argv)
     tr = Transport(a.host, a.key)
@@ -330,7 +379,12 @@ def main(argv=None):
             print(json.dumps(tr.call(f"status {a.run_id}")))
         elif a.cmd == "result":
             wait(tr, a.run_id, a.timeout)
-            return summarize(tr, a.run_id)
+            code = summarize(tr, a.run_id)
+            if a.out_dir:
+                fetch_extras(tr, a.run_id, a.out_dir)
+            return code
+        elif a.cmd == "fetch":
+            fetch_extras(tr, a.run_id, a.out_dir)
         elif a.cmd == "clean":
             print(json.dumps(tr.call("clean " + " ".join(shlex.quote(x) for x in a.rest))))
         else:

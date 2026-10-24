@@ -9,6 +9,7 @@ import os
 import shlex
 import subprocess
 import sys
+import tempfile
 import tarfile
 import io
 import time
@@ -74,16 +75,18 @@ def resolve(repo, ref):
 def make_bundle(repo, sha, have):
     """增量 bundle：排除 Mac 上已有且本地也有的 commit。要给 bundle 一个 ref，临时建一条再删。"""
     ref = f"refs/testhost/{sha}"
-    git(repo, "update-ref", ref, sha)
-    try:
+    gd = git(repo, "rev-parse", "--absolute-git-dir").decode().strip()
+    with tempfile.TemporaryDirectory() as tmp:     # 临时仓库借对象库，不往源仓库写任何 ref
+        t = Path(tmp) / "t.git"
+        git(Path(tmp), "init", "-q", "--bare", str(t))
+        (t / "objects/info/alternates").write_text(gd + "/objects\n")
+        git(t, "update-ref", ref, sha)
         excl = []
         for h in have:
             if subprocess.run(["git", "-C", str(repo), "cat-file", "-e", f"{h}^{{commit}}"],
                               capture_output=True).returncode == 0:
                 excl.append(f"^{h}")
-        return git(repo, "bundle", "create", "-", ref, *excl)
-    finally:
-        git(repo, "update-ref", "-d", ref)
+        return git(t, "bundle", "create", "-", ref, *excl)
 
 
 def eval_names(src, names):
@@ -157,7 +160,7 @@ def plan(args):
         if n not in repos:
             p = (fp / d["path"]).resolve() if "path" in d else fp.parent / n
             repos[n] = (p, resolve(p, refs.get(n, d.get("ref", "HEAD"))))
-    snaps = []
+    snaps, repos_src = [], {}
     for spec in args.snapshot:
         n, _, rest = spec.partition("=")
         repo_commit, _, pathspec = rest.partition(":")
@@ -170,7 +173,9 @@ def plan(args):
             pf = d["paths_from"]
             src = git(fp, "show", f"{fc}:{pf['file']}").decode()
             snaps.append((n, rp, d["commit"], list(eval_names(src, pf["names"]))))
-    return repos, desc, snaps
+            if d.get("repo_env"):     # 测试里要 git show/archive 该仓库：整库同步成 <键>-src
+                repos_src[f"{n}-src"] = (rp, resolve(rp, d["commit"]))
+    return repos, desc, snaps, repos_src
 
 
 def push_repos(tr, repos):
@@ -254,7 +259,7 @@ def wait(tr, rid, timeout, interval=15):
 
 
 def cmd_run(tr, a):
-    repos, desc, snaps = plan(a)
+    repos, desc, snaps, repos_src = plan(a)
     ping = tr.call("ping")
     n = a.n
     if n is None:
@@ -263,7 +268,7 @@ def cmd_run(tr, a):
             n = max(2, n // 2)
             log(f"网关显示大模型在跑，并发减半为 {n}")
     log(f"测试机 {ping['host']}：{ping['ncpu']} 核，在跑 {ping['running']} 个 run，-n {n}")
-    push_repos(tr, repos)
+    push_repos(tr, {**repos, **repos_src})
     snapmap = push_snapshots(tr, snaps)
     first = next(iter(repos))
     rid = a.run_id or f"r{datetime.now():%m%d%H%M%S}-{repos[first][1][:7]}"

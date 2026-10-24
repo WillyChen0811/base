@@ -109,6 +109,9 @@ h = hashlib.sha256(json.dumps([py, sorted(pipl)]).encode()).hexdigest()[:12]
 print("hash", h); print("python", py)
 for p in pipl: print("pip", p)
 for p in d.get("pythonpath", []): print("pp", p)
+for k, sd in d.get("snapshots", {}).items():
+    if sd.get("repo_env") and os.path.isdir(th + "/repos/" + k + "-src.git"):
+        print("env", sd["repo_env"] + "=" + th + "/repos/" + k + "-src.git")
 for k, v in d.get("env", {}).items():
     v = v.replace("{run}", run)
     while "{snapshot:" in v:
@@ -178,6 +181,9 @@ a_prepare() {
       fi
     fi
   fi
+  # 子进程会清掉 PYTHONPATH（如基准子进程）；pythonpath 另走环境变量，由 .pth 并进 sys.path
+  local sp; sp=$("$E/bin/python" -c 'import site;print(site.getsitepackages()[0])' 2>/dev/null) \
+    && [ -d "$sp" ] && printf '%s\n' 'import os,sys; sys.path.extend(p for p in os.environ.get("TESTHOST_PYPATH","").split(":") if p)' >"$sp/testhost_extra.pth"
   printf '{"success":true,"run_id":"%s","env":"%s","env_reused":%s,"repos":{%s},"seconds":%s}\n' \
     "$rid" "$hash" "$reused" "$res" $((SECONDS - t0))
 }
@@ -206,7 +212,7 @@ a_run() {
     q=$(cd "$R/src/$wd/$p" 2>/dev/null && pwd -P) || fail "pythonpath 不存在：$p"
     case "$q" in "$R"/src/*) pp="$pp${pp:+:}$q";; *) fail "pythonpath 逃出了 run 目录：$p";; esac
   done <"$R/pythonpath"
-  local ev=(HOME="$R/home" TMPDIR="$R/tmp" CMDPROTO_RAMDISK_ROOT="$R/ramdisk" PYTHONPATH="$pp"
+  local ev=(HOME="$R/home" TMPDIR="$R/tmp" CMDPROTO_RAMDISK_ROOT="$R/ramdisk" PYTHONPATH="$pp" TESTHOST_PYPATH="$pp"
             PATH="$E/bin:$PATH" PYTHONUNBUFFERED=1 PYTHONUTF8=1 TESTHOST_RUN_ID="$rid")
   while IFS= read -r p; do [ -n "$p" ] && ev+=("$p"); done <"$R/envvars"
   local cmd=("$E/bin/python" -m pytest -p no:cacheprovider -v -rfE --junitxml="$R/out/junit.xml")

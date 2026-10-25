@@ -144,6 +144,17 @@ def parse_repo(spec):
     return (name or path.name.removesuffix(".git")), path
 
 
+ENV_CANDIDATES = ("testhost.json", "cmdproto/testenv.json")    # 缺省：先通用名，再兼容 xxyi 旧名
+
+
+def find_env_file(repo, commit, given):
+    """环境描述在被测仓库该 commit 里的相对路径：显式给的优先，否则按候选顺序找第一个存在的。"""
+    for c in ([given] if given else ENV_CANDIDATES):
+        if subprocess.run(["git", "-C", str(repo), "cat-file", "-e", f"{commit}:{c}"], capture_output=True).returncode == 0:
+            return c
+    raise THError(f"{given or ' 或 '.join(ENV_CANDIDATES)} 在被测仓库 {commit[:8]} 里不存在")
+
+
 def plan(args):
     """算出：仓库 {名: (路径, 完整 commit)}、环境描述、快照 [(名, 仓库路径, commit, 路径列表)]。"""
     if not args.repo:
@@ -155,10 +166,13 @@ def plan(args):
         repos[n] = (p, resolve(p, refs.get(n, "HEAD")))
     first = next(iter(repos))
     fp, fc = repos[first]
+    args.env_file = find_env_file(fp, fc, args.env_file)
     try:
         desc = json.loads(git(fp, "show", f"{fc}:{args.env_file}"))
     except ValueError:
         raise THError(f"{args.env_file} 不是合法 JSON")
+    if args.task and args.task not in desc.get("tasks", {}):
+        raise THError(f"{args.env_file} 里没有任务 {args.task}（有：{', '.join(desc.get('tasks', {})) or '无'}）")
     for n, d in desc.get("repos", {}).items():
         if n not in repos:
             p = (fp / d["path"]).resolve() if "path" in d else fp.parent / n
@@ -209,12 +223,21 @@ def push_snapshots(tr, snaps):
     return out
 
 
-def summarize(tr, rid):
+def summarize(tr, rid, task=None):
     data = tr.call(f"fetch {rid}", raw=True)
     tf = tarfile.open(fileobj=io.BytesIO(data))
     get = lambda n: tf.extractfile(n).read() if n in tf.getnames() else None
     ex = (get("exit") or b"").decode().strip()
     code = int(ex) if ex else 3
+    if task:
+        try:
+            wall = int(get("exit.end")) - int(get("start"))
+        except (TypeError, ValueError):
+            wall = 0
+        print("日志尾部：")
+        print("\n".join((get("log.tail") or b"").decode(errors="replace").splitlines()[-40:]))
+        print(f"\n{rid}: 任务 {task} 退出码 {code}，墙钟 {wall}s")
+        return code
     xml = get("junit.xml")
     if not xml:
         print("没有 junit 结果（收集阶段就挂了？），日志尾部：")
@@ -240,8 +263,11 @@ def summarize(tr, rid):
     return code
 
 
-def fetch_extras(tr, rid, out_dir):
-    """把外挂等在 run 目录里写出的文件取回 out_dir（只取普通文件，名字取末段，不信 tar 里的路径）。"""
+def fetch_extras(tr, rid, out_dir, tree=None):
+    """把外挂/任务在 run 目录里写出的文件取回 out_dir（只取普通文件，不信 tar 里的路径）。
+    外挂产出只取名字末段；任务（tree）保留相对路径（去掉开头的 out/），任何 .. 或绝对路径的成员丢弃。"""
+    if tree is None:
+        tree = bool(tr.call(f"status {rid}").get("task"))
     data = tr.call(f"fetchx {rid}", raw=True)
     out = Path(out_dir).expanduser()
     out.mkdir(parents=True, exist_ok=True)
@@ -249,9 +275,17 @@ def fetch_extras(tr, rid, out_dir):
     with tarfile.open(fileobj=io.BytesIO(data)) as tf:
         for m in tf.getmembers():
             name = Path(m.name).name
+            if tree:
+                parts = Path(m.name).parts
+                parts = parts[1:] if parts[:1] == ("out",) else parts
+                if not parts or Path(m.name).is_absolute() or ".." in parts:
+                    continue
+                name = "/".join(parts)
             if not m.isfile() or not name or name.startswith("."):
                 continue
-            (out / name).write_bytes(tf.extractfile(m).read())
+            dst = out / name
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            dst.write_bytes(tf.extractfile(m).read())
             got.append(name)
     print(f"取回 {len(got)} 个外挂产出文件到 {out}：{', '.join(got) if got else '（无）'}")
     return got
@@ -270,7 +304,11 @@ def wait(tr, rid, timeout, interval=15):
             log(f"status 失败（{bad}）：{e}")
             time.sleep(interval)
             continue
-        log(f"{st['state']}：{st['passed']} 通过 {st['failed']} 失败 {st['skipped']} 跳过 {st['percent']}%")
+        if st.get("task"):
+            last = (st.get("log_tail") or "").split("\n")[-1][:100]
+            log(f"{st['state']}（任务 {st['task']}）：{last}")
+        else:
+            log(f"{st['state']}：{st['passed']} 通过 {st['failed']} 失败 {st['skipped']} 跳过 {st['percent']}%")
         if st["finished"]:
             return st
         if time.time() - t0 > timeout:
@@ -279,6 +317,10 @@ def wait(tr, rid, timeout, interval=15):
 
 
 def cmd_run(tr, a):
+    if a.task and (a.k or a.m or a.plugin or a.plugin_file or a.n):
+        raise THError("--task 不能与 -n -k -m --plugin 并用（任务的参数写在描述里或跟在 -- 后）")
+    if not a.task and not a.tests:
+        raise THError("要给测试文件，或用 --task <任务名>")
     repos, desc, snaps, repos_src = plan(a)
     ping = tr.call("ping")
     n = a.n
@@ -311,7 +353,7 @@ def cmd_run(tr, a):
     for f in plugs + helpers:
         tr.call(f"plugin {rid} {f.name}", stdin=f.read_bytes())
         log(f"外挂 {f.name} 已上传")
-    rc = ["run", rid, a.workdir, "-n", str(n)]
+    rc = ["run", rid, a.workdir] + (["--task", a.task] if a.task else ["-n", str(n)])
     for f in plugs:
         rc += ["--plugin", f.stem]
     for kv in a.plugin_env:
@@ -319,12 +361,12 @@ def cmd_run(tr, a):
     for flag, v in (("-k", a.k), ("-m", a.m)):
         if v:
             rc += [flag, v]
-    tr.call(" ".join(shlex.quote(x) for x in rc + a.tests))
+    tr.call(" ".join(shlex.quote(x) for x in rc + (["--"] + a.tests if a.task else a.tests)))
     log(f"已开跑 {rid}（Ctrl-C 不会停远端，之后 python client.py result {rid}）")
     wait(tr, rid, a.timeout)
-    code = summarize(tr, rid)
+    code = summarize(tr, rid, a.task)
     if a.out_dir:
-        fetch_extras(tr, rid, a.out_dir)
+        fetch_extras(tr, rid, a.out_dir, tree=bool(a.task))
     return code
 
 
@@ -351,7 +393,8 @@ def main(argv=None):
     r.add_argument("--commit-of", action="append", default=[], metavar="名=commit或分支")
     r.add_argument("--snapshot", action="append", default=[], metavar="名=仓库@commit:路径,路径|@清单文件")
     r.add_argument("--workdir", required=True, help="Mac 上 src/ 下的工作子目录，如 xxyi")
-    r.add_argument("--env-file", default="cmdproto/testenv.json")
+    r.add_argument("--env-file", help="环境描述在第一个仓库里的相对路径；缺省找 testhost.json，再找 cmdproto/testenv.json")
+    r.add_argument("--task", help="跑环境描述 tasks 里的这个任务（不是 pytest）；其后的位置参数（建议用 -- 隔开）作为追加 argv")
     r.add_argument("--run-id")
     r.add_argument("-n", type=int)
     r.add_argument("-k")
@@ -364,7 +407,7 @@ def main(argv=None):
     r.add_argument("--plugin-env", action="append", default=[], metavar="KEY=VALUE",
                    help="外挂用的环境变量，值里 {run} 展开为 runs/<id>")
     r.add_argument("--out-dir", help="结束后把外挂写在 run 目录里的文件取回到这里")
-    r.add_argument("tests", nargs="+")
+    r.add_argument("tests", nargs="*", help="测试文件；给了 --task 时是任务的追加参数")
     a = ap.parse_args(argv)
     tr = Transport(a.host, a.key)
     try:
@@ -379,7 +422,7 @@ def main(argv=None):
             print(json.dumps(tr.call(f"status {a.run_id}")))
         elif a.cmd == "result":
             wait(tr, a.run_id, a.timeout)
-            code = summarize(tr, a.run_id)
+            code = summarize(tr, a.run_id, tr.call(f"status {a.run_id}").get("task"))
             if a.out_dir:
                 fetch_extras(tr, a.run_id, a.out_dir)
             return code

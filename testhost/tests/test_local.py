@@ -175,3 +175,110 @@ def test_plugin_rejects(toy, cmd):
     tr = client.Transport("x", "x")
     with pytest.raises(client.THError):
         tr.call(cmd)
+
+
+# ---------- 通用环境描述 / 任务
+
+def _toy2(tmp_path, monkeypatch, desc, relpath="testhost.json"):
+    r = tmp_path / "toy2"
+    (r / "tests").mkdir(parents=True)
+    f = r / relpath
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_text(json.dumps(desc))
+    (r / "tests/test_a.py").write_text("def test_ok(): pass\n")
+    (r / "tool.py").write_text(
+        "import os, sys\nos.makedirs('res/sub', exist_ok=True)\nopen('res/sub/a.txt', 'w').write(' '.join(sys.argv[1:]))\n"
+        "open(os.environ['TMPDIR'] + '/../out/b.txt', 'w').write(os.environ['HOME'] + '|' + os.environ['TESTHOST_TASK'])\n"
+        "print('done', len(sys.argv) - 1)\nsys.exit(int(os.environ.get('RC', '0')))\n")
+    subprocess.run(["git", "init", "-q", str(r)], check=True)
+    _git(r, "add", "-A")
+    _git(r, "commit", "-qm", "i")
+    th = tmp_path / "th"
+    monkeypatch.setenv("TESTHOST_LOCAL", str(th))
+    monkeypatch.setenv("TESTHOST_ENV_STUB", sys.prefix)
+    return r, th
+
+
+def _envhash(th, rid):
+    return (th / "runs" / rid / "envhash").read_text().strip()
+
+
+def test_env_path_resolution(tmp_path, monkeypatch):
+    r, th = _toy2(tmp_path, monkeypatch, {"python": "3.12", "pip": []})
+    base = ["run", "--repo", f"{r}=toy2", "--workdir", "toy2", "tests/test_a.py"]
+    assert client.main(base + ["--run-id", "e1"]) == 0                # 缺省找到根下 testhost.json
+    assert (th / "runs/e1/envfile").read_text().strip() == "src/toy2/testhost.json"
+    # 显式路径优先；两个都有时缺省仍是 testhost.json
+    (r / "other").mkdir()
+    (r / "other/env.json").write_text(json.dumps({"python": "3.12", "pip": ["six"]}))
+    (r / "cmdproto").mkdir()
+    (r / "cmdproto/testenv.json").write_text(json.dumps({"python": "3.12", "pip": ["six", "idna"]}))
+    _git(r, "add", "-A")
+    _git(r, "commit", "-qm", "more")
+    assert client.main(base + ["--run-id", "e2", "--env-file", "other/env.json"]) == 0
+    assert (th / "runs/e2/envfile").read_text().strip() == "src/toy2/other/env.json"
+    assert client.main(base + ["--run-id", "e3"]) == 0
+    assert (th / "runs/e3/envfile").read_text().strip() == "src/toy2/testhost.json"
+    assert _envhash(th, "e2") != _envhash(th, "e3")
+    with pytest.raises(client.THError):
+        client.plan(client.argparse.Namespace(repo=[f"{r}=toy2"], commit_of=[], snapshot=[], env_file="nope.json", task=None))
+
+
+def test_env_path_legacy_fallback(toy):
+    r, th = toy       # toy 只有 cmdproto/testenv.json
+    assert client.main(["run", "--repo", f"{r}=toy", "--workdir", "toy", "-n", "1", "--run-id", "l1", "tests/test_a.py"]) == 1
+    assert (th / "runs/l1/envfile").read_text().strip() == "src/toy/cmdproto/testenv.json"
+
+
+def test_hash_old_desc_unchanged_and_conda(tmp_path, monkeypatch):
+    import hashlib
+    r, th = _toy2(tmp_path, monkeypatch, {"python": "3.12", "pip": ["six"]})
+    argv = ["run", "--repo", f"{r}=toy2", "--workdir", "toy2", "tests/test_a.py", "--run-id"]
+    assert client.main(argv + ["h1"]) == 0
+    old = hashlib.sha256(json.dumps(["3.12", sorted(["six", "pytest", "pytest-xdist"])]).encode()).hexdigest()[:12]
+    assert _envhash(th, "h1") == old              # 没有 conda：与旧算法完全一致，旧缓存继续命中
+    (r / "testhost.json").write_text(json.dumps({"python": "3.12", "pip": ["six"], "conda": ["nodejs=20"]}))
+    _git(r, "add", "-A")
+    _git(r, "commit", "-qm", "conda")
+    assert client.main(argv + ["h2"]) == 0
+    assert _envhash(th, "h2") != old
+    (r / "testhost.json").write_text(json.dumps({"python": "3.12", "pip": [], "conda": ["-bad"]}))
+    _git(r, "add", "-A")
+    _git(r, "commit", "-qm", "bad")
+    assert client.main(argv + ["h3"]) == 3        # conda 包名不合法
+
+
+TASK_DESC = {"python": "3.12", "pip": [], "tasks": {
+    "mk": {"cmd": ["python", "tool.py", "{run}/x"], "cwd": ".", "outputs": ["res/**/*.txt", "src/toy2/res/sub/a.txt"]},
+    "sub": {"cmd": ["python", "tool.py"], "cwd": "tests", "outputs": []},
+    "evil": {"cmd": ["python", "tool.py"], "outputs": ["../../etc/passwd"]}}}
+
+
+def test_task_run_and_fetch(tmp_path, monkeypatch, capsys):
+    r, th = _toy2(tmp_path, monkeypatch, TASK_DESC)
+    out = tmp_path / "got"
+    argv = ["run", "--repo", f"{r}=toy2", "--workdir", "toy2", "--task", "mk", "--run-id", "k1", "--out-dir", str(out)]
+    assert client.main(argv + ["--", "--flag", "a b", "-x"]) == 0
+    txt = capsys.readouterr().out
+    assert "任务 mk 退出码 0" in txt and "done 4" in txt           # {run}/x + 3 个追加参数
+    assert (out / "src/toy2/res/sub/a.txt").read_text() == f"{th}/runs/k1/x --flag a b -x"
+    assert (out / "b.txt").read_text() == f"{th}/runs/k1/home|mk"      # out/ 前缀去掉，HOME 指进 run 目录
+    st = client.Transport("x", "x").call("status k1")
+    assert st["task"] == "mk" and st["state"] == "finished" and st["exit"] == 0 and "done 4" in st["log_tail"]
+    # 退出码照传；cwd 相对工作子目录
+    monkeypatch.setenv("RC", "7")
+    assert client.main(["run", "--repo", f"{r}=toy2", "--workdir", "toy2", "--task", "sub", "--run-id", "k2"]) == 7
+    assert (th / "runs/k2/src/toy2/tests/res/sub/a.txt").exists()
+
+
+def test_task_rejects(tmp_path, monkeypatch):
+    r, th = _toy2(tmp_path, monkeypatch, TASK_DESC)
+    base = ["run", "--repo", f"{r}=toy2", "--workdir", "toy2"]
+    assert client.main(base + ["--task", "nope"]) == 3                       # 描述里没有
+    assert client.main(base + ["--task", "mk", "-n", "2"]) == 3              # 不能与 pytest 选项并用
+    assert client.main(base + ["--task", "evil", "--run-id", "ev"]) == 3     # outputs 逃逸
+    assert client.main(base) == 3                                            # 没测试也没任务
+    tr = client.Transport("x", "x")
+    for cmd in ["run ev toy2 -- a", "run ev toy2 --task ../x", "run ev toy2 --task mk t.py", "run ev toy2 --task mk -k x"]:
+        with pytest.raises(client.THError):
+            tr.call(cmd)

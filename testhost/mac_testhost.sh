@@ -6,7 +6,7 @@ TH="${TESTHOST_HOME:-$HOME/xxyi-testhost}"
 export PATH="$TH/miniforge/bin:${PATH:-/usr/bin:/bin}:/usr/bin:/bin:/usr/sbin:/sbin"
 PY="$TH/miniforge/bin/python"; [ -x "$PY" ] || PY=python3
 CONDA="$TH/miniforge/bin/conda"; [ -x "$CONDA" ] || CONDA=conda
-VERSION=2
+VERSION=3
 mkdir -p "$TH"/{bin,repos,snapshots,envs,runs,dl} 2>/dev/null
 
 jstr() { printf '%s' "$1" | tr '\n\t' '  ' | sed 's/\\/\\\\/g; s/"/\\"/g'; }
@@ -95,9 +95,10 @@ a_snapshot() {
   printf '{"success":true,"snapshot":"%s","existed":false}\n' "$1"
 }
 
-# 环境描述解析：输出 hash/python/pip/pp(pythonpath)/env 行；hash 只看 python 与 pip，换依赖才重建
+# 环境描述解析：输出 hash/python/conda/pip/pp(pythonpath)/env 行；hash 只看 python、pip 与（若有）conda，换依赖才重建
+# 没写 conda 时 hash 的输入与旧版完全一样，已建的环境继续命中
 SPEC_PY='
-import hashlib, json, os, sys
+import hashlib, json, os, re, sys
 f, run, th = sys.argv[1:4]
 snaps = dict(a.split("=", 1) for a in sys.argv[4:])
 d = json.load(open(f))
@@ -105,8 +106,13 @@ pipl = [str(x) for x in d.get("pip", [])]
 for x in ("pytest", "pytest-xdist"):
     if not any(p.lower().startswith(x) for p in pipl): pipl.append(x)
 py = str(d.get("python", "3.12"))
-h = hashlib.sha256(json.dumps([py, sorted(pipl)]).encode()).hexdigest()[:12]
+cl = [str(x) for x in d.get("conda", [])]
+for c in cl:
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._=<>!*,-]{0,80}", c): sys.exit("conda 包名不合法：" + c)
+key = [py, sorted(pipl)] + ([sorted(cl)] if cl else [])
+h = hashlib.sha256(json.dumps(key).encode()).hexdigest()[:12]
 print("hash", h); print("python", py)
+for c in cl: print("conda", c)
 for p in pipl: print("pip", p)
 for p in d.get("pythonpath", []): print("pp", p)
 for k, sd in d.get("snapshots", {}).items():
@@ -125,7 +131,7 @@ for k, v in d.get("env", {}).items():
 # prepare <run_id> <repo>=<commit>... [--env 相对路径] [--snap 键=快照名]
 a_prepare() {
   local rid="${1:-}"; safe "$rid" || fail "run_id 不合法"; shift
-  local R="$TH/runs/$rid" envrel=cmdproto/testenv.json t0=$SECONDS first= spec x repo commit
+  local R="$TH/runs/$rid" envrel= t0=$SECONDS first= spec x repo commit
   local items=() snaps=()
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -136,7 +142,7 @@ a_prepare() {
     esac
   done
   [ ${#items[@]} -gt 0 ] || fail "至少要一个 <仓库>=<commit>"
-  saferel "$envrel" || fail "--env 路径不合法"
+  [ -z "$envrel" ] || saferel "$envrel" || fail "--env 路径不合法"
   guard_th
   if [ -e "$R" ]; then alive "$R" && fail "run 正在跑"; rm -rf "$R"; fi
   mkdir -p "$R"/{src,home,tmp,ramdisk,out}
@@ -153,16 +159,19 @@ a_prepare() {
     [ -n "$first" ] || first="$repo"
     res="$res${res:+,}\"$repo\":\"$commit\""
   done
+  if [ -z "$envrel" ]; then   # 没给 --env：先 testhost.json，再兼容旧的 cmdproto/testenv.json
+    for x in testhost.json cmdproto/testenv.json; do [ -f "$R/src/$first/$x" ] && { envrel="$x"; break; }; done
+  fi
   [ -f "$R/src/$first/$envrel" ] || fail "$first 里没有环境描述 $envrel"
   spec=$("$PY" -c "$SPEC_PY" "$R/src/$first/$envrel" "$R" "$TH" ${snaps[@]+"${snaps[@]}"} 2>"$R/spec.err") \
     || fail "环境描述不可用：$(tail -2 "$R/spec.err")"
-  local hash pyv reqs=() pps= envs=()
+  local hash pyv reqs=() cpk=() pps= envs=()
   while read -r k v; do
-    case "$k" in hash) hash="$v";; python) pyv="$v";; pip) reqs+=("$v");; pp) pps="$pps$v"$'\n';; env) envs+=("$v");; esac
+    case "$k" in hash) hash="$v";; python) pyv="$v";; pip) reqs+=("$v");; conda) cpk+=("$v");; pp) pps="$pps$v"$'\n';; env) envs+=("$v");; esac
   done <<<"$spec"
   printf '%s' "$pps" >"$R/pythonpath"
   { printf '%s\n' ${envs[@]+"${envs[@]}"}; } >"$R/envvars"
-  echo "$hash" >"$R/envhash"
+  echo "$hash" >"$R/envhash"; echo "src/$first/$envrel" >"$R/envfile"
 
   local E="$TH/envs/$hash" reused=true lock="$TH/envs/.lock-$hash" i=0
   if ! { [ -e "$E.ok" ] && [ -x "$E/bin/python" ]; }; then
@@ -174,7 +183,7 @@ a_prepare() {
       trap 'rmdir "$lock" 2>/dev/null' EXIT
       if [ -e "$E.ok" ] && [ -x "$E/bin/python" ]; then reused=true; else
         rm -rf "$E" "$E.ok"; local lg="$TH/dl/env-$hash.log"
-        { "$CONDA" create -y -q -p "$E" "python=$pyv" pip \
+        { "$CONDA" create -y -q -p "$E" "python=$pyv" pip ${cpk[@]+"${cpk[@]}"} \
           && "$E/bin/python" -m pip install -q --disable-pip-version-check ${reqs[@]+"${reqs[@]}"}; } >"$lg" 2>&1 \
           || { rm -rf "$E"; fail "建环境失败（日志 ${lg}）：$(tail -3 "$lg")"; }
         touch "$E.ok"
@@ -199,11 +208,32 @@ a_plugin() {
   printf '{"success":true,"plugin":"%s"}\n' "$f"
 }
 
+# 任务解析：从该 run 检出的环境描述里读 tasks[名]，不信任何外部传入的命令。
+# 输出（NUL 分隔）：cwd（相对工作子目录，"." 表示就是它）、argv...；outputs 模式写到第 4 个参数文件，一行一个。{run} 换成 run 目录。
+TASK_PY='
+import json, sys
+f, name, run, outf = sys.argv[1:5]
+t = json.load(open(f)).get("tasks", {}).get(name)
+if not isinstance(t, dict): sys.exit("描述里没有任务 " + name)
+cmd = t.get("cmd")
+if not (isinstance(cmd, list) and cmd and all(isinstance(x, str) and x and "\n" not in x for x in cmd)):
+    sys.exit("任务 cmd 要是非空字符串数组")
+def rel(x, what):
+    if not isinstance(x, str) or not x or x.startswith(("/", "-")) or ".." in x.split("/") or "\n" in x:
+        sys.exit(what + "路径不合法：" + str(x))
+    return x
+cwd = rel(t.get("cwd", "."), "cwd")
+outs = [rel(x, "outputs ") for x in t.get("outputs", [])]
+open(outf, "w").write("".join(x + "\n" for x in outs))
+sys.stdout.write("".join(x.replace("{run}", run) + "\0" for x in [cwd] + cmd))
+'
+
+# run <run_id> <工作子目录> --task <任务名> [--plugin-env K=V]... [-- 追加参数...]：跑描述里声明的任务（argv 直接执行，不经 shell）
 # run <run_id> <工作子目录> [-n N] [-k 表达式] [-m 标记] [--plugin 模块]... [--plugin-env K=V]... <测试文件...>：后台跑，立即返回
 a_run() {
   local rid="${1:-}" wd="${2:-}"; safe "$rid" || fail "run_id 不合法"; saferel "$wd" || fail "工作子目录不合法"
   shift 2
-  local R="$TH/runs/$rid" n= k= m= files=() plugs=() penv=() x
+  local R="$TH/runs/$rid" n= k= m= files=() plugs=() penv=() x task= extra=()
   [ -d "$R/src/$wd" ] || fail "没有 $rid/src/${wd}，先 prepare"
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -216,11 +246,16 @@ a_run() {
       --plugin-env) [[ "${2:-}" =~ ^[A-Za-z_][A-Za-z0-9_]{0,60}=[^[:cntrl:]]*$ ]] || fail "--plugin-env 要 KEY=VALUE"
         case "${2%%=*}" in PATH|HOME|TMPDIR|PYTHON*|TESTHOST_*|LD_*|DYLD_*|CMDPROTO_RAMDISK_ROOT) fail "--plugin-env 不许改 ${2%%=*}";; esac
         x="${2#*=}"; penv+=("${2%%=*}=${x//\{run\}/$R}"); shift 2;;
+      --task) safe "${2:-}" || fail "--task 任务名不合法"; task="$2"; shift 2;;
+      --) shift; [ -n "$task" ] || fail "-- 追加参数只能跟 --task 用"
+        for x in "$@"; do case "$x" in *$'\n'*) fail "追加参数不许含换行";; esac; extra+=("$x"); done; break;;
       -*) fail "不许的选项：${1}（只放行 -n -k -m --plugin --plugin-env）";;
       *) saferel "$1" || fail "测试路径不合法：$1"; files+=("$1"); shift;;
     esac
   done
-  [ ${#files[@]} -gt 0 ] || fail "没有测试文件"
+  if [ -n "$task" ]; then
+    [ ${#files[@]} -eq 0 ] && [ ${#plugs[@]} -eq 0 ] && [ -z "$n$k$m" ] || fail "--task 不能与测试文件、-n -k -m、--plugin 并用"
+  else [ ${#files[@]} -gt 0 ] || fail "没有测试文件"; fi
   [ -e "$R/out/exit" ] || ! alive "$R" || fail "这个 run 已经在跑"
   rm -f "$R"/out/*
   local E="$TH/envs/$(cat "$R/envhash")" pp= p q
@@ -238,14 +273,28 @@ a_run() {
             PATH="$E/bin:$PATH" PYTHONUNBUFFERED=1 PYTHONUTF8=1 TESTHOST_RUN_ID="$rid")
   while IFS= read -r p; do [ -n "$p" ] && ev+=("$p"); done <"$R/envvars"
   ev+=(${penv[@]+"${penv[@]}"})
-  local cmd=("$E/bin/python" -m pytest -p no:cacheprovider -v -rfE --junitxml="$R/out/junit.xml")
-  [ -n "$n" ] && [ "$n" -gt 1 ] && cmd+=(-n "$n")
-  [ -n "$k" ] && cmd+=(-k "$k")
-  [ -n "$m" ] && cmd+=(-m "$m")
-  for x in ${plugs[@]+"${plugs[@]}"}; do cmd+=(-p "$x"); done
-  cmd+=("${files[@]}")
+  local cmd cwd="$R/src/$wd"
+  if [ -n "$task" ]; then
+    local tl=() cw
+    "$PY" -c "$TASK_PY" "$R/$(cat "$R/envfile")" "$task" "$R" "$R/out/outputs" >"$R/taskargv" 2>"$R/spec.err" \
+      || fail "任务不可用：$(tail -2 "$R/spec.err")"
+    while IFS= read -r -d '' x; do tl+=("$x"); done <"$R/taskargv"
+    cw="${tl[0]}"; cmd=("${tl[@]:1}")
+    q=$(cd "$R/src/$wd/$cw" 2>/dev/null && pwd -P) || fail "任务 cwd 不存在：$cw"
+    case "$q" in "$R"/src/*) cwd="$q";; *) fail "任务 cwd 逃出了 run 目录：$cw";; esac
+    case "${cmd[0]}" in */*) ;; *) q=$(PATH="$E/bin:$PATH" command -v "${cmd[0]}") || fail "找不到命令 ${cmd[0]}"; cmd[0]="$q";; esac
+    cmd+=(${extra[@]+"${extra[@]}"})
+    ev+=(TESTHOST_TASK="$task"); echo "$task" >"$R/out/task"
+  else
+    cmd=("$E/bin/python" -m pytest -p no:cacheprovider -v -rfE --junitxml="$R/out/junit.xml")
+    [ -n "$n" ] && [ "$n" -gt 1 ] && cmd+=(-n "$n")
+    [ -n "$k" ] && cmd+=(-k "$k")
+    [ -n "$m" ] && cmd+=(-m "$m")
+    for x in ${plugs[@]+"${plugs[@]}"}; do cmd+=(-p "$x"); done
+    cmd+=("${files[@]}")
+  fi
   date +%s >"$R/out/start"
-  ( cd "$R/src/$wd" && nohup env -i "${ev[@]}" bash -c 'rc=0; "$@" || rc=$?; date +%s >"$0.end"; echo $rc >"$0"' \
+  ( cd "$cwd" && nohup env -i "${ev[@]}" bash -c 'rc=0; "$@" || rc=$?; date +%s >"$0.end"; echo $rc >"$0"' \
       "$R/out/exit" "${cmd[@]}" >"$R/out/log" 2>&1 </dev/null & echo $! >"$R/out/pid" )
   printf '{"success":true,"run_id":"%s","started":true,"workers":%s}\n' "$rid" "${n:-1}"
 }
@@ -283,9 +332,16 @@ a_status() {
   [ -n "$cnt" ] || cnt=$(log_counts "$R/out/log")
   read -r p f s <<<"${cnt:-0 0 0}"
   pct=$(grep -oE '\[ *[0-9]+%\]' "$R/out/log" 2>/dev/null | tail -1 | tr -dc '0-9')
-  printf '{"success":true,"run_id":"%s","state":"%s","finished":%s,"exit":%s,"passed":%s,"failed":%s,"skipped":%s,"percent":%s,"elapsed":%s}\n' \
+  local task tail=
+  task=$(cat "$R/out/task" 2>/dev/null)
+  if [ -n "$task" ]; then   # 任务没有通过/失败计数，给日志末几行
+    tail=$(tail -n 5 "$R/out/log" 2>/dev/null | LC_ALL=C tr '\000-\011\013-\037\177' ' ' | sed 's/\\/\\\\/g; s/"/\\"/g' \
+      | awk '{printf "%s%s", (NR > 1 ? "\\n" : ""), $0}')
+    [ "$state" = finished ] && pct=
+  fi
+  printf '{"success":true,"run_id":"%s","state":"%s","finished":%s,"exit":%s,"passed":%s,"failed":%s,"skipped":%s,"percent":%s,"elapsed":%s,"task":"%s","log_tail":"%s"}\n' \
     "$rid" "$state" "$([ "$state" = running ] || [ "$state" = prepared ] && echo false || echo true)" "$ex" \
-    "${p:-0}" "${f:-0}" "${s:-0}" "${pct:-0}" $((en - st))
+    "${p:-0}" "${f:-0}" "${s:-0}" "${pct:-0}" $((en - st)) "$task" "$tail"
 }
 
 # fetch <run_id>：junit、日志尾部、退出码打成 tar 输出
@@ -297,17 +353,33 @@ a_fetch() {
   tar -c -C "$o" -f - "${fs[@]}"
 }
 
+# 任务声明的 outputs（out/outputs，一行一个相对路径或通配，相对 run 目录或 run 的 out/）：命中的普通文件（不跟软链、≤50MB、不出 run 目录）
+task_outputs() {
+  local R="$1" pat x
+  [ -f "$R/out/outputs" ] || return 0
+  "$PY" -c 'import glob, os, sys
+R = os.path.realpath(sys.argv[1])
+for pat in open(sys.argv[2]).read().split("\n"):
+    if not pat: continue
+    for base in (R, R + "/out"):
+        for x in glob.glob(os.path.join(base, pat), recursive=True):
+            if os.path.islink(x) or not os.path.isfile(x): continue
+            if not os.path.realpath(x).startswith(R + "/") or os.path.getsize(x) > 52428800: continue
+            print(os.path.relpath(x, R))' "$R" "$R/out/outputs"
+}
+
 # fetchx <run_id>：run 目录里外挂等写出的文件（run 目录顶层、out/ 里非内置的普通文件），tar 输出，成员名相对 run 目录
 a_fetchx() {
   safe "${1:-}" || fail "run_id 不合法"
   local R="$TH/runs/$1"; [ -d "$R/out" ] || fail "没有这个 run"
   local x
-  for x in "$R"/* "$R"/out/*; do
+  { for x in "$R"/* "$R"/out/*; do
     [ -f "$x" ] && [ ! -L "$x" ] || continue
-    case "${x#"$R"/}" in pythonpath|envvars|envhash|spec.err|out/log|out/log.tail|out/pid|out/exit|out/exit.end|out/start|out/junit.xml) continue;; esac
+    case "${x#"$R"/}" in pythonpath|envvars|envhash|envfile|taskargv|spec.err|out/outputs|out/task|out/log|out/log.tail|out/pid|out/exit|out/exit.end|out/start|out/junit.xml) continue;; esac
     [ "$(wc -c <"$x")" -le 52428800 ] || continue
     printf '%s\n' "${x#"$R"/}"
-  done | tar -c -C "$R" -T - -f -
+  done
+  task_outputs "$R"; } | sort -u | tar -c -C "$R" -T - -f -
 }
 
 wipe_dir() { guard_th; find "$TH/$1" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null; }

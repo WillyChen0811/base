@@ -110,7 +110,14 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 	json.NewEncoder(w).Encode(v)
 }
 
+// proxyAllowed 只放行模型接口（/v1/ 开头）。oMLX 的 /admin/ 等管理接口不经网关。
+func proxyAllowed(p string) bool { return strings.HasPrefix(p, "/v1/") }
+
 func (g *Gateway) handleProxy(w http.ResponseWriter, r *http.Request) {
+	if !proxyAllowed(r.URL.Path) {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "网关不转发此路径"})
+		return
+	}
 	var body []byte
 	model := ""
 	if r.Body != nil && r.Body != http.NoBody {

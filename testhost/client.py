@@ -92,6 +92,12 @@ def make_bundle(repo, sha, have):
         return git(t, "bundle", "create", "-", ref, *excl)
 
 
+def is_ancestor(repo, sha, tip):
+    """sha 是 tip 的祖先（tip 本地没有时视为否）。"""
+    return subprocess.run(["git", "-C", str(repo), "merge-base", "--is-ancestor", sha, tip],
+                          capture_output=True).returncode == 0
+
+
 def eval_names(src, names):
     """从 Python 源码取模块级常量元组（支持 Name 引用与 *展开），不 import 源文件。"""
     env = {}
@@ -199,7 +205,8 @@ def push_repos(tr, repos):
     inv = tr.call("inventory")["repos"]
     for n, (p, sha) in repos.items():
         have = inv.get(n, [])
-        if sha in have:
+        if sha in have or any(is_ancestor(p, sha, h) for h in have):
+            # 祖先 commit：对象已随某个已同步 tip 在 Mac 裸仓库里，prepare 按 sha 直接 archive，不需要 ref
             log(f"{n}@{sha[:8]} Mac 上已有")
             continue
         data = make_bundle(p, sha, have)

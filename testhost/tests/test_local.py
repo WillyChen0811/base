@@ -282,3 +282,22 @@ def test_task_rejects(tmp_path, monkeypatch):
     for cmd in ["run ev toy2 -- a", "run ev toy2 --task ../x", "run ev toy2 --task mk t.py", "run ev toy2 --task mk -k x"]:
         with pytest.raises(client.THError):
             tr.call(cmd)
+
+
+def test_ancestor_commit_skips_bundle(toy, capsys, monkeypatch):
+    r, th = toy
+    (r / "tests/b.txt").write_text("b")
+    _git(r, "add", "-A")
+    _git(r, "commit", "-qm", "second")
+    first = subprocess.run(["git", "-C", str(r), "rev-parse", "HEAD~1"], capture_output=True, text=True).stdout.strip()
+    argv = ["run", "--repo", f"{r}=toy", "--workdir", "toy", "-n", "2", "tests/test_a.py"]
+    assert client.main(argv + ["--run-id", "a1"]) == 1          # 先同步 tip
+    capsys.readouterr()
+    called = []
+    orig = client.make_bundle
+    monkeypatch.setattr(client, "make_bundle", lambda *a: called.append(a) or orig(*a))
+    assert client.main(["run", "--repo", f"{r}=toy", "--commit-of", f"toy={first}", "--workdir", "toy", "-n", "2",
+                        "--run-id", "a2", "tests/test_a.py"]) == 1
+    assert not called and "Mac 上已有" in capsys.readouterr().out
+    assert (th / "runs/a2/src/toy/tests/test_a.py").exists()
+    assert not (th / "runs/a2/src/toy/tests/b.txt").exists()     # 检出的是祖先版本

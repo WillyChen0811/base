@@ -250,7 +250,7 @@ def test_hash_old_desc_unchanged_and_conda(tmp_path, monkeypatch):
 
 TASK_DESC = {"python": "3.12", "pip": [], "tasks": {
     "mk": {"cmd": ["python", "tool.py", "{run}/x"], "cwd": ".", "outputs": ["res/**/*.txt", "src/toy2/res/sub/a.txt"]},
-    "sub": {"cmd": ["python", "tool.py"], "cwd": "tests", "outputs": []},
+    "sub": {"cmd": ["python", "../tool.py"], "cwd": "tests", "outputs": []},
     "evil": {"cmd": ["python", "tool.py"], "outputs": ["../../etc/passwd"]}}}
 
 
@@ -266,8 +266,8 @@ def test_task_run_and_fetch(tmp_path, monkeypatch, capsys):
     st = client.Transport("x", "x").call("status k1")
     assert st["task"] == "mk" and st["state"] == "finished" and st["exit"] == 0 and "done 4" in st["log_tail"]
     # 退出码照传；cwd 相对工作子目录
-    monkeypatch.setenv("RC", "7")
-    assert client.main(["run", "--repo", f"{r}=toy2", "--workdir", "toy2", "--task", "sub", "--run-id", "k2"]) == 7
+    assert client.main(["run", "--repo", f"{r}=toy2", "--workdir", "toy2", "--task", "sub", "--run-id", "k2",
+                        "--plugin-env", "RC=7"]) == 7
     assert (th / "runs/k2/src/toy2/tests/res/sub/a.txt").exists()
 
 

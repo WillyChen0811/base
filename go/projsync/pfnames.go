@@ -294,7 +294,8 @@ type PFCrossClash struct {
 // PFCrossSideClashes 给 Mac 和 Ubuntu 同一目录的名字集合，找折叠键相同但字节不同的对（§4.2 第 4 条）：
 // 含只差大小写（Mac Report.docx / Ubuntu report.docx）、一边 NFC 一边 NFD；
 // 名字是目录时同样算（目录段只差大小写 → 调用方跳过这个目录的整棵子树）。
-// 两边字节完全相同的名字不算；一个键下一边有多个名字时，两两配对。
+// 两边字节完全相同的名字不算；一个键下一边有多个名字时，所有字节不同的 (Mac, Ubuntu) 组合都列出
+// （其中可能有与另一边字节相同的名字，它们同时是「同一边撞名」，由 PFSameSideClashes 报告，调用方取并集即可）。
 // 结果按 (Mac, Ubuntu) 字节序排序，没有返回 nil。调用方把每对里的两个名字都判超出范围。
 func PFCrossSideClashes(mac, ubuntu []string) []PFCrossClash {
 	byKey := func(names []string) map[string]map[string]bool {

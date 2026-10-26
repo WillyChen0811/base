@@ -713,8 +713,8 @@ func TestPFEdgeGolden(t *testing.T) {
 	if got := PFCrossSideClashes(live, ubuntu); !reflect.DeepEqual(got, wantCross) {
 		t.Errorf("PFCrossSideClashes = %v，期望 %v", got, wantCross)
 	}
-	// 两边完全一样 → 没有跨边差异
-	if got := PFCrossSideClashes(live, live); got != nil {
+	// 两边完全一样（且各边内部没有撞名）→ 没有跨边差异
+	if got := PFCrossSideClashes(ubuntu, ubuntu); got != nil {
 		t.Errorf("两边一样时应没有跨边差异，得到 %v", got)
 	}
 

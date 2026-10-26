@@ -100,21 +100,33 @@ func defaultProcCmdline(pid int) (string, error) {
 	return strings.TrimSpace(strings.ReplaceAll(string(raw), "\x00", " ")), nil
 }
 
+// scriptRunners 是能把脚本当第一个参数跑的解释器：claude/codex 用 npm 装的时候命令行是 `node …/codex.js`。
+var scriptRunners = map[string]bool{"node": true, "nodejs": true, "bun": true, "deno": true}
+
 // agentOfCmdline 判断命令行属于哪种 agent："claude"、"codex" 或 ""。
-// 只看前两个参数（可执行文件与解释器的脚本）以及 npm 包名，免得 `vim claude` 之类误判；同时命中两种就不认。
+// 认三种写法：可执行文件本身叫 claude/codex；解释器（node 等）跑的脚本叫 claude(.js)/codex(.js)；
+// 命令行里带 npm 包名（@anthropic-ai/claude-code、@openai/codex）。
+// `vim claude`、`bash -lc claude` 这类不算；同时命中两种就不认。
 func agentOfCmdline(cmdline string) string {
 	args := strings.Fields(cmdline)
 	is := func(name, pkg string) bool {
 		if strings.Contains(cmdline, pkg) {
 			return true
 		}
-		for i := 0; i < len(args) && i < 2; i++ {
-			b := filepath.Base(args[i])
-			if b == name || strings.TrimSuffix(b, ".js") == name {
-				return true
-			}
+		if len(args) == 0 {
+			return false
 		}
-		return false
+		base := func(a string) string {
+			b := filepath.Base(a)
+			for _, ext := range []string{".js", ".mjs", ".cjs"} {
+				b = strings.TrimSuffix(b, ext)
+			}
+			return b
+		}
+		if filepath.Base(args[0]) == name {
+			return true
+		}
+		return len(args) > 1 && scriptRunners[filepath.Base(args[0])] && base(args[1]) == name
 	}
 	c, x := is("claude", "@anthropic-ai/claude-code"), is("codex", "@openai/codex")
 	switch {

@@ -1131,7 +1131,7 @@ func TestPFTransferReuseRefreshesReference(t *testing.T) {
 	}
 	meta := filepath.Join(e.rstage, job.SHA256+".meta")
 	part := e.rpart(job.SHA256)
-	oldT := time.Now().Add(-30 * 24 * time.Hour)
+	oldT := time.Now().Add(-30 * 24 * time.Hour).Truncate(time.Second) // SFTP 的时间只到秒
 	// 把 part 和 meta 都弄成「30 天前」；meta 末行记的 part 时间同步改成新的，保证仍能复用
 	age := func() {
 		os.Chtimes(part, oldT, oldT)

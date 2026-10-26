@@ -515,16 +515,25 @@ func Run(ctx context.Context, dir string, stdin io.Reader, stdout io.Writer) (er
 			errJSON(w, http.StatusBadGateway, "解析会话列表失败: "+err.Error())
 			return
 		}
+		// 忙闲灯：远端钩子写的本地状态文件，同一条 SSH 连接上顺带读回来；读不到不影响列表（busy 为空串）。
+		// 只给 tmux 列表里还在的会话挂状态，会话没了留下的文件忽略。
+		var busy map[string]busyInfo
+		if len(list) > 0 {
+			busy = readBusyStates(r.Context(), pool, r.URL.Query().Get("host"))
+		}
 		type item struct {
 			Name     string `json:"name"`
 			Attached int    `json:"attached"`
 			Windows  int    `json:"windows"`
 			Created  int64  `json:"created"`
 			Activity int64  `json:"activity"`
+			Busy     string `json:"busy"`      // "busy"、"idle" 或空串（读不到）
+			BusyTime int64  `json:"busy_time"` // 钩子写状态的 unix 秒；Busy 为空时是 0
 		}
 		items := []item{}
 		for _, s := range list {
-			items = append(items, item{s.Name, s.Attached, s.Windows, s.Created.Unix(), s.Activity.Unix()})
+			b := busy[s.Name]
+			items = append(items, item{s.Name, s.Attached, s.Windows, s.Created.Unix(), s.Activity.Unix(), b.State, b.Time})
 		}
 		writeJSON(w, map[string]any{"sessions": items})
 	})

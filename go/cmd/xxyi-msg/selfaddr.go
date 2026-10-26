@@ -159,10 +159,9 @@ func findPaneSession(pid int, panes map[int]string) (string, error) {
 	return "", nil
 }
 
-// selfAddrFromProcTree 是 selfAddr 的第三步：没有 XXYI_ADDR、也没有 TMUX 时，
-// 沿进程树找自己所在的 tmux 会话，地址前缀按现有选侧规则（见 ubuntuSide）。
-// 拿不到就回 errNoSelfAddr（带一步原因），send 照旧报错、state 照旧静默。
-func selfAddrFromProcTree() (string, error) {
+// procTreeSession 是 selfAddr 第三步的会话名部分：沿进程树找自己所在的 tmux 会话。
+// 拿不到就回 errNoSelfAddr（带一步原因）。会话名已校验过（checkSessionName）。
+func procTreeSession() (string, error) {
 	out, err := listPanes()
 	if err != nil {
 		return "", fmt.Errorf("%w（列 tmux pane 失败：%v）", errNoSelfAddr, err)
@@ -179,6 +178,17 @@ func selfAddrFromProcTree() (string, error) {
 		return "", errNoSelfAddr
 	}
 	if err := checkSessionName(name); err != nil {
+		return "", err
+	}
+	return name, nil
+}
+
+// selfAddrFromProcTree 是 selfAddr 的第三步：没有 XXYI_ADDR、也没有 TMUX 时，
+// 沿进程树找自己所在的 tmux 会话，地址前缀按现有选侧规则（见 ubuntuSide）。
+// 拿不到就回 errNoSelfAddr（带一步原因），send 照旧报错。
+func selfAddrFromProcTree() (string, error) {
+	name, err := procTreeSession()
+	if err != nil {
 		return "", err
 	}
 	if ubuntuSide() {
@@ -198,10 +208,7 @@ func ubuntuSide() bool {
 	return isUbuntuSideFiles(defaultEndpointPath(), defaultClientBundlePathUbuntu(), defaultXxyiConfigPath())
 }
 
-// hookLog 给 state 钩子追加一行排查日志："时间 参数 结果"。
-func hookLog(args []string, result string) { hookLogCmd("state", args, result) }
-
-// hookLogCmd 给钩子类子命令追加一行排查日志："时间 子命令 参数 结果"（state 与 approve-hook 共用）。
+// hookLogCmd 给钩子类子命令追加一行排查日志："时间 子命令 参数 结果"（approve-hook 用；state 钩子只写本地状态文件，不再记日志）。
 // 目录跟证书包同一侧（Ubuntu 是 ~/.xxyi-support，Mac 是 ~/.xxyi）；目录不存在就不写。
 // 超过 256KB 先整份改名 .1 再写新的。任何失败静默忽略：日志只给排查用，
 // 不影响退出码，也不占 2 秒上报预算（本地一次 stat 加一次追加）。

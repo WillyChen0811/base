@@ -23,9 +23,9 @@ import (
 // 超时与上限，测试里可调小。
 var (
 	httpTimeout   = 10 * time.Second       // send/who/inbox 的 HTTP 超时
-	stateDeadline = 2 * time.Second        // state 的总耗时上限（含 HTTP 客户端超时）：钩子在等，超了直接放弃
+	stateDeadline = 2 * time.Second        // state 的总耗时上限：钩子在等，超了直接放弃
 	tmuxTimeout   = 2 * time.Second        // 取 tmux 会话名的超时
-	stopHookWait  = 800 * time.Millisecond // state --check 等标准输入里钩子 JSON 的上限，留出时间把状态报出去
+	stopHookWait  = 800 * time.Millisecond // state --start 等标准输入里钩子 JSON 的上限
 )
 
 // 消息类型，与服务端 support 的 Kind* 同一套字面量（命令行不接受 reply，回复走 reply 子命令）。
@@ -360,11 +360,8 @@ func selfAddr() (string, error) {
 		return a, nil
 	}
 	if os.Getenv("TMUX") != "" {
-		name, err := tmuxSession()
+		name, err := tmuxEnvSession()
 		if err != nil {
-			return "", fmt.Errorf("取 tmux 会话名失败：%w", err)
-		}
-		if err := checkSessionName(name); err != nil {
 			return "", err
 		}
 		if ubuntuSide() {
@@ -373,6 +370,18 @@ func selfAddr() (string, error) {
 		return "mac:" + name, nil
 	}
 	return selfAddrFromProcTree()
+}
+
+// tmuxEnvSession 在 TMUX 环境变量存在时，用 tmux 取当前会话名并校验。
+func tmuxEnvSession() (string, error) {
+	name, err := tmuxSession()
+	if err != nil {
+		return "", fmt.Errorf("取 tmux 会话名失败：%w", err)
+	}
+	if err := checkSessionName(name); err != nil {
+		return "", err
+	}
+	return name, nil
 }
 
 // checkSessionName 校验 tmux 会话名能不能当地址名用（与服务端 support.ValidAddr 同一套字符集）。
@@ -526,12 +535,6 @@ type inboxMessage struct {
 // inboxResp 是 GET /msg/inbox 的响应。
 type inboxResp struct {
 	Messages   []inboxMessage `json:"messages"`
-	Unanswered []inboxMessage `json:"unanswered"`
-}
-
-// stateResp 是 POST /msg/state?check=1 的响应；unanswered 非空表示这次状态上报被按住。
-type stateResp struct {
-	OK         bool           `json:"ok"`
 	Unanswered []inboxMessage `json:"unanswered"`
 }
 
@@ -1093,161 +1096,6 @@ func cmdWho(ctx context.Context, out io.Writer) error {
 	}
 	fmt.Fprintln(out, text)
 	return nil
-}
-
-// 忙闲状态字面量，与服务端 support.PeerState 一致。
-const (
-	stateBusy = "busy"
-	stateIdle = "idle"
-	stateGone = "gone"
-)
-
-// stopHook 是从钩子标准输入里读到的东西。
-type stopHook struct {
-	active bool
-	ok     bool // 有没有读到并解析成功
-}
-
-// stopHookActive 读钩子塞进来的 JSON，取 stop_hook_active。
-// 读放在 goroutine 里，跟 stateDeadline（再收窄到 stopHookWait）一起 select：
-// 钩子不关标准输入也拖不住这条命令，超时就当没读到（ok=false），照常把状态报出去。
-func stopHookActive(ctx context.Context, stdin io.Reader) (active bool, ok bool) {
-	readCtx, cancel := context.WithTimeout(ctx, stopHookWait)
-	defer cancel()
-	ch := make(chan stopHook, 1)
-	go func() {
-		var h struct {
-			StopHookActive bool `json:"stop_hook_active"`
-		}
-		err := json.NewDecoder(stdin).Decode(&h)
-		ch <- stopHook{active: h.StopHookActive, ok: err == nil}
-	}()
-	select {
-	case got := <-ch:
-		return got.active, got.ok
-	case <-readCtx.Done():
-		return false, false
-	}
-}
-
-// sessionSourceCompact 是 SessionStart 钩子 JSON 的 source 之一：上下文压缩触发的"重新开始"。
-const sessionSourceCompact = "compact"
-
-// sessionStartSource 读 SessionStart 钩子塞进来的 JSON，取 source。
-// 读法同 stopHookActive：goroutine 里限时读，读不到返回空串（照常上报状态）。
-func sessionStartSource(ctx context.Context, stdin io.Reader) string {
-	readCtx, cancel := context.WithTimeout(ctx, stopHookWait)
-	defer cancel()
-	ch := make(chan string, 1)
-	go func() {
-		var h struct {
-			Source string `json:"source"`
-		}
-		if json.NewDecoder(stdin).Decode(&h) != nil {
-			ch <- ""
-			return
-		}
-		ch <- h.Source
-	}()
-	select {
-	case got := <-ch:
-		return got
-	case <-readCtx.Done():
-		return ""
-	}
-}
-
-// blockJSON 是 stop hook 的拒绝响应（一行 JSON）：reason 里逐条列出欠回复的请求。
-func blockJSON(un []inboxMessage) string {
-	items := make([]string, 0, len(un))
-	for _, m := range un {
-		// 服务端已按第一行截过，这里再截一次兜底：reason 是一行 JSON，塞整段正文没意义。
-		items = append(items, fmt.Sprintf("#%s（来自 %s：%s）", m.ID, m.From, firstLine(m.Text)))
-	}
-	reason := "你还有没回复的 XXYI 请求：" + strings.Join(items, "；") +
-		"。请先用 xxyi_reply（或 xxyi-msg reply <id> \"…\"）逐条回复，做不了也要回复说明原因。"
-	raw, err := json.Marshal(map[string]string{"decision": "block", "reason": reason})
-	if err != nil {
-		return ""
-	}
-	return string(raw)
-}
-
-// cmdState 给 Claude Code 钩子用：任何错误都静默退出 0，总耗时不超过 stateDeadline。
-// 只有 "idle --check" 才读标准输入拿 stop_hook_active（决定要不要让服务端查欠回复）；
-// "--start"（SessionStart 钩子用）也读标准输入取 source：compact 是压缩中途，
-// Claude 正在干活，什么都不做退出 0；其余（startup/resume/clear/读不到）照常上报；
-// 其余情况绝不碰标准输入，免得等 EOF 卡住钩子。
-// 每次运行都在 ~/.xxyi[-support]/msg-hook.log 追加一行（见 selfaddr.go 的 hookLog）：
-// Codex 跑钩子不带环境变量，出了问题没日志就只能干瞪眼；日志失败忽略，不影响退出码。
-func cmdState(args []string, stdin io.Reader, stdout io.Writer) int {
-	state := ""
-	check := false
-	start := false
-	for _, a := range args {
-		switch a {
-		case "--check":
-			check = true
-		case "--start":
-			start = true
-		case stateBusy, stateIdle, stateGone:
-			if state != "" {
-				hookLog(args, "参数不合法：给了两个状态值")
-				return exitOK // 给了两个状态值：当参数不合法处理
-			}
-			state = a
-		default:
-			hookLog(args, "参数不合法："+a)
-			return exitOK
-		}
-	}
-	if state == "" {
-		hookLog(args, "参数里没有状态")
-		return exitOK
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), stateDeadline)
-	defer cancel()
-	// state 钩子不补发暂存：状态上报是送达确认的唯一依据，别让补发挤掉上报的预算
-	//（补发只在 send/reply/inbox/who 与 MCP 工具调用时做）。
-	if start && sessionStartSource(ctx, stdin) == sessionSourceCompact {
-		hookLog(args, "SessionStart 是 compact，不上报")
-		return exitOK // 压缩触发的 SessionStart：不上报状态，免得把干活中的 Claude 记成空闲
-	}
-	from, err := selfAddr()
-	if err != nil {
-		hookLog(args, "取地址失败："+err.Error())
-		return exitOK
-	}
-	q := url.Values{"addr": {from}, "state": {state}}
-	if state == stateIdle && check {
-		if active, ok := stopHookActive(ctx, stdin); ok && !active {
-			q.Set("check", "1")
-		}
-	}
-	c, err := connect(ctx, stateDeadline)
-	if err != nil {
-		hookLog(args, "addr="+from+" 连不上："+err.Error())
-		return exitOK
-	}
-	b, err := c.do(ctx, http.MethodPost, c.path("/msg/state", q), nil)
-	if err != nil {
-		hookLog(args, "addr="+from+" 上报失败："+err.Error())
-		return exitOK
-	}
-	if q.Get("check") != "1" {
-		hookLog(args, "addr="+from+" 已上报 "+state)
-		return exitOK // 没要求自查：服务端回什么都不拦 Claude 停下
-	}
-	var resp stateResp
-	if json.Unmarshal(b, &resp) != nil || len(resp.Unanswered) == 0 {
-		hookLog(args, "addr="+from+" 已上报 "+state+"，没有欠回复")
-		return exitOK
-	}
-	hookLog(args, fmt.Sprintf("addr=%s 已上报 %s，拦下 %d 条欠回复", from, state, len(resp.Unanswered)))
-	if line := blockJSON(resp.Unanswered); line != "" {
-		fmt.Fprintln(stdout, line)
-	}
-	return exitOK
 }
 
 // run 是程序主体，返回退出码。

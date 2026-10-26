@@ -15,7 +15,6 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -32,7 +31,6 @@ type captured struct {
 
 	// 各接口的响应正文，留空用默认值（都在建服务之前设好，不与处理协程并发写）。
 	respPeers string
-	respState string
 	respInbox string
 	// 审批接口（/approval/ask）的响应正文，留空回「没拿到决定」。
 	respApproval string
@@ -43,13 +41,6 @@ func (c *captured) peersResp() string {
 		return c.respPeers
 	}
 	return `{"peers":{"ubuntu:b":"busy","mac:a":"idle","ubuntu:c":"idle"}}`
-}
-
-func (c *captured) stateResp() string {
-	if c.respState != "" {
-		return c.respState
-	}
-	return `{"ok":true}`
 }
 
 func (c *captured) inboxResp() string {
@@ -110,7 +101,7 @@ func (c *captured) queries() []string {
 	return out
 }
 
-// handler 统一处理 /msg/send（reply 也走它）、/msg/state、/msg/inbox、/msg/who、/msg。
+// handler 统一处理 /msg/send（reply 也走它）、/msg/inbox、/msg/who、/msg。
 func (c *captured) handler() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		rec := capturedReq{
@@ -147,8 +138,6 @@ func (c *captured) handler() http.HandlerFunc {
 			fmt.Fprintf(w, `{"id":%q}`, id)
 		case "/msg/recall":
 			fmt.Fprint(w, `{"ok":true}`)
-		case "/msg/state":
-			fmt.Fprint(w, c.stateResp())
 		case "/msg/inbox":
 			fmt.Fprint(w, c.inboxResp())
 		case "/msg/who", "/msg":
@@ -524,7 +513,7 @@ func TestSelfAddr(t *testing.T) {
 		t.Error("TMUX 设了应该取会话名")
 	}
 
-	// 都没有：send 退出 2，state 静默 0
+	// 都没有：send 退出 2
 	// 第三步兜底同样只吃注入（绝不真执行 tmux）：链上没有 pane 命中 → 还是"不知道自己的地址"。
 	t.Setenv("TMUX", "")
 	tmuxCalled = false
@@ -541,52 +530,6 @@ func TestSelfAddr(t *testing.T) {
 	}
 	if n := cap.count(); n != 2 {
 		t.Errorf("send 判失败前不该发请求，已发 %d", n)
-	}
-	if code := run([]string{"state", "busy"}, nil, io.Discard, io.Discard); code != exitOK {
-		t.Fatalf("没地址时 state 退出码 %d", code)
-	}
-	if n := cap.count(); n != 2 {
-		t.Errorf("没地址时 state 不该发请求，已发 %d", n)
-	}
-}
-
-func TestStateReportsAndSucceeds(t *testing.T) {
-	var cap captured
-	srv := httptest.NewServer(cap.handler())
-	defer srv.Close()
-	useEndpoint(t, srv.URL)
-	t.Setenv("XXYI_ADDR", "ubuntu:cw")
-
-	errOut := &bytes.Buffer{}
-	if code := run([]string{"state", "busy"}, strings.NewReader(`{"huge":"钩子塞的 JSON，不该被读"}`), io.Discard, errOut); code != exitOK {
-		t.Fatalf("退出码 %d", code)
-	}
-	if errOut.Len() != 0 {
-		t.Errorf("state 出错前不该有输出：%q", errOut.String())
-	}
-	got := cap.last(t)
-	if got.path != "/msg/state" || !strings.Contains(got.query, "addr=ubuntu%3Acw") || !strings.Contains(got.query, "state=busy") {
-		t.Errorf("state 请求 %s?%s", got.path, got.query)
-	}
-}
-
-func TestStateNeverRespondsReturnsZeroFast(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		select {
-		case <-r.Context().Done():
-		case <-time.After(5 * time.Second):
-		}
-	}))
-	defer srv.Close()
-	useEndpoint(t, srv.URL)
-	t.Setenv("XXYI_ADDR", "ubuntu:cw")
-
-	start := time.Now()
-	if code := run([]string{"state", "busy"}, nil, io.Discard, io.Discard); code != exitOK {
-		t.Fatalf("退出码 %d", code)
-	}
-	if d := time.Since(start); d > 2500*time.Millisecond {
-		t.Fatalf("耗时 %v，超过 2.5 秒", d)
 	}
 }
 
@@ -607,7 +550,7 @@ func TestSendDoubleDashLiteralText(t *testing.T) {
 	}
 }
 
-// tmux 会话名带中文/空格：send 当场退出 2 并提示改名，state 照旧静默 0、不发请求。
+// tmux 会话名带中文/空格：send 当场退出 2 并提示改名、不发请求。
 func TestSelfAddrIllegalSessionName(t *testing.T) {
 	var cap captured
 	srv := httptest.NewServer(cap.handler())
@@ -628,12 +571,6 @@ func TestSelfAddrIllegalSessionName(t *testing.T) {
 	}
 	if n := cap.count(); n != 0 {
 		t.Errorf("地址不合法时不该发请求，已发 %d", n)
-	}
-	if code := run([]string{"state", "busy"}, nil, io.Discard, io.Discard); code != exitOK {
-		t.Fatalf("state 应静默退出 0，得到 %d", code)
-	}
-	if n := cap.count(); n != 0 {
-		t.Errorf("地址不合法时 state 不该发请求，已发 %d", n)
 	}
 }
 
@@ -682,19 +619,6 @@ func TestSendArgValidation(t *testing.T) {
 		t.Errorf("附件超限不该发请求，已发 %d", cap.count()-n)
 	}
 }
-
-// watchReader 记录自己有没有被读过：state 不带 --check 时绝不该碰标准输入。
-type watchReader struct {
-	r      io.Reader
-	called atomic.Bool
-}
-
-func (w *watchReader) Read(p []byte) (int, error) {
-	w.called.Store(true)
-	return w.r.Read(p)
-}
-
-func (w *watchReader) wasRead() bool { return w.called.Load() }
 
 func TestSendKindAndAskUser(t *testing.T) {
 	var cap captured
@@ -910,203 +834,6 @@ func TestInboxEmptyAndWhoGone(t *testing.T) {
 	// gone 原样打印，不再把非 busy 的补成 idle
 	if want := "mac:a gone\nmac:c idle\nubuntu:b busy\n"; out.String() != want {
 		t.Errorf("who 输出 %q，期望 %q", out.String(), want)
-	}
-}
-
-// --check + stop_hook_active=false：服务端列出欠回复时，标准输出一行 block JSON。
-func TestStateCheckBlocksOnUnanswered(t *testing.T) {
-	var cap captured
-	cap.respState = `{"ok":true,"unanswered":[` +
-		`{"id":"aa11","from":"mac:boss","text":"把分支推上去"},` +
-		`{"id":"bb22","from":"mac:boss","text":"另一件事\n第二行不该出现"}` +
-		`]}`
-	srv := httptest.NewServer(cap.handler())
-	defer srv.Close()
-	useEndpoint(t, srv.URL)
-	t.Setenv("XXYI_ADDR", "ubuntu:cw")
-
-	out := &bytes.Buffer{}
-	if code := run([]string{"state", "idle", "--check"}, strings.NewReader(`{"stop_hook_active":false}`), out, io.Discard); code != exitOK {
-		t.Fatalf("退出码 %d", code)
-	}
-	line := strings.TrimSuffix(out.String(), "\n")
-	if strings.Contains(line, "\n") {
-		t.Fatalf("block 响应必须是一行 JSON：%q", out.String())
-	}
-	var block struct {
-		Decision string `json:"decision"`
-		Reason   string `json:"reason"`
-	}
-	if err := json.Unmarshal([]byte(line), &block); err != nil {
-		t.Fatalf("标准输出不是合法 JSON %q：%v", line, err)
-	}
-	if block.Decision != "block" {
-		t.Errorf("decision %q", block.Decision)
-	}
-	for _, want := range []string{"aa11", "bb22", "mac:boss", "xxyi_reply", "把分支推上去", "另一件事"} {
-		if !strings.Contains(block.Reason, want) {
-			t.Errorf("reason %q 里没有 %q", block.Reason, want)
-		}
-	}
-	if strings.Contains(block.Reason, "第二行不该出现") {
-		t.Errorf("reason 该只带第一行：%q", block.Reason)
-	}
-	if !strings.Contains(block.Reason, "；") {
-		t.Errorf("多条要用「；」连接：%q", block.Reason)
-	}
-	if got := cap.last(t); !strings.Contains(got.query, "check=1") || !strings.Contains(got.query, "state=idle") {
-		t.Errorf("state 请求 %s?%s", got.path, got.query)
-	}
-}
-
-// stop_hook_active=true：请求不带 check，标准输出干净。
-func TestStateCheckSkippedWhenHookActive(t *testing.T) {
-	var cap captured
-	cap.respState = `{"ok":true,"unanswered":[{"id":"aa11","from":"mac:boss","text":"欠着的"}]}`
-	srv := httptest.NewServer(cap.handler())
-	defer srv.Close()
-	useEndpoint(t, srv.URL)
-	t.Setenv("XXYI_ADDR", "ubuntu:cw")
-
-	out := &bytes.Buffer{}
-	if code := run([]string{"state", "idle", "--check"}, strings.NewReader(`{"stop_hook_active":true}`), out, io.Discard); code != exitOK {
-		t.Fatalf("退出码 %d", code)
-	}
-	if out.Len() != 0 {
-		t.Errorf("钩子已在跑时不该有输出：%q", out.String())
-	}
-	if got := cap.last(t); strings.Contains(got.query, "check=") {
-		t.Errorf("stop_hook_active=true 时不该带 check：%s", got.query)
-	}
-}
-
-// 服务端没有欠回复：不带 block，静默退出。
-func TestStateCheckQuietWhenNothingUnanswered(t *testing.T) {
-	var cap captured
-	cap.respState = `{"ok":true,"unanswered":[]}`
-	srv := httptest.NewServer(cap.handler())
-	defer srv.Close()
-	useEndpoint(t, srv.URL)
-	t.Setenv("XXYI_ADDR", "ubuntu:cw")
-
-	out := &bytes.Buffer{}
-	if code := run([]string{"state", "idle", "--check"}, strings.NewReader(`{"stop_hook_active":false}`), out, io.Discard); code != exitOK {
-		t.Fatalf("退出码 %d", code)
-	}
-	if out.Len() != 0 {
-		t.Errorf("没有欠回复不该有输出：%q", out.String())
-	}
-	if got := cap.last(t); !strings.Contains(got.query, "check=1") {
-		t.Errorf("该带 check=1：%s", got.query)
-	}
-}
-
-// 不带 --check：不读标准输入，也不带 check。
-func TestStateWithoutCheckDoesNotReadStdin(t *testing.T) {
-	var cap captured
-	cap.respState = `{"ok":true,"unanswered":[{"id":"aa11","from":"mac:boss","text":"欠着的"}]}`
-	srv := httptest.NewServer(cap.handler())
-	defer srv.Close()
-	useEndpoint(t, srv.URL)
-	t.Setenv("XXYI_ADDR", "ubuntu:cw")
-
-	stdin := &watchReader{r: strings.NewReader(`{"stop_hook_active":false}`)}
-	out := &bytes.Buffer{}
-	if code := run([]string{"state", "idle"}, stdin, out, io.Discard); code != exitOK {
-		t.Fatalf("退出码 %d", code)
-	}
-	if stdin.wasRead() {
-		t.Error("不带 --check 不该读标准输入")
-	}
-	if out.Len() != 0 {
-		t.Errorf("不该有输出：%q", out.String())
-	}
-	if got := cap.last(t); strings.Contains(got.query, "check=") {
-		t.Errorf("不该带 check：%s", got.query)
-	}
-}
-
-// 标准输入一直不关闭：仍在 stateDeadline 内返回（goroutine 读 + select）。
-func TestStateCheckStdinNeverClosesReturnsFast(t *testing.T) {
-	var cap captured
-	srv := httptest.NewServer(cap.handler())
-	defer srv.Close()
-	useEndpoint(t, srv.URL)
-	t.Setenv("XXYI_ADDR", "ubuntu:cw")
-
-	oldDeadline := stateDeadline
-	t.Cleanup(func() { stateDeadline = oldDeadline })
-	stateDeadline = 300 * time.Millisecond
-
-	pr, _ := io.Pipe() // 没人写也没人关
-	start := time.Now()
-	out := &bytes.Buffer{}
-	if code := run([]string{"state", "idle", "--check"}, pr, out, io.Discard); code != exitOK {
-		t.Fatalf("退出码 %d", code)
-	}
-	if d := time.Since(start); d > 1200*time.Millisecond {
-		t.Fatalf("耗时 %v，标准输入不关闭时也没及时返回", d)
-	}
-	if out.Len() != 0 {
-		t.Errorf("读不到钩子 JSON 时不该有输出：%q", out.String())
-	}
-}
-
-// state 接受 gone；参数不合法仍静默退出 0。
-func TestStateGoneAndBadArgs(t *testing.T) {
-	var cap captured
-	srv := httptest.NewServer(cap.handler())
-	defer srv.Close()
-	useEndpoint(t, srv.URL)
-	t.Setenv("XXYI_ADDR", "ubuntu:cw")
-
-	if code := run([]string{"state", "gone"}, nil, io.Discard, io.Discard); code != exitOK {
-		t.Fatalf("退出码 %d", code)
-	}
-	if got := cap.last(t); !strings.Contains(got.query, "state=gone") {
-		t.Errorf("state 请求 %s?%s", got.path, got.query)
-	}
-	for _, args := range [][]string{{"state"}, {"state", "asleep"}, {"state", "busy", "idle"}, {"state", "--check"}, {"state", "--start"}} {
-		if code := run(args, strings.NewReader(`{"stop_hook_active":false}`), io.Discard, io.Discard); code != exitOK {
-			t.Errorf("%v 退出码 %d", args, code)
-		}
-	}
-}
-
-// --start（SessionStart 钩子）：source 是 compact（压缩中途）时什么都不做、不发请求；
-// startup/resume/clear/读不到都照常上报 idle。
-func TestStateStartCompactSkips(t *testing.T) {
-	var cap captured
-	srv := httptest.NewServer(cap.handler())
-	defer srv.Close()
-	useEndpoint(t, srv.URL)
-	t.Setenv("XXYI_ADDR", "ubuntu:cw")
-
-	if code := run([]string{"state", "idle", "--start"}, strings.NewReader(`{"source":"compact"}`), io.Discard, io.Discard); code != exitOK {
-		t.Fatalf("compact 退出码 %d", code)
-	}
-	if n := cap.count(); n != 0 {
-		t.Errorf("compact 时不该发请求，已发 %d", n)
-	}
-
-	for _, src := range []string{"startup", "resume", "clear"} {
-		if code := run([]string{"state", "idle", "--start"}, strings.NewReader(`{"source":"`+src+`"}`), io.Discard, io.Discard); code != exitOK {
-			t.Fatalf("%s 退出码 %d", src, code)
-		}
-		got := cap.last(t)
-		if got.path != "/msg/state" || !strings.Contains(got.query, "state=idle") {
-			t.Errorf("%s 请求 %s?%s", src, got.path, got.query)
-		}
-	}
-
-	// 标准输入不关（读不到钩子 JSON）：等满限时后照常上报
-	pr, pw := io.Pipe()
-	t.Cleanup(func() { pw.Close() })
-	if code := run([]string{"state", "idle", "--start"}, pr, io.Discard, io.Discard); code != exitOK {
-		t.Fatalf("读不到 JSON 退出码 %d", code)
-	}
-	if got := cap.last(t); !strings.Contains(got.query, "state=idle") {
-		t.Errorf("读不到 JSON 时该照常上报：%s?%s", got.path, got.query)
 	}
 }
 

@@ -1,0 +1,38 @@
+{
+  "_说明": "Mac 测试机上跑 Go 的环境描述：client.py run --repo .=base --env-file go/testenv.json --workdir base --task gotest -- -count=1 ./cmd/xxyi-msg/ ./wgtund/；另有任务 govet（go vet ./...）、gobuild（go build ./...）。任务在 env -i 里跑、HOME 指进 run 目录，所以先换回真实家目录，Go 的模块缓存与编译缓存才用得上。go 的路径固定 /usr/local/go/bin/go。",
+  "python": "3.12",
+  "pip": [],
+  "repos": {},
+  "pythonpath": [],
+  "tasks": {
+    "gotest": {
+      "cmd": [
+        "bash",
+        "-c",
+        "export HOME=\"$(eval echo ~$(id -un))\"; exec env -u TMUX -u TMUX_PANE /usr/local/go/bin/go test \"$@\"",
+        "gotest"
+      ],
+      "cwd": "go"
+    },
+    "govet": {
+      "cmd": [
+        "bash",
+        "-c",
+        "export HOME=\"$(eval echo ~$(id -un))\"; exec env -u TMUX -u TMUX_PANE /usr/local/go/bin/go vet \"$@\"",
+        "govet",
+        "./..."
+      ],
+      "cwd": "go"
+    },
+    "gobuild": {
+      "cmd": [
+        "bash",
+        "-c",
+        "export HOME=\"$(eval echo ~$(id -un))\"; exec env -u TMUX -u TMUX_PANE /usr/local/go/bin/go build \"$@\"",
+        "gobuild",
+        "./..."
+      ],
+      "cwd": "go"
+    }
+  }
+}

@@ -829,7 +829,9 @@ func TestPFClassifyUnits(t *testing.T) {
 	}
 	// 什么都没发现：登记 syncing 的全进 Missing
 	got, err = PFClassifyUnits(PFDiscoverResult{}, reg)
-	if err != nil || len(got.Missing) != 2 {
+	// 登记里 syncing 的有 3 个（甲、戊、己）；stopped、starting、stopping 的不进 Missing
+	if err != nil || len(got.Missing) != 3 || got.Missing[0].Code != "260403J0812" ||
+		got.Missing[1].Code != "260403N0101" || got.Missing[2].Code != "260403Z0101" {
 		t.Errorf("发现为空: %+v %v", got, err)
 	}
 	// 登记表不合格：报错

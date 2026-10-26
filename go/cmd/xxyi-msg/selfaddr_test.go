@@ -18,9 +18,11 @@ import (
 	"github.com/WillyChen0811/base/go/xxyica"
 )
 
-// TestMain 把 HOME 统一指到临时目录：钩子日志不许写进真实家目录。
+// TestMain 把 HOME 统一指到临时目录：钩子日志、忙闲状态文件不许写进真实家目录；
+// 同时让 procCmdline 默认读不到任何进程（认 agent 不去碰真进程），用例需要再自己注入。
 // 需要不同家目录布局的用例再 t.Setenv("HOME", t.TempDir()) 覆盖。
 func TestMain(m *testing.M) {
+	procCmdline = func(int) (string, error) { return "", errors.New("测试里不读真进程命令行") }
 	home, err := os.MkdirTemp("", "xxyi-msg-home")
 	if err != nil {
 		panic(err)
@@ -166,7 +168,7 @@ func TestSelfAddrFromProcTreeUbuntuSide(t *testing.T) {
 	}
 }
 
-// 链上无命中：selfAddr 报 errNoSelfAddr（send 的文案不变），state 静默 0 且不发请求。
+// 链上无命中：selfAddr 报 errNoSelfAddr（send 的文案不变）。
 func TestSelfAddrProcTreeNoHit(t *testing.T) {
 	var cap captured
 	srv := httptest.NewServer(cap.handler())
@@ -185,15 +187,12 @@ func TestSelfAddrProcTreeNoHit(t *testing.T) {
 	if !strings.Contains(errOut.String(), "不知道自己的地址") {
 		t.Errorf("stderr %q", errOut.String())
 	}
-	if code := run([]string{"state", "busy"}, nil, io.Discard, io.Discard); code != exitOK {
-		t.Fatalf("state 退出码 %d", code)
-	}
 	if n := cap.count(); n != 0 {
 		t.Errorf("没地址时不该发请求，已发 %d", n)
 	}
 }
 
-// listPanes 失败：同样报错 / 静默。
+// listPanes 失败：同样报错。
 func TestSelfAddrProcTreeListPanesFails(t *testing.T) {
 	var cap captured
 	srv := httptest.NewServer(cap.handler())
@@ -212,11 +211,8 @@ func TestSelfAddrProcTreeListPanesFails(t *testing.T) {
 	if _, err := selfAddr(); err == nil || !strings.Contains(err.Error(), "找不到 tmux") {
 		t.Errorf("原因要带进错误里：%v", err)
 	}
-	if code := run([]string{"state", "busy"}, nil, io.Discard, io.Discard); code != exitOK {
-		t.Fatalf("state 退出码 %d", code)
-	}
 	if n := cap.count(); n != 0 {
-		t.Errorf("列 pane 失败时 state 不该发请求，已发 %d", n)
+		t.Errorf("列 pane 失败时不该发请求，已发 %d", n)
 	}
 }
 
@@ -233,75 +229,27 @@ func TestSelfAddrProcTreeIllegalName(t *testing.T) {
 	}
 }
 
-// state 每次运行在 ~/.xxyi/msg-hook.log 追加一行：地址、结果。
+// 钩子日志（approve-hook 用）：~/.xxyi/msg-hook.log 每次追加一行"时间 子命令 参数 结果"。
 func TestHookLogLine(t *testing.T) {
-	var cap captured
-	srv := httptest.NewServer(cap.handler())
-	defer srv.Close()
-	useEndpoint(t, srv.URL)
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	if err := os.MkdirAll(filepath.Join(home, ".xxyi"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("XXYI_ADDR", "ubuntu:cw")
-	if code := run([]string{"state", "busy"}, nil, io.Discard, io.Discard); code != exitOK {
-		t.Fatalf("退出码 %d", code)
-	}
+	hookLogCmd("approve-hook", []string{"--agent", "codex"}, "addr=ubuntu:cw 已决定 allow=true")
+	hookLogCmd("approve-hook", []string{"--agent", "codex"}, "第二行")
 	raw, err := os.ReadFile(filepath.Join(home, ".xxyi", "msg-hook.log"))
 	if err != nil {
 		t.Fatalf("日志读不了：%v", err)
 	}
-	line := strings.TrimSpace(string(raw))
-	if !strings.HasSuffix(line, "state busy addr=ubuntu:cw 已上报 busy") {
-		t.Errorf("日志行 %q", line)
-	}
-	// 取不到地址也要留下原因
-	if code := run([]string{"state", "idle"}, nil, io.Discard, io.Discard); code != exitOK {
-		t.Fatalf("退出码 %d", code)
-	}
-	raw, _ = os.ReadFile(filepath.Join(home, ".xxyi", "msg-hook.log"))
-	if lines := strings.Split(strings.TrimSpace(string(raw)), "\n"); len(lines) != 2 || !strings.Contains(lines[1], "state idle addr=ubuntu:cw") {
-		t.Errorf("第二行 %q", string(raw))
-	}
-}
-
-// 地址失败的原因也进日志（哪一步失败一目了然）。
-func TestHookLogAddrFailure(t *testing.T) {
-	var cap captured
-	srv := httptest.NewServer(cap.handler())
-	defer srv.Close()
-	useEndpoint(t, srv.URL)
-	home := t.TempDir()
-	t.Setenv("HOME", home)
-	if err := os.MkdirAll(filepath.Join(home, ".xxyi"), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("XXYI_ADDR", "")
-	t.Setenv("TMUX", "")
-	oldPP, oldLP := parentPID, listPanes
-	t.Cleanup(func() { parentPID, listPanes = oldPP, oldLP })
-	parentPID = func(int) (int, error) { return 1, nil }
-	listPanes = func() (string, error) { return "55 other", nil }
-
-	if code := run([]string{"state", "busy", "--check"}, nil, io.Discard, io.Discard); code != exitOK {
-		t.Fatalf("退出码 %d", code)
-	}
-	raw, err := os.ReadFile(filepath.Join(home, ".xxyi", "msg-hook.log"))
-	if err != nil {
-		t.Fatalf("日志读不了：%v", err)
-	}
-	if !strings.Contains(string(raw), "state busy --check 取地址失败：不知道自己的地址") {
-		t.Errorf("日志 %q", string(raw))
+	lines := strings.Split(strings.TrimSpace(string(raw)), "\n")
+	if len(lines) != 2 || !strings.HasSuffix(lines[0], "approve-hook --agent codex addr=ubuntu:cw 已决定 allow=true") || !strings.HasSuffix(lines[1], "第二行") {
+		t.Errorf("日志行 %q", string(raw))
 	}
 }
 
 // Ubuntu 一侧：日志写到 ~/.xxyi-support，Mac 侧目录不碰。
 func TestHookLogUbuntuSideDir(t *testing.T) {
-	var cap captured
-	srv := httptest.NewServer(cap.handler())
-	defer srv.Close()
-	useEndpoint(t, srv.URL)
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	if err := os.MkdirAll(filepath.Join(home, ".xxyi"), 0o700); err != nil {
@@ -313,10 +261,7 @@ func TestHookLogUbuntuSideDir(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(home, ".xxyi-support", "client.json"), []byte("{}"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("XXYI_ADDR", "ubuntu:cw")
-	if code := run([]string{"state", "gone"}, nil, io.Discard, io.Discard); code != exitOK {
-		t.Fatalf("退出码 %d", code)
-	}
+	hookLogCmd("approve-hook", nil, "x")
 	if _, err := os.Stat(filepath.Join(home, ".xxyi-support", "msg-hook.log")); err != nil {
 		t.Errorf("Ubuntu 侧日志：%v", err)
 	}
@@ -329,7 +274,7 @@ func TestHookLogUbuntuSideDir(t *testing.T) {
 func TestHookLogNoDirNoWrite(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
-	hookLog([]string{"busy"}, "不该被写")
+	hookLogCmd("approve-hook", []string{"busy"}, "不该被写")
 	entries, err := os.ReadDir(home)
 	if err != nil {
 		t.Fatal(err)
@@ -352,7 +297,7 @@ func TestHookLogRotation(t *testing.T) {
 	if err := os.WriteFile(path, []byte(old), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	hookLog([]string{"idle"}, "轮转验证")
+	hookLogCmd("approve-hook", []string{"idle"}, "轮转验证")
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
@@ -360,7 +305,7 @@ func TestHookLogRotation(t *testing.T) {
 	if len(raw) > 1024 {
 		t.Errorf("新日志 %d 字节，该只有刚写的一行", len(raw))
 	}
-	if !strings.Contains(string(raw), "state idle 轮转验证") {
+	if !strings.Contains(string(raw), "approve-hook idle 轮转验证") {
 		t.Errorf("新日志 %q", string(raw))
 	}
 	rotated, err := os.ReadFile(path + ".1")

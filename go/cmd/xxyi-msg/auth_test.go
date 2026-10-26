@@ -220,18 +220,6 @@ func TestMissingClientBundle(t *testing.T) {
 		t.Errorf("缺证书时一个请求都不该发出去，收到 %d 个", n)
 	}
 
-	// state：钩子用的，静默退出 0，同样不发请求
-	out := &bytes.Buffer{}
-	if code := run([]string{"state", "busy"}, strings.NewReader(""), out, io.Discard); code != exitOK {
-		t.Errorf("state 退出码 %d", code)
-	}
-	if out.String() != "" {
-		t.Errorf("state 输出 %q", out.String())
-	}
-	if n := cap.count(); n != 0 {
-		t.Errorf("state 不该发请求，收到 %d 个", n)
-	}
-
 	// MCP 工具：isError 同样文案
 	resps := mcpRound(t,
 		mcpCall(1, "tools/call", map[string]any{"name": "xxyi_send", "arguments": map[string]any{

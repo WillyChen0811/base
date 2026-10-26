@@ -710,34 +710,3 @@ func TestSpoolSendFlushesOldFirst(t *testing.T) {
 		t.Errorf("补发完目录里还有 %v", left)
 	}
 }
-
-// state 钩子不补发：状态上报是送达确认的唯一依据，不能被补发挤掉。
-// 暂存压着两条时跑 state：假服务只收到 /msg/state，一条 /msg/send 都没有，暂存原样留着。
-func TestStateDoesNotFlushSpool(t *testing.T) {
-	addr := listenFreeAddr(t)
-	dir := t.TempDir()
-	ep := filepath.Join(dir, "endpoint.json")
-	writeEndpoint(t, ep, addr)
-	setPaths(t, ep, filepath.Join(dir, "config.json"))
-	t.Setenv("XXYI_ADDR", "ubuntu:cw")
-
-	stageOffline(t, addr, 2)
-
-	var cap captured
-	startServerAt(t, addr, cap.handler())
-	if code := run([]string{"state", "busy"}, strings.NewReader(""), &bytes.Buffer{}, io.Discard); code != exitOK {
-		t.Fatalf("state 退出码 %d", code)
-	}
-	cap.mu.Lock()
-	paths := make([]string, 0, len(cap.reqs))
-	for _, r := range cap.reqs {
-		paths = append(paths, r.path)
-	}
-	cap.mu.Unlock()
-	if len(paths) != 1 || paths[0] != "/msg/state" {
-		t.Fatalf("state 发了 %v，不该有任何 /msg/send", paths)
-	}
-	if n := len(spoolList(spoolDirUbuntu)); n != 2 {
-		t.Errorf("state 后暂存剩 %d 条，该原样留 2 条", n)
-	}
-}

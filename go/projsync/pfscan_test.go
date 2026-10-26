@@ -439,7 +439,7 @@ func TestPFScan_DotIcloudStub(t *testing.T) {
 	pfstWrite(t, root, "docs/.both.txt.icloud", "")       //
 	pfstWrite(t, root, "docs/.DS_Store", "junk")          // 普通排除
 	pfstWrite(t, root, "docs/sub/.nested.pdf.icloud", "") // 子目录里的占位
-	pfstWrite(t, root, "docs/..DS_Store.icloud", "")      // 占位的 X 本身会被排除
+	pfstWrite(t, root, "docs/..hidden.icloud", "")      // 占位的 X（.hidden，本地没有）本身会被排除
 	pfstWrite(t, root, "docs/.pack.bad.icloud", "")       // 占位的 X 被名字规则判超出范围
 	opens := &pfstOpens{}
 	res, err := PFScanAndHash(context.Background(), root, nil, PFScanOptions{Filter: pfstFilter, Open: opens.open})
@@ -471,7 +471,7 @@ func TestPFScan_DotIcloudStub(t *testing.T) {
 		t.Errorf("被排除的不该成条目")
 	}
 	if res.Excluded != 2 {
-		t.Errorf("Excluded=%d，想要 2（.DS_Store 和 ..DS_Store.icloud 的 X）", res.Excluded)
+		t.Errorf("Excluded=%d，想要 2（.DS_Store 和 ..hidden.icloud 的 X）", res.Excluded)
 	}
 	pfstWantState(t, res, "docs/pack.bad", PFStateOutOfScope, PFCodeFilter)
 	if s := res.Summary(); s.UnknownPlaceholder != 3 {

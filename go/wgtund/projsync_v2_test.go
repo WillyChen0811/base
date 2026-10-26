@@ -419,7 +419,7 @@ func TestProjsyncV2WiredIntoRun(t *testing.T) {
 		t.Fatalf("GET: %d %s", r.StatusCode, b)
 	}
 	for _, p := range []string{"/projsync/v2/run?name=alpha", "/projsync/v2/commit?name=alpha&side=mac&worktree=/x"} {
-		if r, _ := supportPost(t, st, p, ""); r.StatusCode != 403 {
+		if r, _ := postOrigin(t, st, p, ""); r.StatusCode != 403 {
 			t.Errorf("无 Origin 应 403: %s %d", p, r.StatusCode)
 		}
 	}

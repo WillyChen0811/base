@@ -1,6 +1,6 @@
 package main
 
-// 忙闲灯（state 子命令）的测试：只写本机文件、不联网。
+// 忙闲灯（state 子命令）的测试：只写本机文件（程序里已没有任何联网代码）。
 // tmuxSession/parentPID/listPanes/procCmdline 一律注入，绝不真执行 tmux、不读真进程；HOME 指到临时目录。
 
 import (
@@ -8,7 +8,6 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
-	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -17,21 +16,16 @@ import (
 	"time"
 )
 
-// busyEnv 是一次忙闲测试的环境：临时家目录、一个会记请求的假服务（用来证明 state 不联网）。
+// busyEnv 是一次忙闲测试的环境：临时家目录。
 type busyEnv struct {
 	home string
-	cap  *captured
 }
 
 // newBusyEnv 在 tmux 里（TMUX 已设、会话名为 sess）的环境。
 func newBusyEnv(t *testing.T, sess string) *busyEnv {
 	t.Helper()
-	e := &busyEnv{home: t.TempDir(), cap: &captured{}}
-	srv := httptest.NewServer(e.cap.handler())
-	t.Cleanup(srv.Close)
-	useEndpoint(t, srv.URL)
+	e := &busyEnv{home: t.TempDir()}
 	t.Setenv("HOME", e.home)
-	t.Setenv("XXYI_ADDR", "ubuntu:不该被用到")
 	t.Setenv("TMUX", "/tmp/tmux-1000/default,1,0")
 	t.Setenv("CLAUDECODE", "")
 	t.Setenv("CLAUDE_PROJECT_DIR", "")
@@ -76,13 +70,6 @@ func (e *busyEnv) noFile(t *testing.T, sess string) {
 	t.Helper()
 	if _, err := os.Stat(e.file(sess)); !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("不该有状态文件 %s：%v", e.file(sess), err)
-	}
-}
-
-func (e *busyEnv) noNetwork(t *testing.T) {
-	t.Helper()
-	if n := e.cap.count(); n != 0 {
-		t.Errorf("state 不许联网，假服务收到 %d 个请求", n)
 	}
 }
 
@@ -135,7 +122,6 @@ func TestBusyStateBusyIdleWriteFile(t *testing.T) {
 	if ents, _ := os.ReadDir(e.dir()); len(ents) != 1 {
 		t.Errorf("覆盖后目录里该只有一个文件，实际 %v", ents)
 	}
-	e.noNetwork(t)
 }
 
 // 认不出 agent：JSON 里不带 agent 字段。
@@ -193,7 +179,6 @@ func TestBusyStateGone(t *testing.T) {
 	if code, _ := e.state(t, nil, "gone"); code != exitOK {
 		t.Fatalf("重复 gone 退出码 %d", code)
 	}
-	e.noNetwork(t)
 }
 
 // 不在 tmux 里（认不出会话名）：什么都不写，退出 0。
@@ -218,7 +203,6 @@ func TestBusyStateNotInTmux(t *testing.T) {
 	if _, err := os.Stat(e.dir()); !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("列 pane 失败不该建状态目录：%v", err)
 	}
-	e.noNetwork(t)
 }
 
 // 没有 TMUX 变量（Codex 跑钩子）：沿进程树找到 pane，按会话名写；认出 codex。
@@ -242,7 +226,6 @@ func TestBusyStateProcTreeCodex(t *testing.T) {
 	if rec := e.read(t, "codex1"); rec.State != "busy" || rec.Agent != "codex" {
 		t.Errorf("记录 %+v", rec)
 	}
-	e.noNetwork(t)
 }
 
 // 会话名不合法（带空格/中文）：不写。
@@ -290,7 +273,6 @@ func TestBusyStateCheckDoesNotBlock(t *testing.T) {
 	if code != exitOK || out != "" {
 		t.Fatalf("带 JSON：退出码 %d，stdout %q", code, out)
 	}
-	e.noNetwork(t)
 }
 
 // readFunc 把函数当 io.Reader 用。
@@ -334,7 +316,6 @@ func TestBusyStateStart(t *testing.T) {
 	if rec := e.read(t, "sess1"); rec.State != "idle" {
 		t.Errorf("读不到 JSON 时该照常写 idle：%+v", rec)
 	}
-	e.noNetwork(t)
 }
 
 // 参数不合法：静默退出 0，什么都不写。

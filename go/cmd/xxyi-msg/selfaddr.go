@@ -1,8 +1,8 @@
 package main
 
-// 自寻地址的兜底与钩子日志。
-// Codex 之类的程序跑钩子时不传会话环境变量（XXYI_ADDR、TMUX、TMUX_PANE 都没有），
-// selfAddr 前两步落空后只能沿进程树往上爬：自己、父进程、祖父进程……
+// 找自己住在哪个 tmux 会话里的兜底（state 钩子用）。
+// Codex 之类的程序跑钩子时不传会话环境变量（TMUX、TMUX_PANE 都没有），
+// 只能沿进程树往上爬：自己、父进程、祖父进程……
 // 哪一级正好是 `tmux list-panes` 报出来的 pane_pid，就住在哪个会话里。
 // parentPID/listPanes 是包级函数变量：测试里一律替换，绝不真执行 tmux。
 
@@ -12,21 +12,13 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
-	"time"
 )
 
 // maxProcTreeDepth 是进程树上溯的最大层数：到顶也不是祖先了（也防 pid 复用造出的环）。
 const maxProcTreeDepth = 30
-
-// maxHookLogBytes 是钩子日志的轮转阈值：超过就整份改名 .1 再从头写。
-const maxHookLogBytes = 256 * 1024
-
-// hookLogName 是日志文件名（放在跟证书包同一侧的目录里）。
-const hookLogName = "msg-hook.log"
 
 // parentPID 取某进程的父进程 pid；做成包级变量便于测试替换。
 var parentPID = defaultParentPID
@@ -97,7 +89,7 @@ func defaultListPanes() (string, error) {
 		return "", err
 	}
 	// 默认 tmux 实例之外，还要查 XXYI 在 Mac 上建本机会话用的独立实例（tmux -L xxyi）：
-	// Codex 起 MCP 工具时清掉了 XXYI_ADDR/TMUX，只能靠这里找到自己住在哪个会话。
+	// Codex 起的子进程清掉了 TMUX，只能靠这里找到自己住在哪个会话。
 	var all strings.Builder
 	var firstErr error
 	for _, extra := range [][]string{nil, {"-L", xxyiTmuxSocket}} {
@@ -159,79 +151,26 @@ func findPaneSession(pid int, panes map[int]string) (string, error) {
 	return "", nil
 }
 
-// procTreeSession 是 selfAddr 第三步的会话名部分：沿进程树找自己所在的 tmux 会话。
-// 拿不到就回 errNoSelfAddr（带一步原因）。会话名已校验过（checkSessionName）。
+// procTreeSession 沿进程树找自己所在的 tmux 会话。
+// 拿不到就回 errNoSession（带一步原因）。会话名已校验过（checkSessionName）。
 func procTreeSession() (string, error) {
 	out, err := listPanes()
 	if err != nil {
-		return "", fmt.Errorf("%w（列 tmux pane 失败：%v）", errNoSelfAddr, err)
+		return "", fmt.Errorf("%w（列 tmux pane 失败：%v）", errNoSession, err)
 	}
 	panes := paneSessionsOf(out)
 	if len(panes) == 0 {
-		return "", errNoSelfAddr
+		return "", errNoSession
 	}
 	name, err := findPaneSession(os.Getpid(), panes)
 	if err != nil {
-		return "", fmt.Errorf("%w（沿进程树找 tmux 会话失败：%v）", errNoSelfAddr, err)
+		return "", fmt.Errorf("%w（沿进程树找 tmux 会话失败：%v）", errNoSession, err)
 	}
 	if name == "" {
-		return "", errNoSelfAddr
+		return "", errNoSession
 	}
 	if err := checkSessionName(name); err != nil {
 		return "", err
 	}
 	return name, nil
-}
-
-// selfAddrFromProcTree 是 selfAddr 的第三步：没有 XXYI_ADDR、也没有 TMUX 时，
-// 沿进程树找自己所在的 tmux 会话，地址前缀按现有选侧规则（见 ubuntuSide）。
-// 拿不到就回 errNoSelfAddr（带一步原因），send 照旧报错。
-func selfAddrFromProcTree() (string, error) {
-	name, err := procTreeSession()
-	if err != nil {
-		return "", err
-	}
-	if ubuntuSide() {
-		return "ubuntu:" + name, nil
-	}
-	return "mac:" + name, nil
-}
-
-// ubuntuSide 判当前是不是 Ubuntu 一侧：规则与 connect 共用一个函数（见 run.go 的 isUbuntuSideFiles），
-// 路径按调用时的 HOME 现算（default*Path 就是家目录拼出来的），
-// 这样 connect 走 Mac 的时候地址前缀也一定是 mac:——侧别不一致会被本机接口 403 拒。
-func ubuntuSide() bool {
-	home, err := os.UserHomeDir()
-	if err != nil || home == "" {
-		return false
-	}
-	return isUbuntuSideFiles(defaultEndpointPath(), defaultClientBundlePathUbuntu(), defaultXxyiConfigPath())
-}
-
-// hookLogCmd 给钩子类子命令追加一行排查日志："时间 子命令 参数 结果"（approve-hook 用；state 钩子只写本地状态文件，不再记日志）。
-// 目录跟证书包同一侧（Ubuntu 是 ~/.xxyi-support，Mac 是 ~/.xxyi）；目录不存在就不写。
-// 超过 256KB 先整份改名 .1 再写新的。任何失败静默忽略：日志只给排查用，
-// 不影响退出码，也不占 2 秒上报预算（本地一次 stat 加一次追加）。
-func hookLogCmd(cmd string, args []string, result string) {
-	home, err := os.UserHomeDir()
-	if err != nil || home == "" {
-		return
-	}
-	dir := filepath.Join(home, ".xxyi")
-	if ubuntuSide() {
-		dir = filepath.Join(home, ".xxyi-support")
-	}
-	if st, err := os.Stat(dir); err != nil || !st.IsDir() {
-		return
-	}
-	path := filepath.Join(dir, hookLogName)
-	if st, err := os.Stat(path); err == nil && st.Size() > maxHookLogBytes {
-		_ = os.Rename(path, path+".1") // 轮转失败也继续：大不了这轮不轮转
-	}
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
-	if err != nil {
-		return
-	}
-	defer f.Close()
-	fmt.Fprintf(f, "%s %s %s %s\n", time.Now().Format("2006-01-02 15:04:05.000"), cmd, strings.Join(args, " "), result)
 }

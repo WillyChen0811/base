@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"errors"
-	"io"
 	"net"
 	"net/http"
 	"os"
@@ -196,7 +195,7 @@ func TestProjsyncDefaults(t *testing.T) {
 	}
 }
 
-// 坏配置让 wgtund 启动失败（校验发生在 prepareSupport 之后、起隧道之前）。
+// 坏配置让 wgtund 启动失败（校验发生在起隧道之前）。
 func TestProjsyncBadConfigStopsRun(t *testing.T) {
 	f := newFixture(t, func(cfg map[string]any) {
 		cfg["projsync"] = map[string]any{"host": "nope",
@@ -268,121 +267,13 @@ func TestProjsyncV1PathsGone(t *testing.T) {
 		if resp, b := get(t, st, "/projsync", true); resp.StatusCode != http.StatusNotFound {
 			t.Errorf("withConf=%v: GET /projsync 应 404: %d %s", withConf, resp.StatusCode, b)
 		}
-		if resp, _ := supportPost(t, st, "/projsync/run?name=alpha", testOrigin); resp.StatusCode != http.StatusNotFound {
+		if resp, _ := postOrigin(t, st, "/projsync/run?name=alpha", testOrigin); resp.StatusCode != http.StatusNotFound {
 			t.Errorf("withConf=%v: POST /projsync/run 应 404: %d", withConf, resp.StatusCode)
 		}
 		// v2 仍在
 		if resp, b := get(t, st, "/projsync/v2", true); withConf && resp.StatusCode != http.StatusOK {
 			t.Errorf("有配置时 GET /projsync/v2 应 200: %d %s", resp.StatusCode, b)
 		}
-	}
-}
-
-// ── 协助接线：远端发起 → 用户允许 → v2 RunOnce ──────────
-
-func TestProjsyncSupportWired(t *testing.T) {
-	t.Cleanup(func() { projsyncV2InitForTest = nil })
-	f, lg, _ := supportFixture(t, nil)
-	repo := gitRepoDir(t)
-	patchHosts(t, f.dir, func(cfg map[string]any) {
-		cfg["projsync"] = map[string]any{"host": "ubuntu",
-			"projects": []any{map[string]any{"name": "ai-browser", "local": repo, "remote": "/home/chenwy/ai-browser"}}}
-	})
-	called := make(chan string, 4)
-	projsyncV2InitForTest = func(s *projsyncV2Svc) {
-		s.claudeSync = nil
-		s.round = func(ctx context.Context, env projsync.RoundEnv) projsync.RoundResult {
-			called <- env.Project
-			return projsync.RoundResult{Project: env.Project, Summary: "fake 执行"}
-		}
-	}
-	st, _, _ := run(t, f.dir)
-
-	// /support 状态带项目名（ProjSyncNames 已接线）
-	_, b := get(t, st, "/support", true)
-	if !strings.Contains(string(b), `"projects":["ai-browser"]`) {
-		t.Fatalf("/support 应含 projects: %s", b)
-	}
-
-	resp, b := supportPost(t, st, "/support/start?minutes=5", testOrigin)
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("start 应 200: %d %s", resp.StatusCode, b)
-	}
-	cmd := lg.wait(t, "endpoint.json.tmp")
-	rest := strings.TrimPrefix(cmd, "umask 077 && mkdir -p ~/.xxyi-support && printf '%s' ")
-	q := rest[:strings.Index(rest, " > ")]
-	js, ok := unQuote(q)
-	if !ok {
-		t.Fatalf("入口 JSON 没被单引号包住: %s", q)
-	}
-	var ep struct {
-		Addr  string `json:"addr"`
-		Token string `json:"token"`
-	}
-	if err := json.Unmarshal([]byte(js), &ep); err != nil || ep.Addr == "" || ep.Token == "" {
-		t.Fatalf("入口 JSON 不对 %q: %v", js, err)
-	}
-
-	// 远端发起同步：进待批队列，等用户允许
-	type remoteRes struct {
-		code int
-		body []byte
-	}
-	rr := make(chan remoteRes, 1)
-	go func() {
-		req, err := http.NewRequest(http.MethodPost, "http://"+ep.Addr+"/projsync?name=ai-browser", nil)
-		if err != nil {
-			rr <- remoteRes{0, nil}
-			return
-		}
-		req.Header.Set("Authorization", "Bearer "+ep.Token)
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			rr <- remoteRes{0, []byte(err.Error())}
-			return
-		}
-		defer resp.Body.Close()
-		body, _ := io.ReadAll(resp.Body)
-		rr <- remoteRes{resp.StatusCode, body}
-	}()
-	var id string
-	pollUntil(t, 5*time.Second, "ProjectSync 待批出现", func() bool {
-		_, b := get(t, st, "/support", true)
-		var ls struct {
-			Pending []struct {
-				ID   string `json:"id"`
-				Tool string `json:"tool"`
-			} `json:"pending"`
-		}
-		if err := json.Unmarshal(b, &ls); err != nil {
-			return false
-		}
-		for _, p := range ls.Pending {
-			if p.Tool == "ProjectSync" {
-				id = p.ID
-				return true
-			}
-		}
-		return false
-	})
-	if resp, b := supportPost(t, st, "/support/decide?id="+id+"&allow=1", testOrigin); resp.StatusCode != http.StatusOK {
-		t.Fatalf("批准应 200: %d %s", resp.StatusCode, b)
-	}
-	select {
-	case n := <-called:
-		if n != "ai-browser" {
-			t.Fatalf("ProjSync 调用的项目 = %q", n)
-		}
-	case <-time.After(10 * time.Second):
-		t.Fatal("批准后没调到 ProjSync")
-	}
-	select {
-	case r := <-rr:
-		if r.code != http.StatusOK || !strings.Contains(string(r.body), "fake 执行") {
-			t.Fatalf("远端应拿到同步结果 200: %d %s", r.code, r.body)
-		}
-	case <-time.After(10 * time.Second):
-		t.Fatal("等远端 projsync 响应超时")
 	}
 }
 

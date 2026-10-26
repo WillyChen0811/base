@@ -8,6 +8,10 @@
 - `wgtunnel/socks`：只监听回环地址的 SOCKS5 口（只支持 CONNECT），域名交给隧道那一侧解析。
 - `sshterm`：经任意 Dialer 的 SSH 终端（PTY、窗口大小、退出码），以及把终端桥接到 WebSocket 的 HTTP Handler。
 - `wgtund` + `cmd/wgtund`：助手程序，把上面三块组合起来给桌面应用用（见下）。
+- `cmd/xxyi-msg`：Ubuntu 一侧的小命令，只剩 `state`（钩子用，把忙闲状态写进本机 `~/.xxyi-state`，不联网）
+  和 `projsync-facts` / `projsync-apply`（项目同步的远程协议，Mac 的 wgtund 经 SSH 调用）。
+- `xxyica`：Ed25519 CA，签发带权限声明的证书、请求签名与校验、时间戳+nonce 防重放（纯标准库）。目前没有接线，留着以后辨别「操作是不是用户本人发出的」。
+- `approval`：待批队列、Claude Code PermissionRequest 钩子格式转换、通用审批通道（证书接口 ask + 本机列表/决定）。目前没有接线，用途同上。
 
 ## wgtund 助手程序
     wgtund -dir <配置目录>
@@ -99,55 +103,9 @@ HTTP 接口都要带 `token` 参数；每台主机共用一条 SSH 连接（第�
 错误统一返回 `{"error":"原因"}`：参数不合规 400、主机/会话不存在 404、重名 409、方法不对 405、
 连不上主机或远端执行失败 502。
 
-### 协助服务（可选）
-`hosts.json` 里加 `support` 段才启用；没有这段，下面的接口全部返回 404 `{"error":"没有配置协助"}`。
-让远端主机上的 Claude 借本机做测试：本机主动经共用 SSH 连接在远端开只绑 127.0.0.1 的入口，
-入口地址和令牌写到远端 `~/.xxyi-support/endpoint.json`（权限 600）。
-  ```json
-  "support": {
-    "host": "ubuntu",
-    "claude_bin": "claude",
-    "workdir": "~/xxyi-work",
-    "claude_settings": "~/.xxyi/support-claude.json",
-    "claude_args": ["--model", "sonnet", "--max-budget-usd", "5"],
-    "repos": {"xxyi": {"dir": "~/Documents/codes/xxyi", "remote": "ssh://chenwy@10.0.0.2/home/chenwy/xxyi"}},
-    "git_tunnel": "home"
-  }
-  ```
-- `host`（必填，须在 hosts 里）、`workdir`（必填，须是已存在的目录）、`claude_settings`（可选，Claude Code 设置文件）、
-  `repos`（每项 `dir`、`remote` 都不能空）；`claude_bin` 默认 `claude`；`claude_args` 原样追加给 Claude 的参数（不校验）。旧配置里的 `claude_tools` 已废弃，写了也被忽略。
-- `git_tunnel`：可选，git 同步经这条隧道的 SOCKS 口走 SSH（须在 `socks` 里有同名条目；
-  用 `support.host` 第一个私钥，严格校验 known_hosts）。
-- 主机有多条线路（`routes` 多于一条）时不用写 `git_tunnel`（写了启动失败）：wgtund 会在本机 127.0.0.1 开一个转发口，
-  git 经它自动走主机的当前线路；此时 `support.host` 必须有 `identity_files`（用第一个私钥，同样严格校验 known_hosts）。
-- 不合规时 wgtund 启动失败，错误以 `hosts.json: support…` 开头。
-
-安全模型（只保留一道）：`PermissionRequest` 钩子。
-- 协助的 Claude 就是普通的 Claude Code，用它自己的设置；所有授权请求都经钩子交给你批准，钩子失败即拒绝。
-- `claude_settings` 可选：不写则合并设置里只有钩子；写了则必须是 JSON 对象，内容（沙盒、权限、`defaultMode` 等）不做校验，照你写的用。
-- 启动参数固定为 `--permission-mode auto --permission-prompts none --settings <合并文件>`，并为每个仓库加 `--add-dir <dir>`（按仓库名排序），
-  再原样接 `claude_args`（不校验、无白名单）。自动模式下普通操作直接放行，分类器拿不准的授权请求仍会触发 `PermissionRequest` 钩子交给用户；要换模式可在 `claude_args` 里再写一次 `--permission-mode`（后写的生效）。
-- 每个仓库的 `dir` 必须存在且是 git 仓库顶层，两个仓库名不能指向同一目录。
-- Claude 子进程只继承白名单环境变量（`PATH HOME USER LOGNAME SHELL TMPDIR LANG TERM TZ`、`LC_*`、`ANTHROPIC_*`、
-  `CLAUDE_*`、各种 `*_proxy`），其余不传。
-- 每次开启协助，wgtund 重新读 `claude_settings`（改设置不用重启；文件不是 JSON 对象则开启失败）、复制一份、覆盖其中的 `hooks.PermissionRequest`（指向下面的钩子子命令，
-  失败即拒绝），并强制 `disableAllHooks=false`、删掉 `allowManagedHooksOnly`，写到配置目录的 `support-claude.merged.json`（权限 600），Claude 用 `--settings` 读它；其余设置保留。
-  审计日志在配置目录的 `support-log.jsonl`。
-- 远端 sshd 的 `GatewayPorts` 必须是 `no` 或 `clientspecified`：开监听后 wgtund 会检查实际地址是回环，否则报错并不启动协助。
-- 远端 `endpoint.json` 内容为 `{"addr","token","until"}`，`until` 是截止时间（Unix 秒，延长时会重写）；
-  `macsup` 发现已过期会直接报「Mac 上的协助已到期」，不发请求。
-- 待批请求最多 50 条，超出的钩子请求直接拒绝；Claude 正在工作时 `/sync` 返回 409。
-
-本机接口（同样要主令牌和 CORS 规则）：
-- `GET /support`：状态与最近日志。
-- `POST /support/start?minutes=N`（1..600）、`POST /support/stop`、`POST /support/decide?id=&allow=1|0[&message=]`：
-  除主令牌外，还要求请求头 `Origin` 存在且在 `allowed_origins` 里，否则 403「需要从 xxyi 页面操作」（`GET /support` 不要求）。
-- `POST /support/hook?token=<钩子令牌>`：不走主令牌，由协助服务自己校验钩子令牌；只供下面的子命令使用。
-
-钩子子命令：`wgtund support-hook [http://127.0.0.1:端口/support/hook?token=…]`
-（地址缺省取环境变量 `XXYI_HOOK_URL`；只接受本机地址）。从标准输入读钩子 JSON（最多 1MB）转给本机服务，
-原样输出其回答；任何失败都输出「拒绝」并以退出码 0 结束，让 Claude Code 按拒绝处理。
-`macsup projsync <项目名>`：向远端请求同步一个项目，等待用户批准后执行，成功后以 JSON 打印结果。
+### 协助/消息/审批（已拆除）
+协助/消息/审批已于 2026-10-26 拆除，证书库 xxyica 与审批队列 approval 保留未接线。
+`hosts.json` 里旧的 `support` 段会被 wgtund 直接无视（不报错、不生效），不用特意去删。
 
 ### 项目同步（可选）
 
@@ -178,7 +136,6 @@ HTTP 接口都要带 `token` 参数；每台主机共用一条 SSH 连接（第�
 - `POST /projsync/run?name=`：要求 `Origin` 存在且在 `allowed_origins` 里，否则 403；未知项目 404；正在同步 409「正在同步」；
   否则在后台开始并立即返回 202 `{"started":true}`，之后用 `GET /projsync` 看进度。
 
-远端 Claude 也可以用 `macsup projsync <项目名>` 发起：进入待批队列，用户在 xxyi 点允许后才同步，同步完成后打印结果 JSON。
 
 ## omlxgw（oMLX 网关）
 

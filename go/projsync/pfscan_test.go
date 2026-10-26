@@ -439,7 +439,7 @@ func TestPFScan_DotIcloudStub(t *testing.T) {
 	pfstWrite(t, root, "docs/.both.txt.icloud", "")       //
 	pfstWrite(t, root, "docs/.DS_Store", "junk")          // 普通排除
 	pfstWrite(t, root, "docs/sub/.nested.pdf.icloud", "") // 子目录里的占位
-	pfstWrite(t, root, "docs/..hidden.icloud", "")      // 占位的 X（.hidden，本地没有）本身会被排除
+	pfstWrite(t, root, "docs/..hidden.icloud", "")        // 占位的 X（.hidden，本地没有）本身会被排除
 	pfstWrite(t, root, "docs/.pack.bad.icloud", "")       // 占位的 X 被名字规则判超出范围
 	opens := &pfstOpens{}
 	res, err := PFScanAndHash(context.Background(), root, nil, PFScanOptions{Filter: pfstFilter, Open: opens.open})

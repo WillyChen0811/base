@@ -8,6 +8,7 @@ require (
 	github.com/things-go/go-socks5 v0.1.3
 	golang.org/x/crypto v0.58.0
 	golang.org/x/net v0.60.0
+	golang.org/x/text v0.43.0
 	golang.zx2c4.com/wireguard v0.0.0-20230209153558-1e2c3e5a3c14
 	gvisor.dev/gvisor v0.0.0-20250503011706-39ed1f5ac29c
 )

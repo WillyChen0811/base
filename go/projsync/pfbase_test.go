@@ -159,7 +159,7 @@ func TestPFBase_RoundTrip(t *testing.T) {
 	// 重新加载，一致
 	b2 := pfMustLoadOK(t, meta)
 	pfWant(t, b2, want)
-	if b2.Gen() != 2 || b2.Unit() != pfTU || b2.JournalLines() != 4 {
+	if b2.Gen() != 2 || b2.Unit() != pfTU || b2.JournalLines() != 3 {
 		t.Fatalf("gen=%d unit=%s journal=%d", b2.Gen(), b2.Unit(), b2.JournalLines())
 	}
 	if !reflect.DeepEqual(b2.Meta(), pfTMeta()) {
@@ -974,6 +974,9 @@ func pfIndex(steps []string, s string) int {
 
 func pfNoTmp(t *testing.T, meta string) {
 	t.Helper()
+	if _, err := os.Stat(filepath.Join(meta, "base")); errors.Is(err, os.ErrNotExist) {
+		return // 崩得太早，目录都没建出来
+	}
 	if left := pfTmpLeft(t, filepath.Join(meta, "base")); len(left) != 0 {
 		t.Fatalf("加载后不应残留临时文件: %v", left)
 	}

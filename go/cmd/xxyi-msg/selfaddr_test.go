@@ -1,24 +1,15 @@
 package main
 
-// 进程树自寻地址与钩子日志的测试：parentPID/listPanes 一律注入替换，绝不真执行 tmux。
+// 进程树找 tmux 会话的测试：parentPID/listPanes 一律注入替换，绝不真执行 tmux。
 
 import (
-	"bytes"
-	"context"
 	"errors"
-	"fmt"
-	"io"
-	"net/http"
-	"net/http/httptest"
 	"os"
-	"path/filepath"
 	"strings"
 	"testing"
-
-	"github.com/WillyChen0811/base/go/xxyica"
 )
 
-// TestMain 把 HOME 统一指到临时目录：钩子日志、忙闲状态文件不许写进真实家目录；
+// TestMain 把 HOME 统一指到临时目录：忙闲状态文件不许写进真实家目录；
 // 同时让 procCmdline 默认读不到任何进程（认 agent 不去碰真进程），用例需要再自己注入。
 // 需要不同家目录布局的用例再 t.Setenv("HOME", t.TempDir()) 覆盖。
 func TestMain(m *testing.M) {
@@ -130,343 +121,57 @@ func TestPaneSessionsOf(t *testing.T) {
 	}
 }
 
-// XXYI_ADDR 和 TMUX 都为空：沿进程树命中 pane → mac: 会话名（HOME 里没有 ~/.xxyi-support 的东西）。
-func TestSelfAddrFromProcTreeMac(t *testing.T) {
+// TMUX 为空：沿进程树命中 pane → 会话名。
+func TestProcTreeSessionHit(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
-	t.Setenv("XXYI_ADDR", "")
 	t.Setenv("TMUX", "")
 	me := os.Getpid()
 	useFakeTree(t, map[int]int{me: 90, 90: 80, 80: 1}, "80 codex1\n55 other")
-	addr, err := selfAddr()
-	if err != nil || addr != "mac:codex1" {
-		t.Fatalf("得到 %q,%v，want mac:codex1", addr, err)
+	name, err := procTreeSession()
+	if err != nil || name != "codex1" {
+		t.Fatalf("得到 %q,%v，want codex1", name, err)
 	}
 }
 
-// 有 ~/.xxyi-support 端点或证书 ⇒ Ubuntu 一侧：前缀 ubuntu:。
-func TestSelfAddrFromProcTreeUbuntuSide(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
-	t.Setenv("XXYI_ADDR", "")
-	t.Setenv("TMUX", "")
-	me := os.Getpid()
-	useFakeTree(t, map[int]int{me: 80, 80: 1}, "80 codex1\n")
-	for _, marker := range []string{"endpoint.json", "client.json"} {
-		if err := os.MkdirAll(filepath.Join(home, ".xxyi-support"), 0o700); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(filepath.Join(home, ".xxyi-support", marker), []byte("{}"), 0o600); err != nil {
-			t.Fatal(err)
-		}
-		addr, err := selfAddr()
-		if err != nil || addr != "ubuntu:codex1" {
-			t.Fatalf("%s 在位时得到 %q,%v", marker, addr, err)
-		}
-		if err := os.Remove(filepath.Join(home, ".xxyi-support", marker)); err != nil {
-			t.Fatal(err)
-		}
-	}
-}
-
-// 链上无命中：selfAddr 报 errNoSelfAddr（send 的文案不变）。
-func TestSelfAddrProcTreeNoHit(t *testing.T) {
-	var cap captured
-	srv := httptest.NewServer(cap.handler())
-	defer srv.Close()
-	useEndpoint(t, srv.URL)
-	t.Setenv("HOME", t.TempDir())
-	t.Setenv("XXYI_ADDR", "")
-	t.Setenv("TMUX", "")
+// 链上无命中：报 errNoSession。
+func TestProcTreeSessionNoHit(t *testing.T) {
 	me := os.Getpid()
 	useFakeTree(t, map[int]int{me: 90, 90: 80, 80: 1}, "55 other\n77 second")
-
-	errOut := &bytes.Buffer{}
-	if code := run([]string{"send", "mac:boss", "hi"}, strings.NewReader(""), io.Discard, errOut); code != exitErr {
-		t.Fatalf("退出码 %d，stderr %q", code, errOut.String())
+	if _, err := procTreeSession(); !errors.Is(err, errNoSession) {
+		t.Fatalf("得到 %v，want errNoSession", err)
 	}
-	if !strings.Contains(errOut.String(), "不知道自己的地址") {
-		t.Errorf("stderr %q", errOut.String())
-	}
-	if n := cap.count(); n != 0 {
-		t.Errorf("没地址时不该发请求，已发 %d", n)
+	// 一个 pane 都列不出来：同样。
+	useFakeTree(t, map[int]int{me: 1}, "")
+	if _, err := procTreeSession(); !errors.Is(err, errNoSession) {
+		t.Fatalf("空 pane 列表得到 %v，want errNoSession", err)
 	}
 }
 
-// listPanes 失败：同样报错。
-func TestSelfAddrProcTreeListPanesFails(t *testing.T) {
-	var cap captured
-	srv := httptest.NewServer(cap.handler())
-	defer srv.Close()
-	useEndpoint(t, srv.URL)
-	t.Setenv("HOME", t.TempDir())
-	t.Setenv("XXYI_ADDR", "")
-	t.Setenv("TMUX", "")
+// listPanes 失败：同样报错，原因带进错误里。
+func TestProcTreeSessionListPanesFails(t *testing.T) {
 	oldLP := listPanes
 	t.Cleanup(func() { listPanes = oldLP })
 	listPanes = func() (string, error) { return "", errors.New("找不到 tmux") }
+	_, err := procTreeSession()
+	if !errors.Is(err, errNoSession) || !strings.Contains(err.Error(), "找不到 tmux") {
+		t.Errorf("得到 %v", err)
+	}
+}
 
-	if _, err := selfAddr(); err == nil || !strings.Contains(err.Error(), "不知道自己的地址") {
-		t.Errorf("selfAddr 得到 %v", err)
-	}
-	if _, err := selfAddr(); err == nil || !strings.Contains(err.Error(), "找不到 tmux") {
-		t.Errorf("原因要带进错误里：%v", err)
-	}
-	if n := cap.count(); n != 0 {
-		t.Errorf("列 pane 失败时不该发请求，已发 %d", n)
+// 取父进程失败：同样报错。
+func TestProcTreeSessionParentFails(t *testing.T) {
+	useFakeTree(t, map[int]int{}, "80 codex1\n") // 自己的父进程查不到
+	if _, err := procTreeSession(); !errors.Is(err, errNoSession) {
+		t.Errorf("得到 %v", err)
 	}
 }
 
 // 兜底取到的会话名不合法：跟 TMUX 分支同一套文案。
-func TestSelfAddrProcTreeIllegalName(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
-	t.Setenv("XXYI_ADDR", "")
-	t.Setenv("TMUX", "")
+func TestProcTreeSessionIllegalName(t *testing.T) {
 	me := os.Getpid()
 	useFakeTree(t, map[int]int{me: 80, 80: 1}, "80 中文 会话\n")
-	_, err := selfAddr()
+	_, err := procTreeSession()
 	if err == nil || !strings.Contains(err.Error(), "tmux rename-session") {
 		t.Errorf("得到 %v，该提示改名", err)
-	}
-}
-
-// 钩子日志（approve-hook 用）：~/.xxyi/msg-hook.log 每次追加一行"时间 子命令 参数 结果"。
-func TestHookLogLine(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
-	if err := os.MkdirAll(filepath.Join(home, ".xxyi"), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	hookLogCmd("approve-hook", []string{"--agent", "codex"}, "addr=ubuntu:cw 已决定 allow=true")
-	hookLogCmd("approve-hook", []string{"--agent", "codex"}, "第二行")
-	raw, err := os.ReadFile(filepath.Join(home, ".xxyi", "msg-hook.log"))
-	if err != nil {
-		t.Fatalf("日志读不了：%v", err)
-	}
-	lines := strings.Split(strings.TrimSpace(string(raw)), "\n")
-	if len(lines) != 2 || !strings.HasSuffix(lines[0], "approve-hook --agent codex addr=ubuntu:cw 已决定 allow=true") || !strings.HasSuffix(lines[1], "第二行") {
-		t.Errorf("日志行 %q", string(raw))
-	}
-}
-
-// Ubuntu 一侧：日志写到 ~/.xxyi-support，Mac 侧目录不碰。
-func TestHookLogUbuntuSideDir(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
-	if err := os.MkdirAll(filepath.Join(home, ".xxyi"), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.MkdirAll(filepath.Join(home, ".xxyi-support"), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(home, ".xxyi-support", "client.json"), []byte("{}"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	hookLogCmd("approve-hook", nil, "x")
-	if _, err := os.Stat(filepath.Join(home, ".xxyi-support", "msg-hook.log")); err != nil {
-		t.Errorf("Ubuntu 侧日志：%v", err)
-	}
-	if _, err := os.Stat(filepath.Join(home, ".xxyi", "msg-hook.log")); !errors.Is(err, os.ErrNotExist) {
-		t.Errorf("Mac 侧目录不该有日志：%v", err)
-	}
-}
-
-// 目录不存在就不写；写了也不报错。
-func TestHookLogNoDirNoWrite(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
-	hookLogCmd("approve-hook", []string{"busy"}, "不该被写")
-	entries, err := os.ReadDir(home)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(entries) != 0 {
-		t.Errorf("家目录里冒出了 %v", entries)
-	}
-}
-
-// 超过 256KB：先整份改名 .1，再写新的。
-func TestHookLogRotation(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
-	dir := filepath.Join(home, ".xxyi")
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	path := filepath.Join(dir, "msg-hook.log")
-	old := strings.Repeat("x", maxHookLogBytes+1)
-	if err := os.WriteFile(path, []byte(old), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	hookLogCmd("approve-hook", []string{"idle"}, "轮转验证")
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(raw) > 1024 {
-		t.Errorf("新日志 %d 字节，该只有刚写的一行", len(raw))
-	}
-	if !strings.Contains(string(raw), "approve-hook idle 轮转验证") {
-		t.Errorf("新日志 %q", string(raw))
-	}
-	rotated, err := os.ReadFile(path + ".1")
-	if err != nil {
-		t.Fatalf(".1 读不了：%v", err)
-	}
-	if len(rotated) != len(old) {
-		t.Errorf(".1 长 %d，want %d", len(rotated), len(old))
-	}
-}
-
-// 选侧规则的四种文件布局（connect 与 selfAddr 共用 isUbuntuSideFiles，结论必须一致）：
-// 只有 endpoint.json → ubuntu；只有 Ubuntu 证书（没有 Mac 的 config.json）→ ubuntu；
-// 证书加 config.json 但没有 endpoint.json → mac；什么都没有 → mac。
-func TestUbuntuSideRule(t *testing.T) {
-	cases := []struct {
-		name                  string
-		endpoint, bundle, cfg bool
-		wantUbuntu            bool
-	}{
-		{"只有 endpoint.json", true, false, false, true},
-		{"只有 Ubuntu 证书没有 config.json", false, true, false, true},
-		{"证书加 config.json 没有 endpoint.json", false, true, true, false},
-		{"什么都没有", false, false, false, false},
-	}
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			home := t.TempDir()
-			t.Setenv("HOME", home)
-			sup := filepath.Join(home, ".xxyi-support")
-			mac := filepath.Join(home, ".xxyi")
-			for _, dir := range []string{sup, mac} {
-				if err := os.MkdirAll(dir, 0o700); err != nil {
-					t.Fatal(err)
-				}
-			}
-			// 包级路径与家目录下的默认路径重合：connect 与 ubuntuSide 看的是同一组文件
-			setPaths(t, filepath.Join(sup, "endpoint.json"), filepath.Join(mac, "config.json"))
-			clientBundlePathUbuntu = filepath.Join(sup, "client.json") // setPaths 已登记还原
-			for _, p := range []string{endpointPath, clientBundlePathUbuntu, xxyiConfigPath} {
-				_ = os.Remove(p)
-			}
-			touch := func(p string) {
-				if err := os.WriteFile(p, []byte("{}"), 0o600); err != nil {
-					t.Fatal(err)
-				}
-			}
-			if c.endpoint {
-				touch(endpointPath)
-			}
-			if c.bundle {
-				touch(clientBundlePathUbuntu)
-			}
-			if c.cfg {
-				touch(xxyiConfigPath)
-			}
-
-			if got := isUbuntuSideFiles(endpointPath, clientBundlePathUbuntu, xxyiConfigPath); got != c.wantUbuntu {
-				t.Errorf("isUbuntuSideFiles = %v，want %v", got, c.wantUbuntu)
-			}
-			if got := ubuntuSide(); got != c.wantUbuntu {
-				t.Errorf("ubuntuSide() = %v，want %v", got, c.wantUbuntu)
-			}
-			// 进程树兜底的地址前缀跟着侧别走
-			t.Setenv("XXYI_ADDR", "")
-			t.Setenv("TMUX", "")
-			useFakeTree(t, map[int]int{os.Getpid(): 80, 80: 1}, "80 codex1\n")
-			want := "mac:codex1"
-			if c.wantUbuntu {
-				want = "ubuntu:codex1"
-			}
-			addr, err := selfAddr()
-			if err != nil || addr != want {
-				t.Errorf("selfAddr = %q,%v，want %q", addr, err, want)
-			}
-		})
-	}
-}
-
-// P2 的触发场景：有 ~/.xxyi-support/client.json 和 ~/.xxyi/config.json、没有 endpoint.json。
-// connect 走 Mac 本机接口，selfAddr 的兜底前缀也必须是 mac:（判成 ubuntu 会被本机接口 403 拒）。
-func TestSideConnectAndSelfAddrAgree(t *testing.T) {
-	var msgCap captured
-	msgSrv := httptest.NewServer(msgCap.handler())
-	defer msgSrv.Close()
-	api := http.NewServeMux()
-	api.HandleFunc("/api/terminal", func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprintf(w, `{"http":%q,"token":"mtk"}`, authority(msgSrv.URL))
-	})
-	apiSrv := httptest.NewServer(api)
-	defer apiSrv.Close()
-
-	home := t.TempDir()
-	t.Setenv("HOME", home)
-	sup := filepath.Join(home, ".xxyi-support")
-	if err := os.MkdirAll(sup, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	cfg := filepath.Join(home, ".xxyi", "config.json")
-	if err := os.MkdirAll(filepath.Dir(cfg), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(cfg, []byte(fmt.Sprintf(`{"http_port":%q}`, portOf(t, apiSrv.URL))), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	ca, err := xxyica.NewCA()
-	if err != nil {
-		t.Fatal(err)
-	}
-	bundle := filepath.Join(sup, "client.json")
-	writeTestBundle(t, ca, bundle, "ubuntu")
-
-	setPaths(t, filepath.Join(sup, "endpoint.json"), cfg) // endpoint.json 故意不写
-	clientBundlePathUbuntu = bundle
-	t.Setenv("XXYI_ADDR", "")
-	t.Setenv("TMUX", "")
-	useFakeTree(t, map[int]int{os.Getpid(): 80, 80: 1}, "80 codex1\n")
-
-	if ubuntuSide() {
-		t.Error("装了 Mac 配置又没有端点：该判成 Mac")
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), httpTimeout)
-	defer cancel()
-	c, err := connect(ctx, httpTimeout)
-	if err != nil {
-		t.Fatalf("connect 失败：%v", err)
-	}
-	if !c.query || c.token != "mtk" {
-		t.Errorf("connect 该走 Mac 侧（令牌在查询参数里）：query=%v token=%q", c.query, c.token)
-	}
-	if addr, err := selfAddr(); err != nil || addr != "mac:codex1" {
-		t.Fatalf("selfAddr = %q,%v", addr, err)
-	}
-
-	out := &bytes.Buffer{}
-	if code := run([]string{"send", "ubuntu:boss", "hi"}, strings.NewReader(""), out, io.Discard); code != exitOK {
-		t.Fatalf("退出码 %d，输出 %q", code, out.String())
-	}
-	got := msgCap.last(t)
-	if got.body.From != "mac:codex1" || got.query != "token=mtk" {
-		t.Errorf("from=%q query=%q，前缀该跟 connect 的侧别一致", got.body.From, got.query)
-	}
-}
-
-// 兜底成功后 send 照常走网络（不只是 selfAddr 单测）。
-func TestSendViaProcTreeFallback(t *testing.T) {
-	var cap captured
-	srv := httptest.NewServer(cap.handler())
-	defer srv.Close()
-	useEndpoint(t, srv.URL)
-	t.Setenv("HOME", t.TempDir())
-	t.Setenv("XXYI_ADDR", "")
-	t.Setenv("TMUX", "")
-	me := os.Getpid()
-	useFakeTree(t, map[int]int{me: 90, 90: 80, 80: 1}, "80 codex1\n55 other")
-
-	out := &bytes.Buffer{}
-	if code := run([]string{"send", "mac:boss", "hi"}, strings.NewReader(""), out, io.Discard); code != exitOK {
-		t.Fatalf("退出码 %d", code)
-	}
-	if got := cap.last(t); got.body.From != "mac:codex1" {
-		t.Errorf("from %q", got.body.From)
 	}
 }

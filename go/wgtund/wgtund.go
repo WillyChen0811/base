@@ -74,7 +74,6 @@ type fileConf struct {
 	AllowedOrigins []string          `json:"allowed_origins"`
 	Socks          map[string]string `json:"socks"`
 	Hosts          []hostConf        `json:"hosts"`
-	Support        *supportConf      `json:"support"`
 	Projsync       *projsyncConf     `json:"projsync"`
 	Forwards       []forwardConf     `json:"forwards"`
 	Proxy          string            `json:"proxy"`         // 可选：SOCKS5 代理口（回环），按各转发的 target 规则选线路
@@ -200,10 +199,6 @@ func Run(ctx context.Context, dir string, stdin io.Reader, stdout io.Writer) (er
 		}
 	}
 	if err := validateProxy(conf); err != nil {
-		return err
-	}
-	prep, err := prepareSupport(conf, dir)
-	if err != nil {
 		return err
 	}
 	pjPrep, err := prepareProjsync(conf)
@@ -337,54 +332,7 @@ func Run(ctx context.Context, dir string, stdin io.Reader, stdout io.Writer) (er
 	}
 	closers = append(closers, ln)
 
-	// 协助服务（可选）：本机 HTTP 地址和钩子令牌都要在写合并设置文件前拿到
-	// （projV2 必须在这之前建好：协助的 ProjSync 要直接用它）
-	var supportLocal, supportHook http.Handler
-	var autostart *autostarter // 未启用自动开时为 nil（markManual 对 nil 安全）
-	if prep != nil {
-		svc, fwd, err := startSupport(prep, dir, expand(conf.KnownHosts), ln.Addr().String(), socksAddrs, pool, projV2)
-		if err != nil {
-			return err
-		}
-		closers = append(closers, closerFunc(svc.Close))
-		if fwd != nil {
-			closers = append(closers, fwd)
-		}
-		supportLocal, supportHook = svc.LocalHandler(), svc.HookHandler()
-		if prep.conf.autostartOn() {
-			autostart = startAutostart(svc, autostartRetry, prep.conf.AutostartMinutes)
-			closers = append(closers, autostart) // 在 svc.Close 之前关（closers 逆序执行）
-		}
-	}
-
 	mux := http.NewServeMux()
-	supportRoute := func(w http.ResponseWriter, r *http.Request) {
-		if supportLocal == nil {
-			errJSON(w, http.StatusNotFound, "没有配置协助")
-			return
-		}
-		// 开始/停止/批准只许从 xxyi 页面发起：要求带白名单内的 Origin（curl 等没有 Origin 的调用拿主令牌也不行）
-		if r.Method == http.MethodPost {
-			switch r.URL.Path {
-			case "/support/start", "/support/stop", "/support/decide", "/msg/decide", "/msg/auto", "/approval/decide":
-				if o := r.Header.Get("Origin"); o == "" || !originAllowed(o, conf.AllowedOrigins) {
-					errJSON(w, http.StatusForbidden, "需要从 xxyi 页面操作")
-					return
-				}
-				if r.URL.Path == "/support/start" || r.URL.Path == "/support/stop" {
-					autostart.markManual() // 用户手动开/关过，本次运行不再自动开
-				}
-			}
-		}
-		supportLocal.ServeHTTP(w, r)
-	}
-	mux.HandleFunc("/support", supportRoute)
-	mux.HandleFunc("/support/", supportRoute)
-	mux.HandleFunc("/msg", supportRoute)
-	mux.HandleFunc("/msg/", supportRoute)
-	// 通用审批（任意会话的 PermissionRequest）：同样整段转给 support；decide 的 Origin 校验在上面
-	mux.HandleFunc("/approval", supportRoute)
-	mux.HandleFunc("/approval/", supportRoute)
 	type hostItem struct {
 		Name      string `json:"name"`
 		Tunnel    string `json:"tunnel"`
@@ -666,11 +614,6 @@ func Run(ctx context.Context, dir string, stdin io.Reader, stdout io.Writer) (er
 	mux.Handle("/term", sshterm.Handler(open, sshterm.BridgeOptions{OriginPatterns: conf.AllowedOrigins}))
 
 	guarded := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// 钩子入口由 support 自己校验钩子令牌，不走主令牌；只放行这一个精确路径
-		if supportHook != nil && r.URL.Path == "/support/hook" {
-			supportHook.ServeHTTP(w, r)
-			return
-		}
 		// 页面（如 xxyi 的 127.0.0.1:8765）和本服务端口不同，fetch /hosts、/status 属于跨域：
 		// 只对 allowed_origins 里的来源放行；WebSocket 不受 CORS 管，由 sshterm 自己校验 Origin
 		if o := r.Header.Get("Origin"); o != "" && originAllowed(o, conf.AllowedOrigins) {

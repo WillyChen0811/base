@@ -16,10 +16,6 @@ import (
 )
 
 func main() {
-	// 子命令：wgtund support-hook [地址]，供 Claude Code 的权限钩子调用
-	if len(os.Args) > 1 && os.Args[1] == "support-hook" {
-		os.Exit(wgtund.RunHook(os.Args[2:], os.Stdin, os.Stdout, os.Getenv))
-	}
 	dir := flag.String("dir", "", "配置目录（必填，由调用方指定）")
 	flag.Parse()
 	if *dir == "" {

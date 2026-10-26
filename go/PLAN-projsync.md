@@ -1,5 +1,7 @@
 # 计划：项目同步（Mac 与 Ubuntu 两边同时开工时，交换代码和 Claude 对话记录）
 
+> 2026-10-26：文中的协助通道、`macsup projsync`、消息代码同步已拆除，只剩 Mac 侧主动发起的项目同步（v2）。协助/消息/审批已于 2026-10-26 拆除，证书库 xxyica 与审批队列 approval 保留未接线。
+
 ## 目标
 用户在 Mac 的 xxyi 里点「同步」（或 Ubuntu 上的 Claude 经协助通道发起、用户在 xxyi 点允许），
 由 Mac 上的 wgtund 自己执行（不经过受限的协助 Claude），经主机的当前线路和 Ubuntu 交换：

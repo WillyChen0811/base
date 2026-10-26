@@ -1,38 +1,87 @@
-package support
+package approval
 
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/WillyChen0811/base/go/xxyica"
 )
 
-// approvalsFix 打包一个开了协助的服务 + 本机/远端访问入口；approvalWait 可调、测后还原。
+// httpClient 给测试里的后台请求用，不复用 http.DefaultClient 的连接池。
+var httpClient = &http.Client{Timeout: 20 * time.Second}
+
+// approvalsFix 打包一个审批通道 + 本机/远端两个 mux 的 httptest 服务。
 type approvalsFix struct {
-	s     *Service
-	base  string // http://<远端监听地址>
-	token string
-	lbase string // 本机 LocalHandler 的根
+	ch    *Channel
+	base  string // 远端 mux（MountRemote）的根
+	lbase string // 本机 mux（MountLocal）的根
 }
 
-func newApprovalsFix(t *testing.T) *approvalsFix {
+func newApprovalsFix(t *testing.T, cfg Config) *approvalsFix {
 	t.Helper()
-	oldWait, oldMax := approvalWait, maxApprovalPending
-	t.Cleanup(func() { approvalWait, maxApprovalPending = oldWait, oldMax })
-	s, fr := newTestService(t, Config{})
-	if err := s.Start(30); err != nil {
-		t.Fatalf("Start: %v", err)
+	ch := NewChannel(cfg)
+	rmux, lmux := http.NewServeMux(), http.NewServeMux()
+	ch.MountRemote(rmux)
+	ch.MountLocal(lmux)
+	rsrv, lsrv := httptest.NewServer(rmux), httptest.NewServer(lmux)
+	t.Cleanup(rsrv.Close)
+	t.Cleanup(lsrv.Close)
+	return &approvalsFix{ch: ch, base: rsrv.URL, lbase: lsrv.URL}
+}
+
+// do 发一次同步请求；certHdr 可空。
+func do(t *testing.T, method, rawURL, certHdr string, body []byte) (int, []byte) {
+	t.Helper()
+	req, err := http.NewRequest(method, rawURL, bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("构造请求: %v", err)
 	}
-	return &approvalsFix{
-		s:     s,
-		base:  "http://" + s.Status().RemoteAddr,
-		token: fr.publishRec(0).token,
-		lbase: newServer(t, s.LocalHandler()).URL,
+	if certHdr != "" {
+		req.Header.Set(certAuthHeader, certHdr)
+	}
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		t.Fatalf("%s %s: %v", method, rawURL, err)
+	}
+	defer resp.Body.Close()
+	var buf bytes.Buffer
+	if _, err := buf.ReadFrom(resp.Body); err != nil {
+		t.Fatalf("读响应: %v", err)
+	}
+	return resp.StatusCode, buf.Bytes()
+}
+
+func get(t *testing.T, rawURL string) (int, []byte) {
+	t.Helper()
+	return do(t, http.MethodGet, rawURL, "", nil)
+}
+
+func post(t *testing.T, rawURL string, body []byte) (int, []byte) {
+	t.Helper()
+	return do(t, http.MethodPost, rawURL, "", body)
+}
+
+func waitFor(t *testing.T, d time.Duration, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(d)
+	for {
+		if cond() {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("等待%s超时", what)
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }
 
@@ -75,8 +124,8 @@ func (o approvalAskOut) decision(t *testing.T) (decided, allow bool, message str
 	return r.Decided, r.Allow, r.Message
 }
 
-// approvalAskAsync 后台发一次 ask（阻塞接口）；token/certHdr 可空。
-func approvalAskAsync(rawURL, token, certHdr string, body []byte) <-chan approvalAskOut {
+// approvalAskAsync 后台发一次 ask（阻塞接口）；certHdr 可空。
+func approvalAskAsync(rawURL, certHdr string, body []byte) <-chan approvalAskOut {
 	ch := make(chan approvalAskOut, 1)
 	go func() {
 		req, err := http.NewRequest(http.MethodPost, rawURL, bytes.NewReader(body))
@@ -84,11 +133,8 @@ func approvalAskAsync(rawURL, token, certHdr string, body []byte) <-chan approva
 			ch <- approvalAskOut{err: err}
 			return
 		}
-		if token != "" {
-			req.Header.Set("Authorization", "Bearer "+token)
-		}
 		if certHdr != "" {
-			req.Header.Set("X-XXYI-Auth", certHdr)
+			req.Header.Set(certAuthHeader, certHdr)
 		}
 		resp, err := httpClient.Do(req)
 		if err != nil {
@@ -148,8 +194,8 @@ func approvalDecide(t *testing.T, lbase, id string, allow bool, message string) 
 
 // TestApprovalRemoteAskDecideAllow 远端 ask（ubuntu 地址）阻塞 → 本机看得到 → 允许后放行。
 func TestApprovalRemoteAskDecideAllow(t *testing.T) {
-	f := newApprovalsFix(t)
-	ch := approvalAskAsync(f.base+"/approval/ask", f.token, "",
+	f := newApprovalsFix(t, Config{})
+	ch := approvalAskAsync(f.base+"/approval/ask", "",
 		approvalAskBody("ubuntu:bob", "claude", "/srv/app", hookBash("rm -rf /tmp/x")))
 
 	got := approvalWaitOne(t, f.lbase, 1)
@@ -186,8 +232,8 @@ func TestApprovalRemoteAskDecideAllow(t *testing.T) {
 
 // TestApprovalDecideDenyWithMessage 拒绝带 message → ask 返回 allow=false 和原因。
 func TestApprovalDecideDenyWithMessage(t *testing.T) {
-	f := newApprovalsFix(t)
-	ch := approvalAskAsync(f.base+"/approval/ask", f.token, "",
+	f := newApprovalsFix(t, Config{})
+	ch := approvalAskAsync(f.base+"/approval/ask", "",
 		approvalAskBody("ubuntu:bob", "codex", "/home/bob/x", hookBash("git push --force")))
 
 	got := approvalWaitOne(t, f.lbase, 1)
@@ -200,8 +246,8 @@ func TestApprovalDecideDenyWithMessage(t *testing.T) {
 
 // TestApprovalLocalAsk 本机 ask（mac: 侧）同样阻塞并出现在列表里。
 func TestApprovalLocalAsk(t *testing.T) {
-	f := newApprovalsFix(t)
-	ch := approvalAskAsync(f.lbase+"/approval/ask", "", "",
+	f := newApprovalsFix(t, Config{})
+	ch := approvalAskAsync(f.lbase+"/approval/ask", "",
 		approvalAskBody("mac:frank", "claude", "/Users/frank", hookBash("ls")))
 
 	got := approvalWaitOne(t, f.lbase, 1)
@@ -216,11 +262,11 @@ func TestApprovalLocalAsk(t *testing.T) {
 
 // TestApprovalListOrder 两条 ask 按 Created 从旧到新排。
 func TestApprovalListOrder(t *testing.T) {
-	f := newApprovalsFix(t)
-	ch1 := approvalAskAsync(f.base+"/approval/ask", f.token, "",
+	f := newApprovalsFix(t, Config{})
+	ch1 := approvalAskAsync(f.base+"/approval/ask", "",
 		approvalAskBody("ubuntu:a", "claude", "/1", hookBash("first")))
 	one := approvalWaitOne(t, f.lbase, 1)
-	ch2 := approvalAskAsync(f.base+"/approval/ask", f.token, "",
+	ch2 := approvalAskAsync(f.base+"/approval/ask", "",
 		approvalAskBody("ubuntu:b", "claude", "/2", hookBash("second")))
 	got := approvalWaitOne(t, f.lbase, 2)
 	if got[0].ID != one[0].ID || got[1].Addr != "ubuntu:b" {
@@ -232,13 +278,12 @@ func TestApprovalListOrder(t *testing.T) {
 	<-ch2
 }
 
-// TestApprovalTimeout 超时（approvalWait 调小）→ decided:false，且已从簿中删除。
+// TestApprovalTimeout 超时（Config.Wait 调小）→ decided:false，且已从簿中删除。
 func TestApprovalTimeout(t *testing.T) {
-	f := newApprovalsFix(t)
-	approvalWait = 200 * time.Millisecond
+	f := newApprovalsFix(t, Config{Wait: 200 * time.Millisecond})
 
 	start := time.Now()
-	ch := approvalAskAsync(f.base+"/approval/ask", f.token, "",
+	ch := approvalAskAsync(f.base+"/approval/ask", "",
 		approvalAskBody("ubuntu:bob", "claude", "/x", hookBash("sleep 1")))
 	got := approvalWaitOne(t, f.lbase, 1)
 	id := got[0].ID
@@ -249,7 +294,7 @@ func TestApprovalTimeout(t *testing.T) {
 		t.Fatalf("没人决定应 decided:false，得 %s", out.body)
 	}
 	if el := time.Since(start); el < 150*time.Millisecond {
-		t.Fatalf("应等满 approvalWait 才返回，实际 %v", el)
+		t.Fatalf("应等满 Config.Wait 才返回，实际 %v", el)
 	}
 	if got := approvalGET(t, f.lbase); len(got) != 0 {
 		t.Fatalf("超时后列表应空，得 %+v", got)
@@ -262,14 +307,13 @@ func TestApprovalTimeout(t *testing.T) {
 
 // TestApprovalClientDisconnect 客户端 ctx cancel → 服务端把请求从簿里删掉。
 func TestApprovalClientDisconnect(t *testing.T) {
-	f := newApprovalsFix(t)
+	f := newApprovalsFix(t, Config{})
 	ctx, cancel := context.WithCancel(context.Background())
 	body := approvalAskBody("ubuntu:bob", "claude", "/x", hookBash("long-running"))
 	ch := make(chan struct{})
 	go func() {
 		defer close(ch)
 		req, _ := http.NewRequestWithContext(ctx, http.MethodPost, f.base+"/approval/ask", bytes.NewReader(body))
-		req.Header.Set("Authorization", "Bearer "+f.token)
 		resp, err := httpClient.Do(req)
 		if err == nil {
 			resp.Body.Close()
@@ -286,10 +330,10 @@ func TestApprovalClientDisconnect(t *testing.T) {
 
 // TestApprovalSideAndBadInput 远端 mac: 地址 403、本机 ubuntu: 地址 403、坏地址 400、坏 hook 400、坏正文 400。
 func TestApprovalSideAndBadInput(t *testing.T) {
-	f := newApprovalsFix(t)
+	f := newApprovalsFix(t, Config{})
 
 	// 远端只能 ubuntu: 一侧；阻塞校验都发生在入簿之前，可同步断言。
-	if code, body := remoteDo(t, http.MethodPost, f.base+"/approval/ask", f.token,
+	if code, body := post(t, f.base+"/approval/ask",
 		approvalAskBody("mac:frank", "claude", "/x", hookBash("ls"))); code != 403 {
 		t.Fatalf("远端 mac: 地址应 403，得 %d %s", code, body)
 	}
@@ -317,7 +361,7 @@ func TestApprovalSideAndBadInput(t *testing.T) {
 		t.Fatalf("被拒的请求不该入簿: %+v", got)
 	}
 	// Edit 摘要取 file_path；未知工具取 input 原文。
-	ch := approvalAskAsync(f.lbase+"/approval/ask", "", "",
+	ch := approvalAskAsync(f.lbase+"/approval/ask", "",
 		approvalAskBody("mac:frank", "claude", "/x",
 			`{"hook_event_name":"PermissionRequest","tool_name":"Edit","tool_input":{"file_path":"/a/b.txt"}}`))
 	got := approvalWaitOne(t, f.lbase, 1)
@@ -327,7 +371,7 @@ func TestApprovalSideAndBadInput(t *testing.T) {
 	approvalDecide(t, f.lbase, got[0].ID, false, "")
 	<-ch
 
-	ch = approvalAskAsync(f.lbase+"/approval/ask", "", "",
+	ch = approvalAskAsync(f.lbase+"/approval/ask", "",
 		approvalAskBody("mac:frank", "mystery", "/x",
 			`{"hook_event_name":"PermissionRequest","tool_name":"Mystery","tool_input":{"k":"v"}}`))
 	got = approvalWaitOne(t, f.lbase, 1)
@@ -340,11 +384,10 @@ func TestApprovalSideAndBadInput(t *testing.T) {
 
 // TestApprovalPendingLimit 待批满额后新的 ask 直接 503，已入簿的不受影响。
 func TestApprovalPendingLimit(t *testing.T) {
-	f := newApprovalsFix(t)
-	maxApprovalPending = 2
+	f := newApprovalsFix(t, Config{MaxPending: 2})
 
 	for i := 0; i < 2; i++ {
-		if _, err := f.s.approvals.add(ApprovalRequest{
+		if _, err := f.ch.book.add(ApprovalRequest{
 			Addr: "mac:frank", Agent: "claude", Tool: "Bash",
 			Input: json.RawMessage(`{"command":"x"}`),
 		}); err != nil {
@@ -360,7 +403,7 @@ func TestApprovalPendingLimit(t *testing.T) {
 	}
 	// 腾出一个位置后又能入簿并放行。
 	approvalDecide(t, f.lbase, approvalGET(t, f.lbase)[0].ID, true, "")
-	ch := approvalAskAsync(f.lbase+"/approval/ask", "", "", approvalAskBody("mac:frank", "claude", "/x", hookBash("ls")))
+	ch := approvalAskAsync(f.lbase+"/approval/ask", "", approvalAskBody("mac:frank", "claude", "/x", hookBash("ls")))
 	got := approvalWaitOne(t, f.lbase, 2)
 	approvalDecide(t, f.lbase, got[1].ID, true, "")
 	if decided, allow, _ := (<-ch).decision(t); !decided || !allow {
@@ -372,7 +415,7 @@ func TestApprovalPendingLimit(t *testing.T) {
 
 // TestApprovalDecideNotFound decide 不存在/allow 不对/方法不对。
 func TestApprovalDecideNotFound(t *testing.T) {
-	f := newApprovalsFix(t)
+	f := newApprovalsFix(t, Config{})
 	if code, _ := post(t, f.lbase+"/approval/decide?id=nope&allow=1", nil); code != 404 {
 		t.Fatalf("不存在的 id 应 404，得 %d", code)
 	}
@@ -387,21 +430,30 @@ func TestApprovalDecideNotFound(t *testing.T) {
 	}
 }
 
-// TestApprovalStopKeepsRequests 协助 Stop 不清通用审批的请求（与协助 Queue 的 CancelAll 无关）。
-func TestApprovalStopKeepsRequests(t *testing.T) {
-	f := newApprovalsFix(t)
-	if _, err := f.s.approvals.add(ApprovalRequest{
+// TestApprovalQueueCancelKeepsRequests 待批队列 Queue 的 CancelAll 不清通用审批的请求（两者互相独立）。
+func TestApprovalQueueCancelKeepsRequests(t *testing.T) {
+	f := newApprovalsFix(t, Config{})
+	if _, err := f.ch.book.add(ApprovalRequest{
 		Addr: "mac:frank", Agent: "codex", Tool: "Bash",
 		Input: json.RawMessage(`{"command":"x"}`),
 	}); err != nil {
 		t.Fatal(err)
 	}
-	f.s.Stop("测试收尾")
+	q := NewQueue()
+	q.CancelAll("测试收尾")
 	got := approvalGET(t, f.lbase)
 	if len(got) != 1 || got[0].Agent != "codex" {
-		t.Fatalf("Stop 后通用审批请求应还在: %+v", got)
+		t.Fatalf("CancelAll 后通用审批请求应还在: %+v", got)
 	}
-	approvalDecide(t, f.lbase, got[0].ID, true, "")
+	if p := f.ch.Pending(); len(p) != 1 || p[0].ID != got[0].ID {
+		t.Fatalf("Channel.Pending 应与 GET /approval 一致: %+v", p)
+	}
+	if err := f.ch.Decide(got[0].ID, Decision{Allow: true}); err != nil {
+		t.Fatalf("Channel.Decide: %v", err)
+	}
+	if err := f.ch.Decide(got[0].ID, Decision{Allow: true}); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("重复 Decide 应 ErrNotFound，得 %v", err)
+	}
 }
 
 // TestApprovalDecideCancelRace decide 与取消（显式 cancel / ctx 超时交替）同时抢同一条请求，
@@ -409,13 +461,9 @@ func TestApprovalStopKeepsRequests(t *testing.T) {
 // decide 成功 ⇔ ask 拿到那个决定；decide 撞空（ErrNotFound）⇔ ask decided=false。
 // 每次等待都必须在有界时间内结束，簿最终干净（items/order 都空）。
 func TestApprovalDecideCancelRace(t *testing.T) {
-	oldWait := approvalWait
-	t.Cleanup(func() { approvalWait = oldWait })
-	approvalWait = 30 * time.Second // 单次循环只该由 decide/cancel 叫醒，不该等满这里
-
 	start := time.Now()
 	for i := 0; i < 200; i++ {
-		b := newApprovalBook()
+		b := newApprovalBook(0)
 		w, err := b.add(ApprovalRequest{
 			Addr: "mac:frank", Agent: "claude", Tool: "Bash",
 			Input: json.RawMessage(`{"command":"race"}`),
@@ -430,7 +478,7 @@ func TestApprovalDecideCancelRace(t *testing.T) {
 		if i%2 == 0 {
 			ctx, cancel = context.WithCancel(ctx)
 		} else {
-			ctx, cancel = context.WithTimeout(ctx, 2*time.Millisecond) // 模拟 ask 的 approvalWait 超时
+			ctx, cancel = context.WithTimeout(ctx, 2*time.Millisecond) // 模拟 ask 的等待超时
 		}
 
 		want := Decision{Allow: i%3 == 0, Message: "race"}
@@ -479,33 +527,72 @@ func TestApprovalDecideCancelRace(t *testing.T) {
 	}
 }
 
-// TestApprovalMsgAuthGating 配了 MsgAuth：/approval/ask 无证书一律 401（远端+本机）；
+// certFix 是带证书校验的审批通道：一个 CA、mac/ubuntu 两侧客户端证书。
+type certFix struct {
+	*approvalsFix
+	ubiP ed25519.PrivateKey
+	ubiC xxyica.Cert
+}
+
+func newCertFix(t *testing.T) *certFix {
+	t.Helper()
+	ca, err := xxyica.NewCA()
+	if err != nil {
+		t.Fatalf("NewCA: %v", err)
+	}
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("ubuntu 客户端密钥: %v", err)
+	}
+	cert, err := ca.Issue("ubuntu", pub, xxyica.DefaultPerm("ubuntu"), time.Hour, time.Now())
+	if err != nil {
+		t.Fatalf("签发 ubuntu 证书: %v", err)
+	}
+	v := xxyica.NewVerifier(ca.Public(), func(string) bool { return false })
+	return &certFix{approvalsFix: newApprovalsFix(t, Config{Verifier: v}), ubiP: priv, ubiC: cert}
+}
+
+// sign 对一次请求签名（pathWithQuery 必须与服务端看到的 RequestURI 一致）。
+func (f *certFix) sign(t *testing.T, method, pathWithQuery string, body []byte) string {
+	t.Helper()
+	hdr, err := xxyica.SignRequest(f.ubiP, f.ubiC, method, pathWithQuery, body, time.Now())
+	if err != nil {
+		t.Fatalf("签名请求 %s %s: %v", method, pathWithQuery, err)
+	}
+	return hdr
+}
+
+// TestApprovalCertGating 配了 Verifier：/approval/ask 无证书一律 401（远端+本机）；
 // ubuntu 证书远端 ask 正常走通；本机拿 ubuntu 证书发 mac: 地址 403；
-// 内部接口 GET /approval、POST /approval/decide 不要证书。
-func TestApprovalMsgAuthGating(t *testing.T) {
-	f := newMsgAuthFix(t, true)
+// 证书重放 401；内部接口 GET /approval、POST /approval/decide 不要证书。
+func TestApprovalCertGating(t *testing.T) {
+	f := newCertFix(t)
 	body := approvalAskBody("ubuntu:bob", "claude", "/srv", hookBash("ls"))
 
-	// 远端无证书（令牌有）→ 401。
-	if code, b := authDo(t, http.MethodPost, f.base+"/approval/ask", f.token, "", body); code != 401 || !strings.Contains(string(b), "证书校验失败") {
+	// 远端无证书 → 401。
+	if code, b := do(t, http.MethodPost, f.base+"/approval/ask", "", body); code != 401 || !strings.Contains(string(b), "证书校验失败") {
 		t.Fatalf("远端无证书应 401，得 %d %s", code, b)
 	}
 	// 本机无证书 → 401。
-	if code, b := authDo(t, http.MethodPost, f.lbase+"/approval/ask", "", "", body); code != 401 {
+	if code, b := do(t, http.MethodPost, f.lbase+"/approval/ask", "", body); code != 401 {
 		t.Fatalf("本机无证书应 401，得 %d %s", code, b)
 	}
 	// 本机 ubuntu 证书 + mac: 地址：证书能过、侧别/前缀不过 → 403。
 	macBody := approvalAskBody("mac:frank", "claude", "/x", hookBash("ls"))
-	if code, b := f.localAuth(t, http.MethodPost, "/approval/ask", f.ubiP, f.ubiC, macBody); code != 403 {
+	if code, b := do(t, http.MethodPost, f.lbase+"/approval/ask", f.sign(t, http.MethodPost, "/approval/ask", macBody), macBody); code != 403 {
 		t.Fatalf("ubuntu 证书发 mac: 地址应 403，得 %d %s", code, b)
 	}
 
 	// ubuntu 证书远端 ask：签名后异步请求，本机批准收尾。
-	hdr := f.remoteSign(t, http.MethodPost, "/approval/ask", f.ubiP, f.ubiC, body)
-	ch := approvalAskAsync(f.base+"/approval/ask", f.token, hdr, body)
+	hdr := f.sign(t, http.MethodPost, "/approval/ask", body)
+	ch := approvalAskAsync(f.base+"/approval/ask", hdr, body)
 	got := approvalWaitOne(t, f.lbase, 1)
-	// 内部接口不带证书也放行（Origin 校验在 wgtund 路由层）。
-	if code, _ := authDo(t, http.MethodPost, f.lbase+"/approval/decide?id="+got[0].ID+"&allow=1", "", "", nil); code != 200 {
+	// 同一个签名头再发一次：防重放，401。
+	if code, b := do(t, http.MethodPost, f.base+"/approval/ask", hdr, body); code != 401 {
+		t.Fatalf("重放同一签名应 401，得 %d %s", code, b)
+	}
+	// 内部接口不带证书也放行（Origin 校验在挂载方的路由层）。
+	if code, _ := do(t, http.MethodPost, f.lbase+"/approval/decide?id="+got[0].ID+"&allow=1", "", nil); code != 200 {
 		t.Fatalf("内部 decide 不该要证书，得 %d", code)
 	}
 	if decided, allow, _ := (<-ch).decision(t); !decided || !allow {

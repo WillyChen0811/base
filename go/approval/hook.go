@@ -1,4 +1,4 @@
-package support
+package approval
 
 import (
 	"encoding/json"
@@ -22,13 +22,13 @@ type HookInput struct {
 func ParseHookInput(b []byte) (HookInput, error) {
 	var h HookInput
 	if err := json.Unmarshal(b, &h); err != nil {
-		return HookInput{}, fmt.Errorf("support: 钩子输入不是合法 JSON: %w", err)
+		return HookInput{}, fmt.Errorf("approval: 钩子输入不是合法 JSON: %w", err)
 	}
 	if h.Event != "PermissionRequest" {
-		return HookInput{}, fmt.Errorf("support: 钩子事件不是 PermissionRequest: %q", h.Event)
+		return HookInput{}, fmt.Errorf("approval: 钩子事件不是 PermissionRequest: %q", h.Event)
 	}
 	if h.Tool == "" {
-		return HookInput{}, errors.New("support: 钩子输入缺少 tool_name")
+		return HookInput{}, errors.New("approval: 钩子输入缺少 tool_name")
 	}
 	if len(h.Input) == 0 || string(h.Input) == "null" {
 		h.Input = json.RawMessage("{}")

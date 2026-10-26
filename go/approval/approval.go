@@ -1,5 +1,16 @@
-// Package support 提供 Mac 协助服务的待批队列与 Claude Code 钩子格式转换，纯内存、无网络依赖。
-package support
+// Package approval 是「待用户批准」的队列与通用审批通道：
+//
+//   - Queue（approval.go）：待批队列，Ask 阻塞到用户 Decide、ctx 到期或 CancelAll，纯内存；
+//   - ParseHookInput / HookOutput（hook.go）：Claude Code PermissionRequest 钩子的输入解析与输出生成；
+//   - Channel（approvals.go）：通用审批通道。客户端经证书接口 POST /approval/ask 提交钩子输入并阻塞等决定，
+//     界面经本机接口 GET /approval 查看、POST /approval/decide 批准或拒绝；证书与请求签名校验用 xxyica.Verifier。
+//
+// 现在没有接线：2026-10-26 拆除协助/消息/审批时，从 go/support 里原样挪出这几份代码留下来，
+// 没有任何程序在用它们。留作以后「辨别一个操作是不是用户本人发出的」时用——
+// 用户发出的批准要经证书签名、带权限声明、防重放，这里和 xxyica 是现成的那一套。
+//
+// 只依赖标准库和 go/xxyica。
+package approval
 
 import (
 	"context"
@@ -28,7 +39,7 @@ type Decision struct {
 }
 
 // ErrNotFound 表示要决定的请求不在待批队列里（不存在、已决定或已超时）。
-var ErrNotFound = errors.New("support: 没有这条待批请求")
+var ErrNotFound = errors.New("approval: 没有这条待批请求")
 
 // maxSummaryLen 是摘要的最大长度（按 rune 计）。
 const maxSummaryLen = 200

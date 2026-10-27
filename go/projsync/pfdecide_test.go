@@ -1839,6 +1839,8 @@ func TestPFDecideRandomProperties(t *testing.T) {
 	if testing.Short() {
 		n = 100
 	}
+	seen := map[string]int{}
+	firstTimes := 0
 	for seed := int64(1); seed <= int64(n); seed++ {
 		r := rand.New(rand.NewSource(seed))
 		base := pfdtGenBase(r)
@@ -1867,6 +1869,15 @@ func TestPFDecideRandomProperties(t *testing.T) {
 		pl := PFDecide(in)
 		tag := fmt.Sprintf("seed=%d", seed)
 		pfdtCheckInvariants(t, tag, in, pl)
+		for _, a := range pl.Actions {
+			seen[string(a.Kind)]++
+		}
+		for _, s := range pl.Skips {
+			seen["skip:"+s.Code]++
+		}
+		if pl.Verdict.FirstTime {
+			firstTimes++
+		}
 
 		// 打乱条目顺序，输出逐字节相同。
 		want := pfdtJSON(t, pl)
@@ -1877,6 +1888,19 @@ func TestPFDecideRandomProperties(t *testing.T) {
 			t.Fatalf("%s：打乱后输出不同\n原:%s\n新:%s", tag, want, got)
 		}
 	}
+	// 别让随机测试空转：各种动作、各种跳过原因、首次规则都要真的出现过。
+	if !testing.Short() {
+		for _, k := range []string{"copy_new", "copy_over", "delete", "conflict", "mkdir", "rmdir", "rename_local", "clone_local",
+			"base_set", "base_del", "ledger_copy", "skip:unknown", "skip:out_of_scope", "skip:subtree_not_seen", "skip:office_lock_target", "skip:history_snapshot_differs"} {
+			if seen[k] == 0 {
+				t.Errorf("%d 组随机输入里一次都没出现过 %s（出现次数：%v）", n, k, seen)
+			}
+		}
+		if firstTimes == 0 {
+			t.Errorf("一次首次规则都没出现过")
+		}
+	}
+	t.Logf("%d 组随机输入，各类出现次数：%v，首次规则 %d 次", n, seen, firstTimes)
 }
 
 // 和真的 PFBase（T4）对得上：存盘、重新载入后直接当视图用。

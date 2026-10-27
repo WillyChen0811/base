@@ -112,7 +112,9 @@ const (
 	PFUnitMoveCodeNotQuiet       = "not_quiet"           // 最近有写入
 	PFUnitMoveCodeUnstable       = "unstable"            // 间隔两次扫描指纹不同
 	PFUnitMoveCodeUnreadable     = "unreadable"          // 读不了的目录
-	PFUnitMoveCodeRegistryBad    = "registry_unreadable" // units.json 读不了或坏了
+	PFUnitMoveCodeRegistryBad    = "registry_unreadable"    // units.json 读不了或坏了
+	PFUnitMoveCodePathsBad       = "paths_list_unreadable"  // 配置路径清单读不到/坏了，有没有配置判断不了（§14.4）
+	PFUnitMoveCodeNotConfigured  = "not_configured"          // 编号有配置但这个目录不是配置的那条（§14.2，可以合并）
 	PFUnitMoveCodeChanged        = "changed_during_check"
 	PFUnitMoveCodeNotOurLink     = "not_our_link" // 取消同步：桌面位置不是指向 S 的我们建的链接
 	PFUnitMoveCodeSyncMissing    = "sync_missing" // S 不见了或不是真实目录
@@ -192,6 +194,12 @@ type PFUnitMoveConfig struct {
 	SyncDir string // projfiles.sync_dir，绝对路径
 	Meta    string // meta 目录（~/.xxyi/projfiles），放 units.json 和 moves/
 	Home    string // 用户家目录，校验同步目录用；缺省 os.UserHomeDir()
+
+	// PathsList：XXYI 导出的配置路径清单 ~/.xxyi/projfiles-paths.json（§14.4）。
+	// 非空时 StartSync 走「开始同步的闸」：编号在清单里有配置 → rel 必须是其中一条、键取清单里的；
+	// 清单读不到 → 拒绝。空 = 不启用闸（照旧：键 = 编号；测试与不带 XXYI 的调用方用）。
+	// CreateSynced 不受闸限制（新建同步项目键 = 编号）。
+	PathsList string
 
 	QuietSeconds int           // 「最近没写入」的秒数，缺省 10
 	StableGap    time.Duration // 开始同步前两次扫描的间隔，缺省 2 秒
@@ -1140,6 +1148,34 @@ func (m *PFUnitMover) StartSync(ctx context.Context, rel string) (PFUnitMoveResu
 	p, s, code := rec.LinkPath, rec.SyncPath, rec.Code
 	var rf pfumRefusals
 
+	// 开始同步的闸（§14.4）：这个编号在清单里有配置 → rel 必须是其中一条，键取清单里的；
+	// 清单里没有这个编号 → 照旧（键 = 编号）；清单读不到 → 有没有配置判断不了，拒绝。
+	if m.cfg.PathsList != "" {
+		cp, cpErr := PFLoadConfiguredPaths(m.cfg.PathsList)
+		switch {
+		case cpErr != nil:
+			rf.addf(PFUnitMoveCodePathsBad, "配置路径清单读不到或坏了（%v），判断不了这个编号配置的目录，不能开始同步", cpErr)
+		case len(cp.Units(code)) > 0:
+			cu, conf := cp.Find(code, rel)
+			if !conf {
+				var rels []string
+				for _, u := range cp.Units(code) {
+					rels = append(rels, u.Rel)
+				}
+				rf.addf(PFUnitMoveCodeNotConfigured, "这个编号配置的目录是 %s，这个目录没配置，不能同步（可以合并进去）", strings.Join(rels, "、"))
+			} else if cu.Key != rec.Code { // 另配目录单元（§14.1）：键 = 清单里的 key，编号记进 ProjectCode
+				rec.Code, rec.ProjectCode = cu.Key, code
+				if err := PFValidateUnit(rec); err != nil {
+					rf.addf(PFUnitMoveCodeBadRel, "清单给的键 %q 配这个登记不合格：%v", cu.Key, err)
+					rec.Code, rec.ProjectCode = code, ""
+				} else {
+					code = cu.Key
+					res.Unit = cu.Key
+				}
+			}
+		}
+	}
+
 	// 登记表、移动日志
 	us, err := PFUnitMoveLoadUnits(m.meta)
 	if err != nil {
@@ -1427,8 +1463,8 @@ func (m *PFUnitMover) StopSync(ctx context.Context, code string) (PFUnitMoveResu
 	res := PFUnitMoveResult{Op: PFUnitMoveOpStop}
 	code = PFNormCode(code)
 	res.Unit = code
-	if c, ok := PFCodeFromName(code); !ok || c != code || !pfIsASCII(code) {
-		res.set(PFUnitMoveRefused, PFUnitMoveCodeNoCode, "%q 不是项目编号", code)
+	if _, ok := PFUnitKeyProjectCode(code); !ok { // §14.4：单元键 = 编号 或 编号+R+流水号数字
+		res.set(PFUnitMoveRefused, PFUnitMoveCodeNoCode, "%q 不是项目编号（也不是编号+R+流水号的单元键）", code)
 		res.Refusals = []PFUnitMoveRefusal{{Code: res.Code, Reason: res.Reason}}
 		return res, nil
 	}
@@ -2025,7 +2061,12 @@ func (m *PFUnitMover) RecoverMoves(ctx context.Context) ([]PFUnitMoveResult, err
 }
 
 func (m *PFUnitMover) recordOf(lg *PFUnitMoveLog, state PFUnitState) PFUnitRecord {
-	return PFUnitRecord{Code: lg.Code, Rel: lg.Rel, State: state, LinkPath: lg.P, SyncPath: lg.S, StartedAt: lg.StartedAt}
+	rec := PFUnitRecord{Code: lg.Code, Rel: lg.Rel, State: state, LinkPath: lg.P, SyncPath: lg.S, StartedAt: lg.StartedAt}
+	// §14.4：崩溃恢复出来的记录也要补 ProjectCode（键带 R 后缀时），别让空值被当成等于键。
+	if pc, ok := PFUnitKeyProjectCode(lg.Code); ok && pc != lg.Code {
+		rec.ProjectCode = pc
+	}
+	return rec
 }
 
 func (m *PFUnitMover) haltUnknown(res *PFUnitMoveResult, lg *PFUnitMoveLog, detail string) {

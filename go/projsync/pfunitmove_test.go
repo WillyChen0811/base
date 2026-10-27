@@ -57,6 +57,7 @@ type pfumEnv struct {
 	rename   func(oldPath, newPath string) error
 	sleep    func(ctx context.Context, d time.Duration) error
 	hook     PFUnitMoveHook
+	pathsList string // 非空 = 配置路径清单（§14.4 开始同步的闸）
 }
 
 func newPFUMEnv(t *testing.T) *pfumEnv {
@@ -83,6 +84,7 @@ func newPFUMEnv(t *testing.T) *pfumEnv {
 func (e *pfumEnv) cfg() PFUnitMoveConfig {
 	return PFUnitMoveConfig{
 		WorkDir: e.work, SyncDir: e.syn, Meta: e.meta, Home: e.home,
+		PathsList: e.pathsList,
 		Now: func() time.Time {
 			if e.nowFn != nil {
 				return e.nowFn()
@@ -1491,4 +1493,91 @@ func TestPFUnitMove_UnlinkNeverRemovesDirs(t *testing.T) {
 	if data, _ := os.ReadFile(filepath.Join(target, "a.txt")); string(data) != "a" {
 		t.Errorf("目录里的东西不能被动")
 	}
+}
+
+// ── 开始同步的闸（§14.4）───────────────────────────────
+
+// pfumWritePathsList 写一份配置路径清单（内容为调用方拼好的 JSON）。
+func pfumWritePathsList(t *testing.T, path, body string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPFUnitMove_PathsGate(t *testing.T) {
+	const code = "260403J1301"
+	const relMain = "2026/260403J1301-测试项目己"
+	const relCopy = "2026/260403J1301-测试项目己-副本"
+	const relOther = "2026/260403J1301-没配置"
+	e := newPFUMEnv(t)
+	e.pathsList = filepath.Join(e.home, ".xxyi", "projfiles-paths.json")
+	e.project(relMain)
+	e.project(relCopy)
+
+	// 1) 清单读不到 → 有配置与否判断不了，拒绝并写原因
+	res := e.expectRefused(t, relMain, PFUnitMoveCodePathsBad)
+	if !strings.Contains(res.Reason, "清单") {
+		t.Errorf("原因要写明是清单的问题：%s", res.Reason)
+	}
+
+	// 2) 编号在清单里有配置、rel 是配置的那条 → 照常过，键 = 编号
+	pfumWritePathsList(t, e.pathsList, `{"version":1,"units":[`+
+		`{"key":"`+code+`","code":"`+code+`","serials":[1],"rel":"`+relMain+`"},`+
+		`{"key":"`+code+`R2","code":"`+code+`","serials":[2],"rel":"`+relCopy+`"}]}`)
+	r := e.mustStart(t, relMain)
+	if r.Unit != code {
+		t.Errorf("主目录单元的键应是编号，得 %q", r.Unit)
+	}
+	rec := e.wantUnit(t, code, PFUnitSyncing)
+	if rec.ProjectCode != "" {
+		t.Errorf("键 = 编号时 project_code 应留空，得 %q", rec.ProjectCode)
+	}
+
+	// 3) rel 不是清单里配置的那条 → 拒绝，原因列出配置的目录
+	e.project(relOther)
+	res = e.expectRefused(t, relOther, PFUnitMoveCodeNotConfigured)
+	if !strings.Contains(res.Reason, relMain) || !strings.Contains(res.Reason, relCopy) {
+		t.Errorf("原因要列出这个编号配置的目录：%s", res.Reason)
+	}
+
+	// 4) 另配目录单元：键取清单里的 R2，编号记进 project_code；取消同步按 R2 键也走得通
+	r = e.mustStart(t, relCopy)
+	if r.Unit != code+"R2" {
+		t.Errorf("另配目录单元的键应是 %sR2，得 %q", code, r.Unit)
+	}
+	rec = e.wantUnit(t, code+"R2", PFUnitSyncing)
+	if rec.ProjectCode != code || rec.Rel != relCopy {
+		t.Errorf("登记应是编号 %s 配 %s，得 %+v", code, relCopy, rec)
+	}
+	if got := pfumSnap(t, e.S(relCopy)); len(got) == 0 {
+		t.Errorf("取消前同步目录里应是完整项目")
+	}
+
+	// 编号完全不在清单里 → 照旧（键 = 编号），闸只挡配置过的编号
+	const code2, rel2 = "260403J1302", "2026/260403J1302-另一个项目"
+	e.project(rel2)
+	r = e.mustStart(t, rel2)
+	if r.Unit != code2 {
+		t.Errorf("不在清单里的编号应照旧按编号登记，得 %q", r.Unit)
+	}
+
+	// CreateSynced 不受闸限制：把清单弄坏也照样能建（键 = 编号）
+	pfumWritePathsList(t, e.pathsList, `{"version":1,"units": 坏 JSON`)
+	const code3, rel3 = "260403J1303", "2026/260403J1303-桌面新建"
+	res, err := e.mover().CreateSynced(bg, rel3)
+	if err != nil || res.Status != PFUnitMoveDone || res.Unit != code3 {
+		t.Fatalf("CreateSynced 不该被闸挡住：%+v %v", res, err)
+	}
+
+	// 取消 R2 单元：键检查放宽后按 R2 取消，目录搬回原位
+	e.mustStop(t, code+"R2")
+	if st, err := os.Lstat(e.P(relCopy)); err != nil || !st.IsDir() {
+		t.Errorf("取消后 %s 应搬回桌面原位", relCopy)
+	}
+	e.noUnit(t, code+"R2")
+	e.noTmp(t)
 }

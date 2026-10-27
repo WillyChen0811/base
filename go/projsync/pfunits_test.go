@@ -668,6 +668,102 @@ func TestPFValidateUnitsRejects(t *testing.T) {
 	}
 }
 
+func TestPFValidateUnitSameCodeTwoUnits(t *testing.T) {
+	// 旧记录（units.json 里没 project_code）：照常读、照常合格，ProjectCode 空 = 等于 Code
+	old := pfUnit("260403J1301", "己", PFUnitSyncing)
+	if err := PFValidateUnit(old); err != nil {
+		t.Fatalf("旧记录应照常合格: %v", err)
+	}
+	if old.PFUnitProjectCode() != "260403J1301" {
+		t.Errorf("空 project_code 应等于 Code，得 %q", old.PFUnitProjectCode())
+	}
+	b, err := PFMarshalUnits([]PFUnitRecord{old})
+	if err != nil || strings.Contains(string(b), "project_code") {
+		t.Errorf("omitempty：主目录单元的序列化不该带 project_code: %s %v", b, err)
+	}
+
+	// 另配目录单元：键 = 编号R2，project_code = 编号
+	r2 := pfUnit("260403J1301", "己-副本", PFUnitSyncing)
+	r2.Code, r2.ProjectCode = "260403J1301R2", "260403J1301"
+	if err := PFValidateUnit(r2); err != nil {
+		t.Fatalf("R2 键应合格: %v", err)
+	}
+	if r2.PFUnitProjectCode() != "260403J1301" {
+		t.Errorf("PFUnitProjectCode 应是编号，得 %q", r2.PFUnitProjectCode())
+	}
+	// 不带 project_code 的 R2 记录也合格（键自己说明一切）
+	nopc := r2
+	nopc.ProjectCode = ""
+	if err := PFValidateUnit(nopc); err != nil {
+		t.Errorf("不带 project_code 的 R2 键应合格: %v", err)
+	}
+	// 序列化带 project_code，往返不丢
+	b, err = PFMarshalUnits([]PFUnitRecord{r2})
+	if err != nil || !strings.Contains(string(b), `"project_code":"260403J1301"`) {
+		t.Errorf("序列化应带 project_code: %s %v", b, err)
+	}
+	us, err := PFParseUnits(b)
+	if err != nil || len(us) != 1 || us[0].Code != "260403J1301R2" || us[0].ProjectCode != "260403J1301" {
+		t.Errorf("往返不丢: %+v %v", us, err)
+	}
+
+	// 不合格的键与 project_code
+	for name, mut := range map[string]func(u *PFUnitRecord){
+		"R 后不是数字":   func(u *PFUnitRecord) { u.Code = "260403J1301RB" },
+		"键是别的编号加R": func(u *PFUnitRecord) { u.Code = "260403J1302R2" },
+		"project_code不是编号": func(u *PFUnitRecord) { u.ProjectCode = "260403J1302" },
+		"project_code带空格":  func(u *PFUnitRecord) { u.ProjectCode = " 260403J1301" },
+	} {
+		u := pfUnit("260403J1301", "己-副本", PFUnitSyncing)
+		u.Code, u.ProjectCode = "260403J1301R2", "260403J1301"
+		mut(&u)
+		if err := PFValidateUnit(u); err == nil {
+			t.Errorf("%s：应被拒绝: %+v", name, u)
+		}
+	}
+
+	// 同一编号两个单元（主 + R2）同表合法；rel 撞车拒绝
+	if err := PFValidateUnits([]PFUnitRecord{old, r2}); err != nil {
+		t.Errorf("主目录 + R2 同表应合格: %v", err)
+	}
+	dupe := r2
+	dupe.Rel = old.Rel
+	dupe.LinkPath, dupe.SyncPath = old.LinkPath, old.SyncPath
+	if err := PFValidateUnits([]PFUnitRecord{old, dupe}); err == nil || !strings.Contains(err.Error(), "rel") {
+		t.Errorf("两条登记挂同一 rel 应被拒绝: %v", err)
+	}
+}
+
+func TestPFClassifySameCodeTwoUnits(t *testing.T) {
+	// 同编号两个登记单元：各自的 rel 对上各自的目录，都是 Syncing；
+	// 同编号第三个没配置的目录进 Unconfigured（只报告），登记了但没发现的进 Missing。
+	main := pfUnit("260403J1301", "己", PFUnitSyncing)
+	r2 := pfUnit("260403J1301", "己-副本", PFUnitSyncing)
+	r2.Code, r2.ProjectCode = "260403J1301R2", "260403J1301"
+	gone := pfUnit("260403J1305", "壬", PFUnitSyncing)
+	found := PFDiscoverResult{Units: []PFFoundUnit{
+		pfFound("260403J1301", "2026/260403J1301-己"),
+		pfFound("260403J1301", "2026/260403J1301-己-副本"),
+		pfFound("260403J1301", "2025/260403J1301-没配置"),
+	}}
+	got, err := PFClassifyUnits(found, []PFUnitRecord{main, r2, gone})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Syncing) != 2 || got.Syncing[0].Reg.Code != "260403J1301" || got.Syncing[1].Reg.Code != "260403J1301R2" {
+		t.Errorf("两个登记单元都该按 rel 对上照常同步: %+v", got.Syncing)
+	}
+	if len(got.Unconfigured) != 1 || got.Unconfigured[0].Rel != "2025/260403J1301-没配置" {
+		t.Errorf("没配置的目录应进 Unconfigured: %+v", got.Unconfigured)
+	}
+	if len(got.Duplicates) != 0 {
+		t.Errorf("已登记编号的多目录不该再进 Duplicates: %+v", got.Duplicates)
+	}
+	if len(got.Missing) != 1 || got.Missing[0].Code != "260403J1305" {
+		t.Errorf("Missing 应只剩壬: %+v", got.Missing)
+	}
+}
+
 func TestPFParseUnitsRejects(t *testing.T) {
 	good := `{"code":"260403J0812","rel":"2026/260403J0812-甲","state":"syncing","link_path":"/a/2026/260403J0812-甲","sync_path":"/b/2026/260403J0812-甲","started_at":"2026-10-26T09:30:00Z"}`
 	if us, err := PFParseUnits([]byte("[" + good + "]")); err != nil || len(us) != 1 {

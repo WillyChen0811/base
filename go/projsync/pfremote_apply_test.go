@@ -202,6 +202,56 @@ func TestPFRemoteApplyUnitMkdir(t *testing.T) {
 	}
 }
 
+// §14.4：键 = 编号+R+流水号的另配单元，同编号在别处已有目录是合法配置，unit_mkdir 照常建；
+// 已存在的另配目录按 rel 配上，步骤照常执行（不按编号拒绝、也不报 Dup 停）。
+func TestPFRemoteApplyUnitKeyR(t *testing.T) {
+	f := newPFRTFix(t)
+	f.put("a.txt", "A")
+	ctx := context.Background()
+	const relR2 = "2026/260403J1001-另配"
+	u := PFRemoteUnit{Code: pfrtCode + "R2", Rel: relR2}
+	res, err := f.cl.Apply(ctx, PFRemoteApplyOptions{Unit: u, Round: "r-1"}, []PFRemoteStep{{Op: PFRemoteOpUnitMkdir}, {Op: PFRemoteOpMkdir, Path: "资料"}})
+	pfrtNoErr(t, err)
+	for _, r := range res.Results {
+		pfrtDone(t, r)
+	}
+	if res.Results[0].Apply.Existed {
+		t.Fatal("新建的另配目录不该标 Existed")
+	}
+	if st, err := os.Stat(filepath.Join(f.root, filepath.FromSlash(relR2), "资料")); err != nil || !st.IsDir() {
+		t.Fatalf("另配单元里的目录应建成: %v", err)
+	}
+	if f.exists("资料") {
+		t.Fatal("另配单元的步骤不该落到主目录里")
+	}
+	// 再来一次：另配目录已存在，rel 配得上，unit_mkdir 算已存在，后续步骤照常
+	res, err = f.cl.Apply(ctx, PFRemoteApplyOptions{Unit: u}, []PFRemoteStep{{Op: PFRemoteOpUnitMkdir}, {Op: PFRemoteOpMkdir, Path: "资料2"}})
+	pfrtNoErr(t, err)
+	for _, r := range res.Results {
+		pfrtDone(t, r)
+	}
+	if !res.Results[0].Apply.Existed {
+		t.Fatal("已存在应标 Existed")
+	}
+	// 键与 rel 上的编号对不上：整批拒绝，什么都不写
+	bad := PFRemoteUnit{Code: "260403J1002R2", Rel: relR2}
+	_, err = f.cl.Apply(ctx, PFRemoteApplyOptions{Unit: bad}, []PFRemoteStep{{Op: PFRemoteOpMkdir, Path: "不该被建"}})
+	var re *PFRemoteError
+	if !errors.As(err, &re) || re.Kind != PFRemoteErrRefused {
+		t.Fatalf("键的编号与目录名认出的编号对不上应整批拒绝: %v", err)
+	}
+	if _, serr := os.Lstat(filepath.Join(f.root, filepath.FromSlash(relR2), "不该被建")); serr == nil {
+		t.Fatal("被拒绝的批不该有写入")
+	}
+	// 键 = 编号的主单元：别处已有同编号目录就不建第二个（上面 Refusals 里「别处已有同编号」同理）
+	main2 := PFRemoteUnit{Code: pfrtCode, Rel: "2025/260403J1001-又一个"}
+	res, err = f.cl.Apply(ctx, PFRemoteApplyOptions{Unit: main2}, []PFRemoteStep{{Op: PFRemoteOpUnitMkdir}})
+	pfrtNoErr(t, err)
+	if !res.Stopped || !res.Results[0].Config {
+		t.Fatalf("主单元不能建第二个同编号目录: %+v", res.Results[0])
+	}
+}
+
 func TestPFRemoteApplyUnitMkdirRefusals(t *testing.T) {
 	f := newPFRTFix(t)
 	f.put("a.txt", "A")

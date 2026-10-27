@@ -176,11 +176,14 @@ func (s *PFRemoteServer) facts(ctx context.Context, req *PFRemoteFactsRequest) P
 		return fail("发现单元失败: %v", err)
 	}
 	resp.Incomplete = disc.Incomplete
+	// §14.4：req.Code 是单元键（主目录=编号，另配目录=编号+R+流水号）；
+	// Ubuntu 上按 rel 配对，比对编号时用键的前段（同编号多个目录已合法）。
+	pcf, _ := PFUnitKeyProjectCode(req.Code)
 	var unit *PFFoundUnit
 	for i := range disc.Units {
 		u := &disc.Units[i]
 		switch {
-		case u.Code != req.Code:
+		case u.Code != pcf:
 		case u.Rel == req.Rel:
 			unit = u
 		default:

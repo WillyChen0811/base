@@ -19,7 +19,8 @@ package projsync
 //     有先后依赖的几步（例如冲突：改名 → 新建）让调用方带 StopOnFail。
 //
 // 【单元目录】PFApplier 要求单元目录已存在。新项目首次传到 Ubuntu 时第一步用 unit_mkdir 建单元目录本身：
-// 只在 Rel 的每一级都过得了名字规则、最后一级的编号等于 Code、Ubuntu 上没有别的目录用这个编号、路径上没有符号链接时才建。
+// 只在 Rel 的每一级都过得了名字规则、最后一级的编号等于 Code 的编号（Code 是单元键：编号，或 编号+R+流水号，§14.4）、
+// 路径上没有符号链接时才建；键就是编号的主单元还要求 Ubuntu 上没有别的目录用这个编号（键带 R 的另配单元，同编号在别处有目录是合法的）。
 //
 // 【扩展点】后续任务（T10 台账：ledger_stage / ledger_install）用 pfrRegisterOp 注册新的步骤种类，带自己的校验和执行，
 // 请求里放在 PFRemoteStep.Ext、结果放在 PFRemoteStepResult.Ext；本文件不需要再改。
@@ -590,10 +591,18 @@ func (rc *pfrApplyRun) unitMkdir() PFRemoteStepResult {
 			return bad("上级目录 %q 里认得出编号 %s，单元不能建在另一个单元里面", seg, c)
 		}
 		if i == len(segs)-1 && (!ok || c != pc || !pfIsASCII(c)) {
-			return bad("最后一级 %q 认出的编号是 %q，与 %s 的编号 %s 不符", seg, c, code, pc)
+			return bad("最后一级 %q 认出的编号是 %q，与 %s 不符", seg, c, pc)
 		}
 	}
-	// 同编号多个目录已合法（§14.2），不再「已有同编号目录就不建」；rel 相同的情况 rc.unit 已非空、上面直接回已存在。
+	// §14.2：键=编号+R+流水号的另配单元，同编号在别处已有目录是合法配置，照常建；
+	// 但键=编号的主单元只能有这个编号的一个目录，别处已有就不建（老规矩「已有目录」保留）。
+	if pc == code && rc.disc != nil {
+		for i := range rc.disc.Units {
+			if u := &rc.disc.Units[i]; u.Code == code && u.Rel != rel {
+				return bad("已有目录 %s 也是编号 %s，主单元不能建第二个目录（要同步另一个目录请在 Mac 端登记成 %sR+流水号的另配单元）", u.Rel, code, code)
+			}
+		}
+	}
 	cur := rc.env.root
 	created := false
 	for _, seg := range segs {
@@ -631,6 +640,6 @@ func (rc *pfrApplyRun) unitMkdir() PFRemoteStepResult {
 		cur = next
 	}
 	res.Status, res.Code, res.Existed = PFApplyDone, PFApplyCodeOK, !created
-	rc.unit = &PFFoundUnit{Code: code, Rel: rel}
+	rc.unit = &PFFoundUnit{Code: pc, Rel: rel}
 	return PFRemoteStepResult{Apply: &res}
 }

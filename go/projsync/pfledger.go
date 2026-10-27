@@ -527,12 +527,11 @@ func (r *pfrdRun) doLedgerCopy(i int, a PFAction) {
 				a.Src.Machine(), staged.Hash[:16], ls.Hash[:16]))
 		return
 	}
-	// 2) 两个文件搬到目标边暂存区（Mac 目标：本机暂存区已有，不搬；Ubuntu 目标：上传）。
+	// 2) 两个文件搬到目标边暂存区（源 Mac → 上传；源 Ubuntu → fetch 回 Mac 暂存区；pflJob 按 Dst 定方向。
+	// 原先这里写的是 if a.Dst == PFSideMac { break }——方向守卫写反：Ubuntu→Mac 的 part 从不搬运，
+	// 第 3 步读 Mac 暂存区必然失败，每轮同样跳过、永不收敛（T14b 联调实证，TestItestS18Ledger 复现）。）
 	sent := int64(0)
 	for _, spec := range []pfldFileSpec{staged.SQLite, staged.JSON} {
-		if a.Dst == PFSideMac {
-			break // 源就是 Mac：part 本来就在 Mac 暂存区
-		}
 		tr, ok := r.fetch(i, a, r.pflJob(a.Dst, ls.Dir, spec))
 		if !ok {
 			return

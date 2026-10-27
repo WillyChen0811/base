@@ -673,6 +673,73 @@ func TestProjfilesLimitsAndSettingsForward(t *testing.T) {
 	s.Close()
 }
 
+// T14d：限速设置真正生效——good=0 不限、expensive/unknown 按 300KB/s；setNet 切换立刻改（不等下一轮）；
+// 改设置文件下一轮生效；状态里 limit_bps 能看到当前生效值。
+func TestProjfilesLimitFollowsNetAndSettingsFile(t *testing.T) {
+	s, clock, _ := pfSvcT(t, nil)
+	pfWriteSettings(t, s.prep.settingsPath, map[string]any{
+		"enabled": true, "limit_kbps_good": 0, "limit_kbps_expensive": 300,
+	})
+	var rr pfRounds
+	rr.hook(s)
+	dirs := []projsync.PFDirection{projsync.PFUpload, projsync.PFDownload}
+	s.setNet(projsync.PFRemoteNetGood, clock.now())
+	s.tick(context.Background(), "timer")
+	tr := s.transfer
+	if tr == nil {
+		t.Fatal("传输器没建成")
+	}
+	for _, d := range dirs {
+		if got := tr.Limit(d); got != 0 {
+			t.Errorf("good 网络 %s 应不限速，实为 %d", d, got)
+		}
+	}
+	if got := s.status().LimitBps; got != 0 {
+		t.Errorf("状态 limit_bps 应是 0，实为 %d", got)
+	}
+	// 切热点：setNet 当下就把限速刷上，不用等下一轮
+	s.setNet(projsync.PFRemoteNetExpensive, clock.now())
+	for _, d := range dirs {
+		if got := tr.Limit(d); got != 300*1024 {
+			t.Errorf("切热点后 %s 限速应是 300KB/s，实为 %d", d, got)
+		}
+	}
+	if got := s.status().LimitBps; got != 300*1024 {
+		t.Errorf("状态 limit_bps 应是 300KB/s，实为 %d", got)
+	}
+	// unknown 按 expensive
+	s.setNet(projsync.PFRemoteNetUnknown, clock.now())
+	for _, d := range dirs {
+		if got := tr.Limit(d); got != 300*1024 {
+			t.Errorf("unknown 应按 expensive，%s 实为 %d", d, got)
+		}
+	}
+	// 改设置文件：下一轮生效
+	pfWriteSettings(t, s.prep.settingsPath, map[string]any{
+		"enabled": true, "limit_kbps_good": 0, "limit_kbps_expensive": 120,
+	})
+	s.tick(context.Background(), "timer")
+	for _, d := range dirs {
+		if got := tr.Limit(d); got != 120*1024 {
+			t.Errorf("改设置后下一轮 %s 限速应是 120KB/s，实为 %d", d, got)
+		}
+	}
+	if got := s.status().LimitBps; got != 120*1024 {
+		t.Errorf("状态 limit_bps 应跟着刷成 120KB/s，实为 %d", got)
+	}
+	// 切回 good：0 = 不限
+	s.setNet(projsync.PFRemoteNetGood, clock.now())
+	for _, d := range dirs {
+		if got := tr.Limit(d); got != 0 {
+			t.Errorf("切回 good 后 %s 应不限速，实为 %d", d, got)
+		}
+	}
+	if rr.len() < 2 {
+		t.Errorf("两轮都该跑: %d", rr.len())
+	}
+	s.Close()
+}
+
 // ── 状态文件 ───────────────────────────────────────────
 
 func TestProjfilesStatusFileWritten(t *testing.T) {

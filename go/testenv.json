@@ -15,6 +15,16 @@
       ],
       "cwd": "go"
     },
+    "goitest": {
+      "cmd": [
+        "bash",
+        "-c",
+        "export HOME=\"$(eval echo ~$(id -un))\"; R=\"$1\"; shift; env -u TMUX -u TMUX_PANE /usr/local/go/bin/go test -tags itest \"$@\" >\"$R/out/go.log\" 2>&1; rc=$?; echo \"== go test 退出码 $rc，完整输出在 out/go.log ==\"; grep -E \"^(--- FAIL|FAIL|ok |panic:|# |.*_test\\.go:[0-9]+|.*\\.go:[0-9]+:[0-9]+)\" \"$R/out/go.log\" | tail -n 30; exit $rc",
+        "goitest",
+        "{run}"
+      ],
+      "cwd": "go"
+    },
     "govet": {
       "cmd": [
         "bash",

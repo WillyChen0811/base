@@ -34,7 +34,7 @@ func TestItestS21SameCodeTwoDirs(t *testing.T) {
 
 	// 1) Mac 开始同步主目录，一轮到 Ubuntu。
 	c.startUnit(relF, map[string][]byte{
-		"需求.docx":  []byte("需求 v1\n"),
+		"需求.docx":   []byte("需求 v1\n"),
 		"现场/记录.txt": []byte("记录 v1\n"),
 	})
 	rep := c.round(true)
@@ -75,12 +75,20 @@ func TestItestS21SameCodeTwoDirs(t *testing.T) {
 		t.Errorf("本轮报告没列出没配置的副本目录 %s：%s", relFCopy, jsonOf(rep2))
 	}
 
+	// 登记单元自己的结果里也只是一条「报告」级的 G4（同编号还有别的目录），不是停。
+	if res := unitResult(rep2, "260403J1301"); res == nil {
+		t.Errorf("本轮报告里没有登记单元 260403J1301 的结果：%s", jsonOf(rep2))
+	} else {
+		for _, g := range res.Gates {
+			if g.Code == "G4" && g.Effect != projsync.PFGateReport {
+				t.Errorf("同编号别的目录在登记单元里只该是报告级的 G4：%+v", g)
+			}
+		}
+	}
+
 	// Mac 上不出现副本目录（没配置的内容不过来了）。
 	if _, err := os.Stat(filepathJoin(c.sync, relFCopy)); err == nil {
 		t.Errorf("没配置的副本目录不该同步到 Mac：%s", filepathJoin(c.sync, relFCopy))
-	}
-	if got := c.macFilesOf(relFCopy)["闲.txt"]; got != "" {
-		t.Errorf("副本里的文件不该出现在 Mac：%v", c.macFilesOf(relFCopy))
 	}
 
 	// Ubuntu 上副本内容原样不动。

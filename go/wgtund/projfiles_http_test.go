@@ -107,6 +107,9 @@ func pfAPIT(t *testing.T, fresh projfilesFresh, mut func(st map[string]any)) (*p
 	svc.buildMover = func(projsync.PFUnitMoveConfig) (*projsync.PFUnitMover, error) {
 		return &projsync.PFUnitMover{}, nil
 	}
+	// 设置装进服务（相当于每轮开始时的读设置）：状态接口报的是「已生效」的那份
+	st, _ := loadProjfilesSettings(svc.prep.settingsPath)
+	svc.applySettings(st, nil)
 	rec := newProjfilesRecycler(svc)
 	api := newProjfilesAPI(svc, rec)
 	if fresh != nil {
@@ -221,6 +224,11 @@ func TestProjfilesHTTPSyncBusy(t *testing.T) {
 	}
 	<-entered
 	gate <- struct{}{}
+	// 等第二轮连状态落盘一起收尾，不然临时目录删除会跟写入打架
+	pollUntil(t, 3*time.Second, "第二轮收尾", func() bool {
+		s := svc.status()
+		return !s.Running && strings.HasPrefix(s.LastAction, "跑了")
+	})
 	if resp, _ := pfHTTPDo(t, srv.URL, http.MethodGet, "/projfiles/sync", "", ""); resp.StatusCode != http.StatusMethodNotAllowed {
 		t.Errorf("GET /projfiles/sync 应 405: %d", resp.StatusCode)
 	}
@@ -539,8 +547,9 @@ func TestProjfilesAPIFile(t *testing.T) {
 		t.Fatalf("不该留下临时文件: %v", ents)
 	}
 	t.Setenv("HOME", dir)
-	if got, err := projfilesAPIPath(); err != nil || got != p {
-		t.Errorf("默认路径应是 %s，得到 %s (%v)", p, got, err)
+	want := filepath.Join(dir, ".xxyi", projfilesAPIFileName)
+	if got, err := projfilesAPIPath(); err != nil || got != want {
+		t.Errorf("默认路径应是 %s，得到 %s (%v)", want, got, err)
 	}
 }
 

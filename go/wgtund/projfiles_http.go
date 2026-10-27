@@ -268,6 +268,11 @@ func (h *projfilesAPI) getFresh() (projfilesFresh, error) {
 	}
 	syncDir := h.svc.settingsNow().SyncDir
 	if syncDir == "" {
+		// 定时循环还没跑过（enabled=false 或还没到第一轮）：设置文件是唯一的真相，直接读它
+		st, _ := loadProjfilesSettings(h.svc.prep.settingsPath)
+		syncDir = st.SyncDir
+	}
+	if syncDir == "" {
 		return nil, errors.New("设置里没有 sync_dir，取最新用不了")
 	}
 	f, err := h.newFresh(sched, syncDir)

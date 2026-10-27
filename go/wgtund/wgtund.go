@@ -75,6 +75,7 @@ type fileConf struct {
 	Socks          map[string]string `json:"socks"`
 	Hosts          []hostConf        `json:"hosts"`
 	Projsync       *projsyncConf     `json:"projsync"`
+	Projfiles      *projfilesConf    `json:"projfiles"` // 可选：项目文件同步（见 projfiles.go），缺省关闭
 	Forwards       []forwardConf     `json:"forwards"`
 	Proxy          string            `json:"proxy"`         // 可选：SOCKS5 代理口（回环），按各转发的 target 规则选线路
 	ProxyDefault   string            `json:"proxy_default"` // 没命中规则的目的：direct（默认）或某条转发的名字
@@ -205,6 +206,10 @@ func Run(ctx context.Context, dir string, stdin io.Reader, stdout io.Writer) (er
 	if err != nil {
 		return err
 	}
+	pfPrep, err := prepareProjfiles(conf)
+	if err != nil {
+		return err
+	}
 	knownHostsCb, err := knownhosts.New(expand(conf.KnownHosts))
 	if err != nil {
 		return fmt.Errorf("known_hosts: %w", err)
@@ -305,6 +310,16 @@ func Run(ctx context.Context, dir string, stdin io.Reader, stdout io.Writer) (er
 		v2done := make(chan struct{})
 		go func() { defer close(v2done); projV2.loop(v2ctx) }()
 		closers = append(closers, closerFunc(func() { v2cancel(); <-v2done }))
+	}
+
+	// 项目文件同步（可选）：定时跑 PFSched 的一轮（见 projfiles.go）；没配这段或 enabled=false 时不起协程
+	var projFiles *projfilesSvc
+	if pfPrep != nil {
+		projFiles = newProjfilesSvc(pfPrep, pool)
+		pfctx, pfcancel := context.WithCancel(ctx)
+		pfdone := make(chan struct{})
+		go func() { defer close(pfdone); projFiles.loop(pfctx) }()
+		closers = append(closers, closerFunc(func() { pfcancel(); <-pfdone; projFiles.Close() }))
 	}
 
 	open := func(r *http.Request, cols, rows int) (*sshterm.Session, error) {

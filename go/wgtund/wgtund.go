@@ -75,6 +75,7 @@ type fileConf struct {
 	Socks          map[string]string `json:"socks"`
 	Hosts          []hostConf        `json:"hosts"`
 	Projsync       *projsyncConf     `json:"projsync"`
+	Projfiles      *projfilesConf    `json:"projfiles"` // 可选：项目文件同步（见 projfiles.go），缺省关闭
 	Forwards       []forwardConf     `json:"forwards"`
 	Proxy          string            `json:"proxy"`         // 可选：SOCKS5 代理口（回环），按各转发的 target 规则选线路
 	ProxyDefault   string            `json:"proxy_default"` // 没命中规则的目的：direct（默认）或某条转发的名字
@@ -205,6 +206,10 @@ func Run(ctx context.Context, dir string, stdin io.Reader, stdout io.Writer) (er
 	if err != nil {
 		return err
 	}
+	pfPrep, err := prepareProjfiles(conf)
+	if err != nil {
+		return err
+	}
 	knownHostsCb, err := knownhosts.New(expand(conf.KnownHosts))
 	if err != nil {
 		return fmt.Errorf("known_hosts: %w", err)
@@ -305,6 +310,20 @@ func Run(ctx context.Context, dir string, stdin io.Reader, stdout io.Writer) (er
 		v2done := make(chan struct{})
 		go func() { defer close(v2done); projV2.loop(v2ctx) }()
 		closers = append(closers, closerFunc(func() { v2cancel(); <-v2done }))
+	}
+
+	// 项目文件同步（可选）：定时跑 PFSched 的一轮（见 projfiles.go）；没配这段或 enabled=false 时不起协程
+	var projFiles *projfilesSvc
+	var pfAPI *projfilesAPI
+	if pfPrep != nil {
+		projFiles = newProjfilesSvc(pfPrep, pool)
+		pfRec := newProjfilesRecycler(projFiles)
+		projFiles.runRound = pfRec.wrapRound(projFiles.runRound) // 每天第一轮结束后清回收区（见 projfiles_http.go）
+		pfAPI = newProjfilesAPI(projFiles, pfRec)
+		pfctx, pfcancel := context.WithCancel(ctx)
+		pfdone := make(chan struct{})
+		go func() { defer close(pfdone); projFiles.loop(pfctx) }()
+		closers = append(closers, closerFunc(func() { pfcancel(); <-pfdone; projFiles.Close() }))
 	}
 
 	open := func(r *http.Request, cols, rows int) (*sshterm.Session, error) {
@@ -436,6 +455,21 @@ func Run(ctx context.Context, dir string, stdin io.Reader, stdout io.Writer) (er
 		mux.HandleFunc("/projsync/v2", noProj)
 		mux.HandleFunc("/projsync/v2/run", noProj)
 		mux.HandleFunc("/projsync/v2/commit", noProj)
+	}
+
+	// 项目文件同步的本机接口（可选）：/projfiles/*，只认令牌、不查 Origin（调用方是 cmdproto 子进程与本机命令行）；
+	// 没配这段一律 404。地址与令牌原子写 ~/.xxyi/projfiles-api.json（0600），给本机的界面/命令行取。
+	if pfAPI != nil {
+		mux.Handle("/projfiles/", pfAPI.localHandler(ctx))
+		if p, err := projfilesAPIPath(); err != nil {
+			logf("算 %s 路径失败: %v", projfilesAPIFileName, err)
+		} else if err := writeProjfilesAPI(p, "http://"+ln.Addr().String(), token); err != nil {
+			logf("写 %s 失败: %v", p, err)
+		}
+	} else {
+		mux.HandleFunc("/projfiles/", func(w http.ResponseWriter, r *http.Request) {
+			errJSON(w, http.StatusNotFound, "没有配置项目文件同步")
+		})
 	}
 
 	// tmux 会话管理。写操作用 POST 但不带请求体和自定义头，

@@ -7,7 +7,8 @@ package projsync
 // 每一步的结果原样放进响应（PFApplyResult 已可 JSON 编码）。
 //
 // 【整批拒绝（Error，一步都没做）】请求读得懂但这次不做：根不在白名单、租约在别的协调者手里或读不懂、步骤不合法
-// （未知种类、字段不对、路径不合法、sha256 格式不对……所有步骤都先校验完才开始执行）、单元找不到或同编号有多个目录。
+// （未知种类、字段不对、路径不合法、sha256 格式不对……所有步骤都先校验完才开始执行）、单元找不到（按 rel 配不上，§14.4）
+// 或 rel 上的编号与请求对不上。同编号另有目录不再整批拒绝（§14.2，没配置的只报告）。
 //
 // 【中途停止】按顺序执行，出现下面任一情况就不再执行后面的步骤，响应里写明停在第几步：
 //   - 某一步结果是「放弃且 Uncertain」（现场没能完全恢复原状）；
@@ -376,16 +377,19 @@ func (s *PFRemoteServer) apply(ctx context.Context, req *PFRemoteApplyRequest) P
 			return fail("发现单元失败: %v", err)
 		}
 		rc.disc = &disc
+		// §14.4：按 rel 配对（不再按编号）；req.Code 是单元键，编号取键的前段。
+		// 同编号多个目录已合法（没配置的只报告），不再 Dup 即停（取代 G4）。
+		pc, _ := PFUnitKeyProjectCode(req.Code)
 		for i := range disc.Units {
-			if u := &disc.Units[i]; u.Code == req.Code && u.Rel == req.Rel {
+			if u := &disc.Units[i]; u.Rel == req.Rel {
 				rc.unit = u
 			}
 		}
 		switch {
-		case rc.unit != nil && rc.unit.Dup:
-			return fail("同一个编号 %s 在 Ubuntu 上有多个目录（%s 和 %s），单元停下，一步都没执行", req.Code, rc.unit.Rel, strings.Join(rc.unit.DupRels, "、"))
 		case rc.unit == nil && req.Steps[0].Op != PFRemoteOpUnitMkdir:
 			return fail("Ubuntu 上没有单元 %s（%s），或那里的目录名认不出这个编号，一步都没执行", req.Code, req.Rel)
+		case rc.unit != nil && rc.unit.Code != pc:
+			return fail("单元 %s 登记的目录 %s 在 Ubuntu 上认出的编号是 %s，跟请求对不上，一步都没执行", req.Code, req.Rel, rc.unit.Code)
 		}
 	}
 
@@ -575,6 +579,8 @@ func (rc *pfrApplyRun) unitMkdir() PFRemoteStepResult {
 	if o := PFCheckPath(rel, true); o != nil {
 		return bad("路径不合格：%s", o.Reason)
 	}
+	// §14.4：req.Code 是单元键；目录名里认的编号 = 键的前段（另配目录单元 CODER2 的目录仍叫编号开头）。
+	pc, _ := PFUnitKeyProjectCode(code)
 	for i, seg := range segs {
 		if strings.HasPrefix(seg, ".") {
 			return bad("%q 以 . 开头，发现单元时会被跳过", seg)
@@ -583,15 +589,11 @@ func (rc *pfrApplyRun) unitMkdir() PFRemoteStepResult {
 		if i < len(segs)-1 && ok {
 			return bad("上级目录 %q 里认得出编号 %s，单元不能建在另一个单元里面", seg, c)
 		}
-		if i == len(segs)-1 && (!ok || c != code || !pfIsASCII(c)) {
-			return bad("最后一级 %q 认出的编号是 %q，与 %s 不符", seg, c, code)
+		if i == len(segs)-1 && (!ok || c != pc || !pfIsASCII(c)) {
+			return bad("最后一级 %q 认出的编号是 %q，与 %s 的编号 %s 不符", seg, c, code, pc)
 		}
 	}
-	for _, u := range rc.disc.Units {
-		if u.Code == code {
-			return bad("Ubuntu 上已有目录 %s 用这个编号，不再新建一个", u.Rel)
-		}
-	}
+	// 同编号多个目录已合法（§14.2），不再「已有同编号目录就不建」；rel 相同的情况 rc.unit 已非空、上面直接回已存在。
 	cur := rc.env.root
 	created := false
 	for _, seg := range segs {

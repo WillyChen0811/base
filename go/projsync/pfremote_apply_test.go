@@ -317,7 +317,7 @@ func TestPFRemoteApplyRefusedWholeBatch(t *testing.T) {
 	if _, err := f.cl.Apply(ctx, PFRemoteApplyOptions{Unit: f.unit()}, many); err == nil || PFRemoteIsUncertain(err) {
 		t.Fatalf("步骤太多应在本机拦住: %v", err)
 	}
-	// 单元找不到 / 编号对不上 / 重复
+	// 单元找不到 / rel 上的编号对不上（§14.4 按 rel 配对）
 	unitless := []PFRemoteStep{{Op: PFRemoteOpMkdir, Path: "不该被建"}}
 	for name, u := range map[string]PFRemoteUnit{
 		"单元不存在":   {Code: "260403J9999", Rel: "2026/260403J9999-无"},
@@ -329,14 +329,16 @@ func TestPFRemoteApplyRefusedWholeBatch(t *testing.T) {
 			t.Errorf("%s: 应被拒绝: %v", name, err)
 		}
 	}
-	f.putIn("2025/260403J1001-副本", "b.txt", "B")
-	_, err := f.cl.Apply(ctx, PFRemoteApplyOptions{Unit: f.unit()}, unitless)
-	var re *PFRemoteError
-	if !errors.As(err, &re) || re.Kind != PFRemoteErrRefused || !strings.Contains(re.Msg, "多个目录") {
-		t.Fatalf("同编号多个目录应拒绝: %v", err)
-	}
 	if f.exists("不该被建") {
 		t.Fatal("被拒绝的批不该有任何写入")
+	}
+	// §14.2：同编号另一个目录（没配置）不再 Dup 即停（取代 G4）——rel 配得上就照常执行。
+	f.putIn("2025/260403J1001-副本", "b.txt", "B")
+	if _, err := f.cl.Apply(ctx, PFRemoteApplyOptions{Unit: f.unit()}, []PFRemoteStep{{Op: PFRemoteOpMkdir, Path: "照常建"}}); err != nil {
+		t.Fatalf("同编号另有目录时按 rel 配对应照常执行: %v", err)
+	}
+	if !f.exists("照常建") {
+		t.Fatal("单元里的 mkdir 应建成")
 	}
 }
 

@@ -50,6 +50,7 @@ const (
 
 	projfilesMetaDirName    = "projfiles"
 	projfilesSettingsName   = "projfiles-settings.json"
+	projfilesPathsListName  = "projfiles-paths.json" // XXYI 导出的配置路径清单（§14.1/§14.4，开始同步的闸用它）
 	projfilesStatusFileName = "_round.json"
 	defaultProjfilesXxyiMsg = "~/.local/bin/xxyi-msg"
 )
@@ -85,6 +86,7 @@ type projfilesPrep struct {
 	coordHost    string // 给人看的主机名（原样）
 	metaDir      string // ~/.xxyi/projfiles：units.json、staging、回收、status 都在里面
 	settingsPath string // ~/.xxyi/projfiles-settings.json
+	pathsListPath string // ~/.xxyi/projfiles-paths.json：XXYI 导出的配置路径清单（§14.4 开始同步的闸）
 	statusPath   string // ~/.xxyi/projfiles/status/_round.json
 	// fromSettings：hosts.json 没写 projfiles 段——host/remote_root/remote_meta 不再固定在 prep 里，
 	// 每轮从设置文件取（effRemote），缺项/不合法这一轮不跑并写明原因；总开关是设置文件的 enabled（缺省关）。
@@ -125,9 +127,10 @@ func prepareProjfiles(c *fileConf) (*projfilesPrep, error) {
 		return &projfilesPrep{
 			fromSettings: true, hosts: hosts,
 			xxyiMsg: defaultProjfilesXxyiMsg, coordID: coordID, coordHost: coordHost,
-			metaDir:      filepath.Join(dir, projfilesMetaDirName),
-			settingsPath: filepath.Join(dir, projfilesSettingsName),
-			statusPath:   filepath.Join(dir, projfilesMetaDirName, "status", projfilesStatusFileName),
+			metaDir:       filepath.Join(dir, projfilesMetaDirName),
+			settingsPath:  filepath.Join(dir, projfilesSettingsName),
+			pathsListPath: filepath.Join(dir, projfilesPathsListName),
+			statusPath:    filepath.Join(dir, projfilesMetaDirName, "status", projfilesStatusFileName),
 		}, nil
 	}
 	bad := func(format string, a ...any) error {
@@ -177,9 +180,10 @@ func prepareProjfiles(c *fileConf) (*projfilesPrep, error) {
 		enabled: pc.Enabled, host: host.Name,
 		remoteRoot: projfilesCleanRemote(pc.RemoteRoot), remoteMeta: projfilesCleanRemote(pc.RemoteMeta),
 		xxyiMsg: xxyiMsg, coordID: coordID, coordHost: coordHost,
-		metaDir:      filepath.Join(dir, projfilesMetaDirName),
-		settingsPath: filepath.Join(dir, projfilesSettingsName),
-		statusPath:   filepath.Join(dir, projfilesMetaDirName, "status", projfilesStatusFileName),
+		metaDir:       filepath.Join(dir, projfilesMetaDirName),
+		settingsPath:  filepath.Join(dir, projfilesSettingsName),
+		pathsListPath: filepath.Join(dir, projfilesPathsListName),
+		statusPath:    filepath.Join(dir, projfilesMetaDirName, "status", projfilesStatusFileName),
 	}, nil
 }
 
@@ -711,6 +715,7 @@ func (s *projfilesSvc) buildLocked(st projfilesSettings) error {
 		m, err := s.buildMover(projsync.PFUnitMoveConfig{
 			WorkDir: st.WorkDir, SyncDir: st.SyncDir, Meta: s.prep.metaDir,
 			QuietSeconds: st.QuietSeconds, Now: s.now,
+			PathsList: s.prep.pathsListPath, // §14.4 开始同步的闸：清单读不到时 StartSync 会拒绝并写原因
 		})
 		if err != nil {
 			s.noteOnce(fmt.Sprintf("建单元搬运器失败（不自动建项目、不搬正位；设置改好后整套重建再生效）：%v", err))

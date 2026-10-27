@@ -137,17 +137,23 @@ func (f *PFFresh) mapPaths(paths []string) ([]*pfffTarget, error) {
 			continue
 		}
 		rel = filepath.ToSlash(rel)
-		for _, u := range reg {
+		// §14.2：取「最长匹配的单元 rel」——同编号主目录与另配目录嵌套时，路径归更深的单元。
+		var best *PFUnitRecord
+		for j := range reg {
+			u := &reg[j]
 			if u.State != PFUnitSyncing {
 				continue
 			}
 			if rel == u.Rel || strings.HasPrefix(rel, u.Rel+"/") {
-				inner := strings.TrimPrefix(strings.TrimPrefix(rel, u.Rel), "/")
-				if inner != "" && validRel(inner) != nil {
-					break
+				if best == nil || len(u.Rel) > len(best.Rel) {
+					best = u
 				}
-				out[i] = &pfffTarget{idx: i, rec: u, inner: inner}
-				break
+			}
+		}
+		if best != nil {
+			inner := strings.TrimPrefix(strings.TrimPrefix(rel, best.Rel), "/")
+			if inner == "" || validRel(inner) == nil {
+				out[i] = &pfffTarget{idx: i, rec: *best, inner: inner}
 			}
 		}
 	}
@@ -229,7 +235,7 @@ func (f *PFFresh) Paths(ctx context.Context, paths []string, budget time.Duratio
 	}
 	pollBy := map[string]PFRemotePollUnit{}
 	for _, u := range poll.Units {
-		pollBy[u.Code] = u
+		pollBy[u.Rel] = u // §14.4：Ubuntu 侧对应关系按 rel（同编号可能有多个目录）
 	}
 
 	for _, code := range order {
@@ -323,10 +329,12 @@ const pfffCancelStopGrace = 30 * time.Second
 func (f *PFFresh) online(ctx context.Context, out *PFFreshResult, g []*pfffTarget, pollBy map[string]PFRemotePollUnit, net string, st PFSchedSettings, deadline time.Time) string {
 	s := f.s
 	rec := g[0].rec
+	// §14.4：Ubuntu 侧目录始终用登记的 rec.Rel；Poll 条目按 rel 匹配，只用来补指纹等。
+	// 登记 rel 在 Poll 里对不上 = Ubuntu 上没找到登记的目录：不同步（原有 Missing/G1 不删的语义由下一轮定时同步给）。
 	ubRel := rec.Rel
-	pu, havePoll := pollBy[rec.Code]
-	if havePoll {
-		ubRel = pu.Rel
+	pu, havePoll := pollBy[rec.Rel]
+	if !havePoll {
+		return f.noAnswer(out, g, fmt.Sprintf("Ubuntu 上找不到登记的目录 %s（同编号的其他目录没配置，不同步；要同步请先在 XXYI 里合并过去）", rec.Rel))
 	}
 	remain := time.Until(deadline)
 	if remain < time.Second {

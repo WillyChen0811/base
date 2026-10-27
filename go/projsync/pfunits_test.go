@@ -779,8 +779,12 @@ func TestPFClassifyUnits(t *testing.T) {
 		}
 		return out
 	}
-	if g := codesOf(got.Syncing); !reflect.DeepEqual(g, []string{"260403J0812=2026/260403J0812-甲"}) {
+	// §14.4：按 rel 配对——戊登记的 rel 找得到就照常 Syncing，同编号的副本目录只报告（Unconfigured），不再连坐。
+	if g := codesOf(got.Syncing); !reflect.DeepEqual(g, []string{"260403J0812=2026/260403J0812-甲", "260403N0101=2026/260403N0101-戊"}) {
 		t.Errorf("Syncing = %q", g)
+	}
+	if g := pfPairs(got.Unconfigured); !reflect.DeepEqual(g, []string{"260403N0101 @ 2025/260403N0101-戊的副本"}) {
+		t.Errorf("Unconfigured = %q", g)
 	}
 	if g := codesOf(got.Stopped); !reflect.DeepEqual(g, []string{"260403Q0901=2026/260403Q0901-乙"}) {
 		t.Errorf("Stopped = %q", g)
@@ -794,9 +798,8 @@ func TestPFClassifyUnits(t *testing.T) {
 	}) {
 		t.Errorf("New = %q", g)
 	}
+	// Duplicates 只剩「编号完全没登记过、同编号多个目录」的（X0101）；已登记编号的多目录不再 Dup（§14.2）
 	if g := pfPairs(got.Duplicates); !reflect.DeepEqual(g, []string{
-		"260403N0101 @ 2025/260403N0101-戊的副本",
-		"260403N0101 @ 2026/260403N0101-戊",
 		"260403X0101 @ 2026/260403X0101-新重复a",
 		"260403X0101 @ 2026/260403X0101-新重复b",
 	}) {
@@ -841,10 +844,12 @@ func TestPFClassifyUnits(t *testing.T) {
 }
 
 func TestPFClassifyIgnoresDupFlag(t *testing.T) {
-	// found.Units 里没标 Dup、但编号重复：按编号重算，仍进 Duplicates
+	// §14.4：配对按 rel 重算，不信 Dup 标——两个 found 的 rel 都不是登记的那条：
+	// 编号已登记 → 都进 Unconfigured（只报告）；登记的 rel 没找到 → Missing。
 	found := PFDiscoverResult{Units: []PFFoundUnit{pfFound("260403J0812", "a/260403J0812-1"), pfFound("260403J0812", "b/260403J0812-2")}}
 	got, err := PFClassifyUnits(found, []PFUnitRecord{pfUnit("260403J0812", "甲", PFUnitSyncing)})
-	if err != nil || len(got.Duplicates) != 2 || len(got.Syncing) != 0 || len(got.Missing) != 0 {
+	if err != nil || len(got.Duplicates) != 0 || len(got.Syncing) != 0 ||
+		len(got.Unconfigured) != 2 || len(got.Missing) != 1 || got.Missing[0].Code != "260403J0812" {
 		t.Errorf("%+v %v", got, err)
 	}
 }

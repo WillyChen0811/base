@@ -806,6 +806,110 @@ func TestPFApplyInstallOverStrangerDuringSwap(t *testing.T) {
 	}
 }
 
+// 换回去之后、改回 <sha>.part 之前，新装进去的文件被写了（交换期间它在目标位置上，用户的程序可能写进去了）：
+// 这份内容不能改回 <sha>.part（下一次 verifyPart 会把它当坏 part 删掉），要留在 .pfswap-* 私有名字下，
+// 结果是放弃 + 不确定，Residue 写明位置；目标位置是原来的内容。
+func TestPFApplyInstallOverSwapBackRewrittenNewFileStaysPrivate(t *testing.T) {
+	cases := []struct {
+		name  string
+		write func(t *testing.T, p string)
+		want  string // slot 上最后应有的内容
+	}{
+		{"追加（大小变）", func(t *testing.T, p string) { pfaAppend(t, p, "+用户刚保存的") }, "新+用户刚保存的"},
+		{"原地改写成同样大小的别的内容", func(t *testing.T, p string) {
+			if err := os.WriteFile(p, []byte("改"), 0o600); err != nil { // 「新」「改」都是 3 字节
+				t.Fatal(err)
+			}
+		}, "改"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			e := newPFAEnv(t)
+			e.put("a.docx", "目标现在的内容")
+			want := e.expect("a.docx")
+			want.SHA256 = pfaSHA("判定时以为的内容") // 交换后核对不符，走 swapBack
+			part := e.stage("新")
+			e.onHook("over:after-swapback", func() {
+				ls := e.leftovers()
+				if len(ls) != 1 || ls[0].Kind != "swap" {
+					t.Errorf("换回去之后暂存区应有一个 swap 文件：%v", ls)
+					return
+				}
+				c.write(t, ls[0].Path)
+			})
+			res, err := e.a.InstallOver(bg, "a.docx", part, 1, want)
+			e.wantStatus(res, err, PFApplyAbandoned, PFApplyCodeChangedInWindow)
+			if !res.Uncertain || len(res.Residue) == 0 {
+				t.Fatalf("应标不确定并说明残留：%v", res)
+			}
+			ls := e.leftovers()
+			if len(ls) != 1 || ls[0].Kind != "swap" {
+				t.Fatalf("被写过的内容应留在 .pfswap-* 下：%v", ls)
+			}
+			if !strings.Contains(strings.Join(res.Residue, "\n"), ls[0].Path) {
+				t.Errorf("Residue 应写明这份内容的位置 %s：%v", ls[0].Path, res.Residue)
+			}
+			if b, err := os.ReadFile(ls[0].Path); err != nil || string(b) != c.want {
+				t.Errorf("slot 上的内容 = %q（%v），想要 %q", b, err, c.want)
+			}
+			if _, err := os.Lstat(part.Path); !errors.Is(err, fs.ErrNotExist) {
+				t.Errorf("被写过的文件不能改回 <sha>.part：%v", err)
+			}
+			if got := e.read("a.docx"); got != "目标现在的内容" {
+				t.Errorf("正位应是原来的内容，实际 %q", got)
+			}
+			e.holds("目标现在的内容", c.want)
+			if u, _ := e.rec.Usage(); u.Files != 0 {
+				t.Error("没覆盖成，回收区不该有东西")
+			}
+			// 暂存区清理（哪怕过了很久）也不动私有名字
+			if _, err := PFCleanStaging(bg, PFLocalFS{}, e.stg, time.Hour, time.Now().Add(365*24*time.Hour), nil); err != nil {
+				t.Fatal(err)
+			}
+			if b, err := os.ReadFile(ls[0].Path); err != nil || string(b) != c.want {
+				t.Errorf("暂存区清理之后 slot 上的内容 = %q（%v）", b, err)
+			}
+		})
+	}
+}
+
+// 换回去之后算不出 slot 上这份的哈希（读不了）：同样留在私有名字下，放弃 + 不确定。
+func TestPFApplyInstallOverSwapBackUnreadableNewFileStaysPrivate(t *testing.T) {
+	pfaSkipIfRoot(t)
+	e := newPFAEnv(t)
+	e.put("a.docx", "目标现在的内容")
+	want := e.expect("a.docx")
+	want.SHA256 = pfaSHA("判定时以为的内容")
+	part := e.stage("新")
+	var slot string
+	e.onHook("over:after-swapback", func() {
+		ls := e.leftovers()
+		if len(ls) != 1 {
+			t.Errorf("残留 %v", ls)
+			return
+		}
+		slot = ls[0].Path
+		if err := os.Chmod(slot, 0); err != nil {
+			t.Error(err)
+		}
+	})
+	res, err := e.a.InstallOver(bg, "a.docx", part, 1, want)
+	e.wantStatus(res, err, PFApplyAbandoned, PFApplyCodeChangedInWindow)
+	if !res.Uncertain || len(res.Residue) == 0 || !strings.Contains(strings.Join(res.Residue, "\n"), slot) {
+		t.Errorf("应标不确定并写明位置：%v", res)
+	}
+	if _, err := os.Lstat(part.Path); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("算不出哈希的文件不能改回 <sha>.part：%v", err)
+	}
+	if _, err := os.Lstat(slot); err != nil {
+		t.Errorf("slot 应还在：%v", err)
+	}
+	os.Chmod(slot, 0o600)
+	if got := e.read("a.docx"); got != "目标现在的内容" {
+		t.Errorf("正位应是原来的内容，实际 %q", got)
+	}
+}
+
 func TestPFApplyInstallOverCrashWindows(t *testing.T) {
 	for _, w := range []string{"over:before-swap", "over:after-swap", "over:before-recycle", "over:after-recycle"} {
 		e := newPFAEnv(t)

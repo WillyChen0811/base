@@ -35,7 +35,8 @@ package projsync
 // 【和技术设计不一样的地方】
 //   - 覆盖时不是直接拿 <sha>.part 去交换，而是先把 part 不覆盖地改名为暂存区里的私有名字 .pfswap-<sha前8位>-<随机>，
 //     再与目标交换：被换下来的用户文件落在私有名字上，不会落在 <sha>.part 上被暂存区清理（PFCleanStaging）当成
-//     过期 part 删掉，崩溃时也不会被传输层当作已核验的 part 复用。放弃时再改回 <sha>.part。
+//     过期 part 删掉，崩溃时也不会被传输层当作已核验的 part 复用。放弃时先核对 slot 上的内容仍是 part，再改回 <sha>.part；
+//     核对不符的留在私有名字下（那可能是用户在交换期间写进新装文件里的内容）。
 //   - 覆盖时新文件保留目标原来的权限位（不同步权限位，但不能把可执行脚本覆盖成不可执行）；新建时 0644。
 //
 // 【边界】
@@ -1002,10 +1003,11 @@ func (a *PFApplier) newRenameFailure(rel string, w *pfWalk, err error) PFApplyRe
 // 流程：检查（字节名、前提、Office 锁、可写）→ 核 part 哈希 → 再检查 → part 不覆盖地改名为暂存区私有名字（slot）
 // → 与目标原子交换（darwin RENAME_SWAP、linux RENAME_EXCHANGE）→ 核对换下来的（在 slot 上）确实是 want 那份
 //   - 是：移入同步回收（原因「覆盖」），写 index；
-//   - 不是（核对后、交换前文件被改，或读不了）：再交换一次换回去，把 slot 改回 <sha>.part，放弃（changed_in_window）。
+//   - 不是（核对后、交换前文件被改，或读不了）：再交换一次换回去；slot 上的内容完整核对（sha256、大小）确是 part 才改回
+//     <sha>.part，放弃（changed_in_window）；核对不符或算不出，留在 slot 下不动，放弃且标不确定（见 swapBack）。
 //
 // 钩子窗口：over:before-swap（交换之前）、over:after-swap（交换之后、核对之前）、over:before-recycle（核对通过、移入回收之前）、
-// over:after-recycle（移入回收之后、记账之前）。
+// over:after-recycle（移入回收之后、记账之前）、over:after-swapback（核对不符、换回去之后、核对 slot 之前）。
 func (a *PFApplier) InstallOver(ctx context.Context, rel string, part PFPart, mtimeNs int64, want PFExpect) (PFApplyResult, error) {
 	res := PFApplyResult{Rel: rel}
 	if err := a.checkPartArgs(rel, part); err != nil {
@@ -1058,7 +1060,7 @@ func (a *PFApplier) InstallOver(ctx context.Context, rel string, part PFPart, mt
 		prep.undo(part.Path)
 		return pfClassifyErr(rel, "把暂存文件改名到交换位置", err), nil
 	}
-	// giveUp：交换没发生（或已换回），把 slot 改回 <sha>.part 并恢复它的权限和 mtime
+	// giveUp：交换没发生，把 slot 改回 <sha>.part 并恢复它的权限和 mtime
 	giveUp := func(r PFApplyResult) PFApplyResult {
 		if err := pfRenameNoReplace(slot, part.Path); err != nil {
 			r.Uncertain = true
@@ -1130,7 +1132,13 @@ func (a *PFApplier) InstallOver(ctx context.Context, rel string, part PFPart, mt
 }
 
 // swapBack 在交换后核对不符时把两个文件换回去：目标位置恢复成换之前的样子（现在的内容，可能是别人刚改过的），
-// 新内容的 part 回到暂存区。换回去之后还要确认 slot 上的确是我们的 part（否则说明目标位置又被第三方换过）。
+// 新内容的 part 回到暂存区。换回去之后还要确认 slot 上的确是我们的 part：
+//   - 身份（ino、大小）不对：目标位置又被第三方换过，那份留在 slot；
+//   - 身份对，但内容要完整算一遍 sha256 和大小，与 part 一致才改回 <sha>.part。交换期间新装的文件在目标位置上，
+//     用户的程序可能往里写了东西；不核对就改回 <sha>.part，下一次 verifyPart 会把它当坏 part 删掉。
+//     不一致或算不出来：留在私有名字 slot 下不动（任何代码路径都不删 .pfswap-*），结果是放弃 + Uncertain。
+//
+// 钩子窗口：over:after-swapback（换回去之后、核对 slot 上的内容之前）。
 func (a *PFApplier) swapBack(rel, slot, target string, part PFPart, pst PFStat, prep pfPartPrep, diff string) PFApplyResult {
 	reason := fmt.Sprintf("核对之后、交换之前目标被改动（%s），已换回原样，不覆盖", diff)
 	if err := pfRenameExchange(slot, target); err != nil {
@@ -1159,6 +1167,21 @@ func (a *PFApplier) swapBack(rel, slot, target string, part PFPart, pst PFStat, 
 		// 目标位置在两次交换之间又被第三方换过：slot 上现在是第三方的文件，我们的 part 已经不在了
 		r.Uncertain = true
 		r.Residue = append(r.Residue, fmt.Sprintf("目标位置在交换期间又被换成了别的文件，那份留在暂存区 %s；原来被改动的文件已换回目标位置；新内容的暂存文件已不在，需要重新传", slot))
+		return r
+	}
+	if out, stop := a.hit(r, "over:after-swapback"); stop {
+		return out
+	}
+	f, herr := pfHashFile(context.Background(), slot, false)
+	switch {
+	case herr != nil:
+		r.Uncertain = true
+		r.Residue = append(r.Residue, fmt.Sprintf("换回去之后算不出交换位置上这份文件的 sha256（%v），不确定它还是不是新内容，留在暂存区 %s 没有动；原来被改动的文件已换回目标位置", herr, slot))
+		return r
+	case f.SHA != part.SHA256 || f.Stat.Size != part.Size:
+		r.Uncertain = true
+		r.Residue = append(r.Residue, fmt.Sprintf("交换期间新装进去的文件被写过：换回去之后它的 sha256=%s 大小=%d，不是新内容（期望 sha256=%s 大小=%d）；这份内容可能是用户刚保存的，留在暂存区 %s 没有动，请人工查看；原来被改动的文件已换回目标位置；新内容的暂存文件已不在，需要重新传",
+			f.SHA, f.Stat.Size, part.SHA256, part.Size, slot))
 		return r
 	}
 	if err := pfRenameNoReplace(slot, part.Path); err != nil {

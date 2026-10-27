@@ -191,9 +191,10 @@ type PFFileInfo struct {
 	SHA256  string `json:"sha256"`
 }
 
-// PFExpect 是判定时看到的「目标现状」，原语执行前后都要核对。
+// PFExpect 是判定时看到的「目标现状」，原语执行前后都要核对。T5 判定产出它，T6 写原语核对它，全包只有这一个定义。
 type PFExpect struct {
 	Absent  bool   `json:"absent,omitempty"` // true：期望目标不存在（其余字段忽略）
+	T       string `json:"t,omitempty"`      // "f" 文件、"d" 目录（目录只核对 ino，没有大小、mtime、哈希）；空串按文件处理
 	Size    int64  `json:"size"`             // 期望的大小
 	MtimeNs int64  `json:"mtime_ns"`         // 期望的 mtime（纳秒）
 	Ino     uint64 `json:"ino"`              // 期望的 ino；0 表示不核对 ino
@@ -781,6 +782,9 @@ func (a *PFApplier) checkPartArgs(rel string, part PFPart) error {
 func (a *PFApplier) checkExpectArgs(want PFExpect) error {
 	if want.Absent {
 		return &PFApplyConfigError{Msg: "这个原语的前提必须是「目标存在」，不能是 Absent"}
+	}
+	if want.T != "" && want.T != PFBaseTypeFile {
+		return &PFApplyConfigError{Msg: fmt.Sprintf("这个原语只处理文件，前提的类型 %q 不是文件（目录的前提只能交给建目录、删目录）", want.T)}
 	}
 	if !pfValidSHA(want.SHA256) {
 		return &PFApplyConfigError{Msg: fmt.Sprintf("前提里的 sha256 %q 不合法", want.SHA256)}

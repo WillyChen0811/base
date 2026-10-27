@@ -491,6 +491,56 @@ func TestPFApplyInstallArgsAreConfigErrors(t *testing.T) {
 	}
 }
 
+// 前提的类型：T5 判定产出的文件前提带 T="f"，照常核对；目录前提（T="d"）或不认识的类型给「动文件」的原语，
+// 一律是配置错误，不能当文件去核哈希、更不能静默通过。
+func TestPFApplyExpectTypeField(t *testing.T) {
+	e := newPFAEnv(t)
+	e.put("a.docx", "旧")
+	part := e.stage("新")
+	for _, tp := range []string{"d", "x"} {
+		w := e.expect("a.docx")
+		w.T = tp
+		calls := map[string]func() error{
+			"InstallOver": func() error { _, err := e.a.InstallOver(bg, "a.docx", part, 1, w); return err },
+			"Delete":      func() error { _, err := e.a.Delete(bg, "a.docx", w, PFReasonDelete); return err },
+			"Rename":      func() error { _, err := e.a.Rename(bg, "a.docx", "b.docx", w); return err },
+			"ConflictRename": func() error {
+				_, err := e.a.ConflictRename(bg, "a.docx", "a (冲突).docx", w)
+				return err
+			},
+		}
+		for name, f := range calls {
+			var ce *PFApplyConfigError
+			if err := f(); !errors.As(err, &ce) {
+				t.Errorf("T=%q 的前提给 %s 应返回配置错误，得到 %v", tp, name, err)
+			}
+		}
+		if _, err := os.Stat(e.abs("a.docx")); err != nil {
+			t.Fatalf("被拒绝后 a.docx 应原样在位：%v", err)
+		}
+	}
+	// T="f" 与空串都按文件核对，字段齐全时照常执行
+	for _, tp := range []string{"f", ""} {
+		e.put("a.docx", "旧")
+		w := e.expect("a.docx")
+		w.T = tp
+		res, err := e.a.Delete(bg, "a.docx", w, PFReasonDelete)
+		e.wantDone(res, err)
+	}
+	// T="f" 但内容变了：仍然放弃，不因为带了 T 就少核对
+	e.put("a.docx", "旧")
+	w := e.expect("a.docx")
+	w.T = "f"
+	w.SHA256 = pfaSHA("别的")
+	res, err := e.a.Delete(bg, "a.docx", w, PFReasonDelete)
+	if err != nil || res.Status == PFApplyDone {
+		t.Errorf("哈希不符不该完成：%v %v", res, err)
+	}
+	if _, err := os.Stat(e.abs("a.docx")); err != nil {
+		t.Errorf("哈希不符后 a.docx 应仍在位或已回到原位：%v", err)
+	}
+}
+
 func TestPFApplyInstallNewReadOnlyDir(t *testing.T) {
 	pfaSkipIfRoot(t)
 	e := newPFAEnv(t)

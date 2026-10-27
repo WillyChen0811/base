@@ -127,16 +127,7 @@ type PFDecideInput struct {
 	Loc *time.Location
 }
 
-// PFExpect 是判定时在某一边看到的一个路径的现状，写原语执行前要逐项核对，不符就放弃这一步。
-type PFExpect struct {
-	// Absent 为 true：要求这个路径不存在（其余字段无意义）。
-	Absent  bool   `json:"absent,omitempty"`
-	T       string `json:"t,omitempty"` // "f" 文件、"d" 目录
-	Size    int64  `json:"size,omitempty"`
-	SHA256  string `json:"sha256,omitempty"` // 文件：小写十六进制
-	MtimeNs int64  `json:"mtime_ns,omitempty"`
-	Ino     uint64 `json:"ino,omitempty"` // 目录只核对 ino
-}
+// PFExpect 的定义在 pfapply.go（T5 判定产出、T6 写原语核对的是同一个类型）。
 
 // PFActionKind 是动作种类。
 type PFActionKind string

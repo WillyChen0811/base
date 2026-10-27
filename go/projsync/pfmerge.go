@@ -684,7 +684,7 @@ func (m *pfMergeCtx) run(ctx context.Context, plan PFMergePlanResult, rc *PFRecy
 	if ctx.Err() == nil && !res.Rejected {
 		m.recycleEmptyDirs(rc, now, plan, res)
 	}
-	if len(res.Applied) > 0 || len(res.Recycled) > 0 || len(res.RecycleDirs) > 0 || len(res.Residue) > 0 {
+	if len(res.Applied) > 0 || len(res.Recycled) > 0 || len(res.RecycleDirs) > 0 {
 		res.Touched = true
 	}
 }
@@ -874,6 +874,7 @@ func (m *pfMergeCtx) putBackReport(rc *PFRecycle, res *PFMergeRunResult, now tim
 	case err != nil:
 		msg := fmt.Sprintf("%s；挪回原处和转存都失败（%v），这份文件仍在回收区 %s，到期会被自动清理，请尽快取走", why, err, placed.Rel)
 		res.Residue = append(res.Residue, rel+"："+msg)
+		res.Touched = true
 		return &pfMergeMovedErr{reason: "回收后核对没通过：" + msg}
 	case home:
 		return &pfMergeAskErr{reason: "回收后核对没通过，已不覆盖地挪回原处，请你定：" + why}
@@ -916,6 +917,7 @@ func (m *pfMergeCtx) putBack(rc *PFRecycle, res *PFMergeRunResult, now time.Time
 			if re := rc.Record(placed.Day, entry); re != nil {
 				res.Residue = append(res.Residue, fmt.Sprintf("%s 已转存到 %s，但记账（index.jsonl）失败：%v", rel, kr, re))
 			}
+			res.Touched = true // 东西已经不在原处了
 			return dst, false, nil
 		}
 		if !pfIsErrno(e, syscall.EEXIST) {
@@ -926,6 +928,9 @@ func (m *pfMergeCtx) putBack(rc *PFRecycle, res *PFMergeRunResult, now time.Time
 }
 
 // recycleEmptyDirs 自底向上把来源里**实际空了**的目录放进回收区（改名；只动确实空的，绝不删非空的）。
+// 检查空和改名之间有窗口（别的程序仍可能往目录里写文件，而目录改名带着内容走），所以放进回收区之后**再查一次**：
+// 非空就不覆盖地挪回原处（putBack）；原位被占则转存到回收区根下的「_不自动清理」；都做不到就明确报告，
+// 目录还在回收区原处（到期会被清理）。
 func (m *pfMergeCtx) recycleEmptyDirs(rc *PFRecycle, now time.Time, plan PFMergePlanResult, res *PFMergeRunResult) {
 	// 深→浅排序（深的先挪，父目录随之空）。"." 是根，最后处理。
 	dirs := sortByDepthDesc(plan.EmptyDirs)
@@ -953,9 +958,34 @@ func (m *pfMergeCtx) recycleEmptyDirs(rc *PFRecycle, now time.Time, plan PFMerge
 		if d == "." {
 			recycleRel = m.srcName
 		}
+		if m.cfg.stepHook != nil {
+			m.cfg.stepHook("dir:before-place", dirAbs)
+		}
 		placed, err := rc.Place(dirAbs, now, m.fromRel, recycleRel)
 		if err != nil {
 			res.Residue = append(res.Residue, fmt.Sprintf("空目录 %s 进回收区失败：%v（留在原处）", d, err))
+			continue
+		}
+		if m.cfg.stepHook != nil {
+			m.cfg.stepHook("dir:after-place", placed.Stored)
+		}
+		// 放进去之后复查：检查空和改名之间若有人往里写了东西，目录改名是连内容一起带走的。
+		after, rerr := os.ReadDir(placed.Stored)
+		if rerr != nil || len(after) > 0 {
+			why := fmt.Sprintf("目录 %s 放进回收区后发现里面不是空的（计划之后有人写入了东西）", d)
+			if rerr != nil {
+				why = fmt.Sprintf("目录 %s 放进回收区后读不了它（%v），没法确认是空的", d, rerr)
+			}
+			where, home, perr := m.putBack(rc, res, now, placed, dirAbs, recycleRel, 0, why)
+			switch {
+			case perr != nil:
+				res.Residue = append(res.Residue, fmt.Sprintf("%s；挪回原处和转存都失败（%v），这个目录仍在回收区 %s，到期会被自动清理，请尽快取走", why, perr, placed.Rel))
+				res.Touched = true
+			case home:
+				res.Residue = append(res.Residue, why+"，已不覆盖地挪回原处，没有回收")
+			default:
+				res.Residue = append(res.Residue, fmt.Sprintf("%s；原位已被占，这个目录转存到了回收区的 %s（不会被自动清理）", why, where))
+			}
 			continue
 		}
 		res.RecycleDirs = append(res.RecycleDirs, placed.Rel)

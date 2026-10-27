@@ -1081,6 +1081,162 @@ func TestPFMergeSameVerifyHashStatChangedAsk(t *testing.T) {
 	}
 }
 
+// ── 评审 20-4：空目录放进回收区后复查 ───────────────────────────────
+
+// pfMergeDirRaceSetup 搭一个会让 src/sub 变空的合并：src/sub/deep.txt 挪走后 sub 是空目录，计划里要进回收区。
+func pfMergeDirRaceSetup(t *testing.T) (*pfMergeFix, PFMergeConfig, PFMergePlanResult) {
+	t.Helper()
+	f := pfMergeSetup(t)
+	f.put(f.work, "src/sub/deep.txt", "深层")
+	if err := os.MkdirAll(filepath.Join(f.work, "dst"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cfg := f.cfg()
+	plan, err := PFMergePlan(cfg, "src", "dst")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasStr(plan.EmptyDirs, "sub") {
+		t.Fatalf("计划里 sub 应会变空: %+v", plan.EmptyDirs)
+	}
+	return f, cfg, plan
+}
+
+// pfMergeFindContent 在目录树里找内容等于 want 的文件，返回相对路径（没有返回空串）。
+func pfMergeFindContent(t *testing.T, root, want string) string {
+	t.Helper()
+	for _, rp := range pfWalkFiles(t, root) {
+		if b, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(rp))); err == nil && string(b) == want {
+			return rp
+		}
+	}
+	return ""
+}
+
+// 检查空和改名之间有人往目录里写了文件：整个目录改名会带着内容进回收区。放进去后复查发现非空，
+// 不覆盖地挪回原处，文件一个都不丢，不记成已回收。
+func TestPFMergeEmptyDirRaceRestored(t *testing.T) {
+	f, cfg, plan := pfMergeDirRaceSetup(t)
+	cfg.stepHook = func(stage, arg string) {
+		if stage == "dir:before-place" && strings.HasSuffix(arg, string(filepath.Separator)+"sub") {
+			_ = os.WriteFile(filepath.Join(arg, "刚写入.txt"), []byte("检查之后写的"), 0o644)
+		}
+	}
+	res, err := PFMergeRun(context.Background(), cfg, "src", "dst", plan.Fingerprint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := readFile(t, filepath.Join(f.work, "src", "sub", "刚写入.txt")); got != "检查之后写的" {
+		t.Fatalf("新写入的文件应随目录挪回原处: %q（%+v）", got, res)
+	}
+	for _, d := range res.RecycleDirs {
+		if strings.HasSuffix(d, "/sub") {
+			t.Errorf("非空的 sub 不该记成已回收: %+v", res.RecycleDirs)
+		}
+	}
+	if !strings.Contains(strings.Join(res.Residue, "\n"), "不是空的") {
+		t.Errorf("应在 Residue 里说明发现非空、已挪回: %+v", res.Residue)
+	}
+	if pfMergeFindContent(t, PFRoundMacRecycleDir(f.meta), "检查之后写的") != "" {
+		t.Error("新写入的文件不能留在回收区里")
+	}
+	if _, err := os.Lstat(filepath.Join(PFRoundMacRecycleDir(f.meta), pfRecycleKeepDir)); err == nil {
+		t.Error("挪回成功时不该有「_不自动清理」")
+	}
+	// 来源根里 sub 还在，所以根也不会被当空目录回收
+	if _, err := os.Lstat(filepath.Join(f.work, "src")); err != nil {
+		t.Errorf("来源根应还在: %v", err)
+	}
+	if got := readFile(t, filepath.Join(f.work, "dst", "sub", "deep.txt")); got != "深层" {
+		t.Errorf("deep.txt 应已挪到目标: %q", got)
+	}
+}
+
+// 非空又挪不回（原位被人建了新的同名目录）：转存到回收区根下的「_不自动清理」，到期清理不会碰；
+// 连转存也做不到：目录仍在回收区，明确报告，内容不丢。
+func TestPFMergeEmptyDirRaceCannotRestore(t *testing.T) {
+	hookFor := func(f *pfMergeFix, blockKeep bool) func(stage, arg string) {
+		return func(stage, arg string) {
+			if stage == "dir:after-place" && strings.HasSuffix(arg, string(filepath.Separator)+"sub") {
+				_ = os.WriteFile(filepath.Join(arg, "刚写入.txt"), []byte("放进回收区后才写的"), 0o644) // 仍持有目录句柄的程序
+				_ = os.MkdirAll(filepath.Join(f.work, "src", "sub"), 0o755)                     // 原位被占
+				if blockKeep {
+					_ = os.WriteFile(filepath.Join(PFRoundMacRecycleDir(f.meta), pfRecycleKeepDir), []byte("占位"), 0o644)
+				}
+			}
+		}
+	}
+	t.Run("转存到 _不自动清理", func(t *testing.T) {
+		f, cfg, plan := pfMergeDirRaceSetup(t)
+		cfg.stepHook = hookFor(f, false)
+		res, err := PFMergeRun(context.Background(), cfg, "src", "dst", plan.Fingerprint)
+		if err != nil {
+			t.Fatal(err)
+		}
+		kept := filepath.Join(PFRoundMacRecycleDir(f.meta), pfRecycleKeepDir, "src", "sub", "刚写入.txt")
+		if got := readFile(t, kept); got != "放进回收区后才写的" {
+			t.Fatalf("应转存到 %s: %q（%+v）", kept, got, res)
+		}
+		if !strings.Contains(strings.Join(res.Residue, "\n"), pfRecycleKeepDir) {
+			t.Errorf("应在 Residue 里说明转存位置: %+v", res.Residue)
+		}
+		for _, d := range res.RecycleDirs {
+			if strings.HasSuffix(d, "/sub") {
+				t.Errorf("不该记成已回收: %+v", res.RecycleDirs)
+			}
+		}
+		if !res.Touched {
+			t.Error("东西挪走了，Touched 应为真")
+		}
+		// 到期清理（时间拨到很久以后）不碰它
+		rc, _ := NewPFRecycle(PFRoundMacRecycleDir(f.meta), PFRecycleOptions{Now: func() time.Time { return f.now.AddDate(0, 0, 400) }})
+		if _, err := rc.Clean(7); err != nil {
+			t.Fatal(err)
+		}
+		if got := readFile(t, kept); got != "放进回收区后才写的" {
+			t.Errorf("到期清理不该删 %s: %q", pfRecycleKeepDir, got)
+		}
+	})
+	t.Run("转存也做不到", func(t *testing.T) {
+		f, cfg, plan := pfMergeDirRaceSetup(t)
+		cfg.stepHook = hookFor(f, true)
+		res, err := PFMergeRun(context.Background(), cfg, "src", "dst", plan.Fingerprint)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(strings.Join(res.Residue, "\n"), "尽快取走") {
+			t.Errorf("应明确报告目录仍在回收区、会被清理、请尽快取走: %+v", res.Residue)
+		}
+		if pfMergeFindContent(t, PFRoundMacRecycleDir(f.meta), "放进回收区后才写的") == "" {
+			t.Error("目录里的文件应仍在回收区，不能丢")
+		}
+	})
+}
+
+// 复查通过（真的是空的）时照旧进回收区，不影响正常流程。
+func TestPFMergeEmptyDirStillRecycledWhenEmpty(t *testing.T) {
+	f, cfg, plan := pfMergeDirRaceSetup(t)
+	res, err := PFMergeRun(context.Background(), cfg, "src", "dst", plan.Fingerprint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(filepath.Join(f.work, "src", "sub")); !os.IsNotExist(err) {
+		t.Errorf("空的 sub 应已进回收区: %v", err)
+	}
+	foundSub := false
+	for _, d := range res.RecycleDirs {
+		if strings.HasSuffix(d, "/sub") {
+			foundSub = true
+		}
+	}
+	if !foundSub {
+		t.Errorf("RecycleDirs 里应有 sub: %+v", res.RecycleDirs)
+	}
+	if len(res.Residue) != 0 {
+		t.Errorf("正常流程不该有 Residue: %+v", res.Residue)
+	}
+}
+
 // ── 小工具 ──────────────────────────────────────────────
 
 func hasStr(ss []string, s string) bool {

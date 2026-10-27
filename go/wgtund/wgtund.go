@@ -312,7 +312,8 @@ func Run(ctx context.Context, dir string, stdin io.Reader, stdout io.Writer) (er
 		closers = append(closers, closerFunc(func() { v2cancel(); <-v2done }))
 	}
 
-	// 项目文件同步（可选）：定时跑 PFSched 的一轮（见 projfiles.go）；没配这段或 enabled=false 时不起协程
+	// 项目文件同步：定时跑 PFSched 的一轮（见 projfiles.go）。有 projfiles 段且 enabled=false 时协程不起；
+	// 没这段也照样起（host/remote_root/remote_meta 与总开关每轮从设置文件读，缺项/没启用就在状态里说清楚）
 	var projFiles *projfilesSvc
 	var pfAPI *projfilesAPI
 	if pfPrep != nil {
@@ -457,8 +458,9 @@ func Run(ctx context.Context, dir string, stdin io.Reader, stdout io.Writer) (er
 		mux.HandleFunc("/projsync/v2/commit", noProj)
 	}
 
-	// 项目文件同步的本机接口（可选）：/projfiles/*，只认令牌、不查 Origin（调用方是 cmdproto 子进程与本机命令行）；
-	// 没配这段一律 404。地址与令牌原子写 ~/.xxyi/projfiles-api.json（0600），给本机的界面/命令行取。
+	// 项目文件同步的本机接口：/projfiles/*，只认令牌、不查 Origin（调用方是 cmdproto 子进程与本机命令行）；
+	// 没配 projfiles 段也照样挂（XXYI 的「项目同步」窗口要靠 /projfiles/status 显示「没启用/缺什么」），
+	// 只有 prep 都算不出来（拿不到家目录/主机名）才 404。地址与令牌原子写 ~/.xxyi/projfiles-api.json（0600）。
 	if pfAPI != nil {
 		mux.Handle("/projfiles/", pfAPI.localHandler(ctx))
 		if p, err := projfilesAPIPath(); err != nil {

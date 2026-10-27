@@ -557,7 +557,7 @@ func (h *projfilesAPI) dirSwitchWhy() string {
 	}
 	st, _ := loadProjfilesSettings(h.svc.prep.settingsPath)
 	if h.svc.needRebuild(st) {
-		return "同步根/同步目录/工作目录刚改过，正在切换，稍后再试"
+		return "同步主机/同步根/同步目录/工作目录刚改过，正在切换，稍后再试"
 	}
 	return ""
 }

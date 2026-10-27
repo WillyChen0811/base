@@ -185,14 +185,24 @@ func (r *pfRounds) hook(s *projfilesSvc) {
 // ── 配置 ───────────────────────────────────────────────
 
 func TestProjfilesConfig(t *testing.T) {
-	// 没配这段：nil，服务不启动
+	// 没配这段：不再是 nil——服务照样起，fromSettings 模式，总开关看设置文件（缺省关）
 	c := &fileConf{KnownHosts: "/kh", Hosts: []hostConf{{Name: "ubuntu", IdentityFiles: []string{"/id"}}}}
-	if p, err := prepareProjfiles(c); err != nil || p != nil {
-		t.Fatalf("没配 projfiles 段应返回 nil: %v %+v", err, p)
+	p, err := prepareProjfiles(c)
+	if err != nil || p == nil {
+		t.Fatalf("没配 projfiles 段也应返回可用的 prep: %v %+v", err, p)
+	}
+	if !p.fromSettings || p.enabled || p.host != "" || p.remoteMeta != "" {
+		t.Fatalf("没这段应是 fromSettings、host/remote_meta 留空等设置文件补: %+v", p)
+	}
+	if p.xxyiMsg != defaultProjfilesXxyiMsg || p.coordID == "" || p.coordHost == "" {
+		t.Fatalf("没这段时缺省值也要照规则补: %+v", p)
+	}
+	if p.hosts["ubuntu"].Name != "ubuntu" || len(p.hosts["ubuntu"].IdentityFiles) == 0 {
+		t.Fatalf("hosts 该带上供每轮校验: %+v", p.hosts)
 	}
 	// 正常一段：字段、路径、默认值
 	c = pfConfT(t, nil)
-	p, err := prepareProjfiles(c)
+	p, err = prepareProjfiles(c)
 	if err != nil {
 		t.Fatal(err)
 	}

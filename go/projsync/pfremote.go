@@ -245,7 +245,7 @@ type PFRemoteFactsResponse struct {
 	TotalItems  int             `json:"total_items"`
 	TotalNames  int             `json:"total_names"`
 	Excluded    int             `json:"excluded"`
-	Summary     PFRemoteSummary `json:"summary"`
+	Summary     PFRemoteSummary `json:"summary"` // 扫描时（哈希之前）的计数；客户端拼好全部页后会按哈希之后的结果重算
 	ScannedAtNs int64           `json:"scanned_at_ns"`
 
 	// 本页内容：Items 是整个扫描结果（按路径字节序）里从 AfterItem 起的一段，Names 同理从 AfterName 起；

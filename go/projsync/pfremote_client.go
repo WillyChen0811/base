@@ -284,6 +284,7 @@ func (c *PFRemoteClient) Facts(ctx context.Context, u PFRemoteUnit, opt PFRemote
 	}
 	out.Names = names
 	out.Scan.HashStats = out.HashStats
+	out.Summary = pfrSummary(out.Scan) // 哈希之后的计数（服务端头部的计数是哈希之前的）
 	return out, nil
 }
 

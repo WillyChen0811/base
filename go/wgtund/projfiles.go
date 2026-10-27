@@ -402,6 +402,14 @@ type projfilesStatus struct {
 	SettingsProblems []string          `json:"settings_problems,omitempty"`
 	Notices          []string          `json:"notices,omitempty"`
 
+	// ActiveWorkDir / ActiveSyncDir：当前实际在用（build 已经用上）的两个目录——
+	// 设置可能已经改了但整套重建还没跑完，报这两个才是真的。
+	ActiveWorkDir string `json:"active_work_dir,omitempty"`
+	ActiveSyncDir string `json:"active_sync_dir,omitempty"`
+	// SwitchBusy 非空表示「目录刚改过、整套重建还没完」；这期间 unit/start 等一律拒绝。
+	SwitchBusy   bool   `json:"switch_busy,omitempty"`
+	SwitchReason string `json:"switch_reason,omitempty"`
+
 	StartedUp    bool                        `json:"started_up"`
 	Startup      []projsync.PFUnitMoveResult `json:"startup,omitempty"`
 	StartupError string                      `json:"startup_error,omitempty"`
@@ -428,6 +436,10 @@ type projfilesSvc struct {
 
 	wake chan struct{}
 
+	// buildMu 串起「检查 built → 构建 → 发布」，保证第一次 build 并发进来只建出一套；
+	// rebuildLocked 也走它，这样并发的 getFresh / tick 不会看到半成品。
+	buildMu sync.Mutex
+
 	mu        sync.Mutex
 	remote    *projsync.PFRemoteClient
 	sftpFS    *projfilesRemoteFS
@@ -435,20 +447,27 @@ type projfilesSvc struct {
 	mover     *projsync.PFUnitMover
 	sched     *projsync.PFSched
 	built     bool
+	// builtWork / builtSync：build 发布时实际用的 work_dir/sync_dir，用来对比新一份设置有没有改过目录；
+	// 改了就要整套重建（见 tick 的 rebuildLocked 分支）。
+	builtWork string
+	builtSync string
 	buildErr  string
-	startedUp bool
-	startup   []projsync.PFUnitMoveResult
-	startupEr string
-	running   bool
-	net       string
-	netAt     time.Time
-	settings  projfilesSettings
-	problems  []string
-	notices   []string
-	lastRound *projsync.PFSchedReport
-	lastFull  time.Time
-	nextAt    time.Time
-	lastAct   string
+	// switchBusy 非空表示「work_dir 或 sync_dir 刚改过、整套重建还没跑完」：
+	// 这时 unit/start / unit/stop / unit/create / fresh 一律拒绝，避免对旧目录继续操作。
+	switchBusy string
+	startedUp  bool
+	startup    []projsync.PFUnitMoveResult
+	startupEr  string
+	running    bool
+	net        string
+	netAt      time.Time
+	settings   projfilesSettings
+	problems   []string
+	notices    []string
+	lastRound  *projsync.PFSchedReport
+	lastFull   time.Time
+	nextAt     time.Time
+	lastAct    string
 }
 
 func newProjfilesSvc(prep *projfilesPrep, pool *sshPool) *projfilesSvc {
@@ -484,15 +503,47 @@ func errText(err error) string {
 
 // ── 零件 ────────────────────────────────────────────────
 
+// errProjfilesDirSwitch 是设置里的 work_dir/sync_dir 跟已经建成的那一套不一致、
+// 又不能在调用方那里整套重建时返回的错误：调用方（HTTP）应当回 busy/503，让人稍后再试。
+var errProjfilesDirSwitch = errors.New("同步目录或工作目录刚改过，正在切换，稍后再试")
+
 // build 建 Ubuntu 客户端、传输器、调度器。work_dir/sync_dir 来自设置文件，所以必须在读到设置之后调。
-// 建成一次就不再重建；上次没建成（目录还没出现等）时下一次再试。
+// 全程走 buildMu（fix 2：并发只建一套）：
+//   - 已建成且目录没改 → 直接复用；
+//   - 已建成但目录改了 → 返回 errProjfilesDirSwitch（整套重建是 tick 在 acquire 分支里做的事）；
+//   - 还没建成 → 建一套发布出去，并把用过的目录记进 builtWork/builtSync。
 func (s *projfilesSvc) build(st projfilesSettings) error {
+	s.buildMu.Lock()
+	defer s.buildMu.Unlock()
 	s.mu.Lock()
-	if s.built {
+	if s.built && s.builtWork == st.WorkDir && s.builtSync == st.SyncDir {
 		s.mu.Unlock()
 		return nil
 	}
+	if s.built {
+		s.mu.Unlock()
+		return errProjfilesDirSwitch
+	}
 	s.mu.Unlock()
+	return s.buildLocked(st)
+}
+
+// rebuildLocked 强制按新目录整套重建：调用方必须先 acquire() 占住轮次（tick 已经这样做）。
+// 走 buildMu 保证跟并发的 build / getFresh 互不看到半成品；旧的 sched 与 transfer 先关再换。
+func (s *projfilesSvc) rebuildLocked(st projfilesSettings) error {
+	s.buildMu.Lock()
+	defer s.buildMu.Unlock()
+	s.mu.Lock()
+	if !s.built || (s.builtWork == st.WorkDir && s.builtSync == st.SyncDir) {
+		s.mu.Unlock()
+		return nil // 要么还没建成（build() 处理），要么目录没变（不必重建）
+	}
+	s.mu.Unlock()
+	return s.buildLocked(st)
+}
+
+// buildLocked 实际造零件并发布；调用方持有 buildMu。
+func (s *projfilesSvc) buildLocked(st projfilesSettings) error {
 	runner := s.runner // 测试注入；生产为 nil，用共用连接池的 SSH 远程执行
 	if runner == nil {
 		if s.pool == nil {
@@ -523,7 +574,7 @@ func (s *projfilesSvc) build(st projfilesSettings) error {
 			QuietSeconds: st.QuietSeconds, Now: s.now,
 		})
 		if err != nil {
-			s.noteOnce(fmt.Sprintf("建单元搬运器失败（不自动建项目、不搬正位；设置改好后重启 wgtund 才生效）：%v", err))
+			s.noteOnce(fmt.Sprintf("建单元搬运器失败（不自动建项目、不搬正位；设置改好后整套重建再生效）：%v", err))
 		} else {
 			mover = m
 		}
@@ -534,14 +585,67 @@ func (s *projfilesSvc) build(st projfilesSettings) error {
 		OnTouchedDue: func([]string) { s.kick() },
 	})
 	if err != nil {
+		transfer.Close()
 		return err
 	}
 	s.mu.Lock()
-	s.remote, s.transfer, s.mover, s.sched, s.built, s.buildErr = remote, transfer, mover, sched, true, ""
+	oldSched, oldTransfer := s.sched, s.transfer
+	s.remote, s.transfer, s.mover, s.sched = remote, transfer, mover, sched
+	s.built, s.buildErr = true, ""
+	s.builtWork, s.builtSync = st.WorkDir, st.SyncDir
 	s.mu.Unlock()
+	// 旧的调度器与传输器整套关掉（rebuild 时 baseCtx 取消会让 in-flight 那一轮和 touched 去抖都停下来）。
+	if oldSched != nil {
+		oldSched.Close()
+	}
+	if oldTransfer != nil {
+		oldTransfer.Close()
+	}
 	// 新建的传输器立刻按当前网络挂上限：启动恢复那一轮在第一次 tick 之前就会传文件。
 	s.applyLimits(st, s.effNet())
 	return nil
+}
+
+// needRebuild 看当前设置里的 work_dir/sync_dir 是不是跟 build 用的那一份不同。
+func (s *projfilesSvc) needRebuild(st projfilesSettings) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.built && (s.builtWork != st.WorkDir || s.builtSync != st.SyncDir)
+}
+
+// switchPending 看服务是不是正在「目录改了但还没整套重建完」的切换期；HTTP 接口用它决定要不要拒绝写请求。
+func (s *projfilesSvc) switchPending() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.switchBusy != ""
+}
+
+// switchReason 是切换期给人看的一句话。
+func (s *projfilesSvc) switchReason() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.switchBusy
+}
+
+// activeDirs 报当前实际在用的 work_dir/sync_dir（状态接口用）。
+func (s *projfilesSvc) activeDirs() (string, string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.builtWork, s.builtSync
+}
+
+// markSwitchBusy 把服务标成切换期，reason 给人看。
+func (s *projfilesSvc) markSwitchBusy(reason string) {
+	s.mu.Lock()
+	s.switchBusy = reason
+	s.mu.Unlock()
+}
+
+// clearSwitchBusy 解除切换期。
+func (s *projfilesSvc) clearSwitchBusy() {
+	s.mu.Lock()
+	s.switchBusy = ""
+	s.mu.Unlock()
 }
 
 // attachSFTPReal 在共用 SSH 连接上开一条 SFTP 会话并挂到传输器上，全程共用；连接还活着就复用。
@@ -763,35 +867,33 @@ func (s *projfilesSvc) startupOnce(ctx context.Context) {
 	s.persist()
 }
 
-// tick 是到点或被唤醒之后的动作：读设置 → 落参数 → 该跑就跑一轮 → 写状态。
+// tick 是到点或被唤醒之后的动作：读设置 → 若目录改了进入切换期 → 该跑就跑一轮（必要时先整套重建）→ 写状态。
 func (s *projfilesSvc) tick(ctx context.Context, reason string) {
 	now := s.now()
 	st, problems := loadProjfilesSettings(s.prep.settingsPath)
 	s.applySettings(st, problems)
-	if err := s.build(st); err != nil {
+	// 目录改了：先进切换期，unit/start / unit/stop / unit/create / fresh 都拒绝，
+	// 直到本轮 acquire 之后 rebuildLocked 完成。
+	if s.needRebuild(st) {
+		s.markSwitchBusy("同步目录或工作目录刚改过，正在切换，稍后再试")
+	}
+	if err := s.build(st); err != nil && err != errProjfilesDirSwitch {
 		s.setBuildError(err)
 		s.setAction("没跑：零件还没建成（" + err.Error() + "）")
 		s.persist()
 		return
 	}
-	sched := s.getSched()
-	// SetSettings 是整体替换，会把网络状态一起洗掉，所以紧跟着把已上报的网络补回去。
-	sched.SetSettings(s.schedSettings(st))
-	s.mu.Lock()
-	net, at := s.net, s.netAt
-	s.mu.Unlock()
-	sched.SetNet(net, at)
 	if !st.Enabled {
 		s.setAction("没跑：设置里 enabled=false")
 		s.persist()
 		return
 	}
-	if net = s.effNet(); net == projsync.PFRemoteNetOffline {
+	if net := s.effNet(); net == projsync.PFRemoteNetOffline {
 		s.setAction("没跑：断网")
 		s.persist()
 		return
 	}
-	s.applyLimits(st, net)
+	net := s.effNet()
 	if err := s.attachSFTP(); err != nil {
 		s.noteOnce("开 SFTP 会话失败（要传文件时会失败）：" + err.Error())
 	}
@@ -802,6 +904,26 @@ func (s *projfilesSvc) tick(ctx context.Context, reason string) {
 	case !s.acquire():
 		s.setAction("没跑：上一轮还在进行")
 	default:
+		// 已经占住轮次：这时没有任何轮次和搬运在跑，可以整套重建。
+		if s.switchPending() {
+			if err := s.rebuildLocked(st); err != nil {
+				s.release()
+				s.setBuildError(err)
+				s.setAction("没跑：整套重建没成功（" + err.Error() + "）")
+				s.persist()
+				return
+			}
+			s.clearSwitchBusy()
+			s.noteOnce("同步目录/工作目录改了，已整套重建")
+		}
+		sched := s.getSched()
+		// SetSettings 是整体替换，会把网络状态一起洗掉，所以紧跟着把已上报的网络补回去。
+		sched.SetSettings(s.schedSettings(st))
+		s.mu.Lock()
+		netAt := s.netAt
+		s.mu.Unlock()
+		sched.SetNet(net, netAt)
+		s.applyLimits(st, net)
 		kind := "常规"
 		if opt.Full {
 			kind = "全量"
@@ -914,6 +1036,8 @@ func (s *projfilesSvc) status() projfilesStatus {
 		Net: s.effNetLocked(), Running: s.running, Updated: s.now(), LastAction: s.lastAct,
 		IntervalS: int(s.intervalLocked(s.settings) / time.Second),
 		Settings:  s.settings, SettingsProblems: s.problems, Notices: s.notices,
+		ActiveWorkDir: s.builtWork, ActiveSyncDir: s.builtSync,
+		SwitchBusy: s.switchBusy != "", SwitchReason: s.switchBusy,
 		StartedUp: s.startedUp, Startup: s.startup, StartupError: s.startupEr,
 		LastRound: s.lastRound, BuildError: s.buildErr,
 	}

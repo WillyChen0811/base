@@ -236,6 +236,25 @@ func pfRecycleSuffixed(base string, t time.Time, hex4 string) string {
 	return main + suffix + ext
 }
 
+// PFRecycled 是一次「放进回收」的结果（导出版，给合并等本包外的原语用）。
+type PFRecycled struct {
+	Stored string // 放进去后的完整路径
+	Rel    string // 相对回收区根目录的路径（/ 分隔），写进 index 的 Stored
+	Day    string // 日期目录名
+	Warn   error  // 改名已成功，但目录 fsync 失败
+}
+
+// Place 把 src 用不覆盖的改名放进回收区 <日期>/<unitRel>/<fileRel>，重名自动换名，不写 index。
+// 与 place 同一套规矩（同卷、路径结构冲突落散放）；src 可以是普通文件，也可以是**已经空了的目录**
+// （合并后来源里逐级清出的空目录，回收是改名、空目录照样挪得动）。调用方放完自己记账。
+func (r *PFRecycle) Place(src string, t time.Time, unitRel, fileRel string) (PFRecycled, error) {
+	p, err := r.place(src, t, unitRel, fileRel)
+	return PFRecycled{Stored: p.Stored, Rel: p.Rel, Day: p.Day, Warn: p.Warn}, err
+}
+
+// Record 往当天的 index.jsonl 追加一条并 fsync（导出版的记账）。
+func (r *PFRecycle) Record(day string, e PFRecycleEntry) error { return r.record(day, e) }
+
 // ── 读 index ────────────────────────────────────────────
 
 // Days 返回回收区里所有日期目录名（升序）。

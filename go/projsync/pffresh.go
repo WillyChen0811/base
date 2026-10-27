@@ -334,7 +334,7 @@ func (f *PFFresh) online(ctx context.Context, out *PFFreshResult, g []*pfffTarge
 	ubRel := rec.Rel
 	pu, havePoll := pollBy[rec.Rel]
 	if !havePoll {
-		return f.noAnswer(out, g, fmt.Sprintf("Ubuntu 上找不到登记的目录 %s（同编号的其他目录没配置，不同步；要同步请先在 XXYI 里合并过去）", rec.Rel))
+		return f.noAnswer(out, g, fmt.Sprintf("Ubuntu 上找不到登记的目录 %s（同编号的其他目录没配置，不同步）", rec.Rel))
 	}
 	remain := time.Until(deadline)
 	if remain < time.Second {

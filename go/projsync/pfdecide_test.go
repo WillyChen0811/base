@@ -549,6 +549,27 @@ func TestPFDecideG4(t *testing.T) {
 	}
 }
 
+// §14.2：Ubuntu 上同编号还有别的目录（没配置）只报告，不停整个单元，文案不承诺合并。
+func TestPFDecideUbuntuDupReportOnly(t *testing.T) {
+	b := pfdtNewBase(map[string]string{"a.txt": "v1"})
+	items := []PFScanItem{pfdtF("a.txt", "v1")}
+	in := pfdtIn(b, items, items)
+	in.UbuntuDup = []string{"2025/261001J0101-旧名字", "2025/261001J0101-另一个"}
+	pl := PFDecide(in)
+	g, ok := pfdtGate(pl, "G4")
+	if !ok || g.Effect != PFGateReport || pl.Verdict.Stopped {
+		t.Fatalf("Ubuntu 上同编号别的目录应只报告、不停：%+v", pl.Verdict)
+	}
+	for _, want := range []string{"Ubuntu 上同一编号还有别的目录", "2025/261001J0101-旧名字", "2025/261001J0101-另一个", "没配置，不同步"} {
+		if !strings.Contains(g.Reason, want) {
+			t.Errorf("报告文案应含 %q：%s", want, g.Reason)
+		}
+	}
+	if strings.Contains(g.Reason, "合并") {
+		t.Errorf("Ubuntu 上的目录第一版合并不了，文案不该承诺合并：%s", g.Reason)
+	}
+}
+
 func TestPFDecideG5BaseUntrusted(t *testing.T) {
 	mac := []PFScanItem{pfdtF("a.txt", "v1")}
 	ub := []PFScanItem{pfdtF("b.txt", "v2")}

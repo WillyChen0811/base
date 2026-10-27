@@ -11,6 +11,7 @@ package projsync
 import (
 	"context"
 	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -199,14 +200,14 @@ func pfumStopScenario() pfumCrashScenario {
 			return e.want(t, e.S(pfumRel))
 		},
 		op: func(e *pfumEnv) (PFUnitMoveResult, error) { return e.mover().StopSync(bg, pfumCode) },
-		wantWindows: []string{"stop:after-stopping", "stop:logged-begin", "stop:after-unlink", "stop:logged-rename",
-			"stop:after-rename", "stop:after-verify", "stop:logged-register", "stop:after-register", "stop:after-done"},
+		wantWindows: []string{"stop:after-stopping", "stop:logged-begin", "stop:logged-unlink", "stop:after-detach", "stop:after-unlink",
+			"stop:logged-rename", "stop:after-rename", "stop:after-verify", "stop:logged-register", "stop:after-register", "stop:after-done"},
 		final: func(w string) string {
 			switch w {
-			case "stop:after-stopping", "stop:logged-begin":
-				return "link" // 链接还没删：退回同步中
+			case "stop:after-stopping", "stop:logged-begin", "stop:logged-unlink":
+				return "link" // 链接还没动：退回同步中
 			}
-			return "desktop"
+			return "desktop" // after-detach 起链接已在临时位置：恢复补删它，接着挪回
 		},
 		verify: func(t *testing.T, e *pfumEnv, where string) {
 			if where == "link" {
@@ -726,7 +727,7 @@ func TestPFUnitMove_StopRenameFailsRelinks(t *testing.T) {
 	e.project(pfumRel)
 	e.mustStart(t, pfumRel)
 	want := e.want(t, e.S(pfumRel))
-	e.rename = func(a, b string) error { return syscall.EXDEV }
+	e.rename = pfumFailRenameFrom(e.S(pfumRel), syscall.EXDEV) // 只让 S→P 失败；桌面链接移到临时位置的改名要成功
 	res, err := e.mover().StopSync(bg, pfumCode)
 	if err != nil || res.Status != PFUnitMoveRolledBack || res.Code != PFUnitMoveCodeCrossVolume {
 		t.Fatalf("改名失败应回退：%v %+v", err, res)
@@ -755,7 +756,7 @@ func TestPFUnitMove_StopRenameAndRelinkFailHalts(t *testing.T) {
 	e.project(pfumRel)
 	e.mustStart(t, pfumRel)
 	want := e.want(t, e.S(pfumRel))
-	e.rename = func(a, b string) error { return syscall.EXDEV }
+	e.rename = pfumFailRenameFrom(e.S(pfumRel), syscall.EXDEV)
 	e.symlink = func(target, link string) error { return syscall.EACCES }
 	res, err := e.mover().StopSync(bg, pfumCode)
 	if err != nil || res.Status != PFUnitMoveHalted || len(res.Residue) != 2 {
@@ -786,6 +787,375 @@ func TestPFUnitMove_StopRenameAndRelinkFailHalts(t *testing.T) {
 		t.Errorf("应回到桌面：%s", where)
 	}
 	e.wantUnit(t, pfumCode, PFUnitStopped)
+}
+
+// pfumFailRenameFrom 返回一个改名函数：来源是 from 时失败（返回 errno），其余照常不覆盖地改名。
+func pfumFailRenameFrom(from string, errno syscall.Errno) func(a, b string) error {
+	return func(a, b string) error {
+		if a == from {
+			return errno
+		}
+		return pfRenameNoReplace(a, b)
+	}
+}
+
+// unlinkTmps 返回 <meta>/moves/ 下取消同步暂放桌面链接的临时位置（<编号>.unlink-*）。
+func (e *pfumEnv) unlinkTmps(t *testing.T) []string {
+	t.Helper()
+	ents, err := os.ReadDir(filepath.Join(e.meta, "moves"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out []string
+	for _, en := range ents {
+		if strings.Contains(en.Name(), ".unlink-") {
+			out = append(out, filepath.Join(e.meta, "moves", en.Name()))
+		}
+	}
+	return out
+}
+
+// ── 取消同步：桌面链接被换掉、先改名到临时位置再核对、再 unlink ──────────
+
+// 桌面链接在「核对之后、改名之前」被换成别的东西（用户的普通文件、目录、指向别处的链接）：
+// 换上的东西被不覆盖地移到临时位置，核对不是链接，原样放回桌面位置；一个字节不丢，停下报告，同步目录里的项目不动。
+func TestPFUnitMove_StopLinkSwappedBeforeDetach(t *testing.T) {
+	for _, kind := range []string{"普通文件", "目录", "指向别处的链接"} {
+		t.Run(kind, func(t *testing.T) {
+			e := newPFUMEnv(t)
+			p := e.project(pfumRel)
+			want := e.want(t, p)
+			e.mustStart(t, pfumRel)
+			elsewhere := filepath.Join(e.home, "别处")
+			e.put(elsewhere, "别处.txt", "else")
+			var swappedIno uint64
+			e.hook = func(w string) error {
+				if w != "stop:logged-unlink" { // 核对过「是链接」、日志也写了，改名之前
+					return nil
+				}
+				if err := os.Remove(p); err != nil {
+					t.Error(err)
+					return nil
+				}
+				switch kind {
+				case "普通文件":
+					os.WriteFile(p, []byte("用户刚存的文件"), 0o644)
+				case "目录":
+					e.put(p, "用户的文件.txt", "user-data")
+				case "指向别处的链接":
+					os.Symlink(elsewhere, p)
+				}
+				swappedIno = pfumIno(t, p)
+				return nil
+			}
+			res, err := e.mover().StopSync(bg, pfumCode)
+			if err != nil || res.Status != PFUnitMoveHalted || res.Code != PFUnitMoveCodeNotOurLink || len(res.Residue) != 2 {
+				t.Fatalf("桌面链接被换掉应停下报告：%v %+v", err, res)
+			}
+			// 换上的东西原样回到桌面位置（同一个 ino，一个字节不丢）
+			if got := pfumIno(t, p); got != swappedIno {
+				t.Errorf("换上的东西应原样放回（ino %d → %d）", swappedIno, got)
+			}
+			switch kind {
+			case "普通文件":
+				if data, _ := os.ReadFile(p); string(data) != "用户刚存的文件" {
+					t.Errorf("用户的文件被动了：%q", data)
+				}
+			case "目录":
+				if data, _ := os.ReadFile(filepath.Join(p, "用户的文件.txt")); string(data) != "user-data" {
+					t.Errorf("用户的目录被动了")
+				}
+			case "指向别处的链接":
+				if tgt, _ := os.Readlink(p); tgt != elsewhere {
+					t.Errorf("别处的链接被动了：%q", tgt)
+				}
+			}
+			pfumSameSnap(t, "同步目录里的项目", pfumSnap(t, e.S(pfumRel)), want.snap)
+			if got := pfumIno(t, e.S(pfumRel)); got != want.ino {
+				t.Errorf("项目目录 ino 变了：%d → %d", want.ino, got)
+			}
+			if tmps := e.unlinkTmps(t); len(tmps) != 0 {
+				t.Errorf("临时位置不该留东西：%v", tmps)
+			}
+			e.wantUnit(t, pfumCode, PFUnitSyncing)
+			if st := e.logState(t, pfumCode); st != "" {
+				t.Errorf("放回去之后日志应清掉：%q", st)
+			}
+			if rep, err := e.mover().RecoverMoves(bg); err != nil || len(rep) != 0 {
+				t.Errorf("没有要恢复的：%v %+v", err, rep)
+			}
+		})
+	}
+}
+
+// 换上的东西移到临时位置之后，桌面位置又被占了：放不回去，留在临时位置，停下报告；日志和 stopping 都留着，
+// 重启恢复也停下、不动任何东西；人把占位的拿走之后恢复把它放回去。
+func TestPFUnitMove_StopLinkSwappedAndPOccupiedAgain(t *testing.T) {
+	e := newPFUMEnv(t)
+	p := e.project(pfumRel)
+	want := e.want(t, p)
+	e.mustStart(t, pfumRel)
+	e.hook = func(w string) error {
+		switch w {
+		case "stop:logged-unlink":
+			os.Remove(p)
+			os.WriteFile(p, []byte("文件甲"), 0o644)
+		case "stop:after-detach": // 文件甲已被移到临时位置；这时桌面位置又被人放了个目录
+			e.put(p, "乙.txt", "乙")
+		}
+		return nil
+	}
+	res, err := e.mover().StopSync(bg, pfumCode)
+	if err != nil || res.Status != PFUnitMoveHalted || res.Code != PFUnitMoveCodeNotOurLink {
+		t.Fatalf("放不回去应停下报告：%v %+v", err, res)
+	}
+	tmps := e.unlinkTmps(t)
+	if len(tmps) != 1 {
+		t.Fatalf("文件甲应留在临时位置：%v", tmps)
+	}
+	if data, _ := os.ReadFile(tmps[0]); string(data) != "文件甲" {
+		t.Errorf("临时位置上的内容 = %q", data)
+	}
+	if !strings.Contains(strings.Join(res.Residue, "\n"), tmps[0]) {
+		t.Errorf("Residue 应写明临时位置 %s：%v", tmps[0], res.Residue)
+	}
+	if data, _ := os.ReadFile(filepath.Join(p, "乙.txt")); string(data) != "乙" {
+		t.Errorf("桌面位置上别人放的东西不能被动")
+	}
+	pfumSameSnap(t, "同步目录里的项目", pfumSnap(t, e.S(pfumRel)), want.snap)
+	e.wantUnit(t, pfumCode, PFUnitStopping)
+	if st := e.logState(t, pfumCode); st != PFUnitMoveLogMovingBack {
+		t.Errorf("停下时日志应留着：%q", st)
+	}
+	// 再取消：有没做完的日志，拒绝
+	e.hook = nil
+	if r, err := e.mover().StopSync(bg, pfumCode); err != nil || r.Status != PFUnitMoveRefused || r.Code != PFUnitMoveCodeMovePending {
+		t.Errorf("有没做完的日志应拒绝：%v %+v", err, r)
+	}
+	// 重启恢复：停下，整个家目录一个字节不动
+	home := pfumSnap(t, e.home)
+	for i := 0; i < 2; i++ {
+		rep, err := e.mover().RecoverMoves(bg)
+		if err != nil || len(rep) != 1 || rep[0].Status != PFUnitMoveHalted || rep[0].Code != PFUnitMoveCodeUnknownState {
+			t.Fatalf("恢复应停下报告：%v %+v", err, rep)
+		}
+		pfumSameSnap(t, "恢复停下后整个家目录", pfumSnap(t, e.home), home)
+	}
+	// 人把桌面位置上占位的目录拿走：恢复把临时位置上的文件甲放回桌面位置，停下报告（桌面位置不是我们的链接）
+	if err := os.RemoveAll(p); err != nil {
+		t.Fatal(err)
+	}
+	rep, err := e.mover().RecoverMoves(bg)
+	if err != nil || len(rep) != 1 || rep[0].Status != PFUnitMoveHalted || rep[0].Code != PFUnitMoveCodeNotOurLink {
+		t.Fatalf("占位拿走后应把文件甲放回去并停下报告：%v %+v", err, rep)
+	}
+	if data, _ := os.ReadFile(p); string(data) != "文件甲" {
+		t.Errorf("文件甲应回到桌面位置：%q", data)
+	}
+	if tmps := e.unlinkTmps(t); len(tmps) != 0 {
+		t.Errorf("临时位置不该留东西：%v", tmps)
+	}
+	e.wantUnit(t, pfumCode, PFUnitSyncing)
+	if rep, err := e.mover().RecoverMoves(bg); err != nil || len(rep) != 0 {
+		t.Errorf("没有要恢复的：%v %+v", err, rep)
+	}
+}
+
+// 崩在「桌面链接已改名到临时位置、还没核对」：桌面位置空着，链接在临时位置，项目在同步目录；恢复补删链接、接着挪回桌面。
+func TestPFUnitMove_StopCrashAfterDetachRecovers(t *testing.T) {
+	e := newPFUMEnv(t)
+	p := e.project(pfumRel)
+	want := e.want(t, p)
+	e.mustStart(t, pfumRel)
+	s := e.S(pfumRel)
+	e.hook = pfumCrashAt("stop:after-detach")
+	if _, err := e.mover().StopSync(bg, pfumCode); !errors.Is(err, errPFUMCrash) {
+		t.Fatalf("应模拟崩溃：%v", err)
+	}
+	if _, err := os.Lstat(p); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("桌面位置应空着：%v", err)
+	}
+	tmps := e.unlinkTmps(t)
+	if len(tmps) != 1 {
+		t.Fatalf("链接应在临时位置：%v", tmps)
+	}
+	if tgt, err := os.Readlink(tmps[0]); err != nil || tgt != s {
+		t.Fatalf("临时位置上应是指向 %s 的链接：%q %v", s, tgt, err)
+	}
+	lg, err := PFUnitMoveReadLog(e.meta, pfumCode)
+	if err != nil || lg == nil || lg.UnlinkTmp != tmps[0] || lg.State != PFUnitMoveLogMovingBack {
+		t.Fatalf("日志里应记着临时位置：%v %+v", err, lg)
+	}
+	e.assertOneCopy(t, pfumRel, want, false)
+	e.hook = nil
+	rep, err := e.mover().RecoverMoves(bg)
+	if err != nil || len(rep) != 1 || rep[0].Status != PFUnitMoveDone || rep[0].Code != PFUnitMoveCodeCompleted {
+		t.Fatalf("应补完取消同步：%v %+v", err, rep)
+	}
+	if where := e.assertOneCopy(t, pfumRel, want, false); where != "desktop" {
+		t.Errorf("应回到桌面：%s", where)
+	}
+	if tmps := e.unlinkTmps(t); len(tmps) != 0 {
+		t.Errorf("临时位置上的链接应已删：%v", tmps)
+	}
+	e.wantUnit(t, pfumCode, PFUnitStopped)
+}
+
+// 崩在「桌面链接已改名到临时位置」，而移到临时位置的其实是用户在窗口里换上的普通文件：
+// 恢复不能 unlink 它，要原样放回桌面位置并停下报告；桌面位置又被占了就不动、停下。
+func TestPFUnitMove_StopCrashAfterDetachOfSwappedFile(t *testing.T) {
+	setup := func(t *testing.T) (e *pfumEnv, p string, want pfumWant) {
+		e = newPFUMEnv(t)
+		p = e.project(pfumRel)
+		want = e.want(t, p)
+		e.mustStart(t, pfumRel)
+		e.hook = func(w string) error {
+			switch w {
+			case "stop:logged-unlink":
+				os.Remove(p)
+				os.WriteFile(p, []byte("用户刚存的文件"), 0o644)
+			case "stop:after-detach":
+				return errPFUMCrash
+			}
+			return nil
+		}
+		if _, err := e.mover().StopSync(bg, pfumCode); !errors.Is(err, errPFUMCrash) {
+			t.Fatalf("应模拟崩溃：%v", err)
+		}
+		e.hook = nil
+		return
+	}
+	t.Run("桌面位置空着：放回去", func(t *testing.T) {
+		e, p, want := setup(t)
+		rep, err := e.mover().RecoverMoves(bg)
+		if err != nil || len(rep) != 1 || rep[0].Status != PFUnitMoveHalted || rep[0].Code != PFUnitMoveCodeNotOurLink {
+			t.Fatalf("应放回去并停下报告：%v %+v", err, rep)
+		}
+		if data, _ := os.ReadFile(p); string(data) != "用户刚存的文件" {
+			t.Errorf("用户的文件应原样回到桌面位置：%q", data)
+		}
+		if tmps := e.unlinkTmps(t); len(tmps) != 0 {
+			t.Errorf("临时位置不该留东西：%v", tmps)
+		}
+		pfumSameSnap(t, "同步目录里的项目", pfumSnap(t, e.S(pfumRel)), want.snap)
+		e.wantUnit(t, pfumCode, PFUnitSyncing)
+		if st := e.logState(t, pfumCode); st != "" {
+			t.Errorf("放回去之后日志应清掉：%q", st)
+		}
+	})
+	t.Run("桌面位置又被占了：不动", func(t *testing.T) {
+		e, p, _ := setup(t)
+		e.put(p, "占位.txt", "x")
+		home := pfumSnap(t, e.home)
+		for i := 0; i < 2; i++ {
+			rep, err := e.mover().RecoverMoves(bg)
+			if err != nil || len(rep) != 1 || rep[0].Status != PFUnitMoveHalted || rep[0].Code != PFUnitMoveCodeUnknownState {
+				t.Fatalf("现场不认识应停下：%v %+v", err, rep)
+			}
+			pfumSameSnap(t, "停下后整个家目录", pfumSnap(t, e.home), home)
+		}
+		tmps := e.unlinkTmps(t)
+		if len(tmps) != 1 {
+			t.Fatalf("用户的文件应还在临时位置：%v", tmps)
+		}
+		if data, _ := os.ReadFile(tmps[0]); string(data) != "用户刚存的文件" {
+			t.Errorf("临时位置上的内容 = %q", data)
+		}
+	})
+}
+
+// 日志里记的临时位置不在 <meta>/moves/ 下、或名字不是这个编号的：不认识，停下，什么都不动。
+func TestPFUnitMove_RecoverStopUnknownUnlinkTmpHalts(t *testing.T) {
+	for _, bad := range []string{"别处/x.unlink-1", "moves/260403J1001.json", "moves/别的编号.unlink-1"} {
+		t.Run(bad, func(t *testing.T) {
+			e := newPFUMEnv(t)
+			e.project(pfumRel)
+			e.mustStart(t, pfumRel)
+			e.hook = pfumCrashAt("stop:logged-unlink")
+			if _, err := e.mover().StopSync(bg, pfumCode); !errors.Is(err, errPFUMCrash) {
+				t.Fatalf("应模拟崩溃：%v", err)
+			}
+			e.hook = nil
+			lg, err := PFUnitMoveReadLog(e.meta, pfumCode)
+			if err != nil || lg == nil || lg.UnlinkTmp == "" {
+				t.Fatalf("日志里应有临时位置：%v %+v", err, lg)
+			}
+			if strings.HasPrefix(bad, "moves/") {
+				lg.UnlinkTmp = filepath.Join(e.meta, bad)
+			} else {
+				lg.UnlinkTmp = filepath.Join(e.home, bad)
+			}
+			if err := e.mover().writeLog(lg, lg.State, lg.Step); err != nil {
+				t.Fatal(err)
+			}
+			home := pfumSnap(t, e.home)
+			for i := 0; i < 2; i++ {
+				rep, err := e.mover().RecoverMoves(bg)
+				if err != nil || len(rep) != 1 || rep[0].Status != PFUnitMoveHalted || rep[0].Code != PFUnitMoveCodeUnknownState {
+					t.Fatalf("临时位置不认识应停下：%v %+v", err, rep)
+				}
+				pfumSameSnap(t, "停下后整个家目录", pfumSnap(t, e.home), home)
+			}
+		})
+	}
+}
+
+// 桌面链接所在目录与 meta 不同卷：改名到临时位置做不了，取消同步开始前就拒绝，什么都不动。
+func TestPFUnitMove_StopRefusedWhenMetaOnOtherVolume(t *testing.T) {
+	e := newPFUMEnv(t)
+	p := e.project(pfumRel)
+	want := e.want(t, p)
+	e.mustStart(t, pfumRel)
+	m := e.mover() // 先建执行器（建的时候要校验同步目录与 meta 同卷），再让 meta 下的东西「变成」另一个卷
+	e.lstatMod = func(path string, st *PFStat) {
+		if pfumUnder(path, e.meta) {
+			st.Dev += 12345
+		}
+	}
+	res, err := m.StopSync(bg, pfumCode)
+	e.lstatMod = nil
+	if err != nil || res.Status != PFUnitMoveRefused || !pfumHas(pfumRefusalCodes(res), PFUnitMoveCodeCrossVolume) {
+		t.Fatalf("不同卷应拒绝：%v %+v", err, res)
+	}
+	if where := e.assertOneCopy(t, pfumRel, want, false); where != "link" {
+		t.Errorf("链接应原样：%s", where)
+	}
+	if tgt, _ := os.Readlink(e.P(pfumRel)); tgt != e.S(pfumRel) {
+		t.Errorf("链接不能被动")
+	}
+	e.wantUnit(t, pfumCode, PFUnitSyncing)
+	if st := e.logState(t, pfumCode); st != PFUnitMoveLogDone {
+		t.Errorf("没动手就不该留取消的日志：%q", st)
+	}
+	if tmps := e.unlinkTmps(t); len(tmps) != 0 {
+		t.Errorf("临时位置不该留东西：%v", tmps)
+	}
+	e.mustStop(t, pfumCode) // 条件好了可以取消
+}
+
+// 桌面链接改名到临时位置失败（比如跨卷）：一切照旧，链接还在。
+func TestPFUnitMove_StopDetachRenameFailsRollsBack(t *testing.T) {
+	e := newPFUMEnv(t)
+	p := e.project(pfumRel)
+	want := e.want(t, p)
+	e.mustStart(t, pfumRel)
+	e.rename = pfumFailRenameFrom(p, syscall.EXDEV)
+	res, err := e.mover().StopSync(bg, pfumCode)
+	if err != nil || res.Status != PFUnitMoveRolledBack || res.Code != PFUnitMoveCodeUnlinkFailed {
+		t.Fatalf("改名失败应回退：%v %+v", err, res)
+	}
+	if where := e.assertOneCopy(t, pfumRel, want, false); where != "link" {
+		t.Errorf("链接应原样：%s", where)
+	}
+	e.wantUnit(t, pfumCode, PFUnitSyncing)
+	if st := e.logState(t, pfumCode); st != "" {
+		t.Errorf("日志应清掉：%q", st)
+	}
+	if tmps := e.unlinkTmps(t); len(tmps) != 0 {
+		t.Errorf("临时位置不该留东西：%v", tmps)
+	}
+	e.rename = nil
+	e.mustStop(t, pfumCode)
 }
 
 // ── 恢复遇到不认识的现场：停下报告，一个字节都不动 ────────────

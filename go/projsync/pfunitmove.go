@@ -7,7 +7,8 @@ package projsync
 // 【函数】（都是 PFUnitMover 的方法，一个进程里一个实例，内部一把互斥锁：同一时间只做一件事）
 //   StartSync(rel)      开始同步（§12.3）：只读前置检查 → 写移动日志 → 建上级目录 → 不覆盖改名 P→S → 在 P 建链接 →
 //                       核对 → 登记 syncing → 日志记 done。
-//   StopSync(code)      取消同步（§12.4）：登记置 stopping → 检查 S → 写日志 → 只 unlink 那个链接 → 不覆盖改名 S→P →
+//   StopSync(code)      取消同步（§12.4）：登记置 stopping → 检查 S → 写日志 → 把桌面链接不覆盖地改名到 meta 下的临时位置、
+//                       确认是指向 S 的链接才 unlink 它 → 不覆盖改名 S→P →
 //                       核对 → 删空了的年份层 → 登记 stopped（base 不动）。
 //   CreateSynced(rel)   新建同步项目（§12.5）：在 S 建空目录、在 P 建链接、登记。
 //   RecoverMoves()      崩溃恢复（§12.3 第 5 条）：wgtund 启动时调，按磁盘现场补完或停下。
@@ -25,7 +26,8 @@ package projsync
 //
 // 【边界与总原则】识别边界、超出就停：认不出、不确定的一律停下报告现场，不猜、不自动处理。
 //   - 项目文件一个不丢；任何时刻不会出现「桌面上和同步目录里各有一份、都被当成项目」的情况。
-//   - 对项目目录只做三件事：不覆盖的改名（renamex_np RENAME_EXCL）、建符号链接、unlink 一个符号链接。
+//   - 对项目目录只做三件事：不覆盖的改名（renamex_np RENAME_EXCL）、建符号链接、unlink 一个符号链接
+//     （且只 unlink 已经不覆盖地改名到临时位置、并确认是指向 S 的符号链接的那个名字，不 unlink 桌面原路径）。
 //     绝不递归删除；删「年份层」只用 rmdir（目录不空就失败，不会删到东西）。
 //   - 核对不符时停下报告，不删任何东西。
 //   - 只在 macOS 上做（iCloud 是 Mac 的事）；其他平台 NewPFUnitMover 返回「不支持」。
@@ -170,10 +172,13 @@ type PFUnitMoveResult struct {
 //
 //	start:  logged-begin, after-mkdir, logged-rename, after-rename, logged-link, after-link, after-verify,
 //	        logged-register, after-register, after-done；另有 before-rollback（建链接失败、准备改回去之前）
-//	stop:   after-stopping, logged-begin, after-unlink, logged-rename, after-rename, after-verify,
-//	        logged-register, after-register, after-done；另有 before-relink（改名失败、准备把链接建回去之前）
+//	stop:   after-stopping, logged-begin, logged-unlink（临时位置已写进日志、桌面链接还没动）, after-detach（桌面链接已改名到
+//	        临时位置、还没核对）, after-unlink, logged-rename, after-rename, after-verify,
+//	        logged-register, after-register, after-done；另有 before-relink（改名失败、准备把链接建回去之前）；
+//	        P 本来就不在了（链接已没）时没有 logged-unlink、after-detach
 //	create: logged-begin, after-mkdir, logged-link, after-link, after-verify, logged-register, after-register, after-done
-//	recover: 前缀 recover:，窗口名同上（logged-link/after-link/…、logged-rename/after-rename/…），只经过实际做的那几步
+//	recover: 前缀 recover:，窗口名同上（logged-link/after-link/…、logged-rename/after-rename/…），只经过实际做的那几步；
+//	        另有 recover:after-unlink（补删了临时位置上的链接之后）
 type PFUnitMoveHook func(window string) error
 
 // PFUnitMoveConfigError 是配置错误（同步目录不合格等）：什么都没动，上层整个停下报告。
@@ -446,6 +451,7 @@ func PFUnitMoveLoadUnits(meta string) ([]PFUnitRecord, error) {
 //	Dev    同上，st_dev
 //	StartedAt  登记表里要写的 started_at（stop 时是原登记的值）
 //	CreatedDirs 本次要建（建过）的上级目录，从上到下；回退时空着的话按相反顺序 rmdir
+//	UnlinkTmp  取消同步：桌面链接要暂放的临时位置 <meta>/moves/<编号>.unlink-<随机>（改名之前先写进来；删掉链接后清空）
 type PFUnitMoveLog struct {
 	Version     int       `json:"version"`
 	Code        string    `json:"code"`
@@ -459,6 +465,7 @@ type PFUnitMoveLog struct {
 	Dev         uint64    `json:"dev"`
 	StartedAt   time.Time `json:"started_at"`
 	CreatedDirs []string  `json:"created_dirs,omitempty"`
+	UnlinkTmp   string    `json:"unlink_tmp,omitempty"`
 	UpdatedAt   time.Time `json:"updated_at"`
 }
 
@@ -493,6 +500,9 @@ func pfumParseLog(data []byte) (*PFUnitMoveLog, error) {
 	}
 	if l.Ino == 0 && !(l.Op == PFUnitMoveOpCreate) {
 		return nil, errors.New("移动日志缺少 ino")
+	}
+	if l.UnlinkTmp != "" && (l.Op != PFUnitMoveOpStop || !filepath.IsAbs(l.UnlinkTmp) || filepath.Clean(l.UnlinkTmp) != l.UnlinkTmp) {
+		return nil, fmt.Errorf("移动日志里的临时位置 %q 不合法", l.UnlinkTmp)
 	}
 	return &l, nil
 }
@@ -1406,6 +1416,8 @@ func (m *PFUnitMover) startRollback(lg *PFUnitMoveLog, res *PFUnitMoveResult, li
 // ============================================================================
 
 // StopSync 把编号 code 的项目从同步目录挪回桌面原位置。base 不动，Ubuntu 那份不动。
+// 桌面链接不是核对后直接 unlink：先不覆盖地改名到 <meta>/moves/<编号>.unlink-<随机>，对那里核对确是指向 S 的链接才 unlink
+// （见 stopDetach）；桌面位置与 meta 不同卷则拒绝取消同步。
 //
 // 调用方的前提：已经拿到这个单元的单元锁，并且等进行中的传输结束（§12.4 第 1 步）。这里只把登记表置 stopping
 // （以后的轮次跳过），不去等传输。
@@ -1483,8 +1495,9 @@ func (m *PFUnitMover) StopSync(ctx context.Context, code string) (PFUnitMoveResu
 		return res, nil
 	}
 	// P 应当是指向 S 的我们建的链接；链接已经不在、位置是空的（Moved）也行——没东西可删，直接挪回去。
-	if sh, detail := m.shape(p, s, sst.Ino, sst.Dev); sh != pfumShapeLinked && sh != pfumShapeMoved {
-		res, _ = back(PFUnitMoveHalted, PFUnitMoveCodeNotOurLink, "桌面位置 %s 不是指向 %s 的链接，停下，没有动任何东西：%s", p, s, detail)
+	pShape, pDetail := m.shape(p, s, sst.Ino, sst.Dev)
+	if pShape != pfumShapeLinked && pShape != pfumShapeMoved {
+		res, _ = back(PFUnitMoveHalted, PFUnitMoveCodeNotOurLink, "桌面位置 %s 不是指向 %s 的链接，停下，没有动任何东西：%s", p, s, pDetail)
 		res.Residue = m.residue(p, s)
 		return res, nil
 	}
@@ -1512,6 +1525,12 @@ func (m *PFUnitMover) StopSync(ctx context.Context, code string) (PFUnitMoveResu
 		shown, more := pfumCap(f.staleLocks)
 		res.Notes = append(res.Notes, fmt.Sprintf("有 %d 个超过 %v 的 Office 锁文件，当作残留没有挡路：%s%s", len(f.staleLocks), m.cfg.LockStale, strings.Join(shown, "、"), pfumMore(more)))
 	}
+	if pShape == pfumShapeLinked {
+		// 桌面链接要先改名到 meta 下的临时位置，两边不同卷就做不了：开始之前拒绝，什么都不动
+		if why := m.detachVolumeProblem(p); why != "" {
+			rf.addf(PFUnitMoveCodeCrossVolume, "%s", why)
+		}
+	}
 	if len(rf.list) > 0 {
 		res, _ = back(PFUnitMoveRefused, rf.list[0].Code, "%s", rf.summary("取消同步"))
 		res.Refusals = rf.list
@@ -1531,21 +1550,13 @@ func (m *PFUnitMover) StopSync(ctx context.Context, code string) (PFUnitMoveResu
 	}
 	// ── 从这里开始不响应取消 ──
 
-	// 4. 确认 P 是指向 S 的我们建的链接，只 unlink 这个链接（pfumUnlink 对目录会失败，绝不递归）
+	// 4. P 是指向 S 的我们建的链接就把它拿走。不是「核对是链接 → 再 unlink 原路径」（核对和 unlink 之间 P 可能被换成
+	// 普通文件，unlink 会把它删掉），见 stopDetach：先不覆盖地改名到临时位置，对临时位置核对，才 unlink。
 	switch sh, detail := m.shape(p, s, lg.Ino, lg.Dev); sh {
 	case pfumShapeMoved: // 链接已经不在，没东西可删
 	case pfumShapeLinked:
-		if err := pfumUnlink(p); err != nil {
-			if sh, _ := m.shape(p, s, lg.Ino, lg.Dev); sh == pfumShapeLinked { // 没删掉
-				_ = m.clearLog(code)
-				res, _ = back(PFUnitMoveRolledBack, PFUnitMoveCodeUnlinkFailed, "删桌面链接失败，一切照旧：%v", err)
-				res.fail(err)
-				return res, nil
-			}
-			res.set(PFUnitMoveHalted, PFUnitMoveCodeUnlinkFailed, "删桌面链接时出错，现场不明，停下：%v", err)
-			res.fail(err)
-			res.Residue = m.residue(p, s)
-			return res, nil
+		if m.stopDetach(lg, &res) {
+			return res.ret()
 		}
 	default:
 		_ = m.clearLog(code)
@@ -1559,6 +1570,131 @@ func (m *PFUnitMover) StopSync(ctx context.Context, code string) (PFUnitMoveResu
 	}
 	m.stopRename(lg, rec, &res, "stop")
 	return res.ret()
+}
+
+// pfumUnlinkTmpInfix 是取消同步时暂放桌面链接的临时位置的名字中缀：<meta>/moves/<编号>.unlink-<随机>。
+// moves/ 下只认 .json 结尾的日志和 .json.tmp-* 的临时文件，这个名字两种都不是，恢复和列日志都不会把它当日志。
+const pfumUnlinkTmpInfix = ".unlink-"
+
+// detachVolumeProblem 桌面链接要先不覆盖地改名到 <meta>/moves/ 下，所以桌面位置所在目录与 meta 必须同卷；
+// 不同卷（或读不了）返回原因，空串表示可以。
+func (m *PFUnitMover) detachVolumeProblem(p string) string {
+	pd, err := pfumDevOfNearest(m.cfg.Lstat, filepath.Dir(p))
+	if err != nil {
+		return fmt.Sprintf("读桌面位置 %s 所在的卷失败：%v", filepath.Dir(p), err)
+	}
+	moves := filepath.Join(m.meta, "moves")
+	md, err := pfumDevOfNearest(m.cfg.Lstat, moves)
+	if err != nil {
+		return fmt.Sprintf("读 meta 目录 %s 所在的卷失败：%v", moves, err)
+	}
+	if pd != md {
+		return fmt.Sprintf("桌面位置 %s 与 meta 目录 %s 不在同一个卷（st_dev 不同）：取消同步要先把桌面链接改名到 meta 里的临时位置，不能跨盘", filepath.Dir(p), moves)
+	}
+	return ""
+}
+
+// backToSyncing 什么都没删（或已把换下来的东西原样放回）就退出：登记退回 syncing，结果写进 res。
+func (m *PFUnitMover) backToSyncing(res *PFUnitMoveResult, code string, st PFUnitMoveStatus, rcode, format string, a ...any) {
+	if err := m.setUnitState(code, PFUnitSyncing); err != nil {
+		format += "（另：登记表退回 syncing 也失败了：%v，重启时 RecoverMoves 会处理）"
+		a = append(a, err)
+	}
+	res.set(st, rcode, format, a...)
+}
+
+// stopDetach 取消同步的第 4 步，此刻 P 看着是指向 S 的链接。不能「核对是链接 → 再 unlink 原路径」：
+// 核对和 unlink 之间 P 若被换成了普通文件，unlink 会把它删掉。改成：
+//  1. 把临时位置（<meta>/moves/<编号>.unlink-<随机>）写进移动日志（fsync）；
+//  2. 把 P 不覆盖地改名到临时位置（与桌面同卷，开始前已核对）；
+//  3. 对临时位置 Lstat：确实是指向 S 的符号链接才 unlink 它；
+//     不是（普通文件、目录、别的链接）→ 不覆盖地改名回 P；P 已被占就留在临时位置。两种都停下报告（halted），不删任何东西。
+//
+// 返回 true 表示 res 已是最终结果，调用方立刻返回；false 表示链接已拿掉（或本来就不在了），接着做 S→P。
+func (m *PFUnitMover) stopDetach(lg *PFUnitMoveLog, res *PFUnitMoveResult) bool {
+	p, s := lg.P, lg.S
+	tmp := filepath.Join(m.meta, "moves", lg.Code+pfumUnlinkTmpInfix+pfRand4()+pfRand4())
+	lg.UnlinkTmp = tmp
+	if m.step(lg, res, "stop", "unlink") {
+		return true
+	}
+	if err := m.cfg.Rename(p, tmp); err != nil {
+		switch sh, detail := m.shape(p, s, lg.Ino, lg.Dev); sh {
+		case pfumShapeLinked: // 没挪动，一切照旧
+			_ = m.clearLog(lg.Code)
+			m.backToSyncing(res, lg.Code, PFUnitMoveRolledBack, PFUnitMoveCodeUnlinkFailed, "把桌面链接移到临时位置失败，一切照旧：%v", err)
+			res.fail(err)
+			return true
+		case pfumShapeMoved: // 链接在这个间隙里自己没了，没东西可删
+			lg.UnlinkTmp = ""
+			return false
+		default:
+			_ = m.clearLog(lg.Code)
+			m.backToSyncing(res, lg.Code, PFUnitMoveHalted, PFUnitMoveCodeNotOurLink, "桌面位置 %s 在检查之后变了，不是指向 %s 的链接，停下，没有动任何东西：%s", p, s, detail)
+			res.Residue = m.residue(p, s)
+			return true
+		}
+	}
+	m.syncParents(p, tmp)
+	if m.hit(res, "stop:after-detach") {
+		return true
+	}
+	if m.isLinkTo(tmp, s) {
+		if err := pfumUnlink(tmp); err != nil {
+			// 还是链接（没删掉）就放回原处，一切照旧；放不回去就停下
+			if m.isLinkTo(tmp, s) {
+				if rerr := m.cfg.Rename(tmp, p); rerr == nil {
+					m.syncParents(p, tmp)
+					_ = m.clearLog(lg.Code)
+					m.backToSyncing(res, lg.Code, PFUnitMoveRolledBack, PFUnitMoveCodeUnlinkFailed, "删桌面链接失败，已把链接放回原处，一切照旧：%v", err)
+					res.fail(err)
+					return true
+				}
+			}
+			res.set(PFUnitMoveHalted, PFUnitMoveCodeUnlinkFailed, "删桌面链接时出错，现场不明，停下：%v", err)
+			res.fail(err)
+			res.Residue = append(m.residue(p, s), "桌面链接暂放在 "+tmp+"："+m.describe(tmp))
+			return true
+		}
+		m.syncParents(tmp)
+		lg.UnlinkTmp = ""
+		return false
+	}
+	return m.putBackNotLink(lg, res, tmp)
+}
+
+// isLinkTo 报告 path 现在是不是指向 target 的符号链接（不跟随）。
+func (m *PFUnitMover) isLinkTo(path, target string) bool {
+	st, ex, err := m.lstat(path)
+	if err != nil || !ex || st.Kind != PFKindSymlink {
+		return false
+	}
+	t, err := os.Readlink(path)
+	return err == nil && t == target
+}
+
+// putBackNotLink 临时位置 tmp 上的不是指向 S 的链接（桌面位置在检查之后被换成了别的东西，已被我们不覆盖地改名到了 tmp）：
+// 不覆盖地改名回 P。改回去了：清日志、登记退回 syncing，停下报告；P 又被占了或读不了：留在 tmp，日志和 stopping 都保留，停下报告。
+// 不论哪种都没有删任何东西。返回 true（res 已是最终结果）。
+func (m *PFUnitMover) putBackNotLink(lg *PFUnitMoveLog, res *PFUnitMoveResult, tmp string) bool {
+	p, s := lg.P, lg.S
+	desc := m.describe(tmp)
+	if _, ex, err := m.lstat(tmp); err != nil || !ex {
+		res.set(PFUnitMoveHalted, PFUnitMoveCodeNotOurLink, "桌面链接 %s 已改名到临时位置 %s，但那里现在读不到东西（%s），停下，没有删任何东西", p, tmp, desc)
+		res.Residue = append(m.residue(p, s), "临时位置 "+tmp+"："+desc)
+		return true
+	}
+	if err := m.cfg.Rename(tmp, p); err != nil {
+		res.set(PFUnitMoveHalted, PFUnitMoveCodeNotOurLink, "桌面位置 %s 在检查之后被换成了别的东西（%s），不是指向 %s 的链接；想原样放回去时失败（%v），它现在留在 %s，没有删任何东西，停下", p, desc, s, err, tmp)
+		res.fail(err)
+		res.Residue = append(m.residue(p, s), "被换下来的东西留在 "+tmp+"："+desc)
+		return true
+	}
+	m.syncParents(tmp, p)
+	_ = m.clearLog(lg.Code)
+	m.backToSyncing(res, lg.Code, PFUnitMoveHalted, PFUnitMoveCodeNotOurLink, "桌面位置 %s 在检查之后被换成了别的东西（%s），不是指向 %s 的链接；已原样放回 %s，停下，没有删任何东西", p, desc, s, p)
+	res.Residue = m.residue(p, s)
+	return true
 }
 
 // stopRename 从「P 不存在、S 是那个目录」往后做：不覆盖改名 S→P → 核对 → 删空年份层 → 登记 stopped → done。
@@ -1797,6 +1933,8 @@ func (m *PFUnitMover) CreateSynced(ctx context.Context, rel string) (PFUnitMoveR
 //	  P 是指向 S 的链接                     → 还没动：登记退回 syncing，清日志（要取消请再点一次）
 //	  P 不存在、S 是原 ino 的目录           → 接着做：不覆盖改名 S→P、核对、登记 stopped
 //	  P 是原 ino 的目录、S 不存在           → 已经挪回：核对、删空年份层、登记 stopped
+//	  （日志里记了临时位置 UnlinkTmp 且那里有东西时先看它，见 recoverDetach：P 不存在、S 是那个目录时，是指向 S 的链接就补删，
+//	   是别的东西就不覆盖地放回 P 并停下报告；P 又被占了、或现场不是这样，就停下不动）
 //	新建（creating）：
 //	  P、S 都不存在                          → 清日志
 //	  S 是空目录（或 ino 对得上）、P 不存在  → 接着建链接、登记
@@ -1921,7 +2059,50 @@ func (m *PFUnitMover) recoverStart(lg *PFUnitMoveLog, res *PFUnitMoveResult) {
 	}
 }
 
+// recoverDetach 取消同步日志里记了临时位置（UnlinkTmp）时先看临时位置：
+//   - 那里什么都没有：按 P、S 的现场往下（返回 false）；
+//   - P 不存在、S 是那个目录，临时位置是指向 S 的链接：补删这个链接，往下接着做 S→P（返回 false）；
+//   - P 不存在、S 是那个目录，临时位置是别的东西（桌面位置在检查之后被换过）：不覆盖地改名回 P，停下报告；
+//     P 又被占了就留在临时位置，停下报告（返回 true）；
+//   - 其他（临时位置有东西、P 和 S 却不是上面的样子，或日志里的临时位置不认识）：停下，什么都不动（返回 true）。
+func (m *PFUnitMover) recoverDetach(lg *PFUnitMoveLog, res *PFUnitMoveResult) bool {
+	tmp := lg.UnlinkTmp
+	if filepath.Dir(tmp) != filepath.Join(m.meta, "moves") || !strings.HasPrefix(filepath.Base(tmp), lg.Code+pfumUnlinkTmpInfix) {
+		m.haltUnknown(res, lg, fmt.Sprintf("移动日志里记的临时位置 %q 不认识", tmp))
+		return true
+	}
+	_, ex, err := m.lstat(tmp)
+	if err != nil {
+		m.haltUnknown(res, lg, fmt.Sprintf("读临时位置 %s 失败：%v", tmp, err))
+		return true
+	}
+	if !ex {
+		lg.UnlinkTmp = ""
+		return false
+	}
+	if sh, _ := m.shape(lg.P, lg.S, lg.Ino, lg.Dev); sh != pfumShapeMoved {
+		m.haltUnknown(res, lg, fmt.Sprintf("临时位置 %s 上有东西（%s），可桌面位置和同步目录不是「桌面位置空着、项目在同步目录」的样子", tmp, m.describe(tmp)))
+		res.Residue = append(res.Residue, "临时位置 "+tmp+"："+m.describe(tmp))
+		return true
+	}
+	if m.isLinkTo(tmp, lg.S) {
+		if err := pfumUnlink(tmp); err != nil {
+			res.set(PFUnitMoveHalted, PFUnitMoveCodeUnlinkFailed, "补删临时位置 %s 上的桌面链接失败，停下：%v", tmp, err)
+			res.fail(err)
+			res.Residue = append(m.residue(lg.P, lg.S), "桌面链接暂放在 "+tmp+"："+m.describe(tmp))
+			return true
+		}
+		m.syncParents(tmp)
+		lg.UnlinkTmp = ""
+		return m.hit(res, "recover:after-unlink")
+	}
+	return m.putBackNotLink(lg, res, tmp)
+}
+
 func (m *PFUnitMover) recoverStop(lg *PFUnitMoveLog, res *PFUnitMoveResult) {
+	if lg.UnlinkTmp != "" && m.recoverDetach(lg, res) {
+		return
+	}
 	sh, detail := m.shape(lg.P, lg.S, lg.Ino, lg.Dev)
 	rec := m.recordOf(lg, PFUnitSyncing)
 	switch sh {

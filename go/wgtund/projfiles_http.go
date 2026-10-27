@@ -257,15 +257,17 @@ func (h *projfilesAPI) ensureBuilt() error {
 // 保证「检查 built → 建 → 发布」串行；切换期（目录改了还没重建完）一律拒绝，避免拿旧 sched 建新 fresh。
 // builtGen 变了说明整套已重建（旧 sched 已被关掉），缓存的 fresh 必须作废重建，不能继续绑旧的。
 func (h *projfilesAPI) getFresh() (projfilesFresh, error) {
+	// 切换期先拒（含「改了设置但 tick 还没跑到」的窗口）——已缓存的 fresh 绑的是旧目录那一套，
+	// 这时命中缓存也不能给用。
+	if why := h.dirSwitchWhy(); why != "" {
+		return nil, errors.New(why)
+	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if h.fresh != nil && h.freshGen == h.svc.builtGen.Load() {
 		return h.fresh, nil
 	}
 	h.fresh = nil
-	if h.svc.switchPending() {
-		return nil, errors.New(h.svc.switchReason())
-	}
 	if err := h.ensureBuilt(); err != nil {
 		return nil, err
 	}

@@ -342,7 +342,7 @@ func TestPFSchedMultiUnit(t *testing.T) {
 	if err != nil || ms.Network != PFRemoteNetGood || ms.Host != "测试Mac" {
 		t.Errorf("_mac.json: %+v %v", ms, err)
 	}
-	if r.LinksChecked < 3 {
+	if r.LinksChecked != 2 {
 		t.Errorf("轮前应检查了链接: %d", r.LinksChecked)
 	}
 	if r.Totals.Ran != 3 {

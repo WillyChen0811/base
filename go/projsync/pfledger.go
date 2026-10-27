@@ -527,12 +527,9 @@ func (r *pfrdRun) doLedgerCopy(i int, a PFAction) {
 				a.Src.Machine(), staged.Hash[:16], ls.Hash[:16]))
 		return
 	}
-	// 2) 两个文件搬到目标边暂存区（Mac 目标：本机暂存区已有，不搬；Ubuntu 目标：上传）。
+	// 2) 两个文件搬到目标边暂存区（源 Mac → 上传；源 Ubuntu → fetch 回 Mac 暂存区；pflJob 按 Dst 定方向）。
 	sent := int64(0)
 	for _, spec := range []pfldFileSpec{staged.SQLite, staged.JSON} {
-		if a.Dst == PFSideMac {
-			break // 源就是 Mac：part 本来就在 Mac 暂存区
-		}
 		tr, ok := r.fetch(i, a, r.pflJob(a.Dst, ls.Dir, spec))
 		if !ok {
 			return

@@ -277,7 +277,11 @@ func (e *pfumEnv) assertOneCopy(t *testing.T, rel string, want pfumWant, allowNo
 	check := func(where, root string) string {
 		pfumSameSnap(t, "项目内容（"+where+"）", pfumSnap(t, root), want.snap)
 		if want.ino != 0 {
-			if got := pfumIno(t, root); got != want.ino {
+			st, err := pfumStatFollow(root) // 跟随链接：经 P 看到的就是项目目录本身
+			if err != nil {
+				t.Fatalf("stat %s: %v", root, err)
+			}
+			if got := st.Ino; got != want.ino {
 				t.Errorf("项目目录 ino 变了：%d → %d（%s）", want.ino, got, root)
 			}
 		}
@@ -664,7 +668,7 @@ func (e *pfumEnv) expectRefused(t *testing.T, rel string, want ...string) PFUnit
 	p := e.P(rel)
 	var before map[string]string
 	var ino uint64
-	if st, err := os.Lstat(p); err == nil && st.IsDir() {
+	if st, err := os.Lstat(p); err == nil && st.IsDir() && !e.skipSnap {
 		before, ino = pfumSnap(t, p), pfumIno(t, p)
 	}
 	res, err := e.mover().StartSync(bg, rel)
@@ -955,6 +959,7 @@ func TestPFUnitMove_RefuseUnreadableDir(t *testing.T) {
 	pfaSkipIfRoot(t)
 	e := newPFUMEnv(t)
 	root := e.project(pfumRel)
+	e.skipSnap = true // 读不了的目录没法做内容快照
 	dir := filepath.Join(root, "03 空目录")
 	if err := os.Chmod(dir, 0o000); err != nil {
 		t.Fatal(err)

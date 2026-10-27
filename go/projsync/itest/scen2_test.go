@@ -154,10 +154,11 @@ func TestItestS5UnitMovedOutAndBack(t *testing.T) {
 	macSnap := c.macFilesOf(relA)
 	ubSnap := c.ubFilesOf(relA)
 	stash := filepath.Join(filepath.Dir(c.sync), "移出暂存")
-	if err := os.MkdirAll(stash, 0o755); err != nil {
+	dst := filepathJoin(stash, relA)
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil { // 项目带 2026/ 子层，目标父目录要先备好
 		t.Fatalf("建暂存处失败：%v", err)
 	}
-	if err := os.Rename(filepathJoin(c.sync, relA), filepathJoin(stash, relA)); err != nil {
+	if err := os.Rename(filepathJoin(c.sync, relA), dst); err != nil {
 		t.Fatalf("Mac 挪出项目失败：%v", err)
 	}
 	c.sleepQuiet()
@@ -176,7 +177,7 @@ func TestItestS5UnitMovedOutAndBack(t *testing.T) {
 	}
 
 	// 挪回来 → 下一轮恢复正常、无大量重传。
-	if err := os.Rename(filepathJoin(stash, relA), filepathJoin(c.sync, relA)); err != nil {
+	if err := os.Rename(dst, filepathJoin(c.sync, relA)); err != nil {
 		t.Fatalf("Mac 挪回项目失败：%v", err)
 	}
 	c.sleepQuiet()
@@ -192,7 +193,7 @@ func TestItestS5UnitMovedOutAndBack(t *testing.T) {
 	}
 
 	// Ubuntu 端整个项目目录不见了 → Mac 不删，G1 停下。
-	if err := os.RemoveAll(filepathJoin(stash, relA)); err != nil {
+	if err := os.RemoveAll(dst); err != nil {
 		t.Fatalf("清暂存失败：%v", err)
 	}
 	c.env.sh(context.Background(), "rm -rf -- "+quoteShell(c.env.root+"/"+relA))
@@ -424,6 +425,23 @@ func TestItestS18Ledger(t *testing.T) {
 	c.sleepQuiet()
 	rep = c.round(true)
 	c.assertAligned(relB, rep)
+	// 这一轮必须真的把台账一对从 Ubuntu 搬进 Mac（不是「本轮不装，下一轮重新判定」的空转）。
+	res := unitResult(rep, codeB)
+	if res == nil {
+		t.Fatalf("最终一轮没有单元结果：%s", jsonOf(rep.Units))
+	}
+	hitCopy := false
+	for _, d := range res.Done {
+		if d.Kind == projsync.PFActLedgerCopy && d.Side == projsync.PFSideMac {
+			hitCopy = true
+		}
+	}
+	if !hitCopy {
+		t.Errorf("最终一轮没把台账装到 Mac（缺 ledger_copy side=mac）：done=%s skipped=%s", jsonOf(res.Done), jsonOf(res.Skipped))
+	}
+	if res.BytesDown <= 0 {
+		t.Errorf("Ubuntu→Mac 的台账轮 bytes_down=%d，应把一对拉回来", res.BytesDown)
+	}
 	macDB := filepathJoin(c.sync, relB, ledgerDB)
 	got := macSQLiteDump(t, macDB)
 	if !strings.Contains(got, "ok") || !strings.Contains(got, "V003") {

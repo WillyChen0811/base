@@ -25,6 +25,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/WillyChen0811/base/go/projsync"
@@ -451,6 +452,9 @@ type projfilesSvc struct {
 	// 改了就要整套重建（见 tick 的 rebuildLocked 分支）。
 	builtWork string
 	builtSync string
+	// builtGen 每次 build/rebuild 发布成功后 +1；缓存的 PFFresh 靠它认出自己绑的是不是旧一套
+	// （旧 sched 会被关掉，缓存不失效就会拿它继续取最新）。
+	builtGen atomic.Uint64
 	buildErr  string
 	// switchBusy 非空表示「work_dir 或 sync_dir 刚改过、整套重建还没跑完」：
 	// 这时 unit/start / unit/stop / unit/create / fresh 一律拒绝，避免对旧目录继续操作。
@@ -491,6 +495,14 @@ func (s *projfilesSvc) getSched() *projsync.PFSched {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.sched
+}
+
+// schedGen 同一把锁里取当前调度器与它的代次：调用方缓存了 sched 之后，
+// 靠代次变化发现自己缓存的是已被关掉的旧一套（见 projfilesAPI.getFresh）。
+func (s *projfilesSvc) schedGen() (*projsync.PFSched, uint64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.sched, s.builtGen.Load()
 }
 
 // errText 把 error 变成状态里的文本（nil 是空串）。
@@ -593,6 +605,9 @@ func (s *projfilesSvc) buildLocked(st projfilesSettings) error {
 	s.remote, s.transfer, s.mover, s.sched = remote, transfer, mover, sched
 	s.built, s.buildErr = true, ""
 	s.builtWork, s.builtSync = st.WorkDir, st.SyncDir
+	// 每发布一套新零件 +1：缓存的 PFFresh（绑旧 sched）据此作废重建。跟发布同一把锁里加，
+	// 保证「拿到 sched」和「拿到代次」是同一时刻的快照。
+	s.builtGen.Add(1)
 	s.mu.Unlock()
 	// 旧的调度器与传输器整套关掉（rebuild 时 baseCtx 取消会让 in-flight 那一轮和 touched 去抖都停下来）。
 	if oldSched != nil {

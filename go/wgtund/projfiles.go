@@ -798,7 +798,6 @@ func (s *projfilesSvc) tick(ctx context.Context, reason string) {
 		if opt.Full {
 			kind = "全量"
 		}
-		s.setAction(fmt.Sprintf("跑了：网络 %s，%s一轮（%s）", net, kind, reason))
 		rep := s.execRound(ctx, opt, now)
 		s.mu.Lock()
 		s.lastRound, s.running = rep, false
@@ -806,6 +805,8 @@ func (s *projfilesSvc) tick(ctx context.Context, reason string) {
 			s.lastFull = now
 		}
 		s.mu.Unlock()
+		// 跑完之后才记这一句：中途被别人插进来的「跳过」不该盖在最后结果上
+		s.setAction(fmt.Sprintf("跑了：%s一轮（%s）：网络 %s，结果 %s", kind, reason, net, rep.Outcome))
 	}
 	s.persist()
 }

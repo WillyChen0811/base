@@ -120,6 +120,9 @@ type PFMergeItem struct {
 	DestRel string        `json:"dest,omitempty"`
 	// DestRel：落到目标里的相对路径（相对目标根，/ 分隔）。move/same 同 Rel；rename 是改过名的。
 	ask bool // 计划内部：ask 时不进回收、不进 rename 撞名集合
+	// 计划里用来判等的两边内容 MD5（只有大小相同、真的读过内容的 same/rename 才有）：进计划指纹，
+	// 执行 same 回收前拿它核对。读的时候前后 stat 不一致的不会有（那一条直接 ask）。
+	srcMD5, dstMD5 string
 }
 
 // PFMergePlanResult 是一次只读计划的结果。
@@ -517,12 +520,17 @@ func (m *pfMergeCtx) plan() (PFMergePlanResult, error) {
 		res.EmptyDirs = append(res.EmptyDirs, ".")
 	}
 
-	// 指纹：来源全部涉及文件 + 目标里同 rel 已存在的文件，各取 size+mtime+ino，按 rel 排序后哈希。
+	// 指纹：来源全部涉及文件 + 目标里同 rel 已存在的文件，各取 size+mtime+ino；再加上每一条的动作、落点、
+	// 用来判等的两边 MD5（同大小同 mtime 的原地改写看不出来，动作/落点/MD5 变了就必须重新确认）；按 rel 排序后哈希。
 	for _, it := range res.Items {
+		fps = append(fps, "A|"+it.Rel+"|"+string(it.Action)+"|"+it.DestRel+"|"+it.srcMD5+"|"+it.dstMD5)
 		fps = append(fps, pfMergeFingerprintSide("F", it.Rel, filepath.Join(m.fromRoot, filepath.FromSlash(it.Rel)), m.cfg.Stat))
 		if it.Action != PFMergeMove { // move 时目标本来没有；其余目标已有那份也要进指纹
 			fps = append(fps, pfMergeFingerprintSide("T", it.Rel, filepath.Join(m.toRoot, filepath.FromSlash(it.Rel)), m.cfg.Stat))
 		}
+	}
+	for _, d := range res.EmptyDirs {
+		fps = append(fps, "E|"+d)
 	}
 	fps = append(fps, pfMergeFingerprintSide("D", ".", m.fromRoot, m.cfg.Stat))
 	fps = append(fps, pfMergeFingerprintSide("D", ".", m.toRoot, m.cfg.Stat))
@@ -598,18 +606,20 @@ func (m *pfMergeCtx) classifyFile(dirRel, rel, base string, rawNames []string, t
 	}
 
 	// 目标有、是普通文件、大小一样 → 比 MD5；一致 = same，不一致 = rename。
+	// 读之前、读之后各 stat 一次（含 ctime），不一致说明读的时候文件被动了，算出的 MD5 对不上任何一份确定的内容：这一条不做。
 	if tst.Kind == PFKindFile && tst.Size == st.Size {
-		sm, _, serr := pfMergeMD5(fromAbs)
-		tm, _, terr := pfMergeMD5(toAbs)
+		sm, serr := pfMergeHashStable(m.cfg.Stat, fromAbs, st)
+		tm, terr := pfMergeHashStable(m.cfg.Stat, toAbs, tst)
 		if serr != nil || terr != nil {
 			it.Action, it.ask = PFMergeAsk, true
 			if serr != nil {
-				it.Reason = fmt.Sprintf("读来源内容失败（%v），不动", serr)
+				it.Reason = fmt.Sprintf("读来源内容失败或读的时候文件变了（%v），不动", serr)
 			} else {
-				it.Reason = fmt.Sprintf("读目标内容失败（%v），不动", terr)
+				it.Reason = fmt.Sprintf("读目标内容失败或读的时候文件变了（%v），不动", terr)
 			}
 			return it, nil
 		}
+		it.srcMD5, it.dstMD5 = sm, tm
 		if sm == tm {
 			it.Action = PFMergeSame
 			it.Reason = "目标已有同相对路径、大小与 MD5 都一样，来源这份进回收区"
@@ -757,7 +767,7 @@ func (m *pfMergeCtx) itemErr(res *PFMergeRunResult, it PFMergeItem, doing string
 
 // verifySame 回收前再核两边：都还是普通文件、大小相同、内容 MD5 相同。通过返回两边当时的 stat 和 MD5；
 // 任何一项不符（包括读不了）返回 *pfMergeAskErr：这一条不做、来源留在原处。
-func (m *pfMergeCtx) verifySame(src, dst string) (sst, dstSt PFStat, md5hex string, err error) {
+func (m *pfMergeCtx) verifySame(it PFMergeItem, src, dst string) (sst, dstSt PFStat, md5hex string, err error) {
 	ask := func(format string, a ...any) error {
 		return &pfMergeAskErr{reason: "回收前再核对没通过，来源留在原处，请你定：" + fmt.Sprintf(format, a...)}
 	}
@@ -778,19 +788,19 @@ func (m *pfMergeCtx) verifySame(src, dst string) (sst, dstSt PFStat, md5hex stri
 	if sst.Size != dstSt.Size {
 		return sst, dstSt, "", ask("来源 %d 字节、目标 %d 字节，大小已经不一样", sst.Size, dstSt.Size)
 	}
-	sm, sn, serr := pfMergeMD5(src)
+	sm, serr := pfMergeHashStable(m.cfg.Stat, src, sst)
 	if serr != nil {
-		return sst, dstSt, "", ask("读来源内容失败（%v）", serr)
+		return sst, dstSt, "", ask("读来源内容失败或读的时候它变了（%v）", serr)
 	}
-	dm, dn, derr := pfMergeMD5(dst)
+	dm, derr := pfMergeHashStable(m.cfg.Stat, dst, dstSt)
 	if derr != nil {
-		return sst, dstSt, "", ask("读目标内容失败（%v）", derr)
-	}
-	if sn != sst.Size || dn != dstSt.Size {
-		return sst, dstSt, "", ask("读内容时文件大小变了")
+		return sst, dstSt, "", ask("读目标内容失败或读的时候它变了（%v）", derr)
 	}
 	if sm != dm {
 		return sst, dstSt, "", ask("来源与目标的内容现在不一样了")
+	}
+	if it.srcMD5 == "" || sm != it.srcMD5 || dm != it.dstMD5 {
+		return sst, dstSt, "", ask("内容与确认计划时核对的不一样")
 	}
 	return sst, dstSt, sm, nil
 }
@@ -807,7 +817,7 @@ func (m *pfMergeCtx) recycleSame(rc *PFRecycle, now time.Time, it PFMergeItem, r
 	if err := m.checkChains(it); err != nil {
 		return err
 	}
-	st, dstSt, wantMD5, err := m.verifySame(src, dst)
+	st, dstSt, wantMD5, err := m.verifySame(it, src, dst)
 	if err != nil {
 		return err
 	}
@@ -990,14 +1000,27 @@ func pfMergeRenameName(orig, srcName string, exists func(string) bool) (string, 
 	return "", false
 }
 
-// pfMergeMD5 读整个文件算 MD5（大小写十六进制小写），顺带返回字节数。
-func pfMergeMD5(p string) (string, int64, error) {
+// errPFMergeChanged 表示读文件内容的前后，文件的 stat 对不上（读的时候它被改了）。
+var errPFMergeChanged = errors.New("读内容的前后文件的大小/修改时间/变更时间/inode 对不上，读的时候它被改了")
+
+// pfMergeHashStable 读整个文件算 MD5（小写十六进制）。before 是读之前取的 stat；读完再 stat 一次，
+// 大小、mtime、ctime、ino 任何一个跟 before 不一样，或读到的字节数不等于 before.Size，都返回 errPFMergeChanged——
+// 这时算出的 MD5 说明不了「哪一份确定的内容」，调用方这一条不做。
+func pfMergeHashStable(stat PFStatFunc, p string, before PFStat) (string, error) {
 	h := md5.New()
 	n, err := pfMergeReadFile(p, h)
 	if err != nil {
-		return "", 0, err
+		return "", err
 	}
-	return hex.EncodeToString(h.Sum(nil)), n, nil
+	after, err := stat(p)
+	if err != nil {
+		return "", fmt.Errorf("读完内容后 stat 失败: %w", err)
+	}
+	if n != before.Size || after.Kind != before.Kind || after.Size != before.Size || after.MtimeNs != before.MtimeNs ||
+		after.CtimeNs != before.CtimeNs || after.Ino != before.Ino {
+		return "", errPFMergeChanged
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 // pfMergeSHA256 读整个文件算 SHA-256（回收记账用）。

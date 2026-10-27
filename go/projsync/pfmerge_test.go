@@ -8,6 +8,7 @@ package projsync
 import (
 	"context"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -898,6 +899,185 @@ func TestPFMergeTargetRootSymlinkOnlyRegisteredSyncPath(t *testing.T) {
 	pfWriteUnits(t, f.meta, []PFUnitRecord{rec})
 	if _, err := PFMergePlan(f.cfg(), "src", rel); err == nil {
 		t.Error("单元已 stopped 还是链接，应拒绝")
+	}
+}
+
+// ── 评审 20-3：指纹含动作/落点/MD5；哈希前后 stat 不一致不做这一条 ─────────────────
+
+// 计划是 rename（同大小、内容不同）；用户用保留修改时间的方式把来源原地改写成跟目标一样（大小、mtime、inode 都不变）。
+// 以前指纹（size/mtime/ino）不变，run 重做计划变成 same 却照样执行，来源被回收；现在动作/MD5 进了指纹，必须重新确认。
+func TestPFMergeFingerprintCoversActionAndMD5(t *testing.T) {
+	f := pfMergeSetup(t)
+	src := f.put(f.work, "src/a.txt", "来源版本AAA")
+	f.put(f.work, "dst/a.txt", "目标版本BBB")
+	plan, err := PFMergePlan(f.cfg(), "src", "dst")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if it, ok := pfMergeHas(plan.Items, "a.txt"); !ok || it.Action != PFMergeRename {
+		t.Fatalf("起始计划 a.txt 应是 rename: %+v", plan.Items)
+	}
+	// 原地改写来源，内容变得跟目标一样，mtime 还原
+	st, err := os.Stat(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(src, []byte("目标版本BBB"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(src, st.ModTime(), st.ModTime()); err != nil {
+		t.Fatal(err)
+	}
+	plan2, err := PFMergePlan(f.cfg(), "src", "dst")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if it, ok := pfMergeHas(plan2.Items, "a.txt"); !ok || it.Action != PFMergeSame {
+		t.Fatalf("改写后重做计划应是 same: %+v", plan2.Items)
+	}
+	if plan2.Fingerprint == plan.Fingerprint {
+		t.Fatal("动作变了（rename→same），指纹必须不同")
+	}
+	res, err := PFMergeRun(context.Background(), f.cfg(), "src", "dst", plan.Fingerprint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.Rejected || len(res.Recycled) != 0 {
+		t.Fatalf("计划之后变了必须拒绝重新确认: %+v", res)
+	}
+	if got := readFile(t, src); got != "目标版本BBB" {
+		t.Errorf("拒绝时来源不能动: %q", got)
+	}
+	if hasStr(pfMergeRecycledPaths(t, f), "a.txt") {
+		t.Error("不该回收")
+	}
+}
+
+// 落点变了（rename 的候选名被占，换成 -2）也要重新确认——即使涉及文件的 size/mtime/ino 都没变。
+func TestPFMergeFingerprintCoversDestName(t *testing.T) {
+	f := pfMergeSetup(t)
+	f.put(f.work, "src/sub/a.docx", "来源AAA")
+	f.put(f.work, "dst/sub/a.docx", "目标BBBB")
+	plan, err := PFMergePlan(f.cfg(), "src", "dst")
+	if err != nil {
+		t.Fatal(err)
+	}
+	it1, ok := pfMergeHas(plan.Items, "sub/a.docx")
+	if !ok || it1.Action != PFMergeRename || strings.HasSuffix(it1.DestRel, "-2.docx") {
+		t.Fatalf("起始应是 rename 且落点没加后缀: %+v", plan.Items)
+	}
+	// 计划之后，目标子目录里有人占住了第一个候选名（子目录的 mtime 不在指纹里）
+	f.put(f.work, "dst/sub/"+path.Base(it1.DestRel), "别人刚放的")
+	res, err := PFMergeRun(context.Background(), f.cfg(), "src", "dst", plan.Fingerprint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.Rejected {
+		t.Fatalf("落点变了必须拒绝重新确认: %+v", res.Applied)
+	}
+	if _, err := os.Lstat(filepath.Join(f.work, "src", "sub", "a.docx")); err != nil {
+		t.Errorf("拒绝时来源不能动: %v", err)
+	}
+}
+
+// 同一份文件树，连续两次计划的指纹相同（排序稳定、不含随机量）。
+func TestPFMergeFingerprintDeterministic(t *testing.T) {
+	f := pfMergeSetup(t)
+	f.put(f.work, "src/a.txt", "一样")
+	f.put(f.work, "src/b.txt", "来源BBB")
+	f.put(f.work, "src/sub/c.txt", "深层")
+	f.put(f.work, "dst/a.txt", "一样")
+	f.put(f.work, "dst/b.txt", "目标BBB")
+	p1, err := PFMergePlan(f.cfg(), "src", "dst")
+	if err != nil {
+		t.Fatal(err)
+	}
+	p2, err := PFMergePlan(f.cfg(), "src", "dst")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p1.Fingerprint != p2.Fingerprint || p1.Fingerprint == "" {
+		t.Errorf("指纹应稳定: %q vs %q", p1.Fingerprint, p2.Fingerprint)
+	}
+}
+
+// 读内容前后 stat（含 ctime）不一致：这一条不做（ask），不当成 same 也不当成 rename。
+func TestPFMergeHashStatChangedAsk(t *testing.T) {
+	for _, side := range []string{"来源", "目标"} {
+		t.Run(side, func(t *testing.T) {
+			f := pfMergeSetup(t)
+			srcP := f.put(f.work, "src/a.txt", "一样的内容")
+			dstP := f.put(f.work, "dst/a.txt", "一样的内容")
+			victim := srcP
+			if side == "目标" {
+				victim = dstP
+			}
+			calls := 0
+			cfg := f.cfg()
+			cfg.Stat = func(p string) (PFStat, error) {
+				st, err := PFLstat(p)
+				if err == nil && p == victim {
+					calls++
+					if calls >= 2 { // 第 1 次是取 before，之后（读完内容后）的 stat 里 ctime 变了
+						st.CtimeNs += 12345
+					}
+				}
+				return st, err
+			}
+			plan, err := PFMergePlan(cfg, "src", "dst")
+			if err != nil {
+				t.Fatal(err)
+			}
+			it, ok := pfMergeHas(plan.Items, "a.txt")
+			if !ok || it.Action != PFMergeAsk || !strings.Contains(it.Reason, "变了") {
+				t.Fatalf("读内容时 ctime 变了应 ask: %+v", plan.Items)
+			}
+		})
+	}
+}
+
+// 执行时 same 核对读内容前后 stat 不一致：这一条不做，来源留在原处。
+func TestPFMergeSameVerifyHashStatChangedAsk(t *testing.T) {
+	f := pfMergeSetup(t)
+	srcP := f.put(f.work, "src/a.txt", "一样的内容")
+	f.put(f.work, "dst/a.txt", "一样的内容")
+	armed, calls := false, 0
+	cfg := f.cfg()
+	cfg.Stat = func(p string) (PFStat, error) {
+		st, err := PFLstat(p)
+		if err == nil && armed && p == srcP {
+			calls++
+			if calls >= 2 {
+				st.MtimeNs += 7
+			}
+		}
+		return st, err
+	}
+	plan, err := PFMergePlan(cfg, "src", "dst")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.stepHook = func(stage, arg string) {
+		if stage == "same:before-verify" {
+			armed = true
+		}
+	}
+	res, err := PFMergeRun(context.Background(), cfg, "src", "dst", plan.Fingerprint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Rejected {
+		t.Fatalf("不该整体拒绝: %s", res.Reason)
+	}
+	it, ok := pfMergeHas(res.Skipped, "a.txt")
+	if !ok || !strings.Contains(it.Reason, "回收前再核对") {
+		t.Fatalf("应 ask 且说明回收前再核对: skipped=%+v failed=%+v", res.Skipped, res.Failed)
+	}
+	if len(res.Recycled) != 0 || hasStr(pfMergeRecycledPaths(t, f), "a.txt") {
+		t.Error("不能回收")
+	}
+	if _, err := os.Lstat(srcP); err != nil {
+		t.Errorf("来源必须留在原处: %v", err)
 	}
 }
 

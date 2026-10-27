@@ -1007,6 +1007,45 @@ func TestPFUnitMove_RefuseUnreadableDir(t *testing.T) {
 	}
 }
 
+// 被排除的名字（. 开头的隐藏目录）读不了也要拒绝：里面有没有 iCloud 占位无从确认，挪出去就拿不回来。
+func TestPFUnitMove_RefuseUnreadableExcludedDir(t *testing.T) {
+	pfaSkipIfRoot(t)
+	e := newPFUMEnv(t)
+	root := e.project(pfumRel)
+	e.put(root, ".cache/x.bin", "hidden")
+	e.skipSnap = true // 读不了的目录没法做内容快照
+	dir := filepath.Join(root, ".cache")
+	if err := os.Chmod(dir, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(dir, 0o755) })
+	res := e.expectRefused(t, pfumRel, PFUnitMoveCodeUnreadable)
+	if f := pfumRefusalFiles(res, PFUnitMoveCodeUnreadable); len(f) != 1 || f[0] != ".cache" {
+		t.Errorf("应列出读不了的隐藏目录：%v", f)
+	}
+	// 现场一点没动：P 还是原来的真实目录，同步目录里没有东西，没有移动日志（expectRefused 已查后两项）
+	if st, err := os.Lstat(root); err != nil || !st.IsDir() {
+		t.Errorf("项目目录应原样留在桌面：%v", err)
+	}
+	// 权限改回来之后同样的项目可以开始同步（拒绝只因为读不了）
+	if err := os.Chmod(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	e.skipSnap = false
+	e.mustStart(t, pfumRel)
+}
+
+// 被排除的隐藏目录嵌得太深、扫描没进去看，同样拒绝。
+func TestPFUnitMove_RefuseTooDeepExcludedDir(t *testing.T) {
+	e := newPFUMEnv(t)
+	root := e.project(pfumRel)
+	deep := filepath.Join(root, ".deep") + strings.Repeat("/d", pfMaxDepth+2)
+	if err := os.MkdirAll(deep, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	e.expectRefused(t, pfumRel, PFUnitMoveCodeUnreadable)
+}
+
 func TestPFUnitMove_RefuseNotRealDir(t *testing.T) {
 	t.Run("不存在", func(t *testing.T) {
 		e := newPFUMEnv(t)

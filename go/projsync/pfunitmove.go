@@ -950,8 +950,9 @@ type pfumFacts struct {
 	specials    int
 }
 
-// analyze 把一次不带过滤器的扫描整理成事实。占位、读不了、Office 锁在全部条目里找（被排除的也算：
-// 内容只在云端的文件挪出 iCloud 就拿不回来了）；「最近写入」和计数只看没被排除的。
+// analyze 把一次不带过滤器的扫描整理成事实。占位、读不了（含层数过深没进去看的目录）、Office 锁在全部条目里找
+// （被排除的也算：内容只在云端的文件挪出 iCloud 就拿不回来了，进不去的目录里有什么无从确认，排除同步不能免除这个检查）；
+// 「最近写入」和计数只看没被排除的。
 func (m *PFUnitMover) analyze(r *PFScanResult, dev uint64) pfumFacts {
 	var f pfumFacts
 	now := m.now()
@@ -961,7 +962,7 @@ func (m *PFUnitMover) analyze(r *PFScanResult, dev uint64) pfumFacts {
 		if it.Code == PFCodeICloudPlaceholder || (it.HasStat && it.Stat.Dataless()) {
 			f.placeholder = append(f.placeholder, it.Path)
 		}
-		if it.State == PFStateOutOfScope && (it.Code == PFCodeUnreadable || it.Code == PFCodeTooDeep) && !excl {
+		if it.State == PFStateOutOfScope && (it.Code == PFCodeUnreadable || it.Code == PFCodeTooDeep) {
 			f.unreadable = append(f.unreadable, it.Path)
 		}
 		if it.Code == PFCodeVanished {

@@ -47,7 +47,8 @@ func tmuxSessionArgs(pane string) []string {
 }
 
 const usage = "用法：xxyi-msg state busy|idle|gone [--check|--start]（钩子用，只写本机 ~/.xxyi-state）" +
-	" | xxyi-msg projsync-facts|projsync-apply（stdin 读 JSON 请求，项目同步内部用）"
+	" | xxyi-msg projsync-facts|projsync-apply（stdin 读 JSON 请求，项目同步内部用）" +
+	" | xxyi-msg projfiles-poll|projfiles-facts|projfiles-apply（stdin 读 JSON 请求，项目文件同步内部用）"
 
 // errNoSession 是找不到自己所在 tmux 会话时的统一说法（state 据此什么都不写）。
 var errNoSession = errors.New("找不到自己所在的 tmux 会话")
@@ -94,6 +95,9 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	case "projsync-facts", "projsync-apply":
 		// 项目同步的远程协议：只读 stdin、只写 stdout，不读配置、不联网；见 projsync/remote.go。
 		err = cmdProjsync(args[0], stdin, stdout)
+	case "projfiles-poll", "projfiles-facts", "projfiles-apply":
+		// 项目文件同步的远程协议：同上，只读 stdin、只写 stdout；见 projsync/pfremote.go。
+		err = cmdProjfiles(args[0], stdin, stdout)
 	default:
 		fmt.Fprintf(stderr, "未知命令 %q\n%s\n", args[0], usage)
 		return exitErr

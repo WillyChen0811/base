@@ -565,6 +565,155 @@ func (f *pfscFix) settle(codes ...string) {
 	}
 }
 
+// ── §14：同编号多个单元（自定义 rel）─────────────────────
+
+// addUnitRel 登记一个自定义 rel 的单元：Mac 同步目录里建好目录 + 桌面链接。
+// 用于另配目录单元（键 = 编号R数字，rel 的目录名认出的是主编号）。
+func (f *pfscFix) addUnitRel(key, projectCode, rel string, state PFUnitState, macFiles map[string]string) {
+	f.t.Helper()
+	root := filepath.Join(f.syn, filepath.FromSlash(rel))
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		f.t.Fatal(err)
+	}
+	for r, c := range macFiles {
+		pfrdPutAt(f.t, root, r, c, pfrtOld)
+	}
+	link := filepath.Join(f.work, filepath.FromSlash(rel))
+	if err := os.MkdirAll(filepath.Dir(link), 0o755); err != nil {
+		f.t.Fatal(err)
+	}
+	if err := os.Symlink(root, link); err != nil {
+		f.t.Fatal(err)
+	}
+	f.recs = append(f.recs, PFUnitRecord{Code: key, ProjectCode: projectCode, Rel: rel, State: state,
+		LinkPath: link, SyncPath: root, StartedAt: f.ub.now.Add(-time.Hour)})
+	f.saveUnits()
+}
+
+// ubPutRel 在 Ubuntu 根下的任意 rel 目录写文件（同编号的登记目录或没配置的目录都能写到）。
+func (f *pfscFix) ubPutRel(rel, file, content string, mt time.Time) {
+	f.t.Helper()
+	pfrdPutAt(f.t, filepath.Join(f.ub.root, filepath.FromSlash(rel)), file, content, mt)
+}
+
+func (f *pfscFix) ubRelRoot(rel string) string {
+	return filepath.Join(f.ub.root, filepath.FromSlash(rel))
+}
+func (f *pfscFix) macRelRoot(rel string) string {
+	return filepath.Join(f.syn, filepath.FromSlash(rel))
+}
+
+// TestPFSchedSameCodeUnitsRound：同编号两个登记单元（主目录键 = 编号、另配目录键 = 编号R2）
+// 加一个没配置的同编号目录，跑一轮——两个登记单元各自按 rel 同步，没配置的只报告、不动。
+func TestPFSchedSameCodeUnitsRound(t *testing.T) {
+	f := newPFSchedFix(t, pfscOpt{})
+	const code = pfscA // 260403J1001
+	const relMain = "2026/260403J1001-项目己"
+	const relR2 = "2026/260403J1001-项目己-另配"
+	const relUncfg = "2025/260403J1001-没配置"
+
+	f.addUnitRel(code, code, relMain, PFUnitSyncing, map[string]string{"主.txt": "主Mac"})
+	f.addUnitRel(code+"R2", code, relR2, PFUnitSyncing, map[string]string{"副本.txt": "副本Mac"})
+	f.ubPutRel(relMain, "主.txt", "主Mac", pfrtOld)
+	f.ubPutRel(relR2, "副本.txt", "副本Mac", pfrtOld)
+	// Ubuntu 上同编号、rel 不是任何登记单元的目录：没配置，只报告
+	f.ubPutRel(relUncfg, "闲.txt", "别处的内容", pfrtOld)
+
+	r := f.round(PFSchedRoundOptions{})
+	if r.Outcome != PFSchedDone {
+		t.Fatalf("应跑完:\n%s", pfscDump(r))
+	}
+	// 两个登记单元都按各自 rel 跑了
+	f.mustRan(r, code)
+	f.mustRan(r, code+"R2")
+	// 各自的文件同步，互不串门
+	if c, err := os.ReadFile(filepath.Join(f.ubRelRoot(relMain), "主.txt")); err != nil || string(c) != "主Mac" {
+		t.Errorf("主目录 Mac 文件应传到 Ubuntu: %q %v", c, err)
+	}
+	if c, err := os.ReadFile(filepath.Join(f.macRelRoot(relR2), "副本.txt")); err != nil || string(c) != "副本Mac" {
+		t.Errorf("另配目录 Mac 文件应已在（未动）: %q %v", c, err)
+	}
+	// Ubuntu 主目录里不该出现另配目录的文件，反之亦然
+	if _, err := os.Stat(filepath.Join(f.ubRelRoot(relMain), "副本.txt")); err == nil {
+		t.Error("另配目录的文件不该跑进 Ubuntu 主目录")
+	}
+	// 没配置的目录：报告 unconfigured、不停、Ubuntu 内容不动、Mac 上也不出现
+	foundUncfg := false
+	for _, ur := range r.Units {
+		if ur.Rel == relUncfg {
+			foundUncfg = true
+			if ur.Action != PFSchedActNotDone || ur.Why != "unconfigured" || ur.Note != PFNoteUnconfigured {
+				t.Errorf("没配置的目录应只报告:\n%s", pfscDump(r))
+			}
+		}
+	}
+	if !foundUncfg {
+		t.Errorf("报告里应列出没配置的目录 %s:\n%s", relUncfg, pfscDump(r))
+	}
+	if c, _ := os.ReadFile(filepath.Join(f.ubRelRoot(relUncfg), "闲.txt")); string(c) != "别处的内容" {
+		t.Error("没配置目录的 Ubuntu 内容不该被动")
+	}
+	if _, err := os.Stat(filepath.Join(f.macRelRoot(relUncfg))); err == nil {
+		t.Error("没配置目录不该在 Mac 上出现")
+	}
+}
+
+// TestPFFreshSameCodeAttribution：同编号两个登记单元时，取最新/touched 按 rel 找对单元，
+// 且只碰登记的那个——没配置的同编号目录取不到、报不同步（评审 15-2）。
+func TestPFFreshSameCodeAttribution(t *testing.T) {
+	f := newPFSchedFix(t, pfscOpt{})
+	const code = pfscA
+	const relMain = "2026/260403J1001-项目己"
+	const relR2 = "2026/260403J1001-项目己-另配"
+	f.addUnitRel(code, code, relMain, PFUnitSyncing, map[string]string{"m.txt": "主v1"})
+	f.addUnitRel(code+"R2", code, relR2, PFUnitSyncing, map[string]string{"r.txt": "副本v1"})
+	f.ubPutRel(relMain, "m.txt", "主v1", pfrtOld)
+	f.ubPutRel(relR2, "r.txt", "副本v1", pfrtOld)
+	f.settle()
+
+	// Ubuntu 两个登记目录各改各的
+	f.ubPutRel(relMain, "m.txt", "主v2", pfrdOld(5))
+	f.ubPutRel(relR2, "r.txt", "副本v2", pfrdOld(5))
+	mPath := filepath.Join(f.work, filepath.FromSlash(relMain), "m.txt")
+	rPath := filepath.Join(f.work, filepath.FromSlash(relR2), "r.txt")
+	res := f.fr.Paths(context.Background(), []string{mPath, rPath}, 30*time.Second)
+	if res.Items[0].State != PFFreshStateFetched || res.Items[0].Unit != code {
+		t.Errorf("主目录文件应归主单元并取到: %+v note=%s", res.Items[0], res.Note)
+	}
+	if res.Items[1].State != PFFreshStateFetched || res.Items[1].Unit != code+"R2" {
+		t.Errorf("另配目录文件应归 R2 单元并取到: %+v note=%s", res.Items[1], res.Note)
+	}
+	if c, _ := os.ReadFile(filepath.Join(f.macRelRoot(relMain), "m.txt")); string(c) != "主v2" {
+		t.Errorf("主单元应取到主v2: %q", c)
+	}
+	if c, _ := os.ReadFile(filepath.Join(f.macRelRoot(relR2), "r.txt")); string(c) != "副本v2" {
+		t.Errorf("R2 单元应取到副本v2: %q", c)
+	}
+
+	// 没配置的同编号目录：Touched/Paths 都不认（不在同步范围）
+	uncfg := filepath.Join(f.syn, "2025", "260403J1001-没配置", "x.txt")
+	pfrdPutAt(t, filepath.Dir(uncfg), "x.txt", "x", pfrtOld)
+	if got := f.fr.Touched([]string{uncfg}); len(got) != 0 {
+		t.Errorf("没配置目录不该被 touched 认成同步单元: %v", got)
+	}
+	res = f.fr.Paths(context.Background(), []string{uncfg}, 30*time.Second)
+	if res.Items[0].State != PFFreshStateOutScope {
+		t.Errorf("没配置目录取最新应在范围外: %+v", res.Items[0])
+	}
+
+	// 登记单元在 Ubuntu 上没找到登记的 rel（删掉另配目录）→ 取最新应答不同步、note 写清、不误碰主目录
+	if err := os.RemoveAll(f.ubRelRoot(relR2)); err != nil {
+		t.Fatal(err)
+	}
+	res = f.fr.Paths(context.Background(), []string{rPath}, 30*time.Second)
+	if res.Items[0].State == PFFreshStateFetched {
+		t.Errorf("登记目录在 Ubuntu 没了不该应答已取: %+v", res.Items[0])
+	}
+	if c, _ := os.ReadFile(filepath.Join(f.macRelRoot(relMain), "m.txt")); string(c) != "主v2" {
+		t.Error("取 R2 不该动主目录")
+	}
+}
+
 func TestPFFreshFetchThroughLink(t *testing.T) {
 	f := newPFSchedFix(t, pfscOpt{})
 	f.addUnit(pfscA, PFUnitSyncing, map[string]string{"报告/m.txt": "v1", "n.txt": "N1"})

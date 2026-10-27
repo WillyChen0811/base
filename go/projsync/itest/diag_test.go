@@ -44,7 +44,9 @@ func TestItestDiagHostKeyProbe(t *testing.T) {
 			t.Logf("服务器实际出示：type=%s 指纹=%s", k.Type(), ssh.FingerprintSHA256(k))
 			return nil
 		},
-		Timeout: 15 * time.Second,
+		// 钉住 ed25519（与场景配置一致）：让对方出示与注入同型的钥匙再比。
+		HostKeyAlgorithms: []string{"ssh-ed25519"},
+		Timeout:           15 * time.Second,
 	}
 	c, err := ssh.Dial("tcp", addr, cfg)
 	if err != nil {

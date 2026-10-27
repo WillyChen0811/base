@@ -123,7 +123,10 @@ func newEnv(t *testing.T) *itEnv {
 		User:            user,
 		Auth:            []ssh.AuthMethod{ssh.PublicKeys(signer)},
 		HostKeyCallback: ssh.FixedHostKey(hostKey), // 必须校验主机；不匹配直接失败
-		Timeout:         15 * time.Second,
+		// 诊断（r1027123628）：Ubuntu 默认协商出示 ecdsa-sha2-nistp256，注入的是 ed25519 公钥。
+		// 钉住 ed25519 让对方出示同型钥匙，FixedHostKey 仍逐字节比对——只对齐算法协商，不放宽校验。
+		HostKeyAlgorithms: []string{"ssh-ed25519"},
+		Timeout:           15 * time.Second,
 	}}
 	c, err := ssh.Dial("tcp", e.addr, e.runner.cfg)
 	if err != nil {

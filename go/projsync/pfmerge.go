@@ -63,9 +63,9 @@ type PFMergeConfig struct {
 	SyncDir string // 同步目录（目标是同步中的单元时，链接解析进这里）
 	MetaDir string // meta 目录（units.json 在这里；回收区缺省 PFRoundMacRecycleDir(MetaDir)）
 
-	RecycleDir   string      // 回收区根；空 = PFRoundMacRecycleDir(MetaDir)
-	QuietSeconds int         // 静止判定秒数（≤0 取缺省 PFDefaultQuietSeconds）
-	LockWait     time.Duration // run 拿目标单元锁的等待；0 = 只试一次（拿不到即拒）
+	RecycleDir   string        // 回收区根；空 = PFRoundMacRecycleDir(MetaDir)
+	QuietSeconds int           // 静止判定秒数（≤0 取缺省 PFDefaultQuietSeconds）
+	LockWait     time.Duration // run 拿目标单元锁的等待：>0 到点放弃；0 = 一直等到拿到或 ctx 取消（与调度器一致）
 
 	Sched *PFSched // 目标已登记单元时的单元锁；nil 时合并进已同步单元会失败（拿不到锁）
 

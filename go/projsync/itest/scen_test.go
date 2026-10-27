@@ -140,9 +140,15 @@ func TestItestS3Conflict(t *testing.T) {
 		name string
 		tree map[string]string
 	}{{"Mac", c.macFilesOf(relA)}, {"Ubuntu", c.ubFilesOf(relA)}} {
-		// 原名 + 冲突副本正好两个，内容 = 两个版本各一份（谁赢看判定，但两边都不丢）。
-		if len(side.tree) != 2 {
-			t.Errorf("%s 应该有 2 个文件（原名+冲突副本），实际：%s", side.name, jsonOf(mapKeys(side.tree)))
+		// 只看冲突那组：原名 + 恰好一个冲突副本（项目里还有别的.txt，不参与计数）。
+		var group []string
+		for k := range side.tree {
+			if k == "冲突文档.txt" || strings.Contains(strings.TrimSuffix(k, ".txt"), "冲突-") {
+				group = append(group, k)
+			}
+		}
+		if len(group) != 2 {
+			t.Errorf("%s 冲突组应该是 2 个文件（原名+冲突副本），实际：%s", side.name, jsonOf(group))
 			continue
 		}
 		orig, ok := side.tree["冲突文档.txt"]
@@ -151,7 +157,7 @@ func TestItestS3Conflict(t *testing.T) {
 			continue
 		}
 		copyName := ""
-		for k := range side.tree {
+		for _, k := range group {
 			if k != "冲突文档.txt" {
 				copyName = k
 			}

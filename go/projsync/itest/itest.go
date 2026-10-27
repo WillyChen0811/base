@@ -22,16 +22,20 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/WillyChen0811/base/go/projsync"
 	"github.com/pkg/sftp"
 	"golang.org/x/crypto/ssh"
+	"golang.org/x/time/rate"
 )
 
 // itestAllowedPrefix 是 Ubuntu 端允许清场的路径前缀：rm 目标必须以此开头且不含 ".."，否则 t.Fatal。
@@ -99,9 +103,16 @@ func envReq(t *testing.T, name string) string {
 // newEnv 读环境变量并真连 Ubuntu。主机公钥必须与 PROJFILES_ITEST_HOSTKEY 一致。
 func newEnv(t *testing.T) *itEnv {
 	t.Helper()
+	return newEnvAddr(t, envReq(t, "PROJFILES_ITEST_ADDR"))
+}
+
+// newEnvAddr 连指定地址（真机直连，或经 itProxy 本机代理转发到同一台 Ubuntu）。
+// 其余连接要素（用户/钥匙/主机公钥）与环境变量注入的一致，主机校验不放宽——代理只搬 TCP 字节。
+func newEnvAddr(t *testing.T, addr string) *itEnv {
+	t.Helper()
 	e := &itEnv{
 		t:    t,
-		addr: envReq(t, "PROJFILES_ITEST_ADDR"),
+		addr: addr,
 		root: envReq(t, "PROJFILES_ITEST_ROOT"),
 		meta: envReq(t, "PROJFILES_ITEST_META"),
 		msg:  envReq(t, "PROJFILES_ITEST_MSG"),
@@ -358,6 +369,7 @@ type cluster struct {
 	sync string // 同步目录（Mac）
 	meta string // Mac meta
 	mob  *projsync.PFUnitMover
+	tr   *projsync.PFTransfer
 	sch  *projsync.PFSched
 }
 
@@ -376,7 +388,13 @@ func withQuietSeconds(n int) itOpt {
 
 func newCluster(t *testing.T, opts ...itOpt) *cluster {
 	t.Helper()
-	e := newEnv(t)
+	return newClusterAddr(t, envReq(t, "PROJFILES_ITEST_ADDR"), opts...)
+}
+
+// newClusterAddr 同 newCluster，但把 SSH/SFTP 的连接地址指给调用方（经 itProxy 时用）。
+func newClusterAddr(t *testing.T, addr string, opts ...itOpt) *cluster {
+	t.Helper()
+	e := newEnvAddr(t, addr)
 	tdir := t.TempDir()
 	c := &cluster{t: t, env: e,
 		work: filepath.Join(tdir, "work"),
@@ -419,9 +437,30 @@ func newCluster(t *testing.T, opts ...itOpt) *cluster {
 		t.Fatalf("建 PFSched 失败：%v", err)
 	}
 	t.Cleanup(sch.Close)
-	c.mob, c.sch = mob, sch
+	c.mob, c.tr, c.sch = mob, transfer, sch
 	c.cleanUbuntu(context.Background())
 	return c
+}
+
+// redialRemote 是「掐断后续传」场景的现场恢复：重开 SSH 长连接和 SFTP 会话交给传输层
+// （生产 SetRemote 的语义：只对之后开始的传输生效，所以必须在跑续传轮之前调用）。
+// 旧连接就地关闭；newEnvAddr 里登记的 t.Cleanup 会对旧连接再关一次，无害。
+func (c *cluster) redialRemote() {
+	c.t.Helper()
+	sshC, err := ssh.Dial("tcp", c.env.addr, c.env.runner.cfg)
+	if err != nil {
+		c.t.Fatalf("重连 SSH %s 失败：%v", c.env.addr, err)
+	}
+	sf, err := sftp.NewClient(sshC)
+	if err != nil {
+		sshC.Close()
+		c.t.Fatalf("重连后开 SFTP 会话失败：%v", err)
+	}
+	c.env.sf.Close()
+	c.env.ssh.Close()
+	c.env.ssh, c.env.sf = sshC, sf
+	c.tr.SetRemote(&sftpFS{c: sf})
+	c.t.Logf("已重连 SSH+SFTP 并换进传输层（%s）", c.env.addr)
 }
 
 func (c *cluster) cleanUbuntu(ctx context.Context) { c.env.cleanUbuntu(ctx) }
@@ -581,4 +620,163 @@ func bigFile(n int) []byte {
 		b[i] = byte(i*31 + 7)
 	}
 	return b
+}
+
+// ── itProxy：本机 TCP 代理（T14c 场景的网络现场）─────────────────
+//
+// Studio 本机监听 127.0.0.1:<随机端口>，透明转发到 target（真实 Ubuntu SSH）。
+// 只搬 TCP 字节、不碰 SSH/SFTP 语义，主机公钥校验照常。SSH/SFTP 改连 px.Addr() 即可。
+//   - SetLimits(up, down)：两个方向分别限每秒字节上限（0 = 不限），令牌桶所有连接共享（同一条"网线"）；
+//   - SetDelay(d)：每搬一块固定加延迟；
+//   - Cut()：掐断当前所有连接，之后新连接照常（断线续传场景用）；
+//   - SetReject(true)：接受后立刻关闭，握手瞬间失败——模拟"对方不在线"，不让调用方干等拨号超时；
+//   - Up()/Down()：已转发的字节计数（up = 客户端→Ubuntu，down = Ubuntu→客户端）。
+//
+// 只在测试代码里，生产不感知（生产限速/测速见 PFTransfer.SetLimit / PFSpeed）。
+const itProxyChunk = 64 << 10 // 代理搬运块 = 限速粒度（与生产 pfTrLimiterBurst 同量级）
+
+type itProxy struct {
+	t      *testing.T
+	target string
+	ln     net.Listener
+
+	up, down       atomic.Int64
+	limitUp, limDn atomic.Int64 // 每秒字节上限，0 = 不限（计数与限速各自独立）
+	delayMs        atomic.Int64
+	reject         atomic.Bool
+
+	lims  [2]*rate.Limiter // [0]=up [1]=down
+	mu    sync.Mutex
+	conns map[net.Conn]struct{}
+	wg    sync.WaitGroup
+}
+
+func newITProxy(t *testing.T, target string) *itProxy {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("起本机 TCP 代理失败：%v", err)
+	}
+	p := &itProxy{t: t, target: target, ln: ln, conns: map[net.Conn]struct{}{}}
+	for i := range p.lims {
+		p.lims[i] = rate.NewLimiter(rate.Inf, itProxyChunk)
+	}
+	p.wg.Add(1)
+	go p.acceptLoop()
+	t.Cleanup(p.Close)
+	t.Logf("TCP 代理就绪：%s → %s", ln.Addr(), target)
+	return p
+}
+
+// Addr 是 SSH/SFTP 该连的地址（host:port）。
+func (p *itProxy) Addr() string { return p.ln.Addr().String() }
+
+// SetLimits 设两方向每秒字节上限（0 = 不限）；进行中的连接下一次搬运起生效。
+func (p *itProxy) SetLimits(up, down int64) {
+	p.limitUp.Store(up)
+	p.limDn.Store(down)
+	p.apply(0, up)
+	p.apply(1, down)
+}
+
+func (p *itProxy) apply(i int, bps int64) {
+	if bps <= 0 {
+		p.lims[i].SetLimit(rate.Inf)
+	} else {
+		p.lims[i].SetLimit(rate.Limit(bps))
+	}
+	p.lims[i].SetBurst(itProxyChunk)
+}
+
+// SetDelay 每搬一块固定加延迟（0 = 不加）。
+func (p *itProxy) SetDelay(d time.Duration) { p.delayMs.Store(int64(d / time.Millisecond)) }
+
+// SetReject 开关"拒绝新连接"：开时接受后立刻关闭，握手快速失败。
+func (p *itProxy) SetReject(b bool) { p.reject.Store(b) }
+
+// Up/Down 是两方向已转发字节；ResetCounts 清零（场景分段计量用）。
+func (p *itProxy) Up() int64   { return p.up.Load() }
+func (p *itProxy) Down() int64 { return p.down.Load() }
+func (p *itProxy) ResetCounts() { p.up.Store(0); p.down.Store(0) }
+
+// Cut 掐断当前所有连接（计数和暂存区状态都保留；之后新连接照常）。
+func (p *itProxy) Cut() {
+	p.mu.Lock()
+	conns := make([]net.Conn, 0, len(p.conns))
+	for c := range p.conns {
+		conns = append(conns, c)
+	}
+	p.mu.Unlock()
+	for _, c := range conns {
+		c.Close()
+	}
+	p.t.Logf("代理掐断 %d 条连接（up=%d down=%d 字节）", len(conns), p.up.Load(), p.down.Load())
+}
+
+func (p *itProxy) track(c net.Conn) {
+	p.mu.Lock()
+	p.conns[c] = struct{}{}
+	p.mu.Unlock()
+}
+
+func (p *itProxy) untrack(c net.Conn) {
+	p.mu.Lock()
+	delete(p.conns, c)
+	p.mu.Unlock()
+}
+
+func (p *itProxy) acceptLoop() {
+	defer p.wg.Done()
+	for {
+		cli, err := p.ln.Accept()
+		if err != nil {
+			return // listener 已关（Close）
+		}
+		if p.reject.Load() {
+			cli.Close()
+			continue
+		}
+		up, err := net.Dial("tcp", p.target)
+		if err != nil {
+			// 代理连不上目标：如实让客户端也连不上（不缓存不重连）
+			p.t.Logf("代理连目标 %s 失败：%v", p.target, err)
+			cli.Close()
+			continue
+		}
+		p.track(cli)
+		p.track(up)
+		p.wg.Add(2)
+		go func() { defer p.wg.Done(); p.pump(up, cli, p.lims[0], &p.up); cli.Close(); up.Close(); p.untrack(cli); p.untrack(up) }()
+		go func() { defer p.wg.Done(); p.pump(cli, up, p.lims[1], &p.down); up.Close(); cli.Close(); p.untrack(up); p.untrack(cli) }()
+	}
+}
+
+// pump 把 src 搬到 dst：每块过令牌桶、可加固定延迟、按方向计数。任何一侧出错即止。
+func (p *itProxy) pump(dst, src net.Conn, lim *rate.Limiter, cnt *atomic.Int64) {
+	buf := make([]byte, itProxyChunk)
+	for {
+		n, rerr := src.Read(buf)
+		if n > 0 {
+			if err := lim.WaitN(context.Background(), n); err != nil {
+				return // n ≤ burst，只有桶被改坏才到这
+			}
+			if d := p.delayMs.Load(); d > 0 {
+				time.Sleep(time.Duration(d) * time.Millisecond)
+			}
+			if _, err := dst.Write(buf[:n]); err != nil {
+				return
+			}
+			cnt.Add(int64(n))
+		}
+		if rerr != nil {
+			return
+		}
+	}
+}
+
+// Close 停代理：不再接受新连接，掐掉在途的，等搬运 goroutine 退干净。
+func (p *itProxy) Close() {
+	p.ln.Close()
+	p.Cut()
+	p.wg.Wait()
 }

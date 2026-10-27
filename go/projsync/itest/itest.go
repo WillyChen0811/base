@@ -361,7 +361,20 @@ type cluster struct {
 	sch  *projsync.PFSched
 }
 
-func newCluster(t *testing.T) *cluster {
+// itOpt 是建 cluster 时对调度器参数的场景化微调（只动测试注入的 Settings，不碰生产行为）。
+type itOpt func(*projsync.PFSchedSettings)
+
+// withMaxExpensive 把热点/未知网络的暂缓阈值调小（缺省 20 秒≈100MB，联调不想造 100MB 文件）。
+func withMaxExpensive(d time.Duration) itOpt {
+	return func(s *projsync.PFSchedSettings) { s.Limits.MaxExpensive = d }
+}
+
+// withQuietSeconds 改「最近写入」门窗口（S16「写到一半」要几十秒级窗口才不靠赛跑）。
+func withQuietSeconds(n int) itOpt {
+	return func(s *projsync.PFSchedSettings) { s.QuietSeconds = n }
+}
+
+func newCluster(t *testing.T, opts ...itOpt) *cluster {
 	t.Helper()
 	e := newEnv(t)
 	tdir := t.TempDir()
@@ -394,9 +407,13 @@ func newCluster(t *testing.T) *cluster {
 	if err != nil {
 		t.Fatalf("建 PFTransfer 失败：%v", err)
 	}
+	set := projsync.PFSchedSettings{Net: projsync.PFRemoteNetGood, QuietSeconds: 1, Host: "studio-itest"}
+	for _, o := range opts {
+		o(&set)
+	}
 	sch, err := projsync.NewPFSched(projsync.PFSchedConfig{
 		MetaDir: c.meta, WorkDir: c.work, Remote: remote, Transfer: transfer, Mover: mob,
-		Settings: projsync.PFSchedSettings{Net: projsync.PFRemoteNetGood, QuietSeconds: 1, Host: "studio-itest"},
+		Settings: set,
 	})
 	if err != nil {
 		t.Fatalf("建 PFSched 失败：%v", err)

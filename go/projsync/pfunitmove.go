@@ -1021,22 +1021,73 @@ func (m *PFUnitMover) analyze(r *PFScanResult, dev uint64) pfumFacts {
 	return f
 }
 
+// mergeRisk 把另一次扫描的「会让内容丢掉或没法确认」的几类事实并进来（占位、读不了、跨卷、消失、Office 锁），按路径去重。
+// 计数和「最近写入」不并：它们只看第一次扫描；新增、变动由两次扫描的比较（pfumUnstable）负责。
+func (f *pfumFacts) mergeRisk(o pfumFacts) {
+	f.placeholder = pfumUnion(f.placeholder, o.placeholder)
+	f.unreadable = pfumUnion(f.unreadable, o.unreadable)
+	f.vanished = pfumUnion(f.vanished, o.vanished)
+	f.crossVol = pfumUnion(f.crossVol, o.crossVol)
+	f.locks = pfumUnion(f.locks, o.locks)
+	f.staleLocks = pfumUnion(f.staleLocks, o.staleLocks)
+}
+
+// pfumUnion 返回 a 加上 b 里 a 没有的路径（保持 a 的顺序，b 的新增接在后面）。
+func pfumUnion(a, b []string) []string {
+	if len(b) == 0 {
+		return a
+	}
+	seen := make(map[string]bool, len(a)+len(b))
+	for _, x := range a {
+		seen[x] = true
+	}
+	out := append([]string(nil), a...)
+	for _, x := range b {
+		if !seen[x] {
+			seen[x] = true
+			out = append(out, x)
+		}
+	}
+	return out
+}
+
+// pfumRiskKind 说一个扫描条目有没有「占位 / 读不了 / 消失」这类让挪动变危险的状态；没有返回 ""。
+// 排除同步的条目也要看：排除只是不同步，文件照样跟着整个项目一起挪出 iCloud。
+func pfumRiskKind(it PFScanItem) string {
+	switch {
+	case it.Code == PFCodeICloudPlaceholder || (it.HasStat && it.Stat.Dataless()):
+		return "占位"
+	case it.State == PFStateOutOfScope && (it.Code == PFCodeUnreadable || it.Code == PFCodeTooDeep):
+		return "读不了"
+	case it.Code == PFCodeVanished:
+		return "消失"
+	}
+	return ""
+}
+
 func (m *PFUnitMover) scanOpts() PFScanOptions {
 	return PFScanOptions{Stat: m.cfg.Lstat, Now: m.cfg.Now, QuietSeconds: m.cfg.QuietSeconds}
 }
 
 // unstable 比较两次扫描，返回没被排除的条目里的差别（"路径（变动）"）。
+// 被排除的条目，只要任一次扫描里它是占位 / 读不了 / 消失就照样算（排除同步不能免除这个检查）。
+// 稳定签名 size/mtime/ino 看不出文件被 iCloud 驱逐，所以占位与否另按条目本身判。
 func pfumUnstable(a, b *PFScanResult) []string {
 	_, diffs := PFScansStable(a, b)
 	var out []string
 	for _, d := range diffs {
 		isDir := false
-		if it, ok := b.Find(d.Path); ok {
-			isDir = it.Kind == PFKindDir
-		} else if it, ok := a.Find(d.Path); ok {
-			isDir = it.Kind == PFKindDir
+		risky := false
+		bi, inB := b.Find(d.Path)
+		ai, inA := a.Find(d.Path)
+		switch {
+		case inB:
+			isDir = bi.Kind == PFKindDir
+		case inA:
+			isDir = ai.Kind == PFKindDir
 		}
-		if pfumExcluded(d.Path, isDir) {
+		risky = (inB && pfumRiskKind(bi) != "") || (inA && pfumRiskKind(ai) != "")
+		if pfumExcluded(d.Path, isDir) && !risky {
 			continue
 		}
 		out = append(out, d.Path+"（"+d.Why+"）")
@@ -1252,6 +1303,9 @@ func (m *PFUnitMover) StartSync(ctx context.Context, rel string) (PFUnitMoveResu
 			scan2, e2 := PFScan(ctx, p, m.scanOpts())
 			f := m.analyze(scan1, pst.Dev)
 			res.Files, res.Dirs, res.Bytes = f.files, f.dirs, f.bytes
+			if e2 == nil { // 两次扫描之间新出现的占位、读不了、跨卷、锁也要拦（任一次有就拒绝）
+				f.mergeRisk(m.analyze(scan2, pst.Dev))
+			}
 			if len(f.placeholder) > 0 {
 				rf.add(PFUnitMoveCodePlaceholder, fmt.Sprintf("有 %d 个 iCloud 占位文件（内容还只在云端），挪出桌面会丢；先让它们下载到本机", len(f.placeholder)), f.placeholder)
 			}

@@ -1048,6 +1048,131 @@ func TestPFUnitMove_RefuseTooDeepExcludedDir(t *testing.T) {
 	e.expectRefused(t, pfumRel, PFUnitMoveCodeUnreadable)
 }
 
+// 评审 17-1：两次扫描之间新出现的占位、读不了、跨卷、Office 锁也要拦（以前只分析第一次扫描，
+// 而排除项的变化又被稳定性比较过滤掉）。夹具里 sleep 钩子在两次扫描之间动手。
+func TestPFUnitMove_RefuseRiskAppearingBetweenScans(t *testing.T) {
+	t.Run("排除的隐藏文件被驱逐成占位（size/mtime/ino 都没变）", func(t *testing.T) {
+		e := newPFUMEnv(t)
+		root := e.project(pfumRel)
+		e.put(root, ".隐藏资料/内容.bin", "hidden")
+		evicted := false
+		e.sleep = func(ctx context.Context, d time.Duration) error { evicted = true; return nil }
+		e.lstatMod = func(p string, st *PFStat) {
+			if evicted && strings.HasSuffix(p, "内容.bin") {
+				st.Flags |= PFSFDataless
+			}
+		}
+		res := e.expectRefused(t, pfumRel, PFUnitMoveCodePlaceholder)
+		if f := pfumRefusalFiles(res, PFUnitMoveCodePlaceholder); len(f) != 1 || f[0] != ".隐藏资料/内容.bin" {
+			t.Errorf("应列出第二次扫描才变成占位的文件：%v", f)
+		}
+		e.noUnit(t, pfumCode)
+	})
+	t.Run("普通文件被驱逐成占位", func(t *testing.T) {
+		e := newPFUMEnv(t)
+		e.project(pfumRel)
+		evicted := false
+		e.sleep = func(ctx context.Context, d time.Duration) error { evicted = true; return nil }
+		e.lstatMod = func(p string, st *PFStat) {
+			if evicted && strings.HasSuffix(p, "平面图.pdf") {
+				st.Flags |= PFSFDataless
+			}
+		}
+		e.expectRefused(t, pfumRel, PFUnitMoveCodePlaceholder)
+	})
+	t.Run("两次扫描之间新出现 .X.icloud", func(t *testing.T) {
+		e := newPFUMEnv(t)
+		root := e.project(pfumRel)
+		e.skipSnap = true
+		e.sleep = func(ctx context.Context, d time.Duration) error {
+			return os.WriteFile(filepath.Join(root, "02 图纸", ".新图.pdf.icloud"), []byte("stub"), 0o644)
+		}
+		res := e.expectRefused(t, pfumRel, PFUnitMoveCodePlaceholder)
+		if f := pfumRefusalFiles(res, PFUnitMoveCodePlaceholder); len(f) != 1 || f[0] != "02 图纸/新图.pdf" {
+			t.Errorf("应列出 X 的路径：%v", f)
+		}
+	})
+	t.Run("两次扫描之间新出现 Office 锁", func(t *testing.T) {
+		e := newPFUMEnv(t)
+		root := e.project(pfumRel)
+		e.skipSnap = true
+		e.sleep = func(ctx context.Context, d time.Duration) error {
+			return os.WriteFile(filepath.Join(root, "01 合同", "~$合同.docx"), []byte("lock"), 0o644)
+		}
+		e.expectRefused(t, pfumRel, PFUnitMoveCodeOfficeLock)
+	})
+	t.Run("两次扫描之间出现跨卷的内容", func(t *testing.T) {
+		e := newPFUMEnv(t)
+		e.project(pfumRel)
+		moved := false
+		e.sleep = func(ctx context.Context, d time.Duration) error { moved = true; return nil }
+		e.lstatMod = func(p string, st *PFStat) {
+			if moved && strings.HasSuffix(p, "视频") {
+				st.Dev += 5
+			}
+		}
+		e.expectRefused(t, pfumRel, PFUnitMoveCodeCrossVolume)
+	})
+	t.Run("两次扫描之间隐藏目录变得读不了", func(t *testing.T) {
+		pfaSkipIfRoot(t)
+		e := newPFUMEnv(t)
+		root := e.project(pfumRel)
+		e.put(root, ".cache/x.bin", "hidden")
+		e.skipSnap = true
+		dir := filepath.Join(root, ".cache")
+		t.Cleanup(func() { os.Chmod(dir, 0o755) })
+		e.sleep = func(ctx context.Context, d time.Duration) error { return os.Chmod(dir, 0o000) }
+		res := e.expectRefused(t, pfumRel, PFUnitMoveCodeUnreadable)
+		if f := pfumRefusalFiles(res, PFUnitMoveCodeUnreadable); len(f) != 1 || f[0] != ".cache" {
+			t.Errorf("应列出读不了的隐藏目录：%v", f)
+		}
+	})
+}
+
+// pfumUnstable：排除项的变动不算，但排除项在两次之间占位 / 读不了 / 消失状态不同不能被过滤掉。
+func TestPFUnitMove_UnstableKeepsRiskOfExcluded(t *testing.T) {
+	file := func(path string, flags uint32) PFScanItem {
+		st := PFStat{Kind: PFKindFile, Size: 5, MtimeNs: 100, Ino: 7, Flags: flags}
+		return PFScanItem{Path: path, Kind: PFKindFile, Stat: st, HasStat: true, State: PFStateOK}
+	}
+	res := func(items ...PFScanItem) *PFScanResult { return &PFScanResult{Items: items} }
+	// 普通排除项的变动：不算
+	a, b := file(".DS_Store", 0), file(".DS_Store", 0)
+	b.Stat.MtimeNs = 999
+	if got := pfumUnstable(res(a), res(b)); len(got) != 0 {
+		t.Errorf("排除项普通变动不该算不稳定：%v", got)
+	}
+	// 排除项被驱逐（签名 size/mtime/ino 没变，只有 flags 变）：签名比较看不出，但分析第二次扫描会拦；
+	// 这里确认变动本身出现时（又改了 mtime）不会被排除过滤吞掉
+	a, b = file(".隐藏/内容.bin", 0), file(".隐藏/内容.bin", PFSFDataless)
+	b.Stat.MtimeNs = 999
+	if got := pfumUnstable(res(a), res(b)); len(got) != 1 || got[0] != ".隐藏/内容.bin（变动）" {
+		t.Errorf("排除项变成占位不能被过滤：%v", got)
+	}
+	// 排除项新增的 .X.icloud
+	stub := PFScanItem{Path: ".隐藏/.内容.bin.icloud", Kind: PFKindFile, State: PFStateUnknown, Code: PFCodeICloudPlaceholder}
+	if got := pfumUnstable(res(), res(stub)); len(got) != 1 {
+		t.Errorf("新增的 .X.icloud 不能被过滤：%v", got)
+	}
+	// 排除目录读不了
+	dir := PFScanItem{Path: ".cache", Kind: PFKindDir, State: PFStateOutOfScope, Code: PFCodeUnreadable}
+	okDir := PFScanItem{Path: ".cache", Kind: PFKindDir, HasStat: true, Stat: PFStat{Kind: PFKindDir, Ino: 3}, State: PFStateOK}
+	if got := pfumUnstable(res(okDir), res(dir)); len(got) != 1 {
+		t.Errorf("排除目录变得读不了不能被过滤：%v", got)
+	}
+}
+
+func TestPFUnitMove_UnionKeepsOrderAndDedups(t *testing.T) {
+	a := []string{"b", "a"}
+	got := pfumUnion(a, []string{"a", "c", "c"})
+	if strings.Join(got, ",") != "b,a,c" {
+		t.Errorf("并集应保持原顺序、去重：%v", got)
+	}
+	if strings.Join(a, ",") != "b,a" {
+		t.Errorf("不能改动入参：%v", a)
+	}
+}
+
 func TestPFUnitMove_RefuseNotRealDir(t *testing.T) {
 	t.Run("不存在", func(t *testing.T) {
 		e := newPFUMEnv(t)

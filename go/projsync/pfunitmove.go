@@ -115,6 +115,7 @@ const (
 	PFUnitMoveCodeRegistryBad    = "registry_unreadable"   // units.json 读不了或坏了
 	PFUnitMoveCodePathsBad       = "paths_list_unreadable" // 配置路径清单读不到/坏了，有没有配置判断不了（§14.4）
 	PFUnitMoveCodeNotConfigured  = "not_configured"        // 编号有配置但这个目录不是配置的那条（§14.2，可以合并）
+	PFUnitMoveCodeBlocked        = "config_blocked"        // 编号在清单的 blocked 里：它的配置不能同步（如主目录不在工作目录下），原因由清单给（评审 22-1）
 	PFUnitMoveCodeChanged        = "changed_during_check"
 	PFUnitMoveCodeNotOurLink     = "not_our_link" // 取消同步：桌面位置不是指向 S 的我们建的链接
 	PFUnitMoveCodeSyncMissing    = "sync_missing" // S 不见了或不是真实目录
@@ -1199,13 +1200,21 @@ func (m *PFUnitMover) StartSync(ctx context.Context, rel string) (PFUnitMoveResu
 	p, s, code := rec.LinkPath, rec.SyncPath, rec.Code
 	var rf pfumRefusals
 
-	// 开始同步的闸（§14.4）：这个编号在清单里有配置 → rel 必须是其中一条，键取清单里的；
+	// 开始同步的闸（§14.4）：这个编号在清单的 blocked 里 → 拒绝（原因取清单里的 reason）；
+	// 这个编号在清单里有配置 → rel 必须是其中一条，键取清单里的；
 	// 清单里没有这个编号 → 照旧（键 = 编号）；清单读不到 → 有没有配置判断不了，拒绝。
 	// 闸一律走（构造时已要求清单路径非空；路径为空的零值执行器读清单也会失败而拒绝，不会放行）。
 	cp, cpErr := PFLoadConfiguredPaths(m.cfg.PathsList)
+	blockedWhy, isBlocked := cp.BlockedReason(code) // cp 为 nil（读失败）时返回 false，由下面 cpErr 分支先拒绝
 	switch {
 	case cpErr != nil:
 		rf.addf(PFUnitMoveCodePathsBad, "配置路径清单读不到或坏了（%v），判断不了这个编号配置的目录，不能开始同步", cpErr)
+	case isBlocked:
+		// 编号在 blocked 里：它的配置不能同步。不能当「没配置」放行，这个编号下的任何目录（含另配目录）都不能开始同步。
+		if blockedWhy == "" {
+			blockedWhy = "这个编号的配置不能同步"
+		}
+		rf.addf(PFUnitMoveCodeBlocked, "编号 %s 的配置不能同步，不能开始同步：%s", code, blockedWhy)
 	case len(cp.Units(code)) > 0:
 		cu, conf := cp.Find(code, rel)
 		if !conf {

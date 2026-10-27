@@ -1666,6 +1666,53 @@ func TestPFUnitMove_EmptyPathsListRejected(t *testing.T) {
 	}
 }
 
+// 评审 22-1：编号在清单的 blocked 里（它的配置不能同步，如主目录不在工作目录下）→ 开始同步一律拒绝，
+// 原因带上清单给的 reason；不能因为清单里没有这个编号的单元就当「没配置」放行。
+func TestPFUnitMove_PathsGateBlocked(t *testing.T) {
+	const code = "260403J1401"
+	const relOld = "2026/260403J1401-旧资料"
+	const relCopy = "2026/260403J1401-另配"
+	const reason = "主目录 /别处/260403J1401-正式 不在工作目录下，不能同步"
+	e := newPFUMEnv(t)
+	e.project(relOld)
+	e.project(relCopy)
+
+	// 1) blocked、清单里没有这个编号的单元：同编号的没配置目录不能放行
+	pfumWritePathsList(t, e.pathsList, `{"version":1,"units":[],"blocked":[{"code":"`+code+`","reason":"`+reason+`"}]}`)
+	res := e.expectRefused(t, relOld, PFUnitMoveCodeBlocked)
+	if !strings.Contains(res.Reason, reason) {
+		t.Errorf("拒绝原因要带上清单给的 reason：%s", res.Reason)
+	}
+	e.noUnit(t, code)
+
+	// 2) blocked 的编号同时有配置的另配单元：整个编号都不开始同步（连另配的目录也拒）
+	pfumWritePathsList(t, e.pathsList, `{"version":1,"units":[`+
+		`{"key":"`+code+`R2","code":"`+code+`","serials":[2],"rel":"`+relCopy+`"}],`+
+		`"blocked":[{"code":"`+code+`","reason":"`+reason+`"}]}`)
+	e.expectRefused(t, relCopy, PFUnitMoveCodeBlocked)
+	e.expectRefused(t, relOld, PFUnitMoveCodeBlocked)
+	e.noUnit(t, code+"R2")
+
+	// 3) reason 省略：给一句通用说明，照样拒绝
+	pfumWritePathsList(t, e.pathsList, `{"version":1,"units":[],"blocked":[{"code":"`+code+`"}]}`)
+	res = e.expectRefused(t, relOld, PFUnitMoveCodeBlocked)
+	if !strings.Contains(res.Reason, "配置不能同步") {
+		t.Errorf("没有 reason 时也要有通用说明：%s", res.Reason)
+	}
+
+	// 4) 别的编号不受影响；blocked 去掉后这个编号又能同步
+	const code2, rel2 = "260403J1402", "2026/260403J1402-别的项目"
+	e.project(rel2)
+	pfumWritePathsList(t, e.pathsList, `{"version":1,"units":[],"blocked":[{"code":"`+code+`","reason":"x"}]}`)
+	if r := e.mustStart(t, rel2); r.Unit != code2 {
+		t.Errorf("别的编号应照常开始同步：%+v", r)
+	}
+	pfumWritePathsList(t, e.pathsList, `{"version":1,"units":[]}`)
+	if r := e.mustStart(t, relOld); r.Unit != code {
+		t.Errorf("blocked 去掉后应能开始同步：%+v", r)
+	}
+}
+
 func TestPFUnitMove_PathsGate(t *testing.T) {
 	const code = "260403J1301"
 	const relMain = "2026/260403J1301-测试项目己"

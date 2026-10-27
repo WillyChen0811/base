@@ -86,3 +86,61 @@ func TestPFLoadConfiguredPathsEmptyUnits(t *testing.T) {
 		t.Errorf("应是空清单: %+v", cp.ByCode)
 	}
 }
+
+// 评审 22-1：清单的 blocked（编号有配置但不能同步）读得出来；缺省为空；形状不合格就坏。
+func TestPFLoadConfiguredPathsBlocked(t *testing.T) {
+	body := `{"version":1,"units":[` +
+		`{"key":"260403J1301R2","code":"260403J1301","serials":[2],"rel":"2026/260403J1301-项目己-副本"}],` +
+		`"blocked":[{"code":"260403J1301","reason":"主目录 /别处/260403J1301-正式 不在工作目录下，不能同步"},` +
+		`{"code":"260403J1302"}]}`
+	cp, err := PFLoadConfiguredPaths(pfcfgFile(t, body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r, ok := cp.BlockedReason("260403J1301"); !ok || r != "主目录 /别处/260403J1301-正式 不在工作目录下，不能同步" {
+		t.Errorf("应读出 reason: %q %v", r, ok)
+	}
+	if r, ok := cp.BlockedReason("260403J1302"); !ok || r != "" {
+		t.Errorf("reason 可以省略（读出空串但仍是 blocked）: %q %v", r, ok)
+	}
+	if _, ok := cp.BlockedReason("260403J9999"); ok {
+		t.Error("不在 blocked 里的编号不该被挡")
+	}
+	// blocked 与同编号的另配单元可以并存（另配目录单元照常在 units 里）
+	if len(cp.Units("260403J1301")) != 1 {
+		t.Errorf("同编号的另配单元应照常读出: %+v", cp.ByCode)
+	}
+	// 没有 blocked 字段：空，且不影响原有清单
+	cp2, err := PFLoadConfiguredPaths(pfcfgFile(t, pfcfgGood))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := cp2.BlockedReason("260403J1301"); ok || len(cp2.Blocked) != 0 {
+		t.Errorf("没有 blocked 字段应为空: %+v", cp2.Blocked)
+	}
+	// 空数组也行
+	if _, err := PFLoadConfiguredPaths(pfcfgFile(t, `{"version":1,"units":[],"blocked":[]}`)); err != nil {
+		t.Errorf("blocked 为空数组应合格: %v", err)
+	}
+	// nil 清单不挡
+	var nilp *PFConfiguredPaths
+	if _, ok := nilp.BlockedReason("260403J1301"); ok {
+		t.Error("nil 清单不该报 blocked")
+	}
+}
+
+func TestPFLoadConfiguredPathsBlockedReject(t *testing.T) {
+	for name, body := range map[string]string{
+		"编号不合法":        `{"version":1,"units":[],"blocked":[{"code":"没有编号","reason":"x"}]}`,
+		"编号为空":         `{"version":1,"units":[],"blocked":[{"code":"","reason":"x"}]}`,
+		"编号不是归一化形式":    `{"version":1,"units":[],"blocked":[{"code":"260403j1301","reason":"x"}]}`,
+		"编号是带 R 的键":    `{"version":1,"units":[],"blocked":[{"code":"260403J1301R2","reason":"x"}]}`,
+		"同编号两条":        `{"version":1,"units":[],"blocked":[{"code":"260403J1301","reason":"a"},{"code":"260403J1301","reason":"b"}]}`,
+		"条目里有不认识的字段":   `{"version":1,"units":[],"blocked":[{"code":"260403J1301","reason":"a","extra":1}]}`,
+		"blocked 不是数组": `{"version":1,"units":[],"blocked":{"code":"260403J1301"}}`,
+	} {
+		if _, err := PFLoadConfiguredPaths(pfcfgFile(t, body)); err == nil {
+			t.Errorf("%s：应返回 error", name)
+		}
+	}
+}

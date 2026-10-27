@@ -22,6 +22,10 @@ const pfltHV = "历史版本"
 func pfltApplier(t *testing.T, f *pfrdFix) *PFApplier {
 	t.Helper()
 	now := func() time.Time { return f.ub.now }
+	// 夹具只建 sync/meta，单元目录由放文件时顺带建；这里直接建执行器，先建出来
+	if err := os.MkdirAll(f.root, 0o755); err != nil {
+		t.Fatal(err)
+	}
 	rec, err := NewPFRecycle(PFRoundMacRecycleDir(f.meta), PFRecycleOptions{Now: now})
 	if err != nil {
 		t.Fatal(err)
@@ -354,14 +358,14 @@ func TestPFRoundLedgerSync(t *testing.T) {
 	}
 	f.settled()
 
-	// Mac 又存了一版：快照 + 台账都变了
-	f.macPut("a.txt", "v2\n", pfrtOld)
+	// Mac 又存了一版：快照 + 台账都变了（mtime 要换，不然撞上一轮的哈希缓存）
+	f.macPut("a.txt", "v2\n", pfrdOld(1))
 	snap2 := pfltHV + "/文档/f1/V002_cafe1234_a.txt"
-	f.macPut(snap2, "v2\n", pfrtOld)
+	f.macPut(snap2, "v2\n", pfrdOld(1))
 	js2 := pfltIndex("ar1", pfltRow("v1", "f1", 1, pfltSnap1, pfrtSHA("v1\n"), "v1\n"),
 		pfltRow("v2", "f1", 2, snap2, pfrtSHA("v2\n"), "v2\n"))
-	f.macPut(pfltHV+"/档案台账.sqlite3", "DB2", pfrtOld)
-	f.macPut(pfltHV+"/档案索引.json", js2, pfrtOld)
+	f.macPut(pfltHV+"/档案台账.sqlite3", "DB2", pfrdOld(1))
+	f.macPut(pfltHV+"/档案索引.json", js2, pfrdOld(1))
 	r2 := f.mustDone(f.run())
 	pfltLedgerCopied(t, r2)
 	if f.ub.read("历史版本/档案台账.sqlite3") != "DB2" || f.ub.read("历史版本/档案索引.json") != js2 {

@@ -433,6 +433,317 @@ func TestPFMergeRaceNoOverwrite(t *testing.T) {
 	}
 }
 
+// ── 评审 20-1：拿到锁后重做计划；same 回收前再核两边；回收后核对不符要挪回 ──────────
+
+// pfMergeSyncedTarget 搭一个「目标是同步中的单元」：同步目录里有真实目标，工作目录下是指向它的链接，已登记；
+// 同步目录里放一个 a.txt，返回带调度器的配置。
+func pfMergeSyncedTarget(t *testing.T, f *pfMergeFix, aContent string) (cfg PFMergeConfig, sc *PFSched, code, rel string) {
+	t.Helper()
+	code = "260403J0812"
+	rel = "2026/" + code + "-目标"
+	f.put(f.sync, rel+"/a.txt", aContent)
+	link := filepath.Join(f.work, filepath.FromSlash(rel))
+	if err := os.MkdirAll(filepath.Dir(link), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(f.sync, filepath.FromSlash(rel)), link); err != nil {
+		t.Fatal(err)
+	}
+	rec := PFUnitRecord{Code: code, Rel: rel, State: PFUnitSyncing,
+		LinkPath: link, SyncPath: filepath.Join(f.sync, filepath.FromSlash(rel)), StartedAt: f.now}
+	pfWriteUnits(t, f.meta, []PFUnitRecord{rec})
+	tr, err := NewPFTransfer(PFTransferConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sc, err = NewPFSched(PFSchedConfig{MetaDir: f.meta, WorkDir: f.work, Remote: &PFRemoteClient{}, Transfer: tr})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(sc.Close)
+	cfg = f.cfg()
+	cfg.Sched = sc
+	return cfg, sc, code, rel
+}
+
+// pfMergeRecycledPaths 返回回收区 index 里各天记过的原路径（按「合并时内容相同」过滤）。
+func pfMergeRecycledPaths(t *testing.T, f *pfMergeFix) []string {
+	t.Helper()
+	rc, err := NewPFRecycle(PFRoundMacRecycleDir(f.meta), PFRecycleOptions{Now: func() time.Time { return f.now }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out []string
+	for _, day := range mustDays(t, rc) {
+		for _, e := range mustReadIndex(t, rc, day) {
+			if e.Reason == PFMergeReasonSameRecycle {
+				out = append(out, e.Path)
+			}
+		}
+	}
+	return out
+}
+
+// 等锁期间来源被改成别的内容（大小不变、mtime 还原）：拿到锁后必须基于新状态重做计划，
+// 来源这份新内容绝不能被当成重复件回收（要么拒绝、要么按新计划当不同内容保留）。
+func TestPFMergeLockedReplanAfterWait(t *testing.T) {
+	f := pfMergeSetup(t)
+	cfg, sc, code, rel := pfMergeSyncedTarget(t, f, "一样的内容")
+	src := f.put(f.work, "src-copy/a.txt", "一样的内容") // 同内容 → 计划是 same
+	plan, err := PFMergePlan(cfg, "src-copy", rel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if it, ok := pfMergeHas(plan.Items, "a.txt"); !ok || it.Action != PFMergeSame {
+		t.Fatalf("起始计划 a.txt 应是 same: %+v", plan.Items)
+	}
+	unlock, ok := sc.LockUnit(context.Background(), code, 0)
+	if !ok {
+		t.Fatal("拿单元锁")
+	}
+	type out struct {
+		res PFMergeRunResult
+		err error
+	}
+	done := make(chan out, 1)
+	go func() {
+		r, err := PFMergeRun(context.Background(), cfg, "src-copy", rel, plan.Fingerprint)
+		done <- out{r, err}
+	}()
+	time.Sleep(200 * time.Millisecond)
+	// 等锁期间：来源改成同样长度的别的内容，mtime 还原成原来的
+	st, err := os.Stat(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(src, []byte("新的内容！"), 0o644); err != nil { // 同字节数
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(src, st.ModTime(), st.ModTime()); err != nil {
+		t.Fatal(err)
+	}
+	unlock()
+	var o out
+	select {
+	case o = <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("松锁后 run 必须往下走")
+	}
+	if o.err != nil {
+		t.Fatal(o.err)
+	}
+	if hasStr(pfMergeRecycledPaths(t, f), "a.txt") {
+		t.Fatalf("改过的来源不能被当重复件回收：%+v", o.res)
+	}
+	// 新内容必须还在：要么留在来源（被拒绝/没动），要么已按不同内容改名挪进目标
+	found := false
+	for _, root := range []string{filepath.Join(f.work, "src-copy"), filepath.Join(f.sync, filepath.FromSlash(rel))} {
+		for _, rp := range pfWalkFiles(t, root) {
+			if readFile(t, filepath.Join(root, filepath.FromSlash(rp))) == "新的内容！" {
+				found = true
+			}
+		}
+	}
+	if !found {
+		t.Errorf("来源的新内容丢了：%+v", o.res)
+	}
+}
+
+// same 回收前再核对：计划之后（指纹通过之后）来源或目标变了，这一条不做、留在原处、列为要你定。
+func TestPFMergeSameVerifyBeforeRecycle(t *testing.T) {
+	type tc struct {
+		name string
+		hook func(f *pfMergeFix)
+	}
+	cases := []tc{
+		{"来源被改成别的内容", func(f *pfMergeFix) {
+			p := filepath.Join(f.work, "src", "a.txt")
+			_ = os.WriteFile(p, []byte("别的内容AB"), 0o644) // 大小也变
+		}},
+		{"来源被改成同样长度的别的内容且 mtime 还原", func(f *pfMergeFix) {
+			p := filepath.Join(f.work, "src", "a.txt")
+			st, _ := os.Stat(p)
+			_ = os.WriteFile(p, []byte("别样的内容"), 0o644) // 同样 15 字节
+			_ = os.Chtimes(p, st.ModTime(), st.ModTime())
+		}},
+		{"目标被改成别的内容", func(f *pfMergeFix) {
+			_ = os.WriteFile(filepath.Join(f.work, "dst", "a.txt"), []byte("别的"), 0o644)
+		}},
+		{"目标被删", func(f *pfMergeFix) { _ = os.Remove(filepath.Join(f.work, "dst", "a.txt")) }},
+		{"来源被换成链接", func(f *pfMergeFix) {
+			p := filepath.Join(f.work, "src", "a.txt")
+			_ = os.Remove(p)
+			_ = os.Symlink(filepath.Join(f.work, "dst", "a.txt"), p)
+		}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			f := pfMergeSetup(t)
+			f.put(f.work, "src/a.txt", "一样的内容")
+			f.put(f.work, "src/b.txt", "另一个")
+			f.put(f.work, "dst/a.txt", "一样的内容")
+			cfg := f.cfg()
+			plan, err := PFMergePlan(cfg, "src", "dst")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if it, ok := pfMergeHas(plan.Items, "a.txt"); !ok || it.Action != PFMergeSame {
+				t.Fatalf("起始计划 a.txt 应是 same: %+v", plan.Items)
+			}
+			fired := false
+			cfg.stepHook = func(stage, arg string) {
+				if stage == "same:before-verify" && !fired {
+					fired = true
+					c.hook(f)
+				}
+			}
+			res, err := PFMergeRun(context.Background(), cfg, "src", "dst", plan.Fingerprint)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !fired {
+				t.Fatalf("钩子没触发: %+v", res)
+			}
+			if hasStr(pfMergeRecycledPaths(t, f), "a.txt") || len(res.Recycled) != 0 {
+				t.Fatalf("核对不符不能回收: %+v", res.Recycled)
+			}
+			it, ok := pfMergeHas(res.Skipped, "a.txt")
+			if !ok || it.Action != PFMergeAsk || !strings.Contains(it.Reason, "回收前再核对") {
+				t.Errorf("a.txt 应列为要你定（ask），原因带「回收前再核对」: skipped=%+v failed=%+v", res.Skipped, res.Failed)
+			}
+			if !hasStr(res.RemainingSrc, "a.txt") {
+				t.Errorf("来源 a.txt 应列在没挪走的里面: %+v", res.RemainingSrc)
+			}
+			if _, err := os.Lstat(filepath.Join(f.work, "src", "a.txt")); err != nil {
+				t.Errorf("来源必须留在原处: %v", err)
+			}
+			// 其它条目照常（b.txt move）
+			if got := readFile(t, filepath.Join(f.work, "dst", "b.txt")); got != "另一个" {
+				t.Errorf("其它条目应照常执行: %q", got)
+			}
+		})
+	}
+}
+
+// 回收后核对：放进回收区的内容与核对过的不一样（核对和回收之间来源被改）→ 不覆盖地挪回原处，不留在回收区。
+func TestPFMergeSamePostCheckPutsBack(t *testing.T) {
+	f := pfMergeSetup(t)
+	f.put(f.work, "src/a.txt", "一样的内容")
+	f.put(f.work, "dst/a.txt", "一样的内容")
+	cfg := f.cfg()
+	plan, err := PFMergePlan(cfg, "src", "dst")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.stepHook = func(stage, arg string) {
+		if stage == "same:before-place" { // 核对通过之后、放进回收区之前：来源被改（同长度、mtime 还原）
+			st, _ := os.Stat(arg)
+			_ = os.WriteFile(arg, []byte("新的内容！"), 0o644)
+			_ = os.Chtimes(arg, st.ModTime(), st.ModTime())
+		}
+	}
+	res, err := PFMergeRun(context.Background(), cfg, "src", "dst", plan.Fingerprint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Recycled) != 0 || hasStr(pfMergeRecycledPaths(t, f), "a.txt") {
+		t.Fatalf("不该记成回收了: %+v", res)
+	}
+	if got := readFile(t, filepath.Join(f.work, "src", "a.txt")); got != "新的内容！" {
+		t.Errorf("被改的来源应原样挪回原处: %q", got)
+	}
+	if it, ok := pfMergeHas(res.Skipped, "a.txt"); !ok || !strings.Contains(it.Reason, "回收后核对") {
+		t.Errorf("应列为要你定并说明是回收后核对: %+v / %+v", res.Skipped, res.Failed)
+	}
+	if got := readFile(t, filepath.Join(f.work, "dst", "a.txt")); got != "一样的内容" {
+		t.Errorf("目标不能被动: %q", got)
+	}
+}
+
+// 回收后核对不符、原位又被占了：转存到回收区根下的 _不自动清理（到期清理碰不到），记账、报告；
+// 连转存都做不到：明确报告东西仍在回收区。
+func TestPFMergeSamePostCheckKeepsWhenCannotPutBack(t *testing.T) {
+	setup := func(t *testing.T, blockKeep bool) (*pfMergeFix, PFMergeRunResult) {
+		f := pfMergeSetup(t)
+		f.put(f.work, "src/a.txt", "一样的内容")
+		f.put(f.work, "dst/a.txt", "一样的内容")
+		cfg := f.cfg()
+		plan, err := PFMergePlan(cfg, "src", "dst")
+		if err != nil {
+			t.Fatal(err)
+		}
+		cfg.stepHook = func(stage, arg string) {
+			switch stage {
+			case "same:before-place":
+				st, _ := os.Stat(arg)
+				_ = os.WriteFile(arg, []byte("新的内容！"), 0o644)
+				_ = os.Chtimes(arg, st.ModTime(), st.ModTime())
+			case "same:after-place": // 原位被别人新存了一个同名文件
+				_ = os.WriteFile(arg, []byte("别人刚存的"), 0o644)
+				if blockKeep {
+					_ = os.WriteFile(filepath.Join(PFRoundMacRecycleDir(f.meta), pfRecycleKeepDir), []byte("占位"), 0o644)
+				}
+			}
+		}
+		res, err := PFMergeRun(context.Background(), cfg, "src", "dst", plan.Fingerprint)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return f, res
+	}
+	t.Run("转存到 _不自动清理", func(t *testing.T) {
+		f, res := setup(t, false)
+		if got := readFile(t, filepath.Join(f.work, "src", "a.txt")); got != "别人刚存的" {
+			t.Errorf("原位别人新存的文件不能被覆盖: %q", got)
+		}
+		kept := filepath.Join(PFRoundMacRecycleDir(f.meta), pfRecycleKeepDir, "src", "a.txt")
+		if got := readFile(t, kept); got != "新的内容！" {
+			t.Fatalf("被改的内容应转存到 %s: %q（%+v）", kept, got, res)
+		}
+		it, ok := pfMergeHas(res.Failed, "a.txt")
+		if !ok || !strings.Contains(it.Reason, pfRecycleKeepDir) {
+			t.Errorf("失败原因应说明转存到 %s: %+v", pfRecycleKeepDir, res.Failed)
+		}
+		if len(res.Residue) == 0 {
+			t.Error("应写进 Residue")
+		}
+		if hasStr(pfMergeRecycledPaths(t, f), "a.txt") {
+			t.Error("不该有「合并时内容相同」的账")
+		}
+		// 到期清理（把时间拨到很久以后）不碰 _不自动清理
+		rc, _ := NewPFRecycle(PFRoundMacRecycleDir(f.meta), PFRecycleOptions{Now: func() time.Time { return f.now.AddDate(0, 0, 400) }})
+		if _, err := rc.Clean(7); err != nil {
+			t.Fatal(err)
+		}
+		if got := readFile(t, kept); got != "新的内容！" {
+			t.Errorf("到期清理不该删 %s: %q", pfRecycleKeepDir, got)
+		}
+	})
+	t.Run("转存也做不到", func(t *testing.T) {
+		f, res := setup(t, true)
+		it, ok := pfMergeHas(res.Failed, "a.txt")
+		if !ok || !strings.Contains(it.Reason, "到期会被自动清理") {
+			t.Fatalf("应明确报告东西仍在回收区、会被清理: %+v", res.Failed)
+		}
+		if len(res.Residue) == 0 || !strings.Contains(strings.Join(res.Residue, "\n"), "尽快取走") {
+			t.Errorf("Residue 应提醒尽快取走: %+v", res.Residue)
+		}
+		// 东西确实还在回收区里（没丢）
+		found := false
+		rc, _ := NewPFRecycle(PFRoundMacRecycleDir(f.meta), PFRecycleOptions{})
+		for _, day := range mustDays(t, rc) {
+			for _, rp := range pfWalkFiles(t, filepath.Join(rc.Dir(), day)) {
+				if readFile(t, filepath.Join(rc.Dir(), day, filepath.FromSlash(rp))) == "新的内容！" {
+					found = true
+				}
+			}
+		}
+		if !found {
+			t.Error("被改的内容应仍在回收区里，不能丢")
+		}
+	})
+}
+
 // ── 小工具 ──────────────────────────────────────────────
 
 func hasStr(ss []string, s string) bool {

@@ -44,6 +44,9 @@ const (
 
 	pfRecycleIndexName = "index.jsonl"
 	pfRecycleStrayDir  = "_散放"
+	// pfRecycleKeepDir 是回收区根下放「不能自动清理」东西的目录（合并回收后核对不符、又挪不回原位的）。
+	// Clean 只删名字严格是 YYYY-MM-DD 的日期目录，它的名字不是日期，所以到期清理不会碰它。
+	pfRecycleKeepDir   = "_不自动清理"
 	pfRecycleDayLayout = "2006-01-02"
 	pfRecycleMaxTries  = 50
 )

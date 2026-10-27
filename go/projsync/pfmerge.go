@@ -74,6 +74,13 @@ type PFMergeConfig struct {
 	Stat PFStatFunc
 	// moveHook 只给测试：move/rename 真正调 pfRenameNoReplace 之前触发一下，用来注入「目标凭空出现」等竞态。
 	moveHook func(it PFMergeItem)
+	// stepHook 只给测试：执行里几个窗口各触发一次，用来在窗口里改文件系统，验证不丢数据。stage：
+	//   "same:before-verify"  same 回收前核对之前（arg = 来源绝对路径）
+	//   "same:before-place"   same 核对通过、放进回收区之前（arg = 来源绝对路径）
+	//   "same:after-place"    same 刚放进回收区、放后核对之前（arg = 来源原绝对路径，此时那里已空）
+	//   "dir:before-place"    空目录检查通过、放进回收区之前（arg = 目录绝对路径）
+	//   "dir:after-place"     空目录刚放进回收区、复查之前（arg = 它在回收区里的绝对路径）
+	stepHook func(stage, arg string)
 }
 
 func (c PFMergeConfig) filled() PFMergeConfig {
@@ -171,6 +178,8 @@ func PFMergePlan(cfg PFMergeConfig, fromRel, toRel string) (PFMergePlanResult, e
 }
 
 // PFMergeRun 执行合并：先重做计划、比指纹，指纹不同就不动、退回新计划；相同就逐条执行。
+// 目标是已登记单元时：先拿到单元锁，**拿到锁之后再重做一遍计划并核对指纹**（等锁期间用户可能改过东西，
+// 锁之前的那份计划不能当依据）。
 func PFMergeRun(ctx context.Context, cfg PFMergeConfig, fromRel, toRel, fingerprint string) (PFMergeRunResult, error) {
 	m, err := pfMergePrepare(cfg, fromRel, toRel)
 	if err != nil {
@@ -181,11 +190,6 @@ func PFMergeRun(ctx context.Context, cfg PFMergeConfig, fromRel, toRel, fingerpr
 		return PFMergeRunResult{}, err
 	}
 	res := PFMergeRunResult{Plan: plan, Fingerprint: plan.Fingerprint}
-	if plan.Fingerprint != fingerprint {
-		res.Rejected = true
-		res.Reason = "计划之后文件有变动，请重新确认"
-		return res, nil
-	}
 	// 目标是已登记单元：整个执行期间拿住单元锁，跟定时轮次、取最新互斥。
 	if plan.TargetUnit != "" {
 		if cfg.Sched == nil {
@@ -204,6 +208,28 @@ func PFMergeRun(ctx context.Context, cfg PFMergeConfig, fromRel, toRel, fingerpr
 			return res, nil
 		}
 		defer unlock()
+		lockedUnit := plan.TargetUnit
+		// 拿到锁之后重新解析、重做计划：等锁期间登记、目录、文件都可能变了。
+		m2, err := pfMergePrepare(cfg, fromRel, toRel)
+		if err != nil {
+			return res, err
+		}
+		plan2, err := m2.plan()
+		if err != nil {
+			return res, err
+		}
+		m, plan = m2, plan2
+		res.Plan, res.Fingerprint = plan2, plan2.Fingerprint
+		if plan2.TargetUnit != lockedUnit {
+			res.Rejected = true
+			res.Reason = "拿到锁后发现目标单元变了，请重新确认"
+			return res, nil
+		}
+	}
+	if plan.Fingerprint != fingerprint {
+		res.Rejected = true
+		res.Reason = "计划之后文件有变动，请重新确认"
+		return res, nil
 	}
 	// 回收区：same 与空目录都放进去；必须先确认与来源/目标同卷（进回收是改名）。
 	rc, err := NewPFRecycle(cfg.RecycleDir, PFRecycleOptions{Stat: cfg.Stat, Now: cfg.Now})
@@ -551,11 +577,11 @@ func (m *pfMergeCtx) run(ctx context.Context, plan PFMergePlanResult, rc *PFRecy
 			res.RemainingSrc = append(res.RemainingSrc, it.Rel)
 		case PFMergeSame:
 			if err := m.recycleSame(rc, now, it, res); err != nil {
-				m.failed(res, it, "进回收区", err)
+				m.itemErr(res, it, "进回收区", err)
 			}
 		case PFMergeMove, PFMergeRename:
 			if err := m.moveOne(it, res); err != nil {
-				m.failed(res, it, "挪动", err)
+				m.itemErr(res, it, "挪动", err)
 			} else {
 				res.Applied = append(res.Applied, it)
 			}
@@ -564,7 +590,7 @@ func (m *pfMergeCtx) run(ctx context.Context, plan PFMergePlanResult, rc *PFRecy
 	if ctx.Err() == nil && !res.Rejected {
 		m.recycleEmptyDirs(rc, now, plan, res)
 	}
-	if len(res.Applied) > 0 || len(res.Recycled) > 0 || len(res.RecycleDirs) > 0 {
+	if len(res.Applied) > 0 || len(res.Recycled) > 0 || len(res.RecycleDirs) > 0 || len(res.Residue) > 0 {
 		res.Touched = true
 	}
 }
@@ -595,15 +621,90 @@ func (m *pfMergeCtx) moveOne(it PFMergeItem, res *PFMergeRunResult) error {
 	return pfRenameNoReplace(src, dst)
 }
 
+// pfMergeAskErr 是「这一条执行时发现不能做、没动任何东西，列给用户定」：来源还在原处。
+type pfMergeAskErr struct{ reason string }
+
+func (e *pfMergeAskErr) Error() string { return e.reason }
+
+// pfMergeMovedErr 是「这一条没做成，而且来源已经不在原处」（核对不符、挪不回原位）：reason 写清东西现在在哪。
+type pfMergeMovedErr struct{ reason string }
+
+func (e *pfMergeMovedErr) Error() string { return e.reason }
+
+// itemErr 按错误类型记一条：ask → Skipped（来源还在，要你定）；moved → Failed（reason 写现场）；其余 → Failed（来源原地不动）。
+func (m *pfMergeCtx) itemErr(res *PFMergeRunResult, it PFMergeItem, doing string, err error) {
+	var ae *pfMergeAskErr
+	var me *pfMergeMovedErr
+	switch {
+	case errors.As(err, &ae):
+		f := it
+		f.Action, f.Reason, f.ask = PFMergeAsk, ae.reason, true
+		res.Skipped = append(res.Skipped, f)
+		res.RemainingSrc = append(res.RemainingSrc, it.Rel)
+	case errors.As(err, &me):
+		f := it
+		f.Reason = me.reason
+		res.Failed = append(res.Failed, f)
+	default:
+		m.failed(res, it, doing, err)
+	}
+}
+
+// verifySame 回收前再核两边：都还是普通文件、大小相同、内容 MD5 相同。通过返回两边当时的 stat 和 MD5；
+// 任何一项不符（包括读不了）返回 *pfMergeAskErr：这一条不做、来源留在原处。
+func (m *pfMergeCtx) verifySame(src, dst string) (sst, dstSt PFStat, md5hex string, err error) {
+	ask := func(format string, a ...any) error {
+		return &pfMergeAskErr{reason: "回收前再核对没通过，来源留在原处，请你定：" + fmt.Sprintf(format, a...)}
+	}
+	sst, err = m.cfg.Stat(src)
+	if err != nil {
+		return sst, dstSt, "", ask("读不到来源（%v）", err)
+	}
+	if sst.Kind != PFKindFile {
+		return sst, dstSt, "", ask("来源现在是 %s，不是普通文件", sst.Kind)
+	}
+	dstSt, err = m.cfg.Stat(dst)
+	if err != nil {
+		return sst, dstSt, "", ask("读不到目标同路径（%v），目标可能被删了", err)
+	}
+	if dstSt.Kind != PFKindFile {
+		return sst, dstSt, "", ask("目标同路径现在是 %s，不是普通文件", dstSt.Kind)
+	}
+	if sst.Size != dstSt.Size {
+		return sst, dstSt, "", ask("来源 %d 字节、目标 %d 字节，大小已经不一样", sst.Size, dstSt.Size)
+	}
+	sm, sn, serr := pfMergeMD5(src)
+	if serr != nil {
+		return sst, dstSt, "", ask("读来源内容失败（%v）", serr)
+	}
+	dm, dn, derr := pfMergeMD5(dst)
+	if derr != nil {
+		return sst, dstSt, "", ask("读目标内容失败（%v）", derr)
+	}
+	if sn != sst.Size || dn != dstSt.Size {
+		return sst, dstSt, "", ask("读内容时文件大小变了")
+	}
+	if sm != dm {
+		return sst, dstSt, "", ask("来源与目标的内容现在不一样了")
+	}
+	return sst, dstSt, sm, nil
+}
+
 // recycleSame 把内容相同的那份来源文件放进回收区并记账（含 fsync 残留写进 Residue）。
+// 放之前再核两边大小与 MD5（verifySame）；放之后核对被移走的确是核对过的那份、目标也没变，
+// 不符就挪回原处（putBack），绝不让一份不是重复内容的文件当普通重复件到期被清理。
 func (m *pfMergeCtx) recycleSame(rc *PFRecycle, now time.Time, it PFMergeItem, res *PFMergeRunResult) error {
 	src := filepath.Join(m.fromRoot, filepath.FromSlash(it.Rel))
-	st, err := m.cfg.Stat(src)
+	dst := filepath.Join(m.toRoot, filepath.FromSlash(it.DestRel))
+	if m.cfg.stepHook != nil {
+		m.cfg.stepHook("same:before-verify", src)
+	}
+	st, dstSt, wantMD5, err := m.verifySame(src, dst)
 	if err != nil {
 		return err
 	}
-	if st.Kind != PFKindFile {
-		return fmt.Errorf("来源不再是普通文件（现在是 %s）", st.Kind)
+	if m.cfg.stepHook != nil {
+		m.cfg.stepHook("same:before-place", src)
 	}
 	placed, err := rc.Place(src, now, m.fromRel, it.Rel)
 	if err != nil {
@@ -615,9 +716,24 @@ func (m *pfMergeCtx) recycleSame(rc *PFRecycle, now time.Time, it PFMergeItem, r
 	if placed.Warn != nil {
 		res.Residue = append(res.Residue, fmt.Sprintf("%s 已放进回收区，但目录 fsync 失败：%v", it.Rel, placed.Warn))
 	}
-	sha, _, herr := pfMergeSHA256(placed.Stored)
-	if herr != nil {
-		res.Residue = append(res.Residue, fmt.Sprintf("%s 已在回收区 %s，但算内容哈希失败：%v（账没记全）", it.Rel, placed.Rel, herr))
+	if m.cfg.stepHook != nil {
+		m.cfg.stepHook("same:after-place", src)
+	}
+	// 放进去之后核对：被移走的是不是核对过的那份（一次读出 MD5、SHA-256），目标是不是还在、没变。
+	sha, gotMD5, gotN, herr := pfMergeHashBoth(placed.Stored)
+	var bad string
+	switch {
+	case herr != nil:
+		bad = fmt.Sprintf("读回收区里的文件失败（%v），没法确认它是核对过的那份", herr)
+	case gotN != st.Size || gotMD5 != wantMD5:
+		bad = "被移进回收区的内容与刚才核对的不一样（来源在核对和回收之间被改了）"
+	default:
+		if now2, err := m.cfg.Stat(dst); err != nil || now2.Kind != PFKindFile || now2.Size != dstSt.Size || now2.MtimeNs != dstSt.MtimeNs || now2.Ino != dstSt.Ino {
+			bad = "目标同路径在回收期间变了或不见了，来源这份不能当重复件"
+		}
+	}
+	if bad != "" {
+		return m.putBackReport(rc, res, now, placed, src, it.Rel, st.Size, bad)
 	}
 	entry := PFRecycleEntry{
 		Unit: m.fromRel, Path: it.Rel, SHA256: sha, Size: st.Size, MtimeNs: st.MtimeNs,
@@ -628,6 +744,67 @@ func (m *pfMergeCtx) recycleSame(rc *PFRecycle, now time.Time, it PFMergeItem, r
 	}
 	res.Recycled = append(res.Recycled, it)
 	return nil
+}
+
+// putBackReport 处理「放进回收区之后核对发现不该回收」：先不覆盖地挪回原位（返回 ask：来源回到原处，要你定）；
+// 原位被占或挪不回，转存到回收区根下的 _不自动清理（到期清理只删日期目录，不会碰它）并记一条账；
+// 连转存都失败，东西仍在回收区原处（到期会被清理！）——这种情况明确写进 Residue 和失败原因，让人尽快取走。
+// 后两种来源已不在原处，返回 *pfMergeMovedErr。
+func (m *pfMergeCtx) putBackReport(rc *PFRecycle, res *PFMergeRunResult, now time.Time, placed PFRecycled, orig, rel string, size int64, why string) error {
+	where, home, err := m.putBack(rc, res, now, placed, orig, rel, size, why)
+	switch {
+	case err != nil:
+		msg := fmt.Sprintf("%s；挪回原处和转存都失败（%v），这份文件仍在回收区 %s，到期会被自动清理，请尽快取走", why, err, placed.Rel)
+		res.Residue = append(res.Residue, rel+"："+msg)
+		return &pfMergeMovedErr{reason: "回收后核对没通过：" + msg}
+	case home:
+		return &pfMergeAskErr{reason: "回收后核对没通过，已不覆盖地挪回原处，请你定：" + why}
+	default:
+		msg := fmt.Sprintf("%s；原位已被占，这份文件转存到了回收区的 %s（不会被自动清理）", why, where)
+		res.Residue = append(res.Residue, rel+"："+msg)
+		return &pfMergeMovedErr{reason: "回收后核对没通过：" + msg}
+	}
+}
+
+// putBack 把刚放进回收区的 placed 不覆盖地挪回 orig；orig 被占或挪不回，就转存到回收区根下的
+// _不自动清理/<来源 rel>/<rel>（重名加后缀）并在当天 index 记一条带说明的账。
+// 返回东西现在在哪（绝对路径）、是否回到了原位；两步都失败返回 error（东西还在回收区原处）。
+func (m *pfMergeCtx) putBack(rc *PFRecycle, res *PFMergeRunResult, now time.Time, placed PFRecycled, orig, rel string, size int64, why string) (string, bool, error) {
+	err1 := pfRenameNoReplace(placed.Stored, orig)
+	if err1 == nil {
+		_ = pfSyncDir(filepath.Dir(orig))
+		_ = pfSyncDir(filepath.Dir(placed.Stored))
+		return orig, true, nil
+	}
+	keepRel := path.Join(pfRecycleKeepDir, m.fromRel, rel)
+	for i := 0; i < pfRecycleMaxTries; i++ {
+		kr := keepRel
+		if i > 0 {
+			kr = keepRel + "~" + pfRand4()
+		}
+		dst := filepath.Join(rc.Dir(), filepath.FromSlash(kr))
+		if e := pfMkdirAllSync(filepath.Dir(dst), pfDirPerm); e != nil {
+			return placed.Stored, false, errors.Join(err1, e)
+		}
+		e := pfRenameNoReplace(placed.Stored, dst)
+		if e == nil {
+			_ = pfSyncDir(filepath.Dir(dst))
+			_ = pfSyncDir(filepath.Dir(placed.Stored))
+			entry := PFRecycleEntry{
+				Unit: m.fromRel, Path: rel, Size: size, Reason: "合并回收后核对不符", Round: "merge",
+				Time: now.Format(time.RFC3339), Stored: kr,
+				Note: why + "；原位被占，已转存到「" + pfRecycleKeepDir + "」，不会被到期清理",
+			}
+			if re := rc.Record(placed.Day, entry); re != nil {
+				res.Residue = append(res.Residue, fmt.Sprintf("%s 已转存到 %s，但记账（index.jsonl）失败：%v", rel, kr, re))
+			}
+			return dst, false, nil
+		}
+		if !pfIsErrno(e, syscall.EEXIST) {
+			return placed.Stored, false, errors.Join(err1, e)
+		}
+	}
+	return placed.Stored, false, errors.Join(err1, fmt.Errorf("转存位置重名试了 %d 次都已存在", pfRecycleMaxTries))
 }
 
 // recycleEmptyDirs 自底向上把来源里**实际空了**的目录放进回收区（改名；只动确实空的，绝不删非空的）。
@@ -717,6 +894,16 @@ func pfMergeSHA256(p string) (string, int64, error) {
 		return "", 0, err
 	}
 	return hex.EncodeToString(h.Sum(nil)), n, nil
+}
+
+// pfMergeHashBoth 读整个文件，一次算出 SHA-256、MD5 和字节数（回收记账与核对用）。
+func pfMergeHashBoth(p string) (sha, md5hex string, n int64, err error) {
+	hs, hm := sha256.New(), md5.New()
+	n, err = pfMergeReadFile(p, io.MultiWriter(hs, hm))
+	if err != nil {
+		return "", "", 0, err
+	}
+	return hex.EncodeToString(hs.Sum(nil)), hex.EncodeToString(hm.Sum(nil)), n, nil
 }
 
 // pfMergeReadFile 以 O_NOFOLLOW 打开 p 并把内容灌进 w，返回读到的字节数；只读普通文件。

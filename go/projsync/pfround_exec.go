@@ -375,10 +375,10 @@ func (r *pfrdRun) exec(i int, a PFAction) {
 		r.doConflict(i, a)
 	case PFActBaseSet, PFActBaseDel:
 		r.commit(i, a, nil, 0)
-	case PFActLedgerCopy, PFActBaseLedger:
-		r.state[i] = pfrdSkipped
-		r.res.Skipped = append(r.res.Skipped, PFRoundSkip{Path: a.Path, Kind: a.Kind, Code: "ledger_todo",
-			Reason: "台账同步待做（T10）", Source: PFRoundSrcTodo})
+	case PFActLedgerCopy:
+		r.doLedgerCopy(i, a)
+	case PFActBaseLedger:
+		r.doLedgerBase(i, a)
 	default:
 		r.setSkip(i, a, "", "unknown_action", fmt.Sprintf("不认识的动作种类 %q", a.Kind))
 	}

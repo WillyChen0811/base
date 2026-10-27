@@ -76,7 +76,14 @@ func TestCountConnCountsBothDirections(t *testing.T) {
 func TestCountConnKeepsCloseWrite(t *testing.T) {
 	ln, _ := net.Listen("tcp", "127.0.0.1:0")
 	defer ln.Close()
-	go func() { c, _ := ln.Accept(); io.Copy(io.Discard, c); c.Close() }()
+	go func() {
+		c, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		io.Copy(io.Discard, c)
+		c.Close()
+	}()
 	conn, err := (&countDialer{&net.Dialer{}, newTrafficCounter()}).DialContext(context.Background(), "tcp", ln.Addr().String())
 	if err != nil {
 		t.Fatal(err)

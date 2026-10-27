@@ -249,39 +249,58 @@ func TestItestS20UbuntuCLI(t *testing.T) {
 		t.Errorf("下一轮同步后 Mac 上 %s 不是 Ubuntu 改过的新内容：sha=%s 应为 %s", docFile, got, sha256Hex(newBody))
 	}
 
-	// 历史版本目录里的快照与台账（档案台账.sqlite3 + 档案索引.json）都到了 Mac，且和 Ubuntu 一致。
 	macAll := c.macFilesOf(relE)
 	ubAll := c.ubFilesOf(relE)
-	ubTreeSnap := ubAll // 已含历史版本
-	// 找出两侧「历史版本/档案台账.sqlite3」「历史版本/档案索引.json」。
-	histKeys := func(m map[string]string) []string {
-		var out []string
-		for k := range m {
-			if strings.Contains("/"+k, "/历史版本/") &&
-				(strings.HasSuffix(k, "档案台账.sqlite3") || strings.HasSuffix(k, "档案索引.json")) {
-				out = append(out, k)
+
+	if usedScan {
+		// 主路径：历史版本目录里的快照与台账（档案台账.sqlite3 + 档案索引.json）都到了 Mac，且和 Ubuntu 一致。
+		histKeys := func(m map[string]string) []string {
+			var out []string
+			for k := range m {
+				if strings.Contains("/"+k, "/历史版本/") &&
+					(strings.HasSuffix(k, "档案台账.sqlite3") || strings.HasSuffix(k, "档案索引.json")) {
+					out = append(out, k)
+				}
+			}
+			return out
+		}
+		if len(histKeys(ubAll)) == 0 {
+			t.Errorf("Ubuntu 上就没有历史版本台账/索引，/scan -version 没落盘：Ubuntu 清单=%s", jsonOf(mapKeys(ubAll)))
+		}
+		macHist := histKeys(macAll)
+		if len(macHist) == 0 {
+			t.Errorf("Mac 上没有历史版本的台账/索引（档案台账.sqlite3 / 档案索引.json）：Mac 清单=%s", jsonOf(mapKeys(macAll)))
+		}
+		// 历史版本里的台账/索引两侧都要有且内容一致。
+		for _, k := range histKeys(ubAll) {
+			if macAll[k] == "" {
+				t.Errorf("历史版本台账/索引 %s 没同步回 Mac", k)
+			} else if macAll[k] != ubAll[k] {
+				t.Errorf("历史版本台账/索引 %s 两侧内容不一致：Mac=%s Ubuntu=%s", k, macAll[k], ubAll[k])
 			}
 		}
-		return out
-	}
-	if len(histKeys(macAll)) == 0 {
-		t.Errorf("Mac 上没有历史版本的台账/索引（档案台账.sqlite3 / 档案索引.json）：Mac 清单=%s", jsonOf(mapKeys(macAll)))
-	}
-	if len(histKeys(ubTreeSnap)) == 0 {
-		t.Errorf("Ubuntu 上就没有历史版本台账/索引，可能 /scan -version 没落盘：Ubuntu 清单=%s", jsonOf(mapKeys(ubAll)))
+		t.Logf("S20 走的是 /scan -version（写本地建版本）；历史版本台账/索引=%v", macHist)
+	} else {
+		// 退路：/scan -version 要求项目先有档案（Report）行；裸同步的项目没有，退到 /add -project --parent
+		// 在项目里建子目录当写操作——断言那个子目录（含标准子目录）也同步回了 Mac。
+		sub := "260403J1201-x/"
+		found := 0
+		for k := range macAll {
+			if strings.HasPrefix(k, sub) {
+				found++
+			}
+		}
+		if found == 0 {
+			t.Errorf("退路建的子目录 %s 没同步回 Mac：Mac 清单=%s", sub, jsonOf(mapKeys(macAll)))
+		}
+		t.Logf("S20 走的是退路 /add -project --parent（建子目录当写操作），子目录 %s 已到 Mac（%d 项）", sub, found)
 	}
 
-	// 一致性：按 projsync 同步规则过滤两侧后再比，必须完全一致（含历史版本里该同步的快照/台账）。
+	// 一致性：按 projsync 同步规则过滤两侧后再比，必须完全一致（含历史版本里该同步的快照/台账、退路的子目录）。
 	onlyMac, onlyUb, differ := cmpTree(pfFilterTree(macAll), pfFilterTree(ubAll))
 	if len(onlyMac)+len(onlyUb)+len(differ) > 0 {
 		t.Errorf("下一轮同步后项目仍不一致：Mac 独有 %v，Ubuntu 独有 %v，内容不同 %v", onlyMac, onlyUb, differ)
 		c.t.Logf("Mac=%s\nUbuntu=%s\n本轮报告=%s", jsonOf(mapKeys(pfFilterTree(macAll))),
 			jsonOf(mapKeys(pfFilterTree(ubAll))), jsonOf(rep2))
-	}
-
-	if usedScan {
-		t.Logf("S20 走的是 /scan -version（写本地建版本）；历史版本已同步回 Mac 并两侧一致")
-	} else {
-		t.Logf("S20 走的是退路 /add -project --parent（建子目录当写操作）")
 	}
 }

@@ -282,18 +282,20 @@ func TestItestS20UbuntuCLI(t *testing.T) {
 		t.Logf("S20 走的是 /scan -version（写本地建版本）；历史版本台账/索引=%v", macHist)
 	} else {
 		// 退路：/scan -version 要求项目先有档案（Report）行；裸同步的项目没有，退到 /add -project --parent
-		// 在项目里建子目录当写操作——断言那个子目录（含标准子目录）也同步回了 Mac。
-		sub := "260403J1201-x/"
-		found := 0
-		for k := range macAll {
-			if strings.HasPrefix(k, sub) {
-				found++
-			}
+		// 在项目里建子目录当写操作。解析层建的是目录（含标准子目录，不含文件），projsync 照常带目录同步；
+		// 文件清单（macFilesOf）看不到空目录，这里直接查 Mac 同步目录下这些目录是否已建出来。
+		subRoot := filepathJoin(c.sync, relE, "260403J1201-x")
+		if fi, err := os.Stat(subRoot); err != nil || !fi.IsDir() {
+			t.Errorf("退路建的子目录没同步回 Mac：%s（err=%v）", subRoot, err)
 		}
-		if found == 0 {
-			t.Errorf("退路建的子目录 %s 没同步回 Mac：Mac 清单=%s", sub, jsonOf(mapKeys(macAll)))
+		subs, err := os.ReadDir(subRoot)
+		if err != nil {
+			t.Errorf("读 Mac 上的退路子目录失败：%v", err)
 		}
-		t.Logf("S20 走的是退路 /add -project --parent（建子目录当写操作），子目录 %s 已到 Mac（%d 项）", sub, found)
+		if len(subs) == 0 {
+			t.Errorf("退路子目录 %s 里没有标准子目录（没同步过来？）", subRoot)
+		}
+		t.Logf("S20 走的是退路 /add -project --parent（建子目录当写操作），子目录 %s 已到 Mac（标准子目录 %d 个）", subRoot, len(subs))
 	}
 
 	// 一致性：按 projsync 同步规则过滤两侧后再比，必须完全一致（含历史版本里该同步的快照/台账、退路的子目录）。

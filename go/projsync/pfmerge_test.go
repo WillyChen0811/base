@@ -744,6 +744,163 @@ func TestPFMergeSamePostCheckKeepsWhenCannotPutBack(t *testing.T) {
 	})
 }
 
+// ── 评审 20-2：路径中间目录是符号链接时不穿过去 ──────────────────────
+
+// 目标树里的中间目录是链接（指向另一个项目）：对完整路径 stat 会穿过去判成 move，文件就进了别的项目。
+// 现在这一条 ask，别的项目一个字不动。
+func TestPFMergeTargetIntermediateSymlinkAsk(t *testing.T) {
+	f := pfMergeSetup(t)
+	f.put(f.work, "src/资料/报告.pdf", "来源报告")
+	f.put(f.work, "src/普通.txt", "普通")
+	f.put(f.work, "other/占位.txt", "别的项目")
+	if err := os.MkdirAll(filepath.Join(f.work, "dst"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(f.work, "other"), filepath.Join(f.work, "dst", "资料")); err != nil {
+		t.Fatal(err)
+	}
+	plan, err := PFMergePlan(f.cfg(), "src", "dst")
+	if err != nil {
+		t.Fatal(err)
+	}
+	it, ok := pfMergeHas(plan.Items, "资料/报告.pdf")
+	if !ok || it.Action != PFMergeAsk || !strings.Contains(it.Reason, "符号链接") {
+		t.Fatalf("目标中间目录是链接，这一条应 ask 并说明链接: %+v", plan.Items)
+	}
+	if it, ok := pfMergeHas(plan.Items, "普通.txt"); !ok || it.Action != PFMergeMove {
+		t.Errorf("不受影响的文件仍应 move: %+v", plan.Items)
+	}
+	res, err := PFMergeRun(context.Background(), f.cfg(), "src", "dst", plan.Fingerprint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(filepath.Join(f.work, "other", "报告.pdf")); err == nil {
+		t.Fatal("文件不能穿过链接写进别的项目")
+	}
+	if got := readFile(t, filepath.Join(f.work, "src", "资料", "报告.pdf")); got != "来源报告" {
+		t.Errorf("来源必须留在原处: %q", got)
+	}
+	if got := readFile(t, filepath.Join(f.work, "dst", "普通.txt")); got != "普通" {
+		t.Errorf("其它条目照常: %q", got)
+	}
+	if _, ok := pfMergeHas(res.Skipped, "资料/报告.pdf"); !ok {
+		t.Errorf("应列进 Skipped: %+v", res)
+	}
+}
+
+// 执行时现查：计划时目录是真实的，计划之后（挪这一条之前）目标里的目录被换成链接 → 这一条 ask，不穿过去。
+func TestPFMergeRunRecheckChainAtMoveTime(t *testing.T) {
+	f := pfMergeSetup(t)
+	f.put(f.work, "src/资料/报告.pdf", "来源报告")
+	f.put(f.work, "dst/资料/已有.txt", "目标已有")
+	f.put(f.work, "other/占位.txt", "别的项目")
+	cfg := f.cfg()
+	plan, err := PFMergePlan(cfg, "src", "dst")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if it, ok := pfMergeHas(plan.Items, "资料/报告.pdf"); !ok || it.Action != PFMergeMove {
+		t.Fatalf("起始计划应是 move: %+v", plan.Items)
+	}
+	cfg.stepHook = func(stage, arg string) {
+		if stage == "move:start" {
+			dir := filepath.Join(f.work, "dst", "资料")
+			_ = os.RemoveAll(dir)
+			_ = os.Symlink(filepath.Join(f.work, "other"), dir)
+		}
+	}
+	res, err := PFMergeRun(context.Background(), cfg, "src", "dst", plan.Fingerprint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(filepath.Join(f.work, "other", "报告.pdf")); err == nil {
+		t.Fatal("执行时目录变成链接，文件不能穿过去")
+	}
+	if _, ok := pfMergeHas(res.Skipped, "资料/报告.pdf"); !ok || len(res.Applied) != 0 {
+		t.Errorf("这一条应 ask 不动: %+v", res)
+	}
+	if got := readFile(t, filepath.Join(f.work, "src", "资料", "报告.pdf")); got != "来源报告" {
+		t.Errorf("来源必须留在原处: %q", got)
+	}
+}
+
+// 来源、目标路径在工作目录下的上级目录是链接：整个合并不做。
+func TestPFMergeRootAncestorSymlinkRejected(t *testing.T) {
+	f := pfMergeSetup(t)
+	f.put(f.work, "real-year/260403J0001-来源/a.txt", "A")
+	f.put(f.work, "real-year/260403J0001-目标/b.txt", "B")
+	if err := os.Symlink(filepath.Join(f.work, "real-year"), filepath.Join(f.work, "2026")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := PFMergePlan(f.cfg(), "2026/260403J0001-来源", "real-year/260403J0001-目标"); err == nil || !strings.Contains(err.Error(), "上级路径不安全") {
+		t.Errorf("来源上级是链接应拒绝: %v", err)
+	}
+	if _, err := PFMergePlan(f.cfg(), "real-year/260403J0001-来源", "2026/260403J0001-目标"); err == nil || !strings.Contains(err.Error(), "上级路径不安全") {
+		t.Errorf("目标上级是链接应拒绝: %v", err)
+	}
+	// 来源根本身是链接：不是目录，拒绝
+	if err := os.Symlink(filepath.Join(f.work, "real-year", "260403J0001-来源"), filepath.Join(f.work, "link-src")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := PFMergePlan(f.cfg(), "link-src", "real-year/260403J0001-目标"); err == nil {
+		t.Error("来源根是链接应拒绝")
+	}
+}
+
+// 目标根是链接：没登记的链接（指向别的项目）一律拒绝；登记了但链接指向的不是登记的同步位置也拒绝；
+// 指向登记位置的才接受。
+func TestPFMergeTargetRootSymlinkOnlyRegisteredSyncPath(t *testing.T) {
+	f := pfMergeSetup(t)
+	f.put(f.work, "src/a.txt", "A")
+	f.put(f.work, "other-project/x.txt", "别的项目")
+	// 没登记的链接
+	if err := os.Symlink(filepath.Join(f.work, "other-project"), filepath.Join(f.work, "dst-link")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := PFMergePlan(f.cfg(), "src", "dst-link"); err == nil || !strings.Contains(err.Error(), "不是已登记的同步单元") {
+		t.Fatalf("没登记的目标链接应拒绝: %v", err)
+	}
+
+	// 登记了，但链接指向别处（不是登记的 SyncPath）
+	code := "260403J0812"
+	rel := "2026/" + code + "-目标"
+	f.put(f.sync, rel+"/a.txt", "同步位置")
+	link := filepath.Join(f.work, filepath.FromSlash(rel))
+	if err := os.MkdirAll(filepath.Dir(link), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(f.work, "other-project"), link); err != nil {
+		t.Fatal(err)
+	}
+	rec := PFUnitRecord{Code: code, Rel: rel, State: PFUnitSyncing,
+		LinkPath: link, SyncPath: filepath.Join(f.sync, filepath.FromSlash(rel)), StartedAt: f.now}
+	pfWriteUnits(t, f.meta, []PFUnitRecord{rec})
+	if _, err := PFMergePlan(f.cfg(), "src", rel); err == nil || !strings.Contains(err.Error(), "与登记的同步位置") {
+		t.Fatalf("链接指向别处应拒绝: %v", err)
+	}
+
+	// 链接改成指向登记位置：接受
+	if err := os.Remove(link); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(f.sync, filepath.FromSlash(rel)), link); err != nil {
+		t.Fatal(err)
+	}
+	plan, err := PFMergePlan(f.cfg(), "src", rel)
+	if err != nil {
+		t.Fatalf("指向登记位置的链接应接受: %v", err)
+	}
+	if !plan.TargetSync || plan.TargetUnit != code {
+		t.Errorf("应认出同步单元: %+v", plan)
+	}
+	// 登记状态是 stopped 时不该再有链接：当链接拒绝
+	rec.State = PFUnitStopped
+	pfWriteUnits(t, f.meta, []PFUnitRecord{rec})
+	if _, err := PFMergePlan(f.cfg(), "src", rel); err == nil {
+		t.Error("单元已 stopped 还是链接，应拒绝")
+	}
+}
+
 // ── 小工具 ──────────────────────────────────────────────
 
 func hasStr(ss []string, s string) bool {

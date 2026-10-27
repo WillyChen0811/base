@@ -78,6 +78,7 @@ type PFMergeConfig struct {
 	//   "same:before-verify"  same 回收前核对之前（arg = 来源绝对路径）
 	//   "same:before-place"   same 核对通过、放进回收区之前（arg = 来源绝对路径）
 	//   "same:after-place"    same 刚放进回收区、放后核对之前（arg = 来源原绝对路径，此时那里已空）
+	//   "move:start"          move/rename 一条开始、检查两棵树的目录链之前（arg = 来源绝对路径）
 	//   "dir:before-place"    空目录检查通过、放进回收区之前（arg = 目录绝对路径）
 	//   "dir:after-place"     空目录刚放进回收区、复查之前（arg = 它在回收区里的绝对路径）
 	stepHook func(stage, arg string)
@@ -166,6 +167,21 @@ type pfMergeCtx struct {
 	unitCode  string // 目标已登记单元的编号
 	targetSyn bool // 目标是经链接同步中的单元
 	notes     []string
+	chainMemo map[string]string // 计划阶段 chainProblem 的缓存（root\x00dirRel → 结果）；执行阶段不用它，每次现查
+}
+
+// chainCached 是计划阶段用的 chainProblem：同一个目录的结果只查一次。
+func (m *pfMergeCtx) chainCached(root, dirRel string) string {
+	k := root + "\x00" + dirRel
+	if v, ok := m.chainMemo[k]; ok {
+		return v
+	}
+	if m.chainMemo == nil {
+		m.chainMemo = map[string]string{}
+	}
+	v := m.chainProblem(root, dirRel)
+	m.chainMemo[k] = v
+	return v
 }
 
 // PFMergePlan 只读出计划：不建目录、不挪文件、不进回收区。
@@ -276,6 +292,14 @@ func pfMergePrepare(cfg PFMergeConfig, fromRel, toRel string) (*pfMergeCtx, erro
 			return nil, fmt.Errorf("projsync: 来源 %s 是已登记的同步单元（正在同步），不能当合并来源", fr)
 		}
 	}
+	// 来源、目标在工作目录下的上级路径逐级 lstat：任何一级是链接（或不是真实目录）都不合并——
+	// 对完整路径 stat 会穿过中间的链接，文件会被挪到别的项目里。
+	if prob := m.chainProblem(cfg.WorkDir, path.Dir(fr)); prob != "" {
+		return nil, fmt.Errorf("projsync: 合并来源 %s 的上级路径不安全，不合并：%s", fr, prob)
+	}
+	if prob := m.chainProblem(cfg.WorkDir, path.Dir(tr)); prob != "" {
+		return nil, fmt.Errorf("projsync: 合并目标 %s 的上级路径不安全，不合并：%s", tr, prob)
+	}
 	fromRoot := filepath.Join(cfg.WorkDir, filepath.FromSlash(fr))
 	st, err := cfg.Stat(fromRoot)
 	if err != nil {
@@ -289,7 +313,17 @@ func pfMergePrepare(cfg PFMergeConfig, fromRel, toRel string) (*pfMergeCtx, erro
 	}
 	m.fromRoot = fromRoot
 
-	// 目标：工作目录下的 to，若是指向同步目录的链接（已同步单元）→ 按链接解析到真实位置算。
+	// 目标登记：登记表里有同 rel 且不是 stopped → 是正在同步的单元（stopped：目录已挪回桌面，当普通目录合并）。
+	var reg *PFUnitRecord
+	for i := range units {
+		if units[i].Rel == tr && units[i].State != PFUnitStopped {
+			reg = &units[i]
+			break
+		}
+	}
+
+	// 目标：工作目录下的 to。是真实目录就按它算；是符号链接，只有它指向的位置正好是登记单元的 SyncPath
+	// （同步目录里的真实位置）才接受，其它任何链接（指向别的项目、别的盘…）一律不合并。
 	toLink := filepath.Join(cfg.WorkDir, filepath.FromSlash(tr))
 	tst, err := cfg.Stat(toLink)
 	if err != nil {
@@ -299,10 +333,26 @@ func pfMergePrepare(cfg PFMergeConfig, fromRel, toRel string) (*pfMergeCtx, erro
 		return nil, fmt.Errorf("projsync: 读合并目标 %s 失败: %w", tr, err)
 	}
 	toReal := toLink
-	if tst.Kind == PFKindSymlink {
+	switch tst.Kind {
+	case PFKindSymlink:
+		if reg == nil || reg.SyncPath == "" {
+			return nil, fmt.Errorf("projsync: 合并目标 %s 是符号链接，但它不是已登记的同步单元，不合并（链接可能指到别的项目里）", tr)
+		}
 		rp, err := filepath.EvalSymlinks(toLink)
 		if err != nil {
 			return nil, fmt.Errorf("projsync: 合并目标 %s 是指向别处的链接，解析失败（要能读到同步目录里的真实位置才能合并）: %w", tr, err)
+		}
+		want, err := filepath.EvalSymlinks(reg.SyncPath)
+		if err != nil {
+			return nil, fmt.Errorf("projsync: 登记的同步位置 %s 解析失败，不合并: %w", reg.SyncPath, err)
+		}
+		if !pfumUnder(rp, want) || !pfumUnder(want, rp) {
+			return nil, fmt.Errorf("projsync: 合并目标 %s 的链接指向 %s，与登记的同步位置 %s 不一致，不合并", tr, rp, reg.SyncPath)
+		}
+		if cfg.SyncDir != "" {
+			if sd, err := filepath.EvalSymlinks(cfg.SyncDir); err != nil || !pfumUnder(rp, sd) {
+				return nil, fmt.Errorf("projsync: 合并目标 %s 解析到 %s，不在同步目录 %s 里，不合并", tr, rp, cfg.SyncDir)
+			}
 		}
 		toReal = rp
 		m.targetSyn = true
@@ -314,23 +364,45 @@ func pfMergePrepare(cfg PFMergeConfig, fromRel, toRel string) (*pfMergeCtx, erro
 		if rst.Kind != PFKindDir {
 			return nil, fmt.Errorf("projsync: 合并目标 %s 指向的位置不是目录", tr)
 		}
+	case PFKindDir:
+	default:
+		return nil, fmt.Errorf("projsync: 合并目标 %s 不是目录", tr)
 	}
 	m.toRoot = toReal
-
-	// 目标已登记单元：认出编号（执行期间拿它的锁）；登记的 SyncPath 若与解析位置不同，以磁盘解析为准并提示。
-	for _, u := range units {
-		if u.Rel == tr {
-			m.unitCode = u.Code
-			if u.State != PFUnitSyncing && u.State != PFUnitStarting && u.State != PFUnitStopping {
-				// stopped：目录已挪回桌面，不再是同步单元，不锁、当普通目录合并。
-				m.unitCode = ""
-			} else if u.SyncPath != "" && filepath.Clean(u.SyncPath) != filepath.Clean(toReal) && m.targetSyn {
-				m.notes = append(m.notes, fmt.Sprintf("登记里的同步位置 %s 与磁盘解析 %s 不同，按磁盘上实际指向的位置合并", u.SyncPath, toReal))
-			}
-			break
-		}
+	if reg != nil {
+		m.unitCode = reg.Code // 目标是已登记单元：执行期间拿它的锁
 	}
 	return m, nil
+}
+
+// chainProblem 逐级 lstat root 之下 dirRel（/ 分隔；空或 "." 表示 root 本身）的每一级目录：
+// 每一级都必须是真实目录，是符号链接或别的东西就返回一句话说明；某一级不存在则往下都不存在，没有问题（run 时建的是真实目录）；
+// 读不了（不是「不存在」）也算问题——不明的状态不能当正常处理。root 本身不查（它是配置给的或已逐级查过的）。
+func (m *pfMergeCtx) chainProblem(root, dirRel string) string {
+	if dirRel == "" || dirRel == "." {
+		return ""
+	}
+	cur := root
+	var seen []string
+	for _, seg := range strings.Split(dirRel, "/") {
+		cur = filepath.Join(cur, seg)
+		seen = append(seen, seg)
+		st, err := m.cfg.Stat(cur)
+		if err != nil {
+			if errors.Is(err, fs.ErrNotExist) {
+				return ""
+			}
+			return fmt.Sprintf("读 %s 失败（%v）", strings.Join(seen, "/"), err)
+		}
+		switch st.Kind {
+		case PFKindDir:
+		case PFKindSymlink:
+			return fmt.Sprintf("%s 是符号链接，路径会穿过它到别处", strings.Join(seen, "/"))
+		default:
+			return fmt.Sprintf("%s 不是目录", strings.Join(seen, "/"))
+		}
+	}
+	return ""
 }
 
 // pfMergeRel 校验并清洗一段相对路径：非空、不含控制字符、不是绝对路径、没有 .. / . 段、无空段，规范化成 / 分隔。
@@ -481,6 +553,18 @@ func (m *pfMergeCtx) classifyFile(dirRel, rel, base string, rawNames []string, t
 		it.Reason = "是特殊文件（FIFO/socket/设备），不动"
 		return it, nil
 	}
+	// 两棵树里这个文件所在目录的每一级都得是真实目录：中间有链接，对完整路径的 stat 会穿过去，
+	// 文件会被挪进别的项目里。一律不动，列出来。
+	if prob := m.chainCached(m.fromRoot, dirRel); prob != "" {
+		it.Action, it.ask = PFMergeAsk, true
+		it.Reason = "来源里它的上级目录有问题（" + prob + "），不动"
+		return it, nil
+	}
+	if prob := m.chainCached(m.toRoot, dirRel); prob != "" {
+		it.Action, it.ask = PFMergeAsk, true
+		it.Reason = "目标里同路径的上级目录有问题（" + prob + "），不动"
+		return it, nil
+	}
 	// Office 锁：自身是锁文件，或同目录里有保护它的锁 → 不动。
 	if pfumIsOfficeLock(base) {
 		it.Action, it.ask = PFMergeAsk, true
@@ -595,11 +679,32 @@ func (m *pfMergeCtx) run(ctx context.Context, plan PFMergePlanResult, rc *PFRecy
 	}
 }
 
+// checkChains 执行时现查两棵树里这一条所在目录的每一级：有链接（或读不了）返回 *pfMergeAskErr，这一条不动。
+func (m *pfMergeCtx) checkChains(it PFMergeItem) error {
+	if prob := m.chainProblem(m.fromRoot, path.Dir(it.Rel)); prob != "" {
+		return &pfMergeAskErr{reason: "来源里它的上级目录有问题（" + prob + "），不动，请你定"}
+	}
+	if prob := m.chainProblem(m.toRoot, path.Dir(it.DestRel)); prob != "" {
+		return &pfMergeAskErr{reason: "目标里的上级目录有问题（" + prob + "），不动，请你定"}
+	}
+	return nil
+}
+
 // moveOne 不覆盖地挪一个文件：父目录不存在就建；目标已存在（竞态）返回错误、来源原地不动。
 func (m *pfMergeCtx) moveOne(it PFMergeItem, res *PFMergeRunResult) error {
 	src := filepath.Join(m.fromRoot, filepath.FromSlash(it.Rel))
 	dst := filepath.Join(m.toRoot, filepath.FromSlash(it.DestRel))
+	if m.cfg.stepHook != nil {
+		m.cfg.stepHook("move:start", src)
+	}
+	if err := m.checkChains(it); err != nil {
+		return err
+	}
 	if err := pfMkdirAllSync(filepath.Dir(dst), pfDirPerm); err != nil {
+		return err
+	}
+	// 建完父目录、改名之前再查一次：中间任何一级被换成链接就不挪。
+	if err := m.checkChains(it); err != nil {
 		return err
 	}
 	// 再确认 src 还在且仍是普通文件（不跟随链接）。
@@ -698,6 +803,9 @@ func (m *pfMergeCtx) recycleSame(rc *PFRecycle, now time.Time, it PFMergeItem, r
 	dst := filepath.Join(m.toRoot, filepath.FromSlash(it.DestRel))
 	if m.cfg.stepHook != nil {
 		m.cfg.stepHook("same:before-verify", src)
+	}
+	if err := m.checkChains(it); err != nil {
+		return err
 	}
 	st, dstSt, wantMD5, err := m.verifySame(src, dst)
 	if err != nil {
@@ -819,6 +927,12 @@ func (m *pfMergeCtx) recycleEmptyDirs(rc *PFRecycle, now time.Time, plan PFMerge
 		st, err := m.cfg.Stat(dirAbs)
 		if err != nil || st.Kind != PFKindDir {
 			continue // 没了或不是目录：不用回收
+		}
+		if d != "." {
+			if prob := m.chainProblem(m.fromRoot, path.Dir(d)); prob != "" {
+				res.Residue = append(res.Residue, fmt.Sprintf("空目录 %s 的上级路径有问题（%s），不放进回收区（留在原处）", d, prob))
+				continue
+			}
 		}
 		ents, err := os.ReadDir(dirAbs)
 		if err != nil || len(ents) > 0 {

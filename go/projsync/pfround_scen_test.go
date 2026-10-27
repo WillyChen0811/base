@@ -354,8 +354,9 @@ func TestPFRoundUncertainFromPrimitive(t *testing.T) {
 	// 下一轮：c1 两边一样，只补 base；c2、c3 正常下载
 	r2 := f.mustDone(f.run())
 	f.mustSame()
-	if r2.BytesDown != int64(len("二\n")+len("三\n")) {
-		t.Fatalf("下一轮只该传 c2、c3: 下载 %d", r2.BytesDown)
+	// c2、c3 在上一轮已经提前传进了暂存区（核验过的 part 保留），这一轮复用，最多再传它们两个
+	if r2.BytesDown > int64(len("二\n")+len("三\n")) {
+		t.Fatalf("下一轮最多只该传 c2、c3: 下载 %d", r2.BytesDown)
 	}
 	f.settled()
 }
@@ -731,3 +732,28 @@ func pfrdMust(t *testing.T, err error) {
 	}
 }
 
+
+// Ubuntu 上新建的项目：Mac 这边连单元目录（和年份目录）都还没有，按首次规则建出来并全部取回。
+func TestPFRoundUbuntuNewProject(t *testing.T) {
+	f := newPFRDFix(t)
+	f.ubPut("报告/甲.docx", "甲\n", pfrtOld)
+	f.ubPut("乙.txt", "乙\n", pfrtOld)
+	pfrdMust(t, os.MkdirAll(f.ub.abs("空目录"), 0o755))
+	if _, err := os.Lstat(f.root); err == nil {
+		t.Fatal("前提：Mac 上还没有这个单元目录")
+	}
+	r := f.mustDone(f.run())
+	if !r.FirstTime || r.BytesDown == 0 || r.BytesUp != 0 {
+		t.Fatalf("应全部取回:\n%s", pfrdDump(r))
+	}
+	f.mustSame()
+	if fi, err := os.Stat(f.macAbs("空目录")); err != nil || !fi.IsDir() {
+		t.Fatalf("空目录也该建出来: %v", err)
+	}
+	if m := f.loadBase().Meta(); m.MacDirID.Ino == 0 || m.UbuntuDirID.Ino == 0 {
+		t.Fatalf("两边单元目录的 ino 都该记下，否则下一轮会误触发 G2: %+v", m)
+	}
+	if r2 := f.settled(); r2.FirstTime {
+		t.Fatal("第二轮不该再按首次规则")
+	}
+}

@@ -605,11 +605,27 @@ func TestProjfilesHTTPNotConfigured(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	f := newFixture(t, nil)
 	st, _, _ := run(t, f.dir)
+	// 没 projfiles 段不再 404：状态照常回，enabled=false（设置文件缺省关）并说清缺什么
 	resp, b := pfHTTPDo(t, "http://"+st.HTTP, http.MethodGet, "/projfiles/status?token="+st.Token, "", "")
-	if resp.StatusCode != http.StatusNotFound || !strings.Contains(string(b), "项目文件同步") {
-		t.Fatalf("没配置应 404 说清楚: %d %s", resp.StatusCode, b)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("没配这段 /projfiles/status 也不该 404: %d %s", resp.StatusCode, b)
 	}
-	if _, err := os.Stat(filepath.Join(os.Getenv("HOME"), ".xxyi", projfilesAPIFileName)); err == nil {
-		t.Error("没配置 projfiles 时不该写 api.json")
+	var sv map[string]any
+	if err := json.Unmarshal(b, &sv); err != nil {
+		t.Fatalf("状态不是 JSON: %s", b)
+	}
+	if sv["enabled"] != false {
+		t.Errorf("没这段时 enabled 应缺省关: %v", sv["enabled"])
+	}
+	if gap, _ := sv["config_gap"].(string); !strings.Contains(gap, "host") {
+		t.Errorf("config_gap 应说清缺 host: %v", sv["config_gap"])
+	}
+	if from, _ := sv["host_from"].(string); from != "settings" {
+		t.Errorf("没这段时 host 来源应是 settings: %v", sv["host_from"])
+	}
+	// api.json 照样写：XXYI 的窗口靠它找到接口
+	p := filepath.Join(os.Getenv("HOME"), ".xxyi", projfilesAPIFileName)
+	if _, err := os.Stat(p); err != nil {
+		t.Errorf("没配置 projfiles 时也该写 api.json 让窗口能用: %v", err)
 	}
 }

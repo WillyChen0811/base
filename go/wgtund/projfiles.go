@@ -3,8 +3,10 @@ package wgtund
 // projfiles.go：项目文件同步（projfiles）接进 wgtund——配置、设置文件、定时、网络状态（T11a）。
 //
 // 一轮的实际工作全在 projsync.PFSched（它不知道 SSH）；这里只负责：
-//   - hosts.json 的 projfiles 段（与 projsync 同级，缺省关闭；校验方式照 prepareProjsync）；
-//     缺这段或 enabled=false → 服务不跑；
+//   - hosts.json 的 projfiles 段（与 projsync 同级，校验方式照 prepareProjsync）：
+//     有这段 → 段里的值优先（remote_root 仍设置文件优先，见 f328455c），enabled=false 整体关掉；
+//     没这段 → 服务照样创建、接口照样挂（XXYI 的窗口要能显示「没启用/缺什么」），host/remote_root/remote_meta
+//     每轮从设置文件取，总开关是设置文件的 enabled（缺省关：服务空转、不连 Ubuntu）；
 //   - 每轮开始读 ~/.xxyi/projfiles-settings.json（Python 服务写），转成 PFSchedSettings 调 SetSettings、
 //     限速调 PFTransfer.SetLimit；文件不在、读不了、JSON 或某个键不合法 → 整份回落缺省值并在状态里报告；
 //   - 定时：网好每 poll_seconds、热点或未知每 poll_seconds_expensive、断网不跑；启动后 10 秒先跑一轮；
@@ -42,9 +44,9 @@ const (
 	// projfilesNetStale 是网络上报的有效期，超过它按「未知」（热点）对待；与 projsync 的缺省一致。
 	projfilesNetStale = 3 * time.Minute
 
-	projfilesMinPollSeconds = 5      // poll_seconds 的下限，小于它按它算
-	projfilesMaxPollSeconds = 86400  // 秒数上限（一天）
-	projfilesMaxRecycleDays = 3650   // 与 Ubuntu 的 recycle_clean 一致
+	projfilesMinPollSeconds = 5     // poll_seconds 的下限，小于它按它算
+	projfilesMaxPollSeconds = 86400 // 秒数上限（一天）
+	projfilesMaxRecycleDays = 3650  // 与 Ubuntu 的 recycle_clean 一致
 
 	projfilesMetaDirName    = "projfiles"
 	projfilesSettingsName   = "projfiles-settings.json"
@@ -84,6 +86,10 @@ type projfilesPrep struct {
 	metaDir      string // ~/.xxyi/projfiles：units.json、staging、回收、status 都在里面
 	settingsPath string // ~/.xxyi/projfiles-settings.json
 	statusPath   string // ~/.xxyi/projfiles/status/_round.json
+	// fromSettings：hosts.json 没写 projfiles 段——host/remote_root/remote_meta 不再固定在 prep 里，
+	// 每轮从设置文件取（effRemote），缺项/不合法这一轮不跑并写明原因；总开关是设置文件的 enabled（缺省关）。
+	fromSettings bool
+	hosts        map[string]hostConf // 没这段时用来每轮校验 host：必须在 hosts 里且有 identity_files
 }
 
 var (
@@ -93,12 +99,36 @@ var (
 	projfilesCoordRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$`)
 )
 
-// prepareProjfiles 校验 projfiles 段并补缺省；没配这段返回 nil（服务不启动）。
-// 错误信息以「hosts.json: projfiles」开头，照 prepareProjsync 的写法。
+// prepareProjfiles 校验 projfiles 段并补缺省。没配这段不再返回 nil，而是返回 fromSettings 模式的 prep：
+// 服务和 /projfiles/* 照样起（XXYI 的设置窗口要能显示「没启用/缺什么」），host/remote_root/remote_meta
+// 每轮从设置文件取，总开关是设置文件里的 enabled（缺省 false）。错误信息以「hosts.json: projfiles」开头。
 func prepareProjfiles(c *fileConf) (*projfilesPrep, error) {
 	pc := c.Projfiles
 	if pc == nil {
-		return nil, nil
+		// 没这段：路径与缺省照有这段时算好；host/remote_root/remote_meta 留空，每轮由设置文件补。
+		dir, err := xxyiDir()
+		if err != nil {
+			return nil, fmt.Errorf("hosts.json: projfiles %v", err)
+		}
+		coordHost, err := os.Hostname()
+		if err != nil {
+			return nil, fmt.Errorf("hosts.json: projfiles 取不到本机主机名（请补 projfiles 段并写 coord_id）: %v", err)
+		}
+		coordID := projfilesCoordFromHost(coordHost)
+		if coordID == "" {
+			return nil, fmt.Errorf("hosts.json: projfiles 本机主机名 %q 整理不成 coord_id（请补 projfiles 段并写 coord_id）", coordHost)
+		}
+		hosts := make(map[string]hostConf, len(c.Hosts))
+		for i := range c.Hosts {
+			hosts[c.Hosts[i].Name] = c.Hosts[i]
+		}
+		return &projfilesPrep{
+			fromSettings: true, hosts: hosts,
+			xxyiMsg: defaultProjfilesXxyiMsg, coordID: coordID, coordHost: coordHost,
+			metaDir:      filepath.Join(dir, projfilesMetaDirName),
+			settingsPath: filepath.Join(dir, projfilesSettingsName),
+			statusPath:   filepath.Join(dir, projfilesMetaDirName, "status", projfilesStatusFileName),
+		}, nil
 	}
 	bad := func(format string, a ...any) error {
 		return fmt.Errorf("hosts.json: projfiles "+format, a...)
@@ -186,8 +216,11 @@ func projfilesCoordFromHost(h string) string {
 // projfilesSettings 是 ~/.xxyi/projfiles-settings.json（Python 服务写）。
 type projfilesSettings struct {
 	Enabled              bool   `json:"enabled"`
-	WorkDir              string `json:"work_dir"` // 桌面 Projects（单元搬运器的工作目录）
-	SyncDir              string `json:"sync_dir"` // 正位目录
+	WorkDir              string `json:"work_dir"`    // 桌面 Projects（单元搬运器的工作目录）
+	SyncDir              string `json:"sync_dir"`    // 正位目录
+	RemoteRoot           string `json:"remote_root"` // Ubuntu 同步根（绝对路径）；有段时空 = 用 hosts.json 里的（兼容老配置）
+	Host                 string `json:"host"`        // hosts.json 里的主机名；只在没这段时生效（每轮校验）
+	RemoteMeta           string `json:"remote_meta"` // Ubuntu 同步记录目录（绝对路径）；只在没这段时生效
 	PollSeconds          int    `json:"poll_seconds"`
 	PollSecondsExpensive int    `json:"poll_seconds_expensive"`
 	MaxSecondsExpensive  int    `json:"max_seconds_expensive"`
@@ -201,7 +234,7 @@ type projfilesSettings struct {
 // projfilesDefaults 是设置文件的缺省值。enabled 缺省开：真正的总开关在 hosts.json 的 projfiles.enabled。
 func projfilesDefaults() projfilesSettings {
 	return projfilesSettings{
-		Enabled: true,
+		Enabled:     true,
 		PollSeconds: projfilesDefaultPollSeconds, PollSecondsExpensive: projfilesDefaultPollExpensiveSeconds,
 		MaxSecondsExpensive: projfilesDefaultMaxExpensiveSeconds, MaxSecondsUser: projfilesDefaultMaxUserSeconds,
 		RecycleDays: projfilesDefaultRecycleDays, QuietSeconds: projfilesDefaultQuietSeconds,
@@ -223,6 +256,9 @@ func loadProjfilesSettings(path string) (projfilesSettings, []string) {
 		Enabled              *bool   `json:"enabled"`
 		WorkDir              *string `json:"work_dir"`
 		SyncDir              *string `json:"sync_dir"`
+		RemoteRoot           *string `json:"remote_root"`
+		Host                 *string `json:"host"`
+		RemoteMeta           *string `json:"remote_meta"`
 		PollSeconds          *int    `json:"poll_seconds"`
 		PollSecondsExpensive *int    `json:"poll_seconds_expensive"`
 		MaxSecondsExpensive  *int    `json:"max_seconds_expensive"`
@@ -296,6 +332,61 @@ func loadProjfilesSettings(path string) (projfilesSettings, []string) {
 			continue
 		}
 		*f.out = filepath.Clean(p)
+	}
+	// remote_root 是 Ubuntu 上的绝对路径：校验走远端规则（不是本地路径，不做 ~ 展开）。
+	// 合法就用它；不合法或没写就留空——留空表示「用 hosts.json 里的 remote_root」（兼容老配置）。
+	if raw.RemoteRoot != nil {
+		v := strings.TrimSpace(*raw.RemoteRoot)
+		switch {
+		case v == "":
+			// 空 = 交回 hosts.json，不算问题
+		case !strings.HasPrefix(v, "/") || strings.Contains(v, "..") || !projRemoteRe.MatchString(v):
+			problems = append(problems, fmt.Sprintf("remote_root=%q 不是合法的远端绝对路径（必须以 / 开头、只允许字母数字和 . _ / -、不能含 ..），这项留空改用 hosts.json 里的 remote_root", *raw.RemoteRoot))
+		default:
+			st.RemoteRoot = projfilesCleanRemote(v)
+		}
+	}
+	// host 与 remote_meta 只在 hosts.json 没这段时生效（见 settingsModeGap）；host 是名字不是路径，
+	// 「在不在 hosts 里、有没有私钥」由每轮的 settingsModeGap 拿 hosts 来判，这里只去空白。
+	if raw.Host != nil {
+		st.Host = strings.TrimSpace(*raw.Host)
+	}
+	if raw.RemoteMeta != nil {
+		v := strings.TrimSpace(*raw.RemoteMeta)
+		switch {
+		case v == "":
+			// 空 = 交回 hosts.json 的 remote_meta（有这段时本来就用段里的），不算问题
+		case !strings.HasPrefix(v, "/") || strings.Contains(v, "..") || !projRemoteRe.MatchString(v):
+			problems = append(problems, fmt.Sprintf("remote_meta=%q 不合规：必须以 / 开头、只允许字母数字和 . _ / -、不能含 ..", *raw.RemoteMeta))
+		default:
+			st.RemoteMeta = projfilesCleanRemote(v)
+		}
+	}
+	return st, problems
+}
+
+// settingsHasEnabled 只看设置文件里有没有显式写 enabled 键（文件不在/解不开都算没有）。
+// 没这段时总开关以设置文件为准、缺省关，不能用 projfilesDefaults 的 true。
+func settingsHasEnabled(path string) bool {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	var raw struct {
+		Enabled *bool `json:"enabled"`
+	}
+	if json.Unmarshal(b, &raw) != nil {
+		return false
+	}
+	return raw.Enabled != nil
+}
+
+// loadSettings 读设置文件；没这段（fromSettings）时 enabled 以设置文件为准：
+// 没写这个键（或文件不在/解不开）按 false——服务空转、不连 Ubuntu。有这段时行为一字不变。
+func (s *projfilesSvc) loadSettings() (projfilesSettings, []string) {
+	st, problems := loadProjfilesSettings(s.prep.settingsPath)
+	if s.prep.fromSettings && !settingsHasEnabled(s.prep.settingsPath) {
+		st.Enabled = false
 	}
 	return st, problems
 }
@@ -378,25 +469,35 @@ func (r *projfilesRemoteFS) Chtimes(p string, atime, mtime time.Time) error {
 	return c.Chtimes(p, atime, mtime)
 }
 
-func (r *projfilesRemoteFS) Join(elem ...string) string { return filepath.ToSlash(filepath.Join(elem...)) }
+func (r *projfilesRemoteFS) Join(elem ...string) string {
+	return filepath.ToSlash(filepath.Join(elem...))
+}
 
 // projfilesStatus 是 ~/.xxyi/projfiles/status/_round.json 的内容（T11b 的 HTTP 接口直接用同一份）。
 type projfilesStatus struct {
-	Enabled      bool   `json:"enabled"`
-	Host         string `json:"host"`
-	RemoteRoot   string `json:"remote_root"`
-	RemoteMeta   string `json:"remote_meta"`
-	CoordID      string `json:"coord_id"`
-	CoordHost    string `json:"coord_host"`
-	MetaDir      string `json:"meta_dir"`
-	SettingsPath string `json:"settings_path"`
+	Enabled bool   `json:"enabled"`
+	Host    string `json:"host"`
+	// HostFrom 是 Host 的来源：hosts（hosts.json 的 projfiles 段）/ settings（设置文件；没这段时每轮取）。
+	HostFrom string `json:"host_from"`
+	// RemoteRoot 是当前生效的 Ubuntu 同步根（设置里有合法的就报它，否则报 hosts 里的）。
+	RemoteRoot     string `json:"remote_root"`
+	RemoteRootFrom string `json:"remote_root_from"`
+	RemoteMeta     string `json:"remote_meta"`
+	// RemoteMetaFrom 是 RemoteMeta 的来源，规则同 HostFrom。
+	RemoteMetaFrom string `json:"remote_meta_from"`
+	// ConfigGap 是没这段时设置里缺项/不合法的一句话（原文同 last_action 里的原因）；齐全或有这段时空串。
+	ConfigGap      string `json:"config_gap,omitempty"`
+	CoordID        string `json:"coord_id"`
+	CoordHost      string `json:"coord_host"`
+	MetaDir        string `json:"meta_dir"`
+	SettingsPath   string `json:"settings_path"`
 
-	Net       string     `json:"net"`
-	Running   bool       `json:"running"`
-	NextRun   *time.Time `json:"next_run"`
-	Updated   time.Time  `json:"updated"`
-	IntervalS int        `json:"interval_seconds"` // 当前网络下用的轮询间隔
-	LastAction string    `json:"last_action,omitempty"` // 最近一次到点/唤醒时做了什么或为什么没跑
+	Net        string     `json:"net"`
+	Running    bool       `json:"running"`
+	NextRun    *time.Time `json:"next_run"`
+	Updated    time.Time  `json:"updated"`
+	IntervalS  int        `json:"interval_seconds"`      // 当前网络下用的轮询间隔
+	LastAction string     `json:"last_action,omitempty"` // 最近一次到点/唤醒时做了什么或为什么没跑
 
 	Settings         projfilesSettings `json:"settings"`
 	LimitBps         int64             `json:"limit_bps"` // 当前生效的限速（字节/秒），两方向同值，0 = 不限
@@ -407,6 +508,11 @@ type projfilesStatus struct {
 	// 设置可能已经改了但整套重建还没跑完，报这两个才是真的。
 	ActiveWorkDir string `json:"active_work_dir,omitempty"`
 	ActiveSyncDir string `json:"active_sync_dir,omitempty"`
+	// ActiveRemoteRoot / ActiveRemoteRootFrom：当前实际在用（PFRemoteClient 已绑上）的 Ubuntu 同步根与它的来源。
+	ActiveRemoteRoot     string `json:"active_remote_root,omitempty"`
+	ActiveRemoteRootFrom string `json:"active_remote_root_from,omitempty"`
+	// ActiveHost：当前实际在用（runner 已绑上）的主机；设置改了但还没重建完时报的还是旧主机。
+	ActiveHost string `json:"active_host,omitempty"`
 	// SwitchBusy 非空表示「目录刚改过、整套重建还没完」；这期间 unit/start 等一律拒绝。
 	SwitchBusy   bool   `json:"switch_busy,omitempty"`
 	SwitchReason string `json:"switch_reason,omitempty"`
@@ -441,21 +547,29 @@ type projfilesSvc struct {
 	// rebuildLocked 也走它，这样并发的 getFresh / tick 不会看到半成品。
 	buildMu sync.Mutex
 
-	mu        sync.Mutex
-	remote    *projsync.PFRemoteClient
-	sftpFS    *projfilesRemoteFS
-	transfer  *projsync.PFTransfer
-	mover     *projsync.PFUnitMover
-	sched     *projsync.PFSched
-	built     bool
+	mu       sync.Mutex
+	remote   *projsync.PFRemoteClient
+	sftpFS   *projfilesRemoteFS
+	transfer *projsync.PFTransfer
+	mover    *projsync.PFUnitMover
+	sched    *projsync.PFSched
+	built    bool
 	// builtWork / builtSync：build 发布时实际用的 work_dir/sync_dir，用来对比新一份设置有没有改过目录；
 	// 改了就要整套重建（见 tick 的 rebuildLocked 分支）。
 	builtWork string
 	builtSync string
+	// builtRemote / builtRemoteFrom：build 发布时实际用的 Ubuntu 同步根（remote_root）与它的来源
+	// （settings = 设置文件里有合法的，hosts = 回落到 hosts.json）。改了同样要整套重建（PFRemoteClient.Root 绑死了它）。
+	builtRemote     string
+	builtRemoteFrom string
+	// builtHost / builtMeta：build 发布时实际用的主机与 Ubuntu 同步记录目录。
+	// 有 projfiles 段时恒等于 prep 里的值；没这段时每轮来自设置，改了走同一套切换重建。
+	builtHost  string
+	builtMeta  string
 	// builtGen 每次 build/rebuild 发布成功后 +1；缓存的 PFFresh 靠它认出自己绑的是不是旧一套
 	// （旧 sched 会被关掉，缓存不失效就会拿它继续取最新）。
 	builtGen atomic.Uint64
-	buildErr  string
+	buildErr string
 	// switchBusy 非空表示「work_dir 或 sync_dir 刚改过、整套重建还没跑完」：
 	// 这时 unit/start / unit/stop / unit/create / fresh 一律拒绝，避免对旧目录继续操作。
 	switchBusy string
@@ -515,20 +629,25 @@ func errText(err error) string {
 
 // ── 零件 ────────────────────────────────────────────────
 
-// errProjfilesDirSwitch 是设置里的 work_dir/sync_dir 跟已经建成的那一套不一致、
+// errProjfilesDirSwitch 是设置里的主机/同步根/同步目录/工作目录跟已经建成的那一套不一致、
 // 又不能在调用方那里整套重建时返回的错误：调用方（HTTP）应当回 busy/503，让人稍后再试。
-var errProjfilesDirSwitch = errors.New("同步目录或工作目录刚改过，正在切换，稍后再试")
+var errProjfilesDirSwitch = errors.New("同步主机/同步根/同步目录/工作目录刚改过，正在切换，稍后再试")
 
-// build 建 Ubuntu 客户端、传输器、调度器。work_dir/sync_dir 来自设置文件，所以必须在读到设置之后调。
-// 全程走 buildMu（fix 2：并发只建一套）：
-//   - 已建成且目录没改 → 直接复用；
+// build 建 Ubuntu 客户端、传输器、调度器。work_dir/sync_dir/remote_root 来自设置文件（remote_root 空时回落 hosts），
+// 所以必须在读到设置之后调。全程走 buildMu（fix 2：并发只建一套）：
+//   - 已建成且目录（含 remote_root）没改 → 直接复用；
 //   - 已建成但目录改了 → 返回 errProjfilesDirSwitch（整套重建是 tick 在 acquire 分支里做的事）；
-//   - 还没建成 → 建一套发布出去，并把用过的目录记进 builtWork/builtSync。
+//   - 还没建成 → 建一套发布出去，并把用过的目录与同步根记进 builtWork/builtSync/builtRemote。
 func (s *projfilesSvc) build(st projfilesSettings) error {
 	s.buildMu.Lock()
 	defer s.buildMu.Unlock()
+	cfg := s.effRemote(st)
+	if why := s.settingsModeGap(cfg); why != "" {
+		return errors.New(why) // 没这段且设置不齐：不建、也不报错退出（调用方记进状态）
+	}
 	s.mu.Lock()
-	if s.built && s.builtWork == st.WorkDir && s.builtSync == st.SyncDir {
+	if s.built && s.builtWork == st.WorkDir && s.builtSync == st.SyncDir &&
+		s.builtRemote == cfg.remoteRoot && s.builtHost == cfg.host && s.builtMeta == cfg.remoteMeta {
 		s.mu.Unlock()
 		return nil
 	}
@@ -545,10 +664,15 @@ func (s *projfilesSvc) build(st projfilesSettings) error {
 func (s *projfilesSvc) rebuildLocked(st projfilesSettings) error {
 	s.buildMu.Lock()
 	defer s.buildMu.Unlock()
+	cfg := s.effRemote(st)
+	if why := s.settingsModeGap(cfg); why != "" {
+		return errors.New(why)
+	}
 	s.mu.Lock()
-	if !s.built || (s.builtWork == st.WorkDir && s.builtSync == st.SyncDir) {
+	if !s.built || (s.builtWork == st.WorkDir && s.builtSync == st.SyncDir &&
+		s.builtRemote == cfg.remoteRoot && s.builtHost == cfg.host && s.builtMeta == cfg.remoteMeta) {
 		s.mu.Unlock()
-		return nil // 要么还没建成（build() 处理），要么目录没变（不必重建）
+		return nil // 要么还没建成（build() 处理），要么目录/同步根/主机没变（不必重建）
 	}
 	s.mu.Unlock()
 	return s.buildLocked(st)
@@ -561,15 +685,18 @@ func (s *projfilesSvc) buildLocked(st projfilesSettings) error {
 		if s.pool == nil {
 			return errors.New("没有 SSH 连接池")
 		}
-		runner = newSSHRemoteRunner(s.pool, s.prep.host)
+		runner = newSSHRemoteRunner(s.pool, s.effRemote(st).host)
 	}
+	// 本轮生效的一套远端配置：有 projfiles 段时段里优先（remote_root 设置文件优先）；
+	// 没这段时 host/remote_root/remote_meta 全来自设置文件（build 已挡过缺项，这里一定齐）。
+	cfg := s.effRemote(st)
 	remote := &projsync.PFRemoteClient{
 		Runner: runner, XxyiMsg: s.prep.xxyiMsg,
-		Meta: s.prep.remoteMeta, Root: s.prep.remoteRoot, CoordID: s.prep.coordID, CoordHost: s.prep.coordHost,
+		Meta: cfg.remoteMeta, Root: cfg.remoteRoot, CoordID: s.prep.coordID, CoordHost: s.prep.coordHost,
 	}
 	transfer, err := projsync.NewPFTransfer(projsync.PFTransferConfig{
 		LocalStaging:  filepath.Join(s.prep.metaDir, "staging"),
-		RemoteStaging: projsync.PFRemoteStagingDir(s.prep.remoteMeta),
+		RemoteStaging: projsync.PFRemoteStagingDir(cfg.remoteMeta),
 		Remote:        s.sftpFS,
 		VerifyUp:      remote.TargetVerify(),
 	})
@@ -605,6 +732,8 @@ func (s *projfilesSvc) buildLocked(st projfilesSettings) error {
 	s.remote, s.transfer, s.mover, s.sched = remote, transfer, mover, sched
 	s.built, s.buildErr = true, ""
 	s.builtWork, s.builtSync = st.WorkDir, st.SyncDir
+	s.builtRemote, s.builtRemoteFrom = cfg.remoteRoot, cfg.rootFrom
+	s.builtHost, s.builtMeta = cfg.host, cfg.remoteMeta
 	// 每发布一套新零件 +1：缓存的 PFFresh（绑旧 sched）据此作废重建。跟发布同一把锁里加，
 	// 保证「拿到 sched」和「拿到代次」是同一时刻的快照。
 	s.builtGen.Add(1)
@@ -621,11 +750,14 @@ func (s *projfilesSvc) buildLocked(st projfilesSettings) error {
 	return nil
 }
 
-// needRebuild 看当前设置里的 work_dir/sync_dir 是不是跟 build 用的那一份不同。
+// needRebuild 看当前设置里的 work_dir/sync_dir/生效的 remote_root/host/remote_meta
+// 是不是跟 build 用的那一份不同（没这段时后三者来自设置文件，改了同样要整套重建）。
 func (s *projfilesSvc) needRebuild(st projfilesSettings) bool {
+	cfg := s.effRemote(st)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.built && (s.builtWork != st.WorkDir || s.builtSync != st.SyncDir)
+	return s.built && (s.builtWork != st.WorkDir || s.builtSync != st.SyncDir ||
+		s.builtRemote != cfg.remoteRoot || s.builtHost != cfg.host || s.builtMeta != cfg.remoteMeta)
 }
 
 // switchPending 看服务是不是正在「目录改了但还没整套重建完」的切换期；HTTP 接口用它决定要不要拒绝写请求。
@@ -649,6 +781,83 @@ func (s *projfilesSvc) activeDirs() (string, string) {
 	return s.builtWork, s.builtSync
 }
 
+// activeRemote 报当前实际在用（build 已经绑上 PFRemoteClient）的 Ubuntu 同步根与它的来源（状态接口用）。
+// 没建成时是空串/空来源。
+func (s *projfilesSvc) activeRemote() (string, string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.builtRemote, s.builtRemoteFrom
+}
+
+// effRemoteRoot 算一份设置下「该用哪个」Ubuntu 同步根：设置文件里有合法的就用它（来源 settings），
+// 空则回落到 hosts.json 里的（来源 hosts）。prep 在 prepare 之后不再变，无需加锁。
+// loadProjfilesSettings 已把不合法的 remote_root 清成空串，所以这里的非空值一定合法。
+func (s *projfilesSvc) effRemoteRoot(st projfilesSettings) (string, string) {
+	if st.RemoteRoot != "" {
+		return st.RemoteRoot, "settings"
+	}
+	return s.prep.remoteRoot, "hosts"
+}
+
+// projfilesRemoteCfg 是一份设置下「该用哪套」远端配置（主机、同步根、同步记录目录）与各自来源。
+type projfilesRemoteCfg struct {
+	host       string
+	hostFrom   string // hosts（hosts.json 的 projfiles 段）/ settings（设置文件；没这段时）
+	remoteRoot string
+	rootFrom   string // settings（设置文件里有合法的）/ hosts（回落 hosts.json；没这段时恒 settings）
+	remoteMeta string
+	metaFrom   string // 同 hostFrom
+}
+
+// effRemote 汇总一份设置下生效的远端三件套：有 projfiles 段时 host/remote_meta 用段里的
+// （remote_root 仍设置文件优先，照现有规则）；没这段时三项都取设置文件（不合法的值 load 已清成空）。
+func (s *projfilesSvc) effRemote(st projfilesSettings) projfilesRemoteCfg {
+	if s.prep.fromSettings {
+		return projfilesRemoteCfg{host: st.Host, hostFrom: "settings",
+			remoteRoot: st.RemoteRoot, rootFrom: "settings",
+			remoteMeta: st.RemoteMeta, metaFrom: "settings"}
+	}
+	root, rootFrom := s.effRemoteRoot(st)
+	return projfilesRemoteCfg{host: s.prep.host, hostFrom: "hosts",
+		remoteRoot: root, rootFrom: rootFrom,
+		remoteMeta: s.prep.remoteMeta, metaFrom: "hosts"}
+}
+
+// settingsModeGap 是没这段（fromSettings）时设置里缺项/不合法的第一句原因；齐全（或有这段）返回空串。
+// 缺项/不合法 → 这一轮不跑，原因原文写进状态（LastAction / ConfigGap），不报错退出。
+func (s *projfilesSvc) settingsModeGap(cfg projfilesRemoteCfg) string {
+	if !s.prep.fromSettings {
+		return ""
+	}
+	if cfg.host == "" {
+		return "设置里没有 host"
+	}
+	h, ok := s.prep.hosts[cfg.host]
+	if !ok {
+		return fmt.Sprintf("设置里的 host %q 不在 hosts.json 里", cfg.host)
+	}
+	if len(h.IdentityFiles) == 0 {
+		return fmt.Sprintf("设置里的 host %q 没有 identity_files，SSH 无法选私钥", cfg.host)
+	}
+	if cfg.remoteRoot == "" {
+		return "设置里没有 remote_root"
+	}
+	if cfg.remoteMeta == "" {
+		return "设置里没有 remote_meta"
+	}
+	return ""
+}
+
+// activeHost 报当前实际在用（build 已经绑上 runner）的主机；还没建成时回落到 prep 里的（没这段时为空）。
+func (s *projfilesSvc) activeHost() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.builtHost != "" {
+		return s.builtHost
+	}
+	return s.prep.host
+}
+
 // markSwitchBusy 把服务标成切换期，reason 给人看。
 func (s *projfilesSvc) markSwitchBusy(reason string) {
 	s.mu.Lock()
@@ -664,17 +873,19 @@ func (s *projfilesSvc) clearSwitchBusy() {
 }
 
 // attachSFTPReal 在共用 SSH 连接上开一条 SFTP 会话并挂到传输器上，全程共用；连接还活着就复用。
+// 主机取当前实际生效的那套（没 projfiles 段时 host 来自设置文件，切换后跟着换）。
 func (s *projfilesSvc) attachSFTPReal() error {
 	if s.pool == nil {
 		return errors.New("没有 SSH 连接池")
 	}
-	if c, err := s.pool.conn(s.prep.host); err != nil {
+	host := s.activeHost()
+	if c, err := s.pool.conn(host); err != nil {
 		return err
 	} else {
 		select {
 		case <-c.Done():
-			s.pool.drop(s.prep.host, c)
-			if c, err = s.pool.conn(s.prep.host); err != nil {
+			s.pool.drop(host, c)
+			if c, err = s.pool.conn(host); err != nil {
 				return err
 			}
 			if cl, err := c.SFTP(); err != nil {
@@ -761,9 +972,9 @@ func (s *projfilesSvc) schedSettings(st projfilesSettings) projsync.PFSchedSetti
 			MaxExpensive: time.Duration(st.MaxSecondsExpensive) * time.Second,
 			MaxUser:      time.Duration(st.MaxSecondsUser) * time.Second,
 		},
-		Host:          s.prep.coordHost,
+		Host:         s.prep.coordHost,
 		QuietSeconds: st.QuietSeconds,
-		FullInterval:  projfilesFullInterval,
+		FullInterval: projfilesFullInterval,
 	}
 }
 
@@ -834,9 +1045,10 @@ func (s *projfilesSvc) intervalLocked(st projfilesSettings) time.Duration {
 	return time.Duration(sec) * time.Second
 }
 
-// loop 是定时调度：hosts.json 里没启用时立即返回；否则跑到 ctx 结束。
+// loop 是定时调度：有 projfiles 段且 enabled=false 时立即返回（照旧）；没这段时照样跑，
+// 每轮由设置决定跑不跑（enabled 缺省关、缺项不跑，见 tick），这样状态一直是活的。
 func (s *projfilesSvc) loop(ctx context.Context) {
-	if s.prep == nil || !s.prep.enabled {
+	if s.prep == nil || (!s.prep.fromSettings && !s.prep.enabled) {
 		return
 	}
 	s.startupOnce(ctx)
@@ -855,8 +1067,13 @@ func (s *projfilesSvc) loop(ctx context.Context) {
 
 // startupOnce 启动时把没挪完的项目恢复掉（只一次），结果进状态。
 func (s *projfilesSvc) startupOnce(ctx context.Context) {
-	st, problems := loadProjfilesSettings(s.prep.settingsPath)
+	st, problems := s.loadSettings()
 	s.applySettings(st, problems)
+	if why := s.settingsModeGap(s.effRemote(st)); why != "" {
+		s.setAction("启动：没跑（" + why + "）")
+		s.persist()
+		return
+	}
 	if err := s.build(st); err != nil {
 		s.setBuildError(err)
 		s.setAction("启动：零件没建成，" + err.Error())
@@ -885,12 +1102,19 @@ func (s *projfilesSvc) startupOnce(ctx context.Context) {
 // tick 是到点或被唤醒之后的动作：读设置 → 若目录改了进入切换期 → 该跑就跑一轮（必要时先整套重建）→ 写状态。
 func (s *projfilesSvc) tick(ctx context.Context, reason string) {
 	now := s.now()
-	st, problems := loadProjfilesSettings(s.prep.settingsPath)
+	st, problems := s.loadSettings()
 	s.applySettings(st, problems)
-	// 目录改了：先进切换期，unit/start / unit/stop / unit/create / fresh 都拒绝，
+	// 没这段时设置不齐（缺 host / host 不在 hosts / 没私钥 / 远端路径缺项）：这一轮不跑，
+	// 原因原文写进状态（ConfigGap + last_action），不进切换期、不报错退出。
+	if why := s.settingsModeGap(s.effRemote(st)); why != "" {
+		s.setAction("没跑：" + why)
+		s.persist()
+		return
+	}
+	// 目录、同步根或主机改了：先进切换期，unit/start / unit/stop / unit/create / fresh 都拒绝，
 	// 直到本轮 acquire 之后 rebuildLocked 完成。
 	if s.needRebuild(st) {
-		s.markSwitchBusy("同步目录或工作目录刚改过，正在切换，稍后再试")
+		s.markSwitchBusy("同步主机/同步根/同步目录/工作目录刚改过，正在切换，稍后再试")
 	}
 	if err := s.build(st); err != nil && err != errProjfilesDirSwitch {
 		s.setBuildError(err)
@@ -929,7 +1153,7 @@ func (s *projfilesSvc) tick(ctx context.Context, reason string) {
 				return
 			}
 			s.clearSwitchBusy()
-			s.noteOnce("同步目录/工作目录改了，已整套重建")
+			s.noteOnce("同步主机/同步根/同步目录/工作目录改了，已整套重建")
 		}
 		sched := s.getSched()
 		// SetSettings 是整体替换，会把网络状态一起洗掉，所以紧跟着把已上报的网络补回去。
@@ -1045,13 +1269,23 @@ func (s *projfilesSvc) noteOnce(msg string) {
 func (s *projfilesSvc) status() projfilesStatus {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// 当前生效的远端三件套（按已读进服务的设置算）与各自来源；没这段时全部来自设置文件，
+	// 缺项那句原文进 ConfigGap，窗口直接显示「缺什么」。
+	cfg := s.effRemote(s.settings)
+	enabled := s.prep.enabled
+	if s.prep.fromSettings {
+		enabled = s.settings.Enabled
+	}
 	out := projfilesStatus{
-		Enabled: s.prep.enabled, Host: s.prep.host, RemoteRoot: s.prep.remoteRoot, RemoteMeta: s.prep.remoteMeta,
+		Enabled: enabled, Host: cfg.host, HostFrom: cfg.hostFrom,
+		RemoteRoot: cfg.remoteRoot, RemoteRootFrom: cfg.rootFrom,
+		RemoteMeta: cfg.remoteMeta, RemoteMetaFrom: cfg.metaFrom, ConfigGap: s.settingsModeGap(cfg),
 		CoordID: s.prep.coordID, CoordHost: s.prep.coordHost, MetaDir: s.prep.metaDir, SettingsPath: s.prep.settingsPath,
 		Net: s.effNetLocked(), Running: s.running, Updated: s.now(), LastAction: s.lastAct,
 		IntervalS: int(s.intervalLocked(s.settings) / time.Second),
 		Settings:  s.settings, SettingsProblems: s.problems, Notices: s.notices,
 		ActiveWorkDir: s.builtWork, ActiveSyncDir: s.builtSync,
+		ActiveRemoteRoot: s.builtRemote, ActiveRemoteRootFrom: s.builtRemoteFrom, ActiveHost: s.builtHost,
 		SwitchBusy: s.switchBusy != "", SwitchReason: s.switchBusy,
 		StartedUp: s.startedUp, Startup: s.startup, StartupError: s.startupEr,
 		LastRound: s.lastRound, BuildError: s.buildErr,

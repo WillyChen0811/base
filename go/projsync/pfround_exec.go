@@ -925,4 +925,3 @@ func (r *pfrdRun) keepDir(i int, a PFAction, side PFSide, why string) {
 	r.res.Skipped = append(r.res.Skipped, PFRoundSkip{Path: a.Path, Kind: a.Kind, Side: side, Code: PFSkipDirKept,
 		Reason: "另一边删了这个目录，但这边的目录里还有没同步的东西，保留：" + why, Source: PFRoundSrcApply})
 }
-

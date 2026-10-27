@@ -153,7 +153,10 @@ func pfrdPutAt(t *testing.T, root, rel, content string, mt time.Time) {
 	}
 }
 
-func (f *pfrdFix) macPut(rel, content string, mt time.Time) { f.t.Helper(); pfrdPutAt(f.t, f.root, rel, content, mt) }
+func (f *pfrdFix) macPut(rel, content string, mt time.Time) {
+	f.t.Helper()
+	pfrdPutAt(f.t, f.root, rel, content, mt)
+}
 func (f *pfrdFix) ubPut(rel, content string, mt time.Time) {
 	f.t.Helper()
 	pfrdPutAt(f.t, f.ub.abs(""), rel, content, mt)
@@ -690,5 +693,3 @@ func TestPFRoundS4DeletePropagation(t *testing.T) {
 	}
 	f.settled()
 }
-
-

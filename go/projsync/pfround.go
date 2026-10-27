@@ -157,7 +157,9 @@ func (in *PFRoundInput) fill() {
 }
 
 func (in *PFRoundInput) validate() error {
-	bad := func(f string, a ...any) error { return fmt.Errorf("projsync: 一轮同步的输入不合格：%s", fmt.Sprintf(f, a...)) }
+	bad := func(f string, a ...any) error {
+		return fmt.Errorf("projsync: 一轮同步的输入不合格：%s", fmt.Sprintf(f, a...))
+	}
 	if err := PFValidateUnit(in.Unit); err != nil {
 		return bad("单元登记不合格：%v", err)
 	}
@@ -271,7 +273,9 @@ func newPFRDRun(ctx context.Context, in *PFRoundInput) *pfrdRun {
 
 func (r *pfrdRun) now() time.Time { return r.in.Now() }
 
-func (r *pfrdRun) notice(f string, a ...any) { r.res.Notices = append(r.res.Notices, fmt.Sprintf(f, a...)) }
+func (r *pfrdRun) notice(f string, a ...any) {
+	r.res.Notices = append(r.res.Notices, fmt.Sprintf(f, a...))
+}
 
 func (r *pfrdRun) addError(path, code string, uncertain bool, f string, a ...any) {
 	r.res.Errors = append(r.res.Errors, PFRoundError{Path: path, Code: code, Message: fmt.Sprintf(f, a...), Uncertain: uncertain})

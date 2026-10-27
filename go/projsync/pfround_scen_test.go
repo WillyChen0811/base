@@ -732,7 +732,6 @@ func pfrdMust(t *testing.T, err error) {
 	}
 }
 
-
 // Ubuntu 上新建的项目：Mac 这边连单元目录（和年份目录）都还没有，按首次规则建出来并全部取回。
 func TestPFRoundUbuntuNewProject(t *testing.T) {
 	f := newPFRDFix(t)

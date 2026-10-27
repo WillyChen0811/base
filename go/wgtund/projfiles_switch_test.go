@@ -151,11 +151,11 @@ func TestProjfilesDirSwitchRebuild(t *testing.T) {
 		t.Fatalf("不该再说切换: %s", b)
 	}
 	// 缓存的 fresh 已随代次作废，绑的是重建后的新调度器
+	if resp, b := pfHTTPDo(t, srv.URL, http.MethodPost, "/projfiles/fresh", `{"paths":["/s/a"]}`, ""); resp.StatusCode != 200 {
+		t.Fatalf("重建后 fresh 要能用: %d %s", resp.StatusCode, b)
+	}
 	if got := freshBuilds.Load(); got != 2 {
 		t.Fatalf("重建后 fresh 必须重新建一套（不能再绑旧的）: %d", got)
-	}
-	if resp, _ := pfHTTPDo(t, srv.URL, http.MethodPost, "/projfiles/fresh", `{"paths":["/s/a"]}`, ""); resp.StatusCode != 200 {
-		t.Fatalf("重建后 fresh 要能用: %d", resp.StatusCode)
 	}
 }
 

@@ -518,6 +518,10 @@ func (h *projfilesAPI) localHandler(ctx context.Context) http.Handler {
 			busyJSON(w, why)
 			return
 		}
+		if err := h.ensureBuilt(); err != nil {
+			errJSON(w, http.StatusServiceUnavailable, err.Error())
+			return
+		}
 		cfg, err := h.mergeCfg()
 		if err != nil {
 			errJSON(w, http.StatusServiceUnavailable, err.Error())

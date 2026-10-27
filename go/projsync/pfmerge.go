@@ -72,6 +72,8 @@ type PFMergeConfig struct {
 	// 以下只给测试注入。
 	Now  func() time.Time
 	Stat PFStatFunc
+	// moveHook 只给测试：move/rename 真正调 pfRenameNoReplace 之前触发一下，用来注入「目标凭空出现」等竞态。
+	moveHook func(it PFMergeItem)
 }
 
 func (c PFMergeConfig) filled() PFMergeConfig {
@@ -586,6 +588,9 @@ func (m *pfMergeCtx) moveOne(it PFMergeItem, res *PFMergeRunResult) error {
 		return fmt.Errorf("目标 %s 在计划之后凭空出现，为避免覆盖不挪", it.DestRel)
 	} else if !errors.Is(err, fs.ErrNotExist) {
 		return err
+	}
+	if m.cfg.moveHook != nil { // 只给测试：在真正改名前注入竞态（如凭空造出目标），验证不覆盖
+		m.cfg.moveHook(it)
 	}
 	return pfRenameNoReplace(src, dst)
 }

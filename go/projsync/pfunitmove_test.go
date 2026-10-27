@@ -750,6 +750,20 @@ func TestPFUnitMove_RefuseICloudPlaceholder(t *testing.T) {
 		}
 		e.noUnit(t, pfumCode)
 	})
+	t.Run("项目目录本身是占位", func(t *testing.T) {
+		e := newPFUMEnv(t)
+		e.project(pfumRel)
+		root := e.P(pfumRel)
+		e.lstatMod = func(p string, st *PFStat) {
+			if p == root {
+				st.Flags |= PFSFDataless
+			}
+		}
+		res := e.expectRefused(t, pfumRel, PFUnitMoveCodePlaceholder)
+		if f := pfumRefusalFiles(res, PFUnitMoveCodePlaceholder); len(f) != 1 || f[0] != "." {
+			t.Errorf("应说明是项目目录本身：%v", f)
+		}
+	})
 	t.Run("占位目录", func(t *testing.T) {
 		e := newPFUMEnv(t)
 		e.project(pfumRel)

@@ -264,7 +264,7 @@ func TestPFRoundUncertainUbuntuComm(t *testing.T) {
 			// a_ub.txt 要下载到 Mac（路径靠前，先做）；z_mac.txt 要上传（路径靠后，在 Ubuntu 批里）
 			f.ubPut("a_ub.txt", "Ubuntu 新增\n", pfrtOld)
 			f.macPut("z_mac.txt", "Mac 新增\n", pfrtOld)
-			rn := &pfrdRunner{inner: f.ub.run, before: mode == "执行前断", after: mode == "执行后断"}
+			rn := &pfrdRunner{inner: f.runner, before: mode == "执行前断", after: mode == "执行后断"}
 			f.ub.cl.Runner = rn
 			r := f.run()
 			if r.Outcome != PFRoundUncertain || !r.Uncertain || rn.hits != 1 {
@@ -286,7 +286,7 @@ func TestPFRoundUncertainUbuntuComm(t *testing.T) {
 				t.Fatalf("%s：Ubuntu 上 z_mac.txt 的情况不对: %v", mode, ubErr)
 			}
 			// 恢复连接：下一轮重新采集，正确收尾
-			f.ub.cl.Runner = f.ub.run
+			f.ub.cl.Runner = f.runner
 			r2 := f.mustDone(f.run())
 			if mode == "执行后断" && r2.BytesUp != 0 {
 				t.Fatalf("Ubuntu 上已经有了，不该再传: %d", r2.BytesUp)

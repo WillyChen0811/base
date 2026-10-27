@@ -20,15 +20,30 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
 
 // ── 夹具 ────────────────────────────────────────────────
 
+// pfrdSerial 把假 RemoteRunner 串行化：传输器的几个任务会同时调 Ubuntu 的核验，T8 夹具里的 pfrtRunner 自己不加锁
+// （真实的 SSH 连接池是并发安全的）。
+type pfrdSerial struct {
+	mu    sync.Mutex
+	inner RemoteRunner
+}
+
+func (s *pfrdSerial) Run(ctx context.Context, cmd string, stdin []byte) ([]byte, []byte, int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.inner.Run(ctx, cmd, stdin)
+}
+
 type pfrdFix struct {
 	t      *testing.T
 	ub     *pfrtFix
+	runner RemoteRunner // 串行化之后的 Ubuntu 连接
 	base   string
 	sync   string
 	meta   string
@@ -50,7 +65,8 @@ func newPFRDFix(t *testing.T) *pfrdFix {
 	if err != nil {
 		t.Fatal(err)
 	}
-	f := &pfrdFix{t: t, ub: ub, base: base, sync: filepath.Join(base, "XXYI-sync"), meta: filepath.Join(base, "macmeta"), net: PFRemoteNetGood}
+	ub.cl.Runner = &pfrdSerial{inner: ub.run}
+	f := &pfrdFix{t: t, ub: ub, runner: ub.cl.Runner, base: base, sync: filepath.Join(base, "XXYI-sync"), meta: filepath.Join(base, "macmeta"), net: PFRemoteNetGood}
 	f.root = filepath.Join(f.sync, filepath.FromSlash(pfrtRel))
 	for _, d := range []string{f.sync, f.meta} {
 		if err := os.MkdirAll(d, 0o755); err != nil {

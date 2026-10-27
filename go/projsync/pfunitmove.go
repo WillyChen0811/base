@@ -195,9 +195,9 @@ type PFUnitMoveConfig struct {
 	Meta    string // meta 目录（~/.xxyi/projfiles），放 units.json 和 moves/
 	Home    string // 用户家目录，校验同步目录用；缺省 os.UserHomeDir()
 
-	// PathsList：XXYI 导出的配置路径清单 ~/.xxyi/projfiles-paths.json（§14.4）。
-	// 非空时 StartSync 走「开始同步的闸」：编号在清单里有配置 → rel 必须是其中一条、键取清单里的；
-	// 清单读不到 → 拒绝。空 = 不启用闸（照旧：键 = 编号；测试与不带 XXYI 的调用方用）。
+	// PathsList：XXYI 导出的配置路径清单 ~/.xxyi/projfiles-paths.json（§14.4），必须填绝对路径（空或相对路径构造时就失败）。
+	// StartSync 一律走「开始同步的闸」：编号在清单里有配置 → rel 必须是其中一条、键取清单里的；
+	// 编号在 blocked 里 → 拒绝；清单读不到 → 拒绝。不能靠不填来关闸；测试要绕开就显式给一份临时清单。
 	// CreateSynced 不受闸限制（新建同步项目键 = 编号）。
 	PathsList string
 
@@ -275,7 +275,7 @@ func PFUnitMoveValidateConfig(cfg PFUnitMoveConfig) error {
 	if err := pfumPlatformErr(); err != nil {
 		return bad("%v", err)
 	}
-	for _, d := range []struct{ name, p string }{{"工作目录", cfg.WorkDir}, {"同步目录", cfg.SyncDir}, {"meta 目录", cfg.Meta}, {"家目录", cfg.Home}} {
+	for _, d := range []struct{ name, p string }{{"工作目录", cfg.WorkDir}, {"同步目录", cfg.SyncDir}, {"meta 目录", cfg.Meta}, {"家目录", cfg.Home}, {"配置路径清单", cfg.PathsList}} {
 		if d.p == "" {
 			return bad("%s没有设置", d.name)
 		}
@@ -1201,28 +1201,27 @@ func (m *PFUnitMover) StartSync(ctx context.Context, rel string) (PFUnitMoveResu
 
 	// 开始同步的闸（§14.4）：这个编号在清单里有配置 → rel 必须是其中一条，键取清单里的；
 	// 清单里没有这个编号 → 照旧（键 = 编号）；清单读不到 → 有没有配置判断不了，拒绝。
-	if m.cfg.PathsList != "" {
-		cp, cpErr := PFLoadConfiguredPaths(m.cfg.PathsList)
-		switch {
-		case cpErr != nil:
-			rf.addf(PFUnitMoveCodePathsBad, "配置路径清单读不到或坏了（%v），判断不了这个编号配置的目录，不能开始同步", cpErr)
-		case len(cp.Units(code)) > 0:
-			cu, conf := cp.Find(code, rel)
-			if !conf {
-				var rels []string
-				for _, u := range cp.Units(code) {
-					rels = append(rels, u.Rel)
-				}
-				rf.addf(PFUnitMoveCodeNotConfigured, "这个编号配置的目录是 %s，这个目录没配置，不能同步（可以合并进去）", strings.Join(rels, "、"))
-			} else if cu.Key != rec.Code { // 另配目录单元（§14.1）：键 = 清单里的 key，编号记进 ProjectCode
-				rec.Code, rec.ProjectCode = cu.Key, code
-				if err := PFValidateUnit(rec); err != nil {
-					rf.addf(PFUnitMoveCodeBadRel, "清单给的键 %q 配这个登记不合格：%v", cu.Key, err)
-					rec.Code, rec.ProjectCode = code, ""
-				} else {
-					code = cu.Key
-					res.Unit = cu.Key
-				}
+	// 闸一律走（构造时已要求清单路径非空；路径为空的零值执行器读清单也会失败而拒绝，不会放行）。
+	cp, cpErr := PFLoadConfiguredPaths(m.cfg.PathsList)
+	switch {
+	case cpErr != nil:
+		rf.addf(PFUnitMoveCodePathsBad, "配置路径清单读不到或坏了（%v），判断不了这个编号配置的目录，不能开始同步", cpErr)
+	case len(cp.Units(code)) > 0:
+		cu, conf := cp.Find(code, rel)
+		if !conf {
+			var rels []string
+			for _, u := range cp.Units(code) {
+				rels = append(rels, u.Rel)
+			}
+			rf.addf(PFUnitMoveCodeNotConfigured, "这个编号配置的目录是 %s，这个目录没配置，不能同步（可以合并进去）", strings.Join(rels, "、"))
+		} else if cu.Key != rec.Code { // 另配目录单元（§14.1）：键 = 清单里的 key，编号记进 ProjectCode
+			rec.Code, rec.ProjectCode = cu.Key, code
+			if err := PFValidateUnit(rec); err != nil {
+				rf.addf(PFUnitMoveCodeBadRel, "清单给的键 %q 配这个登记不合格：%v", cu.Key, err)
+				rec.Code, rec.ProjectCode = code, ""
+			} else {
+				code = cu.Key
+				res.Unit = cu.Key
 			}
 		}
 	}

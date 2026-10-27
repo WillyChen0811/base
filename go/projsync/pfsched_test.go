@@ -99,7 +99,11 @@ func newPFSchedFix(t *testing.T, o pfscOpt) *pfscFix {
 		cfg.Settings.Net = PFRemoteNetGood
 	}
 	if o.mover {
-		m, err := NewPFUnitMover(PFUnitMoveConfig{WorkDir: f.work, SyncDir: f.syn, Meta: f.meta, Home: f.home})
+		pl := filepath.Join(f.home, ".xxyi", "projfiles-paths.json") // 开始同步的闸要读清单：显式给一份空清单
+		if err := os.WriteFile(pl, []byte(`{"version":1,"units":[]}`), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		m, err := NewPFUnitMover(PFUnitMoveConfig{WorkDir: f.work, SyncDir: f.syn, Meta: f.meta, Home: f.home, PathsList: pl})
 		if err != nil {
 			t.Fatal(err)
 		}

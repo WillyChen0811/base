@@ -405,8 +405,13 @@ func newClusterAddr(t *testing.T, addr string, opts ...itOpt) *cluster {
 			t.Fatalf("建 %s 失败：%v", d, err)
 		}
 	}
+	// 开始同步的闸一律要读清单（路径为空构造就失败）：联调里谁都没配置，给一份空清单
+	pathsList := filepath.Join(tdir, "projfiles-paths.json")
+	if err := os.WriteFile(pathsList, []byte(`{"version":1,"units":[]}`), 0o644); err != nil {
+		t.Fatalf("写配置路径清单失败：%v", err)
+	}
 	mob, err := projsync.NewPFUnitMover(projsync.PFUnitMoveConfig{
-		WorkDir: c.work, SyncDir: c.sync, Meta: c.meta,
+		WorkDir: c.work, SyncDir: c.sync, Meta: c.meta, PathsList: pathsList,
 		QuietSeconds: 1, StableGap: 300 * time.Millisecond,
 	})
 	if err != nil {

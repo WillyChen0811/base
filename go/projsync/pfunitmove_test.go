@@ -57,7 +57,7 @@ type pfumEnv struct {
 	rename    func(oldPath, newPath string) error
 	sleep     func(ctx context.Context, d time.Duration) error
 	hook      PFUnitMoveHook
-	pathsList string // 非空 = 配置路径清单（§14.4 开始同步的闸）
+	pathsList string // 配置路径清单（§14.4 开始同步的闸）；newPFUMEnv 缺省写一份空清单，用例要自己的清单就改写它
 }
 
 func newPFUMEnv(t *testing.T) *pfumEnv {
@@ -78,6 +78,9 @@ func newPFUMEnv(t *testing.T) *pfumEnv {
 			t.Fatal(err)
 		}
 	}
+	// 开始同步的闸一律要读清单（评审 17-2：路径为空不能关闸）：缺省显式给一份空清单（谁都没配置）
+	e.pathsList = filepath.Join(e.home, ".xxyi", "projfiles-paths.json")
+	pfumWritePathsList(t, e.pathsList, `{"version":1,"units":[]}`)
 	return e
 }
 
@@ -431,6 +434,8 @@ func TestPFUnitMove_ValidateConfig(t *testing.T) {
 		{"同步目录没设置", func(c *PFUnitMoveConfig) { c.SyncDir = "" }, "没有设置"},
 		{"工作目录不是绝对路径", func(c *PFUnitMoveConfig) { c.WorkDir = "Desktop/Projects" }, "绝对路径"},
 		{"meta 不是绝对路径", func(c *PFUnitMoveConfig) { c.Meta = ".xxyi" }, "绝对路径"},
+		{"配置路径清单没设置", func(c *PFUnitMoveConfig) { c.PathsList = "" }, "配置路径清单没有设置"},
+		{"配置路径清单不是绝对路径", func(c *PFUnitMoveConfig) { c.PathsList = "projfiles-paths.json" }, "配置路径清单"},
 		{"在 Desktop 下", func(c *PFUnitMoveConfig) { c.SyncDir = filepath.Join(c.Home, "Desktop", "sync") }, "iCloud"},
 		{"就是 Desktop", func(c *PFUnitMoveConfig) { c.SyncDir = filepath.Join(c.Home, "Desktop") }, "iCloud"},
 		{"在 Documents 下", func(c *PFUnitMoveConfig) { c.SyncDir = filepath.Join(c.Home, "Documents", "sync") }, "iCloud"},
@@ -1633,17 +1638,47 @@ func pfumWritePathsList(t *testing.T, path, body string) {
 	}
 }
 
+// 评审 17-2：清单路径为空时不能让开始同步的闸失效——构造执行器就失败（测试要绕开闸，显式给一份临时清单）。
+func TestPFUnitMove_EmptyPathsListRejected(t *testing.T) {
+	e := newPFUMEnv(t)
+	for name, v := range map[string]string{"空": "", "相对路径": "projfiles-paths.json"} {
+		c := e.cfg()
+		c.PathsList = v
+		_, err := NewPFUnitMover(c)
+		var ce *PFUnitMoveConfigError
+		if !errors.As(err, &ce) || !strings.Contains(ce.Msg, "配置路径清单") {
+			t.Errorf("清单路径%s：构造应返回配置错误并说明是清单：%v", name, err)
+		}
+	}
+	// 清单路径给了一个不存在的文件：构造可以过（启动时 XXYI 可能还没导出），但开始同步一律拒绝，不放行
+	e.project(pfumRel)
+	if err := os.Remove(e.pathsList); err != nil {
+		t.Fatal(err)
+	}
+	e.expectRefused(t, pfumRel, PFUnitMoveCodePathsBad)
+	// 零值执行器（没经过构造）也不会因为路径为空而放行：读清单失败 → 拒绝
+	var zero PFUnitMover
+	zero.cfg = PFUnitMoveConfig{StableGap: time.Millisecond}.withDefaults()
+	zero.work, zero.sync, zero.meta = e.work, e.syn, e.meta
+	res, err := zero.StartSync(bg, pfumRel)
+	if err != nil || res.Status != PFUnitMoveRefused || !pfumHas(pfumRefusalCodes(res), PFUnitMoveCodePathsBad) {
+		t.Errorf("路径为空的执行器应拒绝开始同步：%v %+v", err, res)
+	}
+}
+
 func TestPFUnitMove_PathsGate(t *testing.T) {
 	const code = "260403J1301"
 	const relMain = "2026/260403J1301-测试项目己"
 	const relCopy = "2026/260403J1301-测试项目己-副本"
 	const relOther = "2026/260403J1301-没配置"
 	e := newPFUMEnv(t)
-	e.pathsList = filepath.Join(e.home, ".xxyi", "projfiles-paths.json")
 	e.project(relMain)
 	e.project(relCopy)
 
 	// 1) 清单读不到 → 有配置与否判断不了，拒绝并写原因
+	if err := os.Remove(e.pathsList); err != nil {
+		t.Fatal(err)
+	}
 	res := e.expectRefused(t, relMain, PFUnitMoveCodePathsBad)
 	if !strings.Contains(res.Reason, "清单") {
 		t.Errorf("原因要写明是清单的问题：%s", res.Reason)

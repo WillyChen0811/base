@@ -668,6 +668,144 @@ func TestPFValidateUnitsRejects(t *testing.T) {
 	}
 }
 
+func TestPFValidateUnitSameCodeTwoUnits(t *testing.T) {
+	// 旧记录（units.json 里没 project_code）：照常读、照常合格，ProjectCode 空 = 等于 Code
+	old := pfUnit("260403J1301", "己", PFUnitSyncing)
+	if err := PFValidateUnit(old); err != nil {
+		t.Fatalf("旧记录应照常合格: %v", err)
+	}
+	if old.PFUnitProjectCode() != "260403J1301" {
+		t.Errorf("空 project_code 应等于 Code，得 %q", old.PFUnitProjectCode())
+	}
+	b, err := PFMarshalUnits([]PFUnitRecord{old})
+	if err != nil || strings.Contains(string(b), "project_code") {
+		t.Errorf("omitempty：主目录单元的序列化不该带 project_code: %s %v", b, err)
+	}
+
+	// 另配目录单元：键 = 编号R2，project_code = 编号
+	r2 := pfUnit("260403J1301", "己-副本", PFUnitSyncing)
+	r2.Code, r2.ProjectCode = "260403J1301R2", "260403J1301"
+	if err := PFValidateUnit(r2); err != nil {
+		t.Fatalf("R2 键应合格: %v", err)
+	}
+	if r2.PFUnitProjectCode() != "260403J1301" {
+		t.Errorf("PFUnitProjectCode 应是编号，得 %q", r2.PFUnitProjectCode())
+	}
+	// 不带 project_code 的 R2 记录也合格（键自己说明一切）
+	nopc := r2
+	nopc.ProjectCode = ""
+	if err := PFValidateUnit(nopc); err != nil {
+		t.Errorf("不带 project_code 的 R2 键应合格: %v", err)
+	}
+	if nopc.PFUnitProjectCode() != "260403J1301" {
+		t.Errorf("不带 project_code 的 R2 键，项目编号应从键推出 260403J1301，不能拿带 R 的键当编号，得 %q", nopc.PFUnitProjectCode())
+	}
+	// 序列化带 project_code，往返不丢
+	b, err = PFMarshalUnits([]PFUnitRecord{r2})
+	if err != nil || !strings.Contains(string(b), `"project_code": "260403J1301"`) { // PFMarshalUnits 输出带缩进
+		t.Errorf("序列化应带 project_code: %s %v", b, err)
+	}
+	us, err := PFParseUnits(b)
+	if err != nil || len(us) != 1 || us[0].Code != "260403J1301R2" || us[0].ProjectCode != "260403J1301" {
+		t.Errorf("往返不丢: %+v %v", us, err)
+	}
+
+	// 不合格的键与 project_code
+	for name, mut := range map[string]func(u *PFUnitRecord){
+		"R 后不是数字":            func(u *PFUnitRecord) { u.Code = "260403J1301RB" },
+		"键是别的编号加R":           func(u *PFUnitRecord) { u.Code = "260403J1302R2" },
+		"project_code不是编号":   func(u *PFUnitRecord) { u.ProjectCode = "260403J1302" },
+		"project_code带空格":    func(u *PFUnitRecord) { u.ProjectCode = " 260403J1301" },
+		"project_code就是带R的键": func(u *PFUnitRecord) { u.ProjectCode = "260403J1301R2" },
+		"rel 认出的编号与键推出的不同（project_code 留空）": func(u *PFUnitRecord) {
+			u.ProjectCode = ""
+			u.Rel = "2026/260403J1302-己-副本"
+			u.LinkPath, u.SyncPath = "/x/"+u.Rel, "/y/"+u.Rel
+		},
+	} {
+		u := pfUnit("260403J1301", "己-副本", PFUnitSyncing)
+		u.Code, u.ProjectCode = "260403J1301R2", "260403J1301"
+		mut(&u)
+		if err := PFValidateUnit(u); err == nil {
+			t.Errorf("%s：应被拒绝: %+v", name, u)
+		}
+	}
+
+	// 同一编号两个单元（主 + R2）同表合法；rel 撞车拒绝
+	if err := PFValidateUnits([]PFUnitRecord{old, r2}); err != nil {
+		t.Errorf("主目录 + R2 同表应合格: %v", err)
+	}
+	dupe := r2
+	dupe.Rel = old.Rel
+	dupe.LinkPath, dupe.SyncPath = old.LinkPath, old.SyncPath
+	if err := PFValidateUnits([]PFUnitRecord{old, dupe}); err == nil || !strings.Contains(err.Error(), "rel") {
+		t.Errorf("两条登记挂同一 rel 应被拒绝: %v", err)
+	}
+}
+
+func TestPFClassifySameCodeTwoUnits(t *testing.T) {
+	// 同编号两个登记单元：各自的 rel 对上各自的目录，都是 Syncing；
+	// 同编号第三个没配置的目录进 Unconfigured（只报告），登记了但没发现的进 Missing。
+	main := pfUnit("260403J1301", "己", PFUnitSyncing)
+	r2 := pfUnit("260403J1301", "己-副本", PFUnitSyncing)
+	r2.Code, r2.ProjectCode = "260403J1301R2", "260403J1301"
+	gone := pfUnit("260403J1305", "壬", PFUnitSyncing)
+	found := PFDiscoverResult{Units: []PFFoundUnit{
+		pfFound("260403J1301", "2026/260403J1301-己"),
+		pfFound("260403J1301", "2026/260403J1301-己-副本"),
+		pfFound("260403J1301", "2025/260403J1301-没配置"),
+	}}
+	got, err := PFClassifyUnits(found, []PFUnitRecord{main, r2, gone})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Syncing) != 2 || got.Syncing[0].Reg.Code != "260403J1301" || got.Syncing[1].Reg.Code != "260403J1301R2" {
+		t.Errorf("两个登记单元都该按 rel 对上照常同步: %+v", got.Syncing)
+	}
+	if len(got.Unconfigured) != 1 || got.Unconfigured[0].Rel != "2025/260403J1301-没配置" {
+		t.Errorf("没配置的目录应进 Unconfigured: %+v", got.Unconfigured)
+	}
+	if len(got.Duplicates) != 0 {
+		t.Errorf("已登记编号的多目录不该再进 Duplicates: %+v", got.Duplicates)
+	}
+	if len(got.Missing) != 1 || got.Missing[0].Code != "260403J1305" {
+		t.Errorf("Missing 应只剩壬: %+v", got.Missing)
+	}
+}
+
+// 评审 17-3：另配单元（键带 R）没填 project_code 时，按编号归类没配置目录也得用从键推出的编号，
+// 不能拿带 R 的键当编号——否则同编号的没配置目录认不出已登记，被当成 Ubuntu 新项目。
+func TestPFClassifyUnconfiguredWithRKeyWithoutProjectCode(t *testing.T) {
+	r2 := pfUnit("260403J1301", "己-副本", PFUnitSyncing)
+	r2.Code = "260403J1301R2" // 故意不填 ProjectCode
+	for _, withPC := range []bool{false, true} {
+		u := r2
+		if withPC {
+			u.ProjectCode = "260403J1301"
+		}
+		if err := PFValidateUnit(u); err != nil {
+			t.Fatalf("withPC=%v：登记应合格：%v", withPC, err)
+		}
+		found := PFDiscoverResult{Units: []PFFoundUnit{
+			pfFound("260403J1301", "2026/260403J1301-己-副本"),
+			pfFound("260403J1301", "2026/260403J1301-旧资料"),
+		}}
+		got, err := PFClassifyUnits(found, []PFUnitRecord{u})
+		if err != nil {
+			t.Fatalf("withPC=%v：%v", withPC, err)
+		}
+		if len(got.New) != 0 || len(got.Duplicates) != 0 {
+			t.Errorf("withPC=%v：同编号的没配置目录不能当新项目/重复: New=%+v Dup=%+v", withPC, got.New, got.Duplicates)
+		}
+		if len(got.Unconfigured) != 1 || got.Unconfigured[0].Rel != "2026/260403J1301-旧资料" {
+			t.Errorf("withPC=%v：没配置的目录应进 Unconfigured: %+v", withPC, got.Unconfigured)
+		}
+		if len(got.Syncing) != 1 || got.Syncing[0].Reg.Code != "260403J1301R2" {
+			t.Errorf("withPC=%v：登记的另配单元仍按 rel 配上: %+v", withPC, got.Syncing)
+		}
+	}
+}
+
 func TestPFParseUnitsRejects(t *testing.T) {
 	good := `{"code":"260403J0812","rel":"2026/260403J0812-甲","state":"syncing","link_path":"/a/2026/260403J0812-甲","sync_path":"/b/2026/260403J0812-甲","started_at":"2026-10-26T09:30:00Z"}`
 	if us, err := PFParseUnits([]byte("[" + good + "]")); err != nil || len(us) != 1 {
@@ -779,8 +917,12 @@ func TestPFClassifyUnits(t *testing.T) {
 		}
 		return out
 	}
-	if g := codesOf(got.Syncing); !reflect.DeepEqual(g, []string{"260403J0812=2026/260403J0812-甲"}) {
+	// §14.4：按 rel 配对——戊登记的 rel 找得到就照常 Syncing，同编号的副本目录只报告（Unconfigured），不再连坐。
+	if g := codesOf(got.Syncing); !reflect.DeepEqual(g, []string{"260403J0812=2026/260403J0812-甲", "260403N0101=2026/260403N0101-戊"}) {
 		t.Errorf("Syncing = %q", g)
+	}
+	if g := pfPairs(got.Unconfigured); !reflect.DeepEqual(g, []string{"260403N0101 @ 2025/260403N0101-戊的副本"}) {
+		t.Errorf("Unconfigured = %q", g)
 	}
 	if g := codesOf(got.Stopped); !reflect.DeepEqual(g, []string{"260403Q0901=2026/260403Q0901-乙"}) {
 		t.Errorf("Stopped = %q", g)
@@ -794,9 +936,8 @@ func TestPFClassifyUnits(t *testing.T) {
 	}) {
 		t.Errorf("New = %q", g)
 	}
+	// Duplicates 只剩「编号完全没登记过、同编号多个目录」的（X0101）；已登记编号的多目录不再 Dup（§14.2）
 	if g := pfPairs(got.Duplicates); !reflect.DeepEqual(g, []string{
-		"260403N0101 @ 2025/260403N0101-戊的副本",
-		"260403N0101 @ 2026/260403N0101-戊",
 		"260403X0101 @ 2026/260403X0101-新重复a",
 		"260403X0101 @ 2026/260403X0101-新重复b",
 	}) {
@@ -841,10 +982,12 @@ func TestPFClassifyUnits(t *testing.T) {
 }
 
 func TestPFClassifyIgnoresDupFlag(t *testing.T) {
-	// found.Units 里没标 Dup、但编号重复：按编号重算，仍进 Duplicates
+	// §14.4：配对按 rel 重算，不信 Dup 标——两个 found 的 rel 都不是登记的那条：
+	// 编号已登记 → 都进 Unconfigured（只报告）；登记的 rel 没找到 → Missing。
 	found := PFDiscoverResult{Units: []PFFoundUnit{pfFound("260403J0812", "a/260403J0812-1"), pfFound("260403J0812", "b/260403J0812-2")}}
 	got, err := PFClassifyUnits(found, []PFUnitRecord{pfUnit("260403J0812", "甲", PFUnitSyncing)})
-	if err != nil || len(got.Duplicates) != 2 || len(got.Syncing) != 0 || len(got.Missing) != 0 {
+	if err != nil || len(got.Duplicates) != 0 || len(got.Syncing) != 0 ||
+		len(got.Unconfigured) != 2 || len(got.Missing) != 1 || got.Missing[0].Code != "260403J0812" {
 		t.Errorf("%+v %v", got, err)
 	}
 }

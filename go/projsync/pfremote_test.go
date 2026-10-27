@@ -281,7 +281,8 @@ func TestPFRemotePollDupAndSkipped(t *testing.T) {
 		t.Fatalf("单元: %+v", resp.Units)
 	}
 	for _, u := range resp.Units {
-		if !u.Dup || len(u.DupRels) != 1 || u.Fingerprint != "" || u.Error != "" {
+		// §14.2：同编号多个目录不再停，每个目录照常扫描、有指纹（登记单元靠它跳过没变化的轮次）。
+		if !u.Dup || len(u.DupRels) != 1 || !pfValidSHA(u.Fingerprint) || u.Error != "" {
 			t.Fatalf("重复单元: %+v", u)
 		}
 	}
@@ -706,6 +707,33 @@ func TestPFRemoteFactsDup(t *testing.T) {
 	pfrtNoErr(t, err)
 	if !facts.Exists || !facts.Dup || !reflect.DeepEqual(facts.DupRels, []string{"2025/260403J1001-副本"}) {
 		t.Fatalf("%+v", facts)
+	}
+}
+
+// §14.4：单元键带 R（另配目录单元）时，Ubuntu 按 rel 配对、比对编号用键的前段；
+// 同编号的别的目录（这里是主目录）进 Found，不影响这个单元。
+func TestPFRemoteFactsUnitKeyR(t *testing.T) {
+	f := newPFRTFix(t)
+	f.put("a.txt", "主")
+	const relR2 = "2026/260403J1001-另配"
+	f.putIn(relR2, "r.txt", "副")
+	u := PFRemoteUnit{Code: pfrtCode + "R2", Rel: relR2}
+	facts, err := f.cl.Facts(context.Background(), u, PFRemoteFactsOptions{})
+	pfrtNoErr(t, err)
+	if !facts.Exists || facts.UnitPath != filepath.Join(f.root, filepath.FromSlash(relR2)) {
+		t.Fatalf("R2 键应按 rel 配上另配目录: %+v", facts)
+	}
+	if !facts.Dup || !reflect.DeepEqual(facts.DupRels, []string{pfrtRel}) || !reflect.DeepEqual(facts.Found, []string{pfrtRel}) {
+		t.Fatalf("主目录应作为同编号的别的目录报出: %+v", facts)
+	}
+	if facts.Scan == nil || len(facts.Scan.Items) != 1 || facts.Scan.Items[0].Path != "r.txt" {
+		t.Fatalf("扫描的应是另配目录自己的内容: %+v", facts.Scan)
+	}
+	// rel 在 Ubuntu 上没有（编号的别处有）：Exists=false，Found 带出同编号的目录
+	none, err := f.cl.Facts(context.Background(), PFRemoteUnit{Code: pfrtCode + "R3", Rel: "2026/260403J1001-不存在"}, PFRemoteFactsOptions{})
+	pfrtNoErr(t, err)
+	if none.Exists || len(none.Found) != 2 {
+		t.Fatalf("rel 不在应 Exists=false 且报出同编号的两个目录: %+v", none)
 	}
 }
 

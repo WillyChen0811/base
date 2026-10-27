@@ -327,16 +327,16 @@ func (s *PFRemoteServer) poll(ctx context.Context, req *PFRemotePollRequest) PFR
 			continue
 		}
 		pu.DirID = id
-		if !u.Dup {
-			res, serr := PFScan(ctx, abs, s.scanOpts(req.QuietSeconds))
-			switch {
-			case ctx.Err() != nil:
-				return fail("已取消")
-			case serr != nil:
-				pu.Error = "扫描失败: " + serr.Error()
-			default:
-				pu.Fingerprint, pu.Summary = res.Fingerprint(), pfrSummary(res)
-			}
+		// §14.2：同编号多个目录不再整批停（取代 G4），每个目录按自己的 rel 照常扫描给指纹
+		// （登记的另配单元要靠它跳过没变化的轮次；没配置的扫了也只会被报告忽略）。
+		res, serr := PFScan(ctx, abs, s.scanOpts(req.QuietSeconds))
+		switch {
+		case ctx.Err() != nil:
+			return fail("已取消")
+		case serr != nil:
+			pu.Error = "扫描失败: " + serr.Error()
+		default:
+			pu.Fingerprint, pu.Summary = res.Fingerprint(), pfrSummary(res)
 		}
 		resp.Units = append(resp.Units, pu)
 	}

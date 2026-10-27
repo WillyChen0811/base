@@ -50,13 +50,14 @@ type pfumEnv struct {
 	syn  string // 同步目录
 	meta string
 
-	skipSnap bool // expectRefused 不比对项目内容（钩子里会改文件）
-	nowFn    func() time.Time
-	lstatMod func(path string, st *PFStat) // 改 Lstat 的结果（模拟占位、不同卷）
-	symlink  func(target, link string) error
-	rename   func(oldPath, newPath string) error
-	sleep    func(ctx context.Context, d time.Duration) error
-	hook     PFUnitMoveHook
+	skipSnap  bool // expectRefused 不比对项目内容（钩子里会改文件）
+	nowFn     func() time.Time
+	lstatMod  func(path string, st *PFStat) // 改 Lstat 的结果（模拟占位、不同卷）
+	symlink   func(target, link string) error
+	rename    func(oldPath, newPath string) error
+	sleep     func(ctx context.Context, d time.Duration) error
+	hook      PFUnitMoveHook
+	pathsList string // 配置路径清单（§14.4 开始同步的闸）；newPFUMEnv 缺省写一份空清单，用例要自己的清单就改写它
 }
 
 func newPFUMEnv(t *testing.T) *pfumEnv {
@@ -77,12 +78,16 @@ func newPFUMEnv(t *testing.T) *pfumEnv {
 			t.Fatal(err)
 		}
 	}
+	// 开始同步的闸一律要读清单（评审 17-2：路径为空不能关闸）：缺省显式给一份空清单（谁都没配置）
+	e.pathsList = filepath.Join(e.home, ".xxyi", "projfiles-paths.json")
+	pfumWritePathsList(t, e.pathsList, `{"version":1,"units":[]}`)
 	return e
 }
 
 func (e *pfumEnv) cfg() PFUnitMoveConfig {
 	return PFUnitMoveConfig{
 		WorkDir: e.work, SyncDir: e.syn, Meta: e.meta, Home: e.home,
+		PathsList: e.pathsList,
 		Now: func() time.Time {
 			if e.nowFn != nil {
 				return e.nowFn()
@@ -429,6 +434,8 @@ func TestPFUnitMove_ValidateConfig(t *testing.T) {
 		{"同步目录没设置", func(c *PFUnitMoveConfig) { c.SyncDir = "" }, "没有设置"},
 		{"工作目录不是绝对路径", func(c *PFUnitMoveConfig) { c.WorkDir = "Desktop/Projects" }, "绝对路径"},
 		{"meta 不是绝对路径", func(c *PFUnitMoveConfig) { c.Meta = ".xxyi" }, "绝对路径"},
+		{"配置路径清单没设置", func(c *PFUnitMoveConfig) { c.PathsList = "" }, "配置路径清单没有设置"},
+		{"配置路径清单不是绝对路径", func(c *PFUnitMoveConfig) { c.PathsList = "projfiles-paths.json" }, "配置路径清单"},
 		{"在 Desktop 下", func(c *PFUnitMoveConfig) { c.SyncDir = filepath.Join(c.Home, "Desktop", "sync") }, "iCloud"},
 		{"就是 Desktop", func(c *PFUnitMoveConfig) { c.SyncDir = filepath.Join(c.Home, "Desktop") }, "iCloud"},
 		{"在 Documents 下", func(c *PFUnitMoveConfig) { c.SyncDir = filepath.Join(c.Home, "Documents", "sync") }, "iCloud"},
@@ -1046,6 +1053,131 @@ func TestPFUnitMove_RefuseTooDeepExcludedDir(t *testing.T) {
 	e.expectRefused(t, pfumRel, PFUnitMoveCodeUnreadable)
 }
 
+// 评审 17-1：两次扫描之间新出现的占位、读不了、跨卷、Office 锁也要拦（以前只分析第一次扫描，
+// 而排除项的变化又被稳定性比较过滤掉）。夹具里 sleep 钩子在两次扫描之间动手。
+func TestPFUnitMove_RefuseRiskAppearingBetweenScans(t *testing.T) {
+	t.Run("排除的隐藏文件被驱逐成占位（size/mtime/ino 都没变）", func(t *testing.T) {
+		e := newPFUMEnv(t)
+		root := e.project(pfumRel)
+		e.put(root, ".隐藏资料/内容.bin", "hidden")
+		evicted := false
+		e.sleep = func(ctx context.Context, d time.Duration) error { evicted = true; return nil }
+		e.lstatMod = func(p string, st *PFStat) {
+			if evicted && strings.HasSuffix(p, "内容.bin") {
+				st.Flags |= PFSFDataless
+			}
+		}
+		res := e.expectRefused(t, pfumRel, PFUnitMoveCodePlaceholder)
+		if f := pfumRefusalFiles(res, PFUnitMoveCodePlaceholder); len(f) != 1 || f[0] != ".隐藏资料/内容.bin" {
+			t.Errorf("应列出第二次扫描才变成占位的文件：%v", f)
+		}
+		e.noUnit(t, pfumCode)
+	})
+	t.Run("普通文件被驱逐成占位", func(t *testing.T) {
+		e := newPFUMEnv(t)
+		e.project(pfumRel)
+		evicted := false
+		e.sleep = func(ctx context.Context, d time.Duration) error { evicted = true; return nil }
+		e.lstatMod = func(p string, st *PFStat) {
+			if evicted && strings.HasSuffix(p, "平面图.pdf") {
+				st.Flags |= PFSFDataless
+			}
+		}
+		e.expectRefused(t, pfumRel, PFUnitMoveCodePlaceholder)
+	})
+	t.Run("两次扫描之间新出现 .X.icloud", func(t *testing.T) {
+		e := newPFUMEnv(t)
+		root := e.project(pfumRel)
+		e.skipSnap = true
+		e.sleep = func(ctx context.Context, d time.Duration) error {
+			return os.WriteFile(filepath.Join(root, "02 图纸", ".新图.pdf.icloud"), []byte("stub"), 0o644)
+		}
+		res := e.expectRefused(t, pfumRel, PFUnitMoveCodePlaceholder)
+		if f := pfumRefusalFiles(res, PFUnitMoveCodePlaceholder); len(f) != 1 || f[0] != "02 图纸/新图.pdf" {
+			t.Errorf("应列出 X 的路径：%v", f)
+		}
+	})
+	t.Run("两次扫描之间新出现 Office 锁", func(t *testing.T) {
+		e := newPFUMEnv(t)
+		root := e.project(pfumRel)
+		e.skipSnap = true
+		e.sleep = func(ctx context.Context, d time.Duration) error {
+			return os.WriteFile(filepath.Join(root, "01 合同", "~$合同.docx"), []byte("lock"), 0o644)
+		}
+		e.expectRefused(t, pfumRel, PFUnitMoveCodeOfficeLock)
+	})
+	t.Run("两次扫描之间出现跨卷的内容", func(t *testing.T) {
+		e := newPFUMEnv(t)
+		e.project(pfumRel)
+		moved := false
+		e.sleep = func(ctx context.Context, d time.Duration) error { moved = true; return nil }
+		e.lstatMod = func(p string, st *PFStat) {
+			if moved && strings.HasSuffix(p, "视频") {
+				st.Dev += 5
+			}
+		}
+		e.expectRefused(t, pfumRel, PFUnitMoveCodeCrossVolume)
+	})
+	t.Run("两次扫描之间隐藏目录变得读不了", func(t *testing.T) {
+		pfaSkipIfRoot(t)
+		e := newPFUMEnv(t)
+		root := e.project(pfumRel)
+		e.put(root, ".cache/x.bin", "hidden")
+		e.skipSnap = true
+		dir := filepath.Join(root, ".cache")
+		t.Cleanup(func() { os.Chmod(dir, 0o755) })
+		e.sleep = func(ctx context.Context, d time.Duration) error { return os.Chmod(dir, 0o000) }
+		res := e.expectRefused(t, pfumRel, PFUnitMoveCodeUnreadable)
+		if f := pfumRefusalFiles(res, PFUnitMoveCodeUnreadable); len(f) != 1 || f[0] != ".cache" {
+			t.Errorf("应列出读不了的隐藏目录：%v", f)
+		}
+	})
+}
+
+// pfumUnstable：排除项的变动不算，但排除项在两次之间占位 / 读不了 / 消失状态不同不能被过滤掉。
+func TestPFUnitMove_UnstableKeepsRiskOfExcluded(t *testing.T) {
+	file := func(path string, flags uint32) PFScanItem {
+		st := PFStat{Kind: PFKindFile, Size: 5, MtimeNs: 100, Ino: 7, Flags: flags}
+		return PFScanItem{Path: path, Kind: PFKindFile, Stat: st, HasStat: true, State: PFStateOK}
+	}
+	res := func(items ...PFScanItem) *PFScanResult { return &PFScanResult{Items: items} }
+	// 普通排除项的变动：不算
+	a, b := file(".DS_Store", 0), file(".DS_Store", 0)
+	b.Stat.MtimeNs = 999
+	if got := pfumUnstable(res(a), res(b)); len(got) != 0 {
+		t.Errorf("排除项普通变动不该算不稳定：%v", got)
+	}
+	// 排除项被驱逐（签名 size/mtime/ino 没变，只有 flags 变）：签名比较看不出，但分析第二次扫描会拦；
+	// 这里确认变动本身出现时（又改了 mtime）不会被排除过滤吞掉
+	a, b = file(".隐藏/内容.bin", 0), file(".隐藏/内容.bin", PFSFDataless)
+	b.Stat.MtimeNs = 999
+	if got := pfumUnstable(res(a), res(b)); len(got) != 1 || got[0] != ".隐藏/内容.bin（变动）" {
+		t.Errorf("排除项变成占位不能被过滤：%v", got)
+	}
+	// 排除项新增的 .X.icloud
+	stub := PFScanItem{Path: ".隐藏/.内容.bin.icloud", Kind: PFKindFile, State: PFStateUnknown, Code: PFCodeICloudPlaceholder}
+	if got := pfumUnstable(res(), res(stub)); len(got) != 1 {
+		t.Errorf("新增的 .X.icloud 不能被过滤：%v", got)
+	}
+	// 排除目录读不了
+	dir := PFScanItem{Path: ".cache", Kind: PFKindDir, State: PFStateOutOfScope, Code: PFCodeUnreadable}
+	okDir := PFScanItem{Path: ".cache", Kind: PFKindDir, HasStat: true, Stat: PFStat{Kind: PFKindDir, Ino: 3}, State: PFStateOK}
+	if got := pfumUnstable(res(okDir), res(dir)); len(got) != 1 {
+		t.Errorf("排除目录变得读不了不能被过滤：%v", got)
+	}
+}
+
+func TestPFUnitMove_UnionKeepsOrderAndDedups(t *testing.T) {
+	a := []string{"b", "a"}
+	got := pfumUnion(a, []string{"a", "c", "c"})
+	if strings.Join(got, ",") != "b,a,c" {
+		t.Errorf("并集应保持原顺序、去重：%v", got)
+	}
+	if strings.Join(a, ",") != "b,a" {
+		t.Errorf("不能改动入参：%v", a)
+	}
+}
+
 func TestPFUnitMove_RefuseNotRealDir(t *testing.T) {
 	t.Run("不存在", func(t *testing.T) {
 		e := newPFUMEnv(t)
@@ -1491,4 +1623,168 @@ func TestPFUnitMove_UnlinkNeverRemovesDirs(t *testing.T) {
 	if data, _ := os.ReadFile(filepath.Join(target, "a.txt")); string(data) != "a" {
 		t.Errorf("目录里的东西不能被动")
 	}
+}
+
+// ── 开始同步的闸（§14.4）───────────────────────────────
+
+// pfumWritePathsList 写一份配置路径清单（内容为调用方拼好的 JSON）。
+func pfumWritePathsList(t *testing.T, path, body string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// 评审 17-2：清单路径为空时不能让开始同步的闸失效——构造执行器就失败（测试要绕开闸，显式给一份临时清单）。
+func TestPFUnitMove_EmptyPathsListRejected(t *testing.T) {
+	e := newPFUMEnv(t)
+	for name, v := range map[string]string{"空": "", "相对路径": "projfiles-paths.json"} {
+		c := e.cfg()
+		c.PathsList = v
+		_, err := NewPFUnitMover(c)
+		var ce *PFUnitMoveConfigError
+		if !errors.As(err, &ce) || !strings.Contains(ce.Msg, "配置路径清单") {
+			t.Errorf("清单路径%s：构造应返回配置错误并说明是清单：%v", name, err)
+		}
+	}
+	// 清单路径给了一个不存在的文件：构造可以过（启动时 XXYI 可能还没导出），但开始同步一律拒绝，不放行
+	e.project(pfumRel)
+	if err := os.Remove(e.pathsList); err != nil {
+		t.Fatal(err)
+	}
+	e.expectRefused(t, pfumRel, PFUnitMoveCodePathsBad)
+	// 零值执行器（没经过构造）也不会因为路径为空而放行：读清单失败 → 拒绝
+	var zero PFUnitMover
+	zero.cfg = PFUnitMoveConfig{StableGap: time.Millisecond}.withDefaults()
+	zero.work, zero.sync, zero.meta = e.work, e.syn, e.meta
+	res, err := zero.StartSync(bg, pfumRel)
+	if err != nil || res.Status != PFUnitMoveRefused || !pfumHas(pfumRefusalCodes(res), PFUnitMoveCodePathsBad) {
+		t.Errorf("路径为空的执行器应拒绝开始同步：%v %+v", err, res)
+	}
+}
+
+// 评审 22-1：编号在清单的 blocked 里（它的配置不能同步，如主目录不在工作目录下）→ 开始同步一律拒绝，
+// 原因带上清单给的 reason；不能因为清单里没有这个编号的单元就当「没配置」放行。
+func TestPFUnitMove_PathsGateBlocked(t *testing.T) {
+	const code = "260403J1401"
+	const relOld = "2026/260403J1401-旧资料"
+	const relCopy = "2026/260403J1401-另配"
+	const reason = "主目录 /别处/260403J1401-正式 不在工作目录下，不能同步"
+	e := newPFUMEnv(t)
+	e.project(relOld)
+	e.project(relCopy)
+
+	// 1) blocked、清单里没有这个编号的单元：同编号的没配置目录不能放行
+	pfumWritePathsList(t, e.pathsList, `{"version":1,"units":[],"blocked":[{"code":"`+code+`","reason":"`+reason+`"}]}`)
+	res := e.expectRefused(t, relOld, PFUnitMoveCodeBlocked)
+	if !strings.Contains(res.Reason, reason) {
+		t.Errorf("拒绝原因要带上清单给的 reason：%s", res.Reason)
+	}
+	e.noUnit(t, code)
+
+	// 2) blocked 的编号同时有配置的另配单元：整个编号都不开始同步（连另配的目录也拒）
+	pfumWritePathsList(t, e.pathsList, `{"version":1,"units":[`+
+		`{"key":"`+code+`R2","code":"`+code+`","serials":["02"],"rel":"`+relCopy+`"}],`+
+		`"blocked":[{"code":"`+code+`","reason":"`+reason+`"}],"problems":["导出时的一条说明"]}`)
+	e.expectRefused(t, relCopy, PFUnitMoveCodeBlocked)
+	e.expectRefused(t, relOld, PFUnitMoveCodeBlocked)
+	e.noUnit(t, code+"R2")
+
+	// 3) reason 省略：给一句通用说明，照样拒绝
+	pfumWritePathsList(t, e.pathsList, `{"version":1,"units":[],"blocked":[{"code":"`+code+`"}]}`)
+	res = e.expectRefused(t, relOld, PFUnitMoveCodeBlocked)
+	if !strings.Contains(res.Reason, "配置不能同步") {
+		t.Errorf("没有 reason 时也要有通用说明：%s", res.Reason)
+	}
+
+	// 4) 别的编号不受影响；blocked 去掉后这个编号又能同步
+	const code2, rel2 = "260403J1402", "2026/260403J1402-别的项目"
+	e.project(rel2)
+	pfumWritePathsList(t, e.pathsList, `{"version":1,"units":[],"blocked":[{"code":"`+code+`","reason":"x"}]}`)
+	if r := e.mustStart(t, rel2); r.Unit != code2 {
+		t.Errorf("别的编号应照常开始同步：%+v", r)
+	}
+	pfumWritePathsList(t, e.pathsList, `{"version":1,"units":[]}`)
+	if r := e.mustStart(t, relOld); r.Unit != code {
+		t.Errorf("blocked 去掉后应能开始同步：%+v", r)
+	}
+}
+
+func TestPFUnitMove_PathsGate(t *testing.T) {
+	const code = "260403J1301"
+	const relMain = "2026/260403J1301-测试项目己"
+	const relCopy = "2026/260403J1301-测试项目己-副本"
+	const relOther = "2026/260403J1301-没配置"
+	e := newPFUMEnv(t)
+	e.project(relMain)
+	e.project(relCopy)
+
+	// 1) 清单读不到 → 有配置与否判断不了，拒绝并写原因
+	if err := os.Remove(e.pathsList); err != nil {
+		t.Fatal(err)
+	}
+	res := e.expectRefused(t, relMain, PFUnitMoveCodePathsBad)
+	if !strings.Contains(res.Reason, "清单") {
+		t.Errorf("原因要写明是清单的问题：%s", res.Reason)
+	}
+
+	// 2) 编号在清单里有配置、rel 是配置的那条 → 照常过，键 = 编号
+	pfumWritePathsList(t, e.pathsList, `{"version":1,"units":[`+
+		`{"key":"`+code+`","code":"`+code+`","serials":["01"],"rel":"`+relMain+`"},`+
+		`{"key":"`+code+`R2","code":"`+code+`","serials":["02"],"rel":"`+relCopy+`"}]}`)
+	r := e.mustStart(t, relMain)
+	if r.Unit != code {
+		t.Errorf("主目录单元的键应是编号，得 %q", r.Unit)
+	}
+	rec := e.wantUnit(t, code, PFUnitSyncing)
+	if rec.ProjectCode != "" {
+		t.Errorf("键 = 编号时 project_code 应留空，得 %q", rec.ProjectCode)
+	}
+
+	// 3) rel 不是清单里配置的那条 → 拒绝，原因列出配置的目录
+	e.project(relOther)
+	res = e.expectRefused(t, relOther, PFUnitMoveCodeNotConfigured)
+	if !strings.Contains(res.Reason, relMain) || !strings.Contains(res.Reason, relCopy) {
+		t.Errorf("原因要列出这个编号配置的目录：%s", res.Reason)
+	}
+
+	// 4) 另配目录单元：键取清单里的 R2，编号记进 project_code；取消同步按 R2 键也走得通
+	r = e.mustStart(t, relCopy)
+	if r.Unit != code+"R2" {
+		t.Errorf("另配目录单元的键应是 %sR2，得 %q", code, r.Unit)
+	}
+	rec = e.wantUnit(t, code+"R2", PFUnitSyncing)
+	if rec.ProjectCode != code || rec.Rel != relCopy {
+		t.Errorf("登记应是编号 %s 配 %s，得 %+v", code, relCopy, rec)
+	}
+	if got := pfumSnap(t, e.S(relCopy)); len(got) == 0 {
+		t.Errorf("取消前同步目录里应是完整项目")
+	}
+
+	// 编号完全不在清单里 → 照旧（键 = 编号），闸只挡配置过的编号
+	const code2, rel2 = "260403J1302", "2026/260403J1302-另一个项目"
+	e.project(rel2)
+	r = e.mustStart(t, rel2)
+	if r.Unit != code2 {
+		t.Errorf("不在清单里的编号应照旧按编号登记，得 %q", r.Unit)
+	}
+
+	// CreateSynced 不受闸限制：把清单弄坏也照样能建（键 = 编号）
+	pfumWritePathsList(t, e.pathsList, `{"version":1,"units": 坏 JSON`)
+	const code3, rel3 = "260403J1303", "2026/260403J1303-桌面新建"
+	res, err := e.mover().CreateSynced(bg, rel3)
+	if err != nil || res.Status != PFUnitMoveDone || res.Unit != code3 {
+		t.Fatalf("CreateSynced 不该被闸挡住：%+v %v", res, err)
+	}
+
+	// 取消 R2 单元：键检查放宽后按 R2 取消，目录搬回原位
+	e.mustStop(t, code+"R2")
+	if st, err := os.Lstat(e.P(relCopy)); err != nil || !st.IsDir() {
+		t.Errorf("取消后 %s 应搬回桌面原位", relCopy)
+	}
+	e.wantUnit(t, code+"R2", PFUnitStopped) // 取消同步后登记留着，状态是 stopped（与主目录单元一样）
+	e.noTmp(t)
 }

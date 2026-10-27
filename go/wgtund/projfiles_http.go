@@ -14,6 +14,10 @@ package wgtund
 //	POST /projfiles/unit/stop  {code}      取消同步
 //	POST /projfiles/unit/create {rel}      新建一个已同步的项目
 //	GET  /projfiles/unit?code=             这个单元最近一轮的结果与 Aligned（给以后的归档判断用）
+//	POST /projfiles/merge/plan {from_rel,to_rel}
+//	                                        没配置的同编号目录合并进配置目录：只读出计划（move/same/rename/ask + 空目录 + 指纹）
+//	POST /projfiles/merge/run  {from_rel,to_rel,fingerprint}
+//	                                        带指纹执行合并；指纹变了拒绝并退回新计划；目标是已同步单元时执行期拿单元锁
 //	POST /projfiles/unit/release|restore   以后做（501）
 //	POST /projfiles/conflict/resolve       界面定了再做（501）
 //
@@ -488,6 +492,100 @@ func (h *projfilesAPI) localHandler(ctx context.Context) http.Handler {
 		h.unitMove(ctx, w, "stop", body.Code)
 	})
 
+	// 合并（§14.3）：把没配置的同编号目录合并进配置目录（只在 Mac 真做）。
+	// 切换窗口（目录改了还没重建完）一律 busy；run 再占住轮次，目标若是已登记单元由 PFMergeRun 内部
+	// 拿住调度器里那把单元锁，跟本轮跑 / 取最新互斥。
+	mux.HandleFunc("/projfiles/merge/plan", func(w http.ResponseWriter, r *http.Request) {
+		if !needMethod(w, r, http.MethodPost) {
+			return
+		}
+		var body struct {
+			FromRel string `json:"from_rel"`
+			ToRel   string `json:"to_rel"`
+		}
+		if !decodeBody(w, r, &body) {
+			return
+		}
+		if err := relArg(body.FromRel); err != nil {
+			errJSON(w, http.StatusBadRequest, "from_rel: "+err.Error())
+			return
+		}
+		if err := relArg(body.ToRel); err != nil {
+			errJSON(w, http.StatusBadRequest, "to_rel: "+err.Error())
+			return
+		}
+		if why := h.dirSwitchWhy(); why != "" {
+			busyJSON(w, why)
+			return
+		}
+		if err := h.ensureBuilt(); err != nil {
+			errJSON(w, http.StatusServiceUnavailable, err.Error())
+			return
+		}
+		cfg, err := h.mergeCfg()
+		if err != nil {
+			errJSON(w, http.StatusServiceUnavailable, err.Error())
+			return
+		}
+		plan, err := projsync.PFMergePlan(cfg, body.FromRel, body.ToRel)
+		if err != nil {
+			errJSON(w, mergeErrStatus(err), err.Error())
+			return
+		}
+		writeJSON(w, plan)
+	})
+
+	mux.HandleFunc("/projfiles/merge/run", func(w http.ResponseWriter, r *http.Request) {
+		if !needMethod(w, r, http.MethodPost) {
+			return
+		}
+		var body struct {
+			FromRel     string `json:"from_rel"`
+			ToRel       string `json:"to_rel"`
+			Fingerprint string `json:"fingerprint"`
+		}
+		if !decodeBody(w, r, &body) {
+			return
+		}
+		if err := relArg(body.FromRel); err != nil {
+			errJSON(w, http.StatusBadRequest, "from_rel: "+err.Error())
+			return
+		}
+		if err := relArg(body.ToRel); err != nil {
+			errJSON(w, http.StatusBadRequest, "to_rel: "+err.Error())
+			return
+		}
+		if body.Fingerprint == "" {
+			errJSON(w, http.StatusBadRequest, "要带计划指纹 fingerprint（先调 /projfiles/merge/plan 拿）")
+			return
+		}
+		if why := h.dirSwitchWhy(); why != "" {
+			busyJSON(w, why)
+			return
+		}
+		if !h.svc.acquire() {
+			busyJSON(w, "有一轮同步或别的单元操作在进行，稍后再试")
+			return
+		}
+		defer h.svc.release()
+		if err := h.ensureBuilt(); err != nil {
+			errJSON(w, http.StatusServiceUnavailable, err.Error())
+			return
+		}
+		cfg, err := h.mergeCfg()
+		if err != nil {
+			errJSON(w, http.StatusServiceUnavailable, err.Error())
+			return
+		}
+		res, err := projsync.PFMergeRun(r.Context(), cfg, body.FromRel, body.ToRel, body.Fingerprint)
+		if err != nil {
+			errJSON(w, mergeErrStatus(err), err.Error())
+			return
+		}
+		// 指纹不符 / 拿不到锁 / 配置问题：不是服务故障，回 200，rejected+reason+新计划原样交给调用方。
+		writeJSON(w, res)
+	})
+
 	mux.HandleFunc("/projfiles/unit/release", notYet("以后做"))
 	mux.HandleFunc("/projfiles/unit/restore", notYet("以后做"))
 	mux.HandleFunc("/projfiles/conflict/resolve", notYet("界面定了再做"))
@@ -547,6 +645,37 @@ func (h *projfilesAPI) unitMove(ctx context.Context, w http.ResponseWriter, op, 
 		return
 	}
 	writeJSON(w, res)
+}
+
+// mergeCfg 从当前生效的零件拼一份合并配置：work/sync 用实际在用的那对目录（activeDirs，切换期已由
+// dirSwitchWhy 挡在前面），meta/回收区取自 prep.metaDir，静止秒数取设置，单元锁用当前调度器。
+func (h *projfilesAPI) mergeCfg() (projsync.PFMergeConfig, error) {
+	workDir, syncDir := h.svc.activeDirs()
+	if workDir == "" {
+		return projsync.PFMergeConfig{}, errors.New("合并用不了：还没有正在用的工作目录（设置里要有 work_dir）")
+	}
+	if syncDir == "" {
+		return projsync.PFMergeConfig{}, errors.New("合并用不了：还没有正在用的同步目录（设置里要有 sync_dir）")
+	}
+	return projsync.PFMergeConfig{
+		WorkDir:      workDir,
+		SyncDir:      syncDir,
+		MetaDir:      h.svc.prep.metaDir,
+		RecycleDir:   projsync.PFRoundMacRecycleDir(h.svc.prep.metaDir),
+		QuietSeconds: h.svc.settingsNow().QuietSeconds,
+		Sched:        h.svc.getSched(),
+		Now:          h.svc.now,
+	}, nil
+}
+
+// mergeErrStatus 给合并的错误定 HTTP 码：配置类（回收区跨盘等）是服务端问题 503，其余（参数、来源是同步单元、
+// 目录不存在等）都是调用方能把话说清楚改一改的，400。
+func mergeErrStatus(err error) int {
+	var cfgErr *projsync.PFApplyConfigError
+	if errors.As(err, &cfgErr) {
+		return http.StatusServiceUnavailable
+	}
+	return http.StatusBadRequest
 }
 
 // dirSwitchWhy 返回「目录刚改过、正在切换」的一句话；不需要切换时空串。

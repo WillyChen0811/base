@@ -97,22 +97,25 @@ const (
 // 原因代码（结果的 Code、拒绝原因的 Code）：给上层按类处理；给人看的是 Reason。
 const (
 	PFUnitMoveCodeOK             = "ok"
-	PFUnitMoveCodeBadRel         = "bad_rel"             // rel 不合法或不符合登记要求
-	PFUnitMoveCodeNoCode         = "no_code"             // 目录名认不出项目编号
-	PFUnitMoveCodeRegistered     = "registered"          // 编号已登记（同步中/正在开始/正在取消）
-	PFUnitMoveCodeNotRegistered  = "not_registered"      // 取消同步：编号没登记
-	PFUnitMoveCodeBadState       = "bad_state"           // 取消同步：登记状态不是 syncing/stopping
-	PFUnitMoveCodeMovePending    = "move_pending"        // 有没做完的移动日志，先 RecoverMoves 或人工处理
-	PFUnitMoveCodeNotRealDir     = "p_not_real_dir"      // 桌面位置不存在、是链接、不是目录
-	PFUnitMoveCodePathLink       = "path_link"           // 上级目录是链接或文件
-	PFUnitMoveCodeTargetExists   = "target_exists"       // 同步目录里这个位置已经有东西
-	PFUnitMoveCodeCrossVolume    = "cross_volume"        // 与同步目录不同卷
-	PFUnitMoveCodePlaceholder    = "icloud_placeholder"  // iCloud 占位文件（SF_DATALESS 或 .X.icloud）
-	PFUnitMoveCodeOfficeLock     = "office_lock"         // Office 锁
-	PFUnitMoveCodeNotQuiet       = "not_quiet"           // 最近有写入
-	PFUnitMoveCodeUnstable       = "unstable"            // 间隔两次扫描指纹不同
-	PFUnitMoveCodeUnreadable     = "unreadable"          // 读不了的目录
-	PFUnitMoveCodeRegistryBad    = "registry_unreadable" // units.json 读不了或坏了
+	PFUnitMoveCodeBadRel         = "bad_rel"               // rel 不合法或不符合登记要求
+	PFUnitMoveCodeNoCode         = "no_code"               // 目录名认不出项目编号
+	PFUnitMoveCodeRegistered     = "registered"            // 编号已登记（同步中/正在开始/正在取消）
+	PFUnitMoveCodeNotRegistered  = "not_registered"        // 取消同步：编号没登记
+	PFUnitMoveCodeBadState       = "bad_state"             // 取消同步：登记状态不是 syncing/stopping
+	PFUnitMoveCodeMovePending    = "move_pending"          // 有没做完的移动日志，先 RecoverMoves 或人工处理
+	PFUnitMoveCodeNotRealDir     = "p_not_real_dir"        // 桌面位置不存在、是链接、不是目录
+	PFUnitMoveCodePathLink       = "path_link"             // 上级目录是链接或文件
+	PFUnitMoveCodeTargetExists   = "target_exists"         // 同步目录里这个位置已经有东西
+	PFUnitMoveCodeCrossVolume    = "cross_volume"          // 与同步目录不同卷
+	PFUnitMoveCodePlaceholder    = "icloud_placeholder"    // iCloud 占位文件（SF_DATALESS 或 .X.icloud）
+	PFUnitMoveCodeOfficeLock     = "office_lock"           // Office 锁
+	PFUnitMoveCodeNotQuiet       = "not_quiet"             // 最近有写入
+	PFUnitMoveCodeUnstable       = "unstable"              // 间隔两次扫描指纹不同
+	PFUnitMoveCodeUnreadable     = "unreadable"            // 读不了的目录
+	PFUnitMoveCodeRegistryBad    = "registry_unreadable"   // units.json 读不了或坏了
+	PFUnitMoveCodePathsBad       = "paths_list_unreadable" // 配置路径清单读不到/坏了，有没有配置判断不了（§14.4）
+	PFUnitMoveCodeNotConfigured  = "not_configured"        // 编号有配置但这个目录不是配置的那条（§14.2，可以合并）
+	PFUnitMoveCodeBlocked        = "config_blocked"        // 编号在清单的 blocked 里：它的配置不能同步（如主目录不在工作目录下），原因由清单给（评审 22-1）
 	PFUnitMoveCodeChanged        = "changed_during_check"
 	PFUnitMoveCodeNotOurLink     = "not_our_link" // 取消同步：桌面位置不是指向 S 的我们建的链接
 	PFUnitMoveCodeSyncMissing    = "sync_missing" // S 不见了或不是真实目录
@@ -193,6 +196,12 @@ type PFUnitMoveConfig struct {
 	Meta    string // meta 目录（~/.xxyi/projfiles），放 units.json 和 moves/
 	Home    string // 用户家目录，校验同步目录用；缺省 os.UserHomeDir()
 
+	// PathsList：XXYI 导出的配置路径清单 ~/.xxyi/projfiles-paths.json（§14.4），必须填绝对路径（空或相对路径构造时就失败）。
+	// StartSync 一律走「开始同步的闸」：编号在清单里有配置 → rel 必须是其中一条、键取清单里的；
+	// 编号在 blocked 里 → 拒绝；清单读不到 → 拒绝。不能靠不填来关闸；测试要绕开就显式给一份临时清单。
+	// CreateSynced 不受闸限制（新建同步项目键 = 编号）。
+	PathsList string
+
 	QuietSeconds int           // 「最近没写入」的秒数，缺省 10
 	StableGap    time.Duration // 开始同步前两次扫描的间隔，缺省 2 秒
 	LockStale    time.Duration // Office 锁当残留的时长，缺省 12 小时
@@ -267,7 +276,7 @@ func PFUnitMoveValidateConfig(cfg PFUnitMoveConfig) error {
 	if err := pfumPlatformErr(); err != nil {
 		return bad("%v", err)
 	}
-	for _, d := range []struct{ name, p string }{{"工作目录", cfg.WorkDir}, {"同步目录", cfg.SyncDir}, {"meta 目录", cfg.Meta}, {"家目录", cfg.Home}} {
+	for _, d := range []struct{ name, p string }{{"工作目录", cfg.WorkDir}, {"同步目录", cfg.SyncDir}, {"meta 目录", cfg.Meta}, {"家目录", cfg.Home}, {"配置路径清单", cfg.PathsList}} {
 		if d.p == "" {
 			return bad("%s没有设置", d.name)
 		}
@@ -1013,22 +1022,73 @@ func (m *PFUnitMover) analyze(r *PFScanResult, dev uint64) pfumFacts {
 	return f
 }
 
+// mergeRisk 把另一次扫描的「会让内容丢掉或没法确认」的几类事实并进来（占位、读不了、跨卷、消失、Office 锁），按路径去重。
+// 计数和「最近写入」不并：它们只看第一次扫描；新增、变动由两次扫描的比较（pfumUnstable）负责。
+func (f *pfumFacts) mergeRisk(o pfumFacts) {
+	f.placeholder = pfumUnion(f.placeholder, o.placeholder)
+	f.unreadable = pfumUnion(f.unreadable, o.unreadable)
+	f.vanished = pfumUnion(f.vanished, o.vanished)
+	f.crossVol = pfumUnion(f.crossVol, o.crossVol)
+	f.locks = pfumUnion(f.locks, o.locks)
+	f.staleLocks = pfumUnion(f.staleLocks, o.staleLocks)
+}
+
+// pfumUnion 返回 a 加上 b 里 a 没有的路径（保持 a 的顺序，b 的新增接在后面）。
+func pfumUnion(a, b []string) []string {
+	if len(b) == 0 {
+		return a
+	}
+	seen := make(map[string]bool, len(a)+len(b))
+	for _, x := range a {
+		seen[x] = true
+	}
+	out := append([]string(nil), a...)
+	for _, x := range b {
+		if !seen[x] {
+			seen[x] = true
+			out = append(out, x)
+		}
+	}
+	return out
+}
+
+// pfumRiskKind 说一个扫描条目有没有「占位 / 读不了 / 消失」这类让挪动变危险的状态；没有返回 ""。
+// 排除同步的条目也要看：排除只是不同步，文件照样跟着整个项目一起挪出 iCloud。
+func pfumRiskKind(it PFScanItem) string {
+	switch {
+	case it.Code == PFCodeICloudPlaceholder || (it.HasStat && it.Stat.Dataless()):
+		return "占位"
+	case it.State == PFStateOutOfScope && (it.Code == PFCodeUnreadable || it.Code == PFCodeTooDeep):
+		return "读不了"
+	case it.Code == PFCodeVanished:
+		return "消失"
+	}
+	return ""
+}
+
 func (m *PFUnitMover) scanOpts() PFScanOptions {
 	return PFScanOptions{Stat: m.cfg.Lstat, Now: m.cfg.Now, QuietSeconds: m.cfg.QuietSeconds}
 }
 
 // unstable 比较两次扫描，返回没被排除的条目里的差别（"路径（变动）"）。
+// 被排除的条目，只要任一次扫描里它是占位 / 读不了 / 消失就照样算（排除同步不能免除这个检查）。
+// 稳定签名 size/mtime/ino 看不出文件被 iCloud 驱逐，所以占位与否另按条目本身判。
 func pfumUnstable(a, b *PFScanResult) []string {
 	_, diffs := PFScansStable(a, b)
 	var out []string
 	for _, d := range diffs {
 		isDir := false
-		if it, ok := b.Find(d.Path); ok {
-			isDir = it.Kind == PFKindDir
-		} else if it, ok := a.Find(d.Path); ok {
-			isDir = it.Kind == PFKindDir
+		risky := false
+		bi, inB := b.Find(d.Path)
+		ai, inA := a.Find(d.Path)
+		switch {
+		case inB:
+			isDir = bi.Kind == PFKindDir
+		case inA:
+			isDir = ai.Kind == PFKindDir
 		}
-		if pfumExcluded(d.Path, isDir) {
+		risky = (inB && pfumRiskKind(bi) != "") || (inA && pfumRiskKind(ai) != "")
+		if pfumExcluded(d.Path, isDir) && !risky {
 			continue
 		}
 		out = append(out, d.Path+"（"+d.Why+"）")
@@ -1140,6 +1200,41 @@ func (m *PFUnitMover) StartSync(ctx context.Context, rel string) (PFUnitMoveResu
 	p, s, code := rec.LinkPath, rec.SyncPath, rec.Code
 	var rf pfumRefusals
 
+	// 开始同步的闸（§14.4）：这个编号在清单的 blocked 里 → 拒绝（原因取清单里的 reason）；
+	// 这个编号在清单里有配置 → rel 必须是其中一条，键取清单里的；
+	// 清单里没有这个编号 → 照旧（键 = 编号）；清单读不到 → 有没有配置判断不了，拒绝。
+	// 闸一律走（构造时已要求清单路径非空；路径为空的零值执行器读清单也会失败而拒绝，不会放行）。
+	cp, cpErr := PFLoadConfiguredPaths(m.cfg.PathsList)
+	blockedWhy, isBlocked := cp.BlockedReason(code) // cp 为 nil（读失败）时返回 false，由下面 cpErr 分支先拒绝
+	switch {
+	case cpErr != nil:
+		rf.addf(PFUnitMoveCodePathsBad, "配置路径清单读不到或坏了（%v），判断不了这个编号配置的目录，不能开始同步", cpErr)
+	case isBlocked:
+		// 编号在 blocked 里：它的配置不能同步。不能当「没配置」放行，这个编号下的任何目录（含另配目录）都不能开始同步。
+		if blockedWhy == "" {
+			blockedWhy = "这个编号的配置不能同步"
+		}
+		rf.addf(PFUnitMoveCodeBlocked, "编号 %s 的配置不能同步，不能开始同步：%s", code, blockedWhy)
+	case len(cp.Units(code)) > 0:
+		cu, conf := cp.Find(code, rel)
+		if !conf {
+			var rels []string
+			for _, u := range cp.Units(code) {
+				rels = append(rels, u.Rel)
+			}
+			rf.addf(PFUnitMoveCodeNotConfigured, "这个编号配置的目录是 %s，这个目录没配置，不能同步（可以合并进去）", strings.Join(rels, "、"))
+		} else if cu.Key != rec.Code { // 另配目录单元（§14.1）：键 = 清单里的 key，编号记进 ProjectCode
+			rec.Code, rec.ProjectCode = cu.Key, code
+			if err := PFValidateUnit(rec); err != nil {
+				rf.addf(PFUnitMoveCodeBadRel, "清单给的键 %q 配这个登记不合格：%v", cu.Key, err)
+				rec.Code, rec.ProjectCode = code, ""
+			} else {
+				code = cu.Key
+				res.Unit = cu.Key
+			}
+		}
+	}
+
 	// 登记表、移动日志
 	us, err := PFUnitMoveLoadUnits(m.meta)
 	if err != nil {
@@ -1216,6 +1311,9 @@ func (m *PFUnitMover) StartSync(ctx context.Context, rel string) (PFUnitMoveResu
 			scan2, e2 := PFScan(ctx, p, m.scanOpts())
 			f := m.analyze(scan1, pst.Dev)
 			res.Files, res.Dirs, res.Bytes = f.files, f.dirs, f.bytes
+			if e2 == nil { // 两次扫描之间新出现的占位、读不了、跨卷、锁也要拦（任一次有就拒绝）
+				f.mergeRisk(m.analyze(scan2, pst.Dev))
+			}
 			if len(f.placeholder) > 0 {
 				rf.add(PFUnitMoveCodePlaceholder, fmt.Sprintf("有 %d 个 iCloud 占位文件（内容还只在云端），挪出桌面会丢；先让它们下载到本机", len(f.placeholder)), f.placeholder)
 			}
@@ -1427,8 +1525,8 @@ func (m *PFUnitMover) StopSync(ctx context.Context, code string) (PFUnitMoveResu
 	res := PFUnitMoveResult{Op: PFUnitMoveOpStop}
 	code = PFNormCode(code)
 	res.Unit = code
-	if c, ok := PFCodeFromName(code); !ok || c != code || !pfIsASCII(code) {
-		res.set(PFUnitMoveRefused, PFUnitMoveCodeNoCode, "%q 不是项目编号", code)
+	if _, ok := PFUnitKeyProjectCode(code); !ok { // §14.4：单元键 = 编号 或 编号+R+流水号数字
+		res.set(PFUnitMoveRefused, PFUnitMoveCodeNoCode, "%q 不是项目编号（也不是编号+R+流水号的单元键）", code)
 		res.Refusals = []PFUnitMoveRefusal{{Code: res.Code, Reason: res.Reason}}
 		return res, nil
 	}
@@ -2025,7 +2123,12 @@ func (m *PFUnitMover) RecoverMoves(ctx context.Context) ([]PFUnitMoveResult, err
 }
 
 func (m *PFUnitMover) recordOf(lg *PFUnitMoveLog, state PFUnitState) PFUnitRecord {
-	return PFUnitRecord{Code: lg.Code, Rel: lg.Rel, State: state, LinkPath: lg.P, SyncPath: lg.S, StartedAt: lg.StartedAt}
+	rec := PFUnitRecord{Code: lg.Code, Rel: lg.Rel, State: state, LinkPath: lg.P, SyncPath: lg.S, StartedAt: lg.StartedAt}
+	// §14.4：崩溃恢复出来的记录也要补 ProjectCode（键带 R 后缀时），别让空值被当成等于键。
+	if pc, ok := PFUnitKeyProjectCode(lg.Code); ok && pc != lg.Code {
+		rec.ProjectCode = pc
+	}
+	return rec
 }
 
 func (m *PFUnitMover) haltUnknown(res *PFUnitMoveResult, lg *PFUnitMoveLog, detail string) {

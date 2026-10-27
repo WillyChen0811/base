@@ -7,7 +7,8 @@ package projsync
 // 每一步的结果原样放进响应（PFApplyResult 已可 JSON 编码）。
 //
 // 【整批拒绝（Error，一步都没做）】请求读得懂但这次不做：根不在白名单、租约在别的协调者手里或读不懂、步骤不合法
-// （未知种类、字段不对、路径不合法、sha256 格式不对……所有步骤都先校验完才开始执行）、单元找不到或同编号有多个目录。
+// （未知种类、字段不对、路径不合法、sha256 格式不对……所有步骤都先校验完才开始执行）、单元找不到（按 rel 配不上，§14.4）
+// 或 rel 上的编号与请求对不上。同编号另有目录不再整批拒绝（§14.2，没配置的只报告）。
 //
 // 【中途停止】按顺序执行，出现下面任一情况就不再执行后面的步骤，响应里写明停在第几步：
 //   - 某一步结果是「放弃且 Uncertain」（现场没能完全恢复原状）；
@@ -18,7 +19,8 @@ package projsync
 //     有先后依赖的几步（例如冲突：改名 → 新建）让调用方带 StopOnFail。
 //
 // 【单元目录】PFApplier 要求单元目录已存在。新项目首次传到 Ubuntu 时第一步用 unit_mkdir 建单元目录本身：
-// 只在 Rel 的每一级都过得了名字规则、最后一级的编号等于 Code、Ubuntu 上没有别的目录用这个编号、路径上没有符号链接时才建。
+// 只在 Rel 的每一级都过得了名字规则、最后一级的编号等于 Code 的编号（Code 是单元键：编号，或 编号+R+流水号，§14.4）、
+// 路径上没有符号链接时才建；键就是编号的主单元还要求 Ubuntu 上没有别的目录用这个编号（键带 R 的另配单元，同编号在别处有目录是合法的）。
 //
 // 【扩展点】后续任务（T10 台账：ledger_stage / ledger_install）用 pfrRegisterOp 注册新的步骤种类，带自己的校验和执行，
 // 请求里放在 PFRemoteStep.Ext、结果放在 PFRemoteStepResult.Ext；本文件不需要再改。
@@ -376,16 +378,19 @@ func (s *PFRemoteServer) apply(ctx context.Context, req *PFRemoteApplyRequest) P
 			return fail("发现单元失败: %v", err)
 		}
 		rc.disc = &disc
+		// §14.4：按 rel 配对（不再按编号）；req.Code 是单元键，编号取键的前段。
+		// 同编号多个目录已合法（没配置的只报告），不再 Dup 即停（取代 G4）。
+		pc, _ := PFUnitKeyProjectCode(req.Code)
 		for i := range disc.Units {
-			if u := &disc.Units[i]; u.Code == req.Code && u.Rel == req.Rel {
+			if u := &disc.Units[i]; u.Rel == req.Rel {
 				rc.unit = u
 			}
 		}
 		switch {
-		case rc.unit != nil && rc.unit.Dup:
-			return fail("同一个编号 %s 在 Ubuntu 上有多个目录（%s 和 %s），单元停下，一步都没执行", req.Code, rc.unit.Rel, strings.Join(rc.unit.DupRels, "、"))
 		case rc.unit == nil && req.Steps[0].Op != PFRemoteOpUnitMkdir:
 			return fail("Ubuntu 上没有单元 %s（%s），或那里的目录名认不出这个编号，一步都没执行", req.Code, req.Rel)
+		case rc.unit != nil && rc.unit.Code != pc:
+			return fail("单元 %s 登记的目录 %s 在 Ubuntu 上认出的编号是 %s，跟请求对不上，一步都没执行", req.Code, req.Rel, rc.unit.Code)
 		}
 	}
 
@@ -575,6 +580,8 @@ func (rc *pfrApplyRun) unitMkdir() PFRemoteStepResult {
 	if o := PFCheckPath(rel, true); o != nil {
 		return bad("路径不合格：%s", o.Reason)
 	}
+	// §14.4：req.Code 是单元键；目录名里认的编号 = 键的前段（另配目录单元 CODER2 的目录仍叫编号开头）。
+	pc, _ := PFUnitKeyProjectCode(code)
 	for i, seg := range segs {
 		if strings.HasPrefix(seg, ".") {
 			return bad("%q 以 . 开头，发现单元时会被跳过", seg)
@@ -583,13 +590,17 @@ func (rc *pfrApplyRun) unitMkdir() PFRemoteStepResult {
 		if i < len(segs)-1 && ok {
 			return bad("上级目录 %q 里认得出编号 %s，单元不能建在另一个单元里面", seg, c)
 		}
-		if i == len(segs)-1 && (!ok || c != code || !pfIsASCII(c)) {
-			return bad("最后一级 %q 认出的编号是 %q，与 %s 不符", seg, c, code)
+		if i == len(segs)-1 && (!ok || c != pc || !pfIsASCII(c)) {
+			return bad("最后一级 %q 认出的编号是 %q，与 %s 不符", seg, c, pc)
 		}
 	}
-	for _, u := range rc.disc.Units {
-		if u.Code == code {
-			return bad("Ubuntu 上已有目录 %s 用这个编号，不再新建一个", u.Rel)
+	// §14.2：键=编号+R+流水号的另配单元，同编号在别处已有目录是合法配置，照常建；
+	// 但键=编号的主单元只能有这个编号的一个目录，别处已有就不建（老规矩「已有目录」保留）。
+	if pc == code && rc.disc != nil {
+		for i := range rc.disc.Units {
+			if u := &rc.disc.Units[i]; u.Code == code && u.Rel != rel {
+				return bad("已有目录 %s 也是编号 %s，主单元不能建第二个目录（要同步另一个目录请在 Mac 端登记成 %sR+流水号的另配单元）", u.Rel, code, code)
+			}
 		}
 	}
 	cur := rc.env.root
@@ -629,6 +640,6 @@ func (rc *pfrApplyRun) unitMkdir() PFRemoteStepResult {
 		cur = next
 	}
 	res.Status, res.Code, res.Existed = PFApplyDone, PFApplyCodeOK, !created
-	rc.unit = &PFFoundUnit{Code: code, Rel: rel}
+	rc.unit = &PFFoundUnit{Code: pc, Rel: rel}
 	return PFRemoteStepResult{Apply: &res}
 }

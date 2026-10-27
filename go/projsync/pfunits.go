@@ -23,8 +23,9 @@ import (
 //     （testdata/pfunits_codes.json）；
 //  2. Ubuntu 侧单元目录发现（根下最多 5 层，认出编号即停，不跟随符号链接，同编号两个目录两个都标重复）；
 //  3. Mac 侧登记表 units.json 的内存结构、校验、JSON 序列化/反序列化（只做内存与字节，不写文件，
-//     原子写由编排层负责）；
-//  4. 新单元判定（登记中/已停止/Ubuntu 新项目/重复）与「Mac 工作目录里是否已有同编号目录」。
+//     原子写由编排层负责）。单元键 Code 可以是 编号 或 编号+R+流水号（§14.4），ProjectCode 记它属于哪个编号；
+//  4. 单元对账分类（§14.4：按 rel 配对——同步中/正在转变/已停止/没配置的同编号目录/新项目/重复/Ubuntu 上不见了）
+//     与「Mac 工作目录里是否已有同编号目录」。
 //
 // 本文件不管：写任何文件、判定、传输、开始/取消同步时的挪目录和建链接（pfunitmove）、base。
 //
@@ -303,6 +304,7 @@ const (
 	PFNoteStopped         = "已停止同步"
 	PFNoteNewOnUbuntu     = "Ubuntu 新项目"
 	PFNoteDuplicate       = "重复，停下"
+	PFNoteUnconfigured    = "同编号的另一个目录，没配置，不同步" // §14.2：登记单元按 rel 对，同编号不同 rel 只报告
 	PFNoteStartOnMacFirst = "请先对 Mac 上这个项目点开始同步"
 	PFNoteSlotOccupied    = "Mac 上这个位置已被占用（不是项目目录），不自动建"
 )
@@ -500,7 +502,10 @@ func (s PFUnitState) valid() bool {
 
 // PFUnitRecord 是登记表里的一项。
 //
-//   - Code：归一化项目编号（单元键），必须等于 Rel 最后一段认出的编号。
+//   - Code：单元键（归一化），等于项目编号，或 编号+`R`+流水号数字（§14.1 的另配目录单元，如 `260403J1001R2`）。
+//     200 多处按它分组、命名状态文件，不改名。
+//   - ProjectCode：这个单元属于哪个项目编号；键带 `R` 后缀时应显式写；空 = 从键推出（键 = 编号时就是 Code，
+//     键带 R 后缀时是 R 前面那段，见 PFUnitProjectCode），读到的记录一律以推出的编号为准、校验时与 Rel 认出的编号核对。
 //   - Rel：同步目录/工作目录下的相对路径（`<年>/<编号-名称>`，/ 分隔）。
 //   - LinkPath：桌面原位置（工作目录/Rel）的绝对路径，开始同步后是指向 SyncPath 的符号链接。
 //   - SyncPath：同步目录/Rel 的绝对路径，项目实际所在。
@@ -508,21 +513,86 @@ func (s PFUnitState) valid() bool {
 //
 // state 为 stopped 时单元已挪回桌面，LinkPath、SyncPath 可以为空；不为空则照常校验。
 type PFUnitRecord struct {
-	Code      string      `json:"code"`
-	Rel       string      `json:"rel"`
-	State     PFUnitState `json:"state"`
-	LinkPath  string      `json:"link_path"`
-	SyncPath  string      `json:"sync_path"`
-	StartedAt time.Time   `json:"started_at"`
+	Code        string      `json:"code"`
+	ProjectCode string      `json:"project_code,omitempty"`
+	Rel         string      `json:"rel"`
+	State       PFUnitState `json:"state"`
+	LinkPath    string      `json:"link_path"`
+	SyncPath    string      `json:"sync_path"`
+	StartedAt   time.Time   `json:"started_at"`
+}
+
+// PFUnitProjectCode 返回这条登记的项目编号：ProjectCode 非空用它；为空就从单元键推出来（键 = 编号时就是键，
+// 键 = 编号+R+流水号时是 R 前面那段）。无论 ProjectCode 填没填，都不会把带 R 的键本身当编号返回
+// （评审 17-3：按编号归类没配置目录时靠它，空 ProjectCode 的另配单元不能让同编号的没配置目录被当成新项目）。
+// 键认不出（登记本身不合格，PFValidateUnit 会拒）时退回 Code。
+func (u PFUnitRecord) PFUnitProjectCode() string {
+	if u.ProjectCode != "" {
+		return u.ProjectCode
+	}
+	if pc, ok := PFUnitKeyProjectCode(u.Code); ok {
+		return pc
+	}
+	return u.Code
+}
+
+// pfAllASCIIDigits 报告 s 非空且全是 ASCII 数字。
+func pfAllASCIIDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// PFUnitKeyProjectCode 从单元键认出项目编号（§14.4）：键就是编号，或 编号+`R`+流水号数字。
+// 带后缀时从右往左找第一个「后面全是数字的 R」，前段必须本身是认得出的归一化编号。认不出返回 ("", false)。
+func PFUnitKeyProjectCode(key string) (string, bool) {
+	if key == "" || !pfIsASCII(key) || PFNormCode(key) != key {
+		return "", false
+	}
+	if c, ok := PFCodeFromName(key); ok && c == key {
+		return key, true
+	}
+	for i := len(key) - 2; i >= 1; i-- {
+		if key[i] != 'R' || !pfAllASCIIDigits(key[i+1:]) {
+			continue
+		}
+		base := key[:i]
+		if c, ok := PFCodeFromName(base); ok && c == base && pfIsASCII(base) {
+			return base, true
+		}
+	}
+	return "", false
+}
+
+// pfUnitKeyMatchesRel 判断单元键跟 Rel 最后一段认出的编号配不配：相等（主目录单元），
+// 或 编号+`R`+流水号数字（另配目录单元，§14.4）。
+func pfUnitKeyMatchesRel(key, relCode string) bool {
+	if key == relCode {
+		return true
+	}
+	return strings.HasPrefix(key, relCode+"R") && pfAllASCIIDigits(key[len(relCode)+1:])
 }
 
 // PFValidateUnit 校验一条登记：
-//   - Code 非空、纯 ASCII、已是归一化形式（无空白、大写）、认得出是项目编号，并且等于 Rel 最后一段认出的编号；
+//   - Code 非空、纯 ASCII、已是归一化形式（无空白、大写）、是认得出的项目编号，或 编号+`R`+流水号数字
+//     （§14.4 的另配目录单元键）；
+//   - 从 Code 推出项目编号（Code 是编号就是它本身，是 编号+R+流水号 就是 R 前面那段），必须等于 Rel 最后一段认出的编号
+//     （带 R 的键本身从不当编号用，评审 17-3）；
+//   - ProjectCode 为空时用推出的编号；非空时必须是 ASCII、归一化，并且等于推出的编号、也等于 Rel 最后一段认出的编号；
+//   - Rel 最后一段认出的编号必须等于 Code，或 Code = 该编号+`R`+流水号数字（§14.4）；
 //   - State 是四个值之一；
 //   - Rel 过 validRel，不超过 PFUnitMaxDepth 段，没有「.」开头的段，非最后一段的目录名里认不出编号
 //     （否则 Ubuntu 侧发现会停在上级目录，对不上）；
 //   - LinkPath、SyncPath 是干净的绝对路径（filepath.Clean 后不变）且都以 /Rel 结尾，彼此不同；
 //   - StartedAt 非零。
+//
+// 旧的 units.json 没有 project_code 字段，照常读（omitempty；Code 就是编号的老记录全部走「等于」这条路）。
 func PFValidateUnit(u PFUnitRecord) error {
 	if u.Code == "" {
 		return errors.New("projsync: 登记缺少编号 code")
@@ -533,8 +603,8 @@ func PFValidateUnit(u PFUnitRecord) error {
 	if PFNormCode(u.Code) != u.Code {
 		return fmt.Errorf("projsync: 登记编号 %q 不是归一化形式（应无空白、大写）", u.Code)
 	}
-	if c, ok := PFCodeFromName(u.Code); !ok || c != u.Code {
-		return fmt.Errorf("projsync: 登记编号 %q 认不出是项目编号", u.Code)
+	if _, ok := PFUnitKeyProjectCode(u.Code); !ok {
+		return fmt.Errorf("projsync: 登记编号 %q 认不出是项目编号（也不是 编号+R+流水号 的单元键）", u.Code)
 	}
 	if !u.State.valid() {
 		return fmt.Errorf("projsync: 编号 %s 的状态 %q 不是 syncing/starting/stopping/stopped 之一", u.Code, u.State)
@@ -559,8 +629,31 @@ func PFValidateUnit(u PFUnitRecord) error {
 			}
 		}
 	}
-	if c, ok := PFCodeFromName(segs[len(segs)-1]); !ok || c != u.Code {
-		return fmt.Errorf("projsync: 编号 %s 与 rel %q 最后一段认出的编号 %q 不一致", u.Code, u.Rel, c)
+	relCode, ok := PFCodeFromName(segs[len(segs)-1])
+	if !ok {
+		return fmt.Errorf("projsync: 编号 %s 与 rel %q 不一致：最后一段认不出项目编号", u.Code, u.Rel)
+	}
+	if !pfUnitKeyMatchesRel(u.Code, relCode) {
+		return fmt.Errorf("projsync: 编号 %s 与 rel %q 最后一段认出的编号 %q 不一致（也不是 %sR+流水号）", u.Code, u.Rel, relCode, relCode)
+	}
+	// 项目编号一律从键推出来（键认得出已在上面查过），与 Rel 认出的编号比；ProjectCode 填了就必须同它一致。
+	keyProj, _ := PFUnitKeyProjectCode(u.Code)
+	if keyProj != relCode {
+		return fmt.Errorf("projsync: 编号 %s 推出的项目编号 %q 与 rel %q 最后一段认出的编号 %q 不一致", u.Code, keyProj, u.Rel, relCode)
+	}
+	if u.ProjectCode != "" {
+		if !pfIsASCII(u.ProjectCode) {
+			return fmt.Errorf("projsync: 登记 %s 的 project_code %q 含非 ASCII 字符", u.Code, u.ProjectCode)
+		}
+		if PFNormCode(u.ProjectCode) != u.ProjectCode {
+			return fmt.Errorf("projsync: 登记 %s 的 project_code %q 不是归一化形式（应无空白、大写）", u.Code, u.ProjectCode)
+		}
+		if u.ProjectCode != relCode {
+			return fmt.Errorf("projsync: 登记 %s 的 project_code %q 与 rel %q 最后一段认出的编号 %q 不一致", u.Code, u.ProjectCode, u.Rel, relCode)
+		}
+		if u.ProjectCode != keyProj {
+			return fmt.Errorf("projsync: 登记 %s 的 project_code %q 与键推出的项目编号 %q 不一致", u.Code, u.ProjectCode, keyProj)
+		}
 	}
 	if u.State != PFUnitStopped || u.LinkPath != "" {
 		if err := pfCheckAbsPath("link_path", u.Code, u.LinkPath, u.Rel); err != nil {
@@ -597,12 +690,14 @@ func pfCheckAbsPath(field, code, p, rel string) error {
 	return nil
 }
 
-// PFValidateUnits 校验整张登记表：每条合格；编号不重复。
+// PFValidateUnits 校验整张登记表：每条合格；编号（单元键）不重复；rel 不重复。
 //
-// 不另查「单元互相包含」和「路径重复」：单条校验已要求 rel 的上级目录名认不出编号、最后一段认出的编号等于
-// Code、路径以 rel 结尾，所以一个单元在另一个单元里面、两条登记共用路径，都必然表现为编号重复或单条不合格。
+// 不另查「单元互相包含」：单条校验已要求 rel 的上级目录名认不出编号，一个单元在另一个单元里面必然单条不合格。
+// rel 要单独查重：同编号可以有多个单元（键不同、rel 不同），一个 rel 只能归一个单元，
+// 两条登记挂同一个目录会造成一个目录被两套状态同步两次。
 func PFValidateUnits(us []PFUnitRecord) error {
 	codes := map[string]int{}
+	rels := map[string]int{}
 	for i, u := range us {
 		if err := PFValidateUnit(u); err != nil {
 			return fmt.Errorf("第 %d 条: %w", i+1, err)
@@ -611,6 +706,10 @@ func PFValidateUnits(us []PFUnitRecord) error {
 			return fmt.Errorf("projsync: 编号 %s 在登记表里出现了两次（第 %d、%d 条）", u.Code, j+1, i+1)
 		}
 		codes[u.Code] = i
+		if j, ok := rels[u.Rel]; ok {
+			return fmt.Errorf("projsync: rel %q 在登记表里出现了两次（第 %d、%d 条）", u.Rel, j+1, i+1)
+		}
+		rels[u.Rel] = i
 	}
 	return nil
 }
@@ -699,8 +798,7 @@ func PFUpsertUnit(us []PFUnitRecord, rec PFUnitRecord) ([]PFUnitRecord, error) {
 // 四、新单元判定（§12.2）与 Mac 工作目录检查
 // ============================================================================
 
-// PFUnitMatch 是登记项与 Ubuntu 上发现的同编号目录配成的一对。
-// 两边的 rel 是否一致（G4：改名/挪位置）由编排层拿 base 里的 rel 判断，这里不判。
+// PFUnitMatch 是登记项与 Ubuntu 上按 rel 配上的目录组成的一对（§14.4：对应关系按 rel，不再按编号）。
 type PFUnitMatch struct {
 	Reg   PFUnitRecord
 	Found PFFoundUnit
@@ -708,64 +806,76 @@ type PFUnitMatch struct {
 
 // PFUnitClassification 是按登记表对 Ubuntu 发现结果分出的几类，每类按编号（或路径）排序。
 type PFUnitClassification struct {
-	Syncing      []PFUnitMatch  // 登记 syncing、Ubuntu 上找到、编号不重复：正常参加一轮
-	Transitional []PFUnitMatch  // 登记 starting/stopping、Ubuntu 上找到：正在开始/取消同步，本轮不处理
-	Stopped      []PFUnitMatch  // 登记 stopped、Ubuntu 上找到：不处理，状态标 PFNoteStopped
-	New          []PFFoundUnit  // 不在登记表：Ubuntu 新项目（PFNoteNewOnUbuntu），先用 PFCheckWorkDirForUnit 看 Mac 工作目录
-	Duplicates   []PFFoundUnit  // 同编号多个目录（G4）：都标 PFNoteDuplicate，停下，不管登记与否
-	Missing      []PFUnitRecord // 登记 syncing 但 Ubuntu 没发现（可能是还没传过去的新单元，也可能是不见了，由 base 判断，别直接当删除）
+	Syncing      []PFUnitMatch  // 登记 syncing、Ubuntu 上有 rel 相同的目录：正常参加一轮
+	Transitional []PFUnitMatch  // 登记 starting/stopping、Ubuntu 上有 rel 相同的目录：正在开始/取消同步，本轮不处理
+	Stopped      []PFUnitMatch  // 登记 stopped、Ubuntu 上有 rel 相同的目录：不处理，状态标 PFNoteStopped
+	New          []PFFoundUnit  // 编号完全没登记过：Ubuntu 新项目（PFNoteNewOnUbuntu），先用 PFCheckWorkDirForUnit 看 Mac 工作目录
+	Duplicates   []PFFoundUnit  // 编号没登记过、Ubuntu 上同编号却有多个目录：不知道哪个是对的，都标 PFNoteDuplicate，停下
+	Unconfigured []PFFoundUnit  // 同编号有登记单元、但 rel 不是任何登记单元的目录（§14.2）：只报告 PFNoteUnconfigured，不同步、不停
+	Missing      []PFUnitRecord // 登记 syncing 但 Ubuntu 上没有 rel 相同的目录（可能还没传过去，也可能是不见了，由 base 判断，别直接当删除）
 	Incomplete   bool           // 发现不完整（见 PFDiscoverResult.Incomplete）：Missing 不可信
 }
 
-// PFClassifyUnits 把 Ubuntu 侧发现的结果和 Mac 登记表对上。登记表不合格返回 error。
-// 重复与否按 found.Units 的编号自己重算，不依赖 Dup 字段。
+// PFClassifyUnits 把 Ubuntu 侧发现的结果和 Mac 登记表对上（§14.4）：
+//   - 按 rel 配对：登记单元配 Ubuntu 上 Rel 相同的目录（同编号两个登记单元时各配各的）；
+//   - rel 配不上：编号（发现结果的 Code）是某个登记单元的编号 → Unconfigured（没配置的目录，只报告，
+//     不再让整个项目停下——取代原来的 G4 重复即停）；编号完全没登记过 → 按编号看多个目录：
+//     多个 → Duplicates（不知道哪个对，停下），一个 → New。
+//
+// 登记表不合格返回 error。重复与否按 found.Units 自己重算，不依赖 Dup 字段。
 func PFClassifyUnits(found PFDiscoverResult, reg []PFUnitRecord) (PFUnitClassification, error) {
 	var out PFUnitClassification
 	if err := PFValidateUnits(reg); err != nil {
 		return out, err
 	}
 	out.Incomplete = found.Incomplete
-	regByCode := map[string]PFUnitRecord{}
+	regByRel := make(map[string]PFUnitRecord, len(reg))
+	regProj := make(map[string]bool, len(reg))
 	for _, u := range reg {
-		regByCode[u.Code] = u
+		regByRel[u.Rel] = u
+		regProj[u.PFUnitProjectCode()] = true
 	}
-	foundByCode := map[string][]PFFoundUnit{}
+	foundRels := make(map[string]bool, len(found.Units))
+	unregByCode := map[string][]PFFoundUnit{} // 没按 rel 配上、编号也没登记过的目录（按编号查重复）
 	for _, f := range found.Units {
-		foundByCode[f.Code] = append(foundByCode[f.Code], f)
-	}
-	for code, group := range foundByCode {
-		if len(group) > 1 {
-			for i, f := range group {
-				f.Dup = true
-				f.DupRels = nil
-				for j, g := range group {
-					if j != i {
-						f.DupRels = append(f.DupRels, g.Rel)
-					}
-				}
-				sort.Strings(f.DupRels)
-				out.Duplicates = append(out.Duplicates, f)
+		foundRels[f.Rel] = true
+		if r, ok := regByRel[f.Rel]; ok {
+			switch r.State {
+			case PFUnitSyncing:
+				out.Syncing = append(out.Syncing, PFUnitMatch{Reg: r, Found: f})
+			case PFUnitStopped:
+				out.Stopped = append(out.Stopped, PFUnitMatch{Reg: r, Found: f})
+			default: // starting / stopping
+				out.Transitional = append(out.Transitional, PFUnitMatch{Reg: r, Found: f})
 			}
 			continue
 		}
-		f := group[0]
-		r, registered := regByCode[code]
-		switch {
-		case !registered:
-			out.New = append(out.New, f)
-		case r.State == PFUnitSyncing:
-			out.Syncing = append(out.Syncing, PFUnitMatch{Reg: r, Found: f})
-		case r.State == PFUnitStopped:
-			out.Stopped = append(out.Stopped, PFUnitMatch{Reg: r, Found: f})
-		default: // starting / stopping
-			out.Transitional = append(out.Transitional, PFUnitMatch{Reg: r, Found: f})
+		if regProj[f.Code] {
+			out.Unconfigured = append(out.Unconfigured, f)
+			continue
+		}
+		unregByCode[f.Code] = append(unregByCode[f.Code], f)
+	}
+	for _, group := range unregByCode {
+		if len(group) < 2 {
+			out.New = append(out.New, group[0])
+			continue
+		}
+		for i, f := range group {
+			f.Dup = true
+			f.DupRels = nil
+			for j, g := range group {
+				if j != i {
+					f.DupRels = append(f.DupRels, g.Rel)
+				}
+			}
+			sort.Strings(f.DupRels)
+			out.Duplicates = append(out.Duplicates, f)
 		}
 	}
 	for _, r := range reg {
-		if r.State == PFUnitSyncing {
-			if _, ok := foundByCode[r.Code]; !ok {
-				out.Missing = append(out.Missing, r)
-			}
+		if r.State == PFUnitSyncing && !foundRels[r.Rel] {
+			out.Missing = append(out.Missing, r)
 		}
 	}
 	byCode := func(a, b PFUnitMatch) bool { return a.Reg.Code < b.Reg.Code }
@@ -775,6 +885,13 @@ func PFClassifyUnits(found PFDiscoverResult, reg []PFUnitRecord) (PFUnitClassifi
 	sort.Slice(out.New, func(i, j int) bool { return out.New[i].Rel < out.New[j].Rel })
 	sort.Slice(out.Duplicates, func(i, j int) bool {
 		a, b := out.Duplicates[i], out.Duplicates[j]
+		if a.Code != b.Code {
+			return a.Code < b.Code
+		}
+		return a.Rel < b.Rel
+	})
+	sort.Slice(out.Unconfigured, func(i, j int) bool {
+		a, b := out.Unconfigured[i], out.Unconfigured[j]
 		if a.Code != b.Code {
 			return a.Code < b.Code
 		}

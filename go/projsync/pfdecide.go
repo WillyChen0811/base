@@ -113,7 +113,8 @@ type PFDecideInput struct {
 	MacDirID, UbuntuDirID PFDirID
 	// MacRel、UbuntuRel 是两边项目文件夹当前相对根的路径，与 base 记的不同就是 G4（改名/挪位置）。空串 = 不检查。
 	MacRel, UbuntuRel string
-	// MacDup、UbuntuDup 是同一编号在那一边认出的其他目录（PFFoundUnit.DupRels）；非空就是 G4。
+	// MacDup、UbuntuDup 是同一编号在那一边认出的其他目录（PFFoundUnit.DupRels）。
+	// MacDup 非空仍是 G4 停；UbuntuDup 自 §14.2 起只报告（没配置的目录，不同步，不停）。
 	MacDup, UbuntuDup []string
 	// ClockSkew 是两边时钟差（Mac 的钟减 Ubuntu 的钟，正负都行），只看绝对值：超过 5 分钟就是 G6。
 	// ClockUnknown 为 true（测不出来）同样按 G6 处理。
@@ -644,8 +645,10 @@ func PFDecide(in PFDecideInput) *PFPlan {
 	if len(in.MacDup) > 0 {
 		gate("G4", PFGateStop, "Mac 上同一编号认出多个目录（%s 和另外 %s），整个单元停下", in.MacRel, strings.Join(in.MacDup, "、"))
 	}
+	// §14.2：Ubuntu 上同编号的其他目录 = 没配置的目录，只报告，不再让整个单元停下（取代 G4 重复即停）。
+	// 第一版只能合并 Mac 上的目录，Ubuntu 上的合并不了，所以文案不承诺合并。
 	if len(in.UbuntuDup) > 0 {
-		gate("G4", PFGateStop, "Ubuntu 上同一编号认出多个目录（%s 和另外 %s），整个单元停下", in.UbuntuRel, strings.Join(in.UbuntuDup, "、"))
+		gate("G4", PFGateReport, "Ubuntu 上同一编号还有别的目录（%s），没配置，不同步", strings.Join(in.UbuntuDup, "、"))
 	}
 	if in.Base != nil {
 		m := in.Base.Meta()

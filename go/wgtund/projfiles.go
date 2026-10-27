@@ -50,6 +50,7 @@ const (
 
 	projfilesMetaDirName    = "projfiles"
 	projfilesSettingsName   = "projfiles-settings.json"
+	projfilesPathsListName  = "projfiles-paths.json" // XXYI 导出的配置路径清单（§14.1/§14.4，开始同步的闸用它）
 	projfilesStatusFileName = "_round.json"
 	defaultProjfilesXxyiMsg = "~/.local/bin/xxyi-msg"
 )
@@ -76,16 +77,17 @@ type projfilesConf struct {
 
 // projfilesPrep 是校验通过后的 projfiles 配置。
 type projfilesPrep struct {
-	enabled      bool
-	host         string
-	remoteRoot   string
-	remoteMeta   string
-	xxyiMsg      string
-	coordID      string
-	coordHost    string // 给人看的主机名（原样）
-	metaDir      string // ~/.xxyi/projfiles：units.json、staging、回收、status 都在里面
-	settingsPath string // ~/.xxyi/projfiles-settings.json
-	statusPath   string // ~/.xxyi/projfiles/status/_round.json
+	enabled       bool
+	host          string
+	remoteRoot    string
+	remoteMeta    string
+	xxyiMsg       string
+	coordID       string
+	coordHost     string // 给人看的主机名（原样）
+	metaDir       string // ~/.xxyi/projfiles：units.json、staging、回收、status 都在里面
+	settingsPath  string // ~/.xxyi/projfiles-settings.json
+	pathsListPath string // ~/.xxyi/projfiles-paths.json：XXYI 导出的配置路径清单（§14.4 开始同步的闸）
+	statusPath    string // ~/.xxyi/projfiles/status/_round.json
 	// fromSettings：hosts.json 没写 projfiles 段——host/remote_root/remote_meta 不再固定在 prep 里，
 	// 每轮从设置文件取（effRemote），缺项/不合法这一轮不跑并写明原因；总开关是设置文件的 enabled（缺省关）。
 	fromSettings bool
@@ -125,9 +127,10 @@ func prepareProjfiles(c *fileConf) (*projfilesPrep, error) {
 		return &projfilesPrep{
 			fromSettings: true, hosts: hosts,
 			xxyiMsg: defaultProjfilesXxyiMsg, coordID: coordID, coordHost: coordHost,
-			metaDir:      filepath.Join(dir, projfilesMetaDirName),
-			settingsPath: filepath.Join(dir, projfilesSettingsName),
-			statusPath:   filepath.Join(dir, projfilesMetaDirName, "status", projfilesStatusFileName),
+			metaDir:       filepath.Join(dir, projfilesMetaDirName),
+			settingsPath:  filepath.Join(dir, projfilesSettingsName),
+			pathsListPath: filepath.Join(dir, projfilesPathsListName),
+			statusPath:    filepath.Join(dir, projfilesMetaDirName, "status", projfilesStatusFileName),
 		}, nil
 	}
 	bad := func(format string, a ...any) error {
@@ -177,9 +180,10 @@ func prepareProjfiles(c *fileConf) (*projfilesPrep, error) {
 		enabled: pc.Enabled, host: host.Name,
 		remoteRoot: projfilesCleanRemote(pc.RemoteRoot), remoteMeta: projfilesCleanRemote(pc.RemoteMeta),
 		xxyiMsg: xxyiMsg, coordID: coordID, coordHost: coordHost,
-		metaDir:      filepath.Join(dir, projfilesMetaDirName),
-		settingsPath: filepath.Join(dir, projfilesSettingsName),
-		statusPath:   filepath.Join(dir, projfilesMetaDirName, "status", projfilesStatusFileName),
+		metaDir:       filepath.Join(dir, projfilesMetaDirName),
+		settingsPath:  filepath.Join(dir, projfilesSettingsName),
+		pathsListPath: filepath.Join(dir, projfilesPathsListName),
+		statusPath:    filepath.Join(dir, projfilesMetaDirName, "status", projfilesStatusFileName),
 	}, nil
 }
 
@@ -391,26 +395,75 @@ func (s *projfilesSvc) loadSettings() (projfilesSettings, []string) {
 	return st, problems
 }
 
-// projfilesRemoteFS 把 PFTransferFS 的调用转发到「当前」这条 SFTP 会话：
-// 会话还没开成（开机时 Ubuntu 没连上）时一律报「还没连上」，开成之后自动开始用。
-type projfilesRemoteFS struct {
-	mu sync.Mutex
-	c  *sftp.Client
+// projfilesSFTPSession 是一条绑定了主机的 SFTP 会话：传输器只认这个面，测试可换成假的（记下开给哪台主机）。
+// Host 标明这条会话属于哪台主机——换主机后必须重开（见 attachSFTPReal），不能拿旧主机的会话往新主机写。
+type projfilesSFTPSession interface {
+	Host() string                        // 这条会话属于哪台主机
+	Alive() bool                         // 底层 SSH 连接是否还活着（断了要重开）
+	Open(p string) (projsync.PFTransferFile, error)
+	OpenFile(p string, flag int) (projsync.PFTransferFile, error)
+	Stat(p string) (os.FileInfo, error)
+	Remove(p string) error
+	MkdirAll(p string) error
+	ReadDir(p string) ([]os.FileInfo, error)
+	Chtimes(p string, atime, mtime time.Time) error
+	Close() error
 }
 
-func (r *projfilesRemoteFS) attach(c *sftp.Client) {
+// projfilesHostSFTP 用真实 *sftp.Client 实现 projfilesSFTPSession：记住主机名与它借用的 SSH 连接，
+// Alive 看那条连接的 Done 通道（连接断了这条会话就该重开）。
+type projfilesHostSFTP struct {
+	host string
+	c    *sftp.Client
+	done <-chan struct{} // 底层 sshterm.Client 的 Done
+}
+
+func (h *projfilesHostSFTP) Host() string { return h.host }
+func (h *projfilesHostSFTP) Alive() bool {
+	select {
+	case <-h.done:
+		return false
+	default:
+		return true
+	}
+}
+func (h *projfilesHostSFTP) Open(p string) (projsync.PFTransferFile, error) { return h.c.Open(p) }
+func (h *projfilesHostSFTP) OpenFile(p string, flag int) (projsync.PFTransferFile, error) { return h.c.OpenFile(p, flag) }
+func (h *projfilesHostSFTP) Stat(p string) (os.FileInfo, error)                { return h.c.Stat(p) }
+func (h *projfilesHostSFTP) Remove(p string) error                              { return h.c.Remove(p) }
+func (h *projfilesHostSFTP) MkdirAll(p string) error                           { return h.c.MkdirAll(p) }
+func (h *projfilesHostSFTP) ReadDir(p string) ([]os.FileInfo, error)          { return h.c.ReadDir(p) }
+func (h *projfilesHostSFTP) Chtimes(p string, atime, mtime time.Time) error   { return h.c.Chtimes(p, atime, mtime) }
+func (h *projfilesHostSFTP) Close() error                                      { return h.c.Close() }
+
+// projfilesRemoteFS 把 PFTransferFS 的调用转发到「当前」这条 SFTP 会话：
+// 会话还没开成（开机时 Ubuntu 没连上）时一律报「还没连上」，开成之后自动开始用。
+// 会话带主机名：整套重建 / 换主机时先关掉旧的再挂新的，绝不拿旧主机的会话往新主机写（评审 14-1）。
+type projfilesRemoteFS struct {
+	mu   sync.Mutex
+	sess projfilesSFTPSession
+}
+
+func (r *projfilesRemoteFS) attach(sess projfilesSFTPSession) {
 	r.mu.Lock()
-	r.c = c
+	r.sess = sess
 	r.mu.Unlock()
 }
 
-func (r *projfilesRemoteFS) get() (*sftp.Client, error) {
+// cur 返回当前会话（没挂是 nil）；attachSFTPReal 用它判「同一台且还活着就复用」。
+func (r *projfilesRemoteFS) cur() projfilesSFTPSession {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.c == nil {
+	return r.sess
+}
+
+func (r *projfilesRemoteFS) get() (projfilesSFTPSession, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.sess == nil {
 		return nil, errors.New("还没有连上 Ubuntu 的 SFTP")
 	}
-	return r.c, nil
+	return r.sess, nil
 }
 
 func (r *projfilesRemoteFS) Open(p string) (projsync.PFTransferFile, error) {
@@ -538,6 +591,8 @@ type projfilesSvc struct {
 	startUp    func(ctx context.Context) ([]projsync.PFUnitMoveResult, error)
 	buildMover func(cfg projsync.PFUnitMoveConfig) (*projsync.PFUnitMover, error)
 	attachSFTP func() error
+	// openSFTP 在指定主机上开一条会话（评审 14-1：会话必须绑主机）；测试换成假的记下开给哪台。
+	openSFTP func(host string) (projfilesSFTPSession, error)
 	// runner 非 nil 时代替连接池的 SSH 远程执行（测试用假 Runner，不连真机器）。
 	runner projsync.RemoteRunner
 
@@ -602,6 +657,7 @@ func newProjfilesSvc(prep *projfilesPrep, pool *sshPool) *projfilesSvc {
 		return projsync.NewPFUnitMover(cfg)
 	}
 	s.attachSFTP = s.attachSFTPReal
+	s.openSFTP = s.openSFTPReal
 	return s
 }
 
@@ -711,6 +767,7 @@ func (s *projfilesSvc) buildLocked(st projfilesSettings) error {
 		m, err := s.buildMover(projsync.PFUnitMoveConfig{
 			WorkDir: st.WorkDir, SyncDir: st.SyncDir, Meta: s.prep.metaDir,
 			QuietSeconds: st.QuietSeconds, Now: s.now,
+			PathsList: s.prep.pathsListPath, // §14.4 开始同步的闸：清单读不到时 StartSync 会拒绝并写原因
 		})
 		if err != nil {
 			s.noteOnce(fmt.Sprintf("建单元搬运器失败（不自动建项目、不搬正位；设置改好后整套重建再生效）：%v", err))
@@ -745,6 +802,9 @@ func (s *projfilesSvc) buildLocked(st projfilesSettings) error {
 	if oldTransfer != nil {
 		oldTransfer.Close()
 	}
+	// 评审 14-1：整套重建（多为换了主机）时把旧的 SFTP 会话也关掉清空——传输器绑的还是同一个 sftpFS，
+	// 不关掉就会拿旧主机的会话往新主机写。关掉后由本轮 acquire 之后的 attachSFTP 在新生效主机上重开。
+	s.detachSFTP()
 	// 新建的传输器立刻按当前网络挂上限：启动恢复那一轮在第一次 tick 之前就会传文件。
 	s.applyLimits(st, s.effNet())
 	return nil
@@ -872,39 +932,51 @@ func (s *projfilesSvc) clearSwitchBusy() {
 	s.mu.Unlock()
 }
 
-// attachSFTPReal 在共用 SSH 连接上开一条 SFTP 会话并挂到传输器上，全程共用；连接还活着就复用。
+// attachSFTPReal 把「当前生效主机」的 SFTP 会话挂到传输器上，全程共用：
+//   - 已经挂着同一台、底层连接还活着 → 复用，不重开；
+//   - 主机换了、或还没开会话、或底层连接断了 → 先关掉旧的，再在新生效的主机上开一条挂上。
+//
+// 关键（评审 14-1）：换主机后不能让新一轮继续用旧主机的会话往旧机器写——会话带主机名，这里逐轮核对。
 // 主机取当前实际生效的那套（没 projfiles 段时 host 来自设置文件，切换后跟着换）。
 func (s *projfilesSvc) attachSFTPReal() error {
-	if s.pool == nil {
-		return errors.New("没有 SSH 连接池")
-	}
 	host := s.activeHost()
-	if c, err := s.pool.conn(host); err != nil {
-		return err
-	} else {
-		select {
-		case <-c.Done():
-			s.pool.drop(host, c)
-			if c, err = s.pool.conn(host); err != nil {
-				return err
-			}
-			if cl, err := c.SFTP(); err != nil {
-				return err
-			} else {
-				s.sftpFS.attach(cl)
-			}
-		default:
-			if _, ok := s.sftpFS.get(); ok == nil {
-				return nil // 会话已经开着，连接也活着
-			}
-			cl, err := c.SFTP()
-			if err != nil {
-				return err
-			}
-			s.sftpFS.attach(cl)
-		}
+	if host == "" {
+		return errors.New("还不知道要连哪台 Ubuntu（设置里没有 host，也没有 hosts.json）")
 	}
+	if cur := s.sftpFS.cur(); cur != nil && cur.Host() == host && cur.Alive() {
+		return nil // 同一台、连接还活着 → 复用这条会话
+	}
+	s.detachSFTP() // 换主机 / 重连：关掉旧会话再开新的
+	sess, err := s.openSFTP(host)
+	if err != nil {
+		return err
+	}
+	s.sftpFS.attach(sess)
 	return nil
+}
+
+// openSFTPReal 在共用连接池的指定主机上开一条 SFTP 会话，包成带主机名的会话。连接已断则丢弃重取。
+func (s *projfilesSvc) openSFTPReal(host string) (projfilesSFTPSession, error) {
+	if s.pool == nil {
+		return nil, errors.New("没有 SSH 连接池")
+	}
+	c, err := s.pool.conn(host)
+	if err != nil {
+		return nil, err
+	}
+	select {
+	case <-c.Done():
+		s.pool.drop(host, c) // 连接已断：丢掉重取一条
+		if c, err = s.pool.conn(host); err != nil {
+			return nil, err
+		}
+	default:
+	}
+	cl, err := c.SFTP()
+	if err != nil {
+		return nil, err
+	}
+	return &projfilesHostSFTP{host: host, c: cl, done: c.Done()}, nil
 }
 
 // ── 网络 ────────────────────────────────────────────────
@@ -1133,9 +1205,6 @@ func (s *projfilesSvc) tick(ctx context.Context, reason string) {
 		return
 	}
 	net := s.effNet()
-	if err := s.attachSFTP(); err != nil {
-		s.noteOnce("开 SFTP 会话失败（要传文件时会失败）：" + err.Error())
-	}
 	opt, run := s.roundOpt(now)
 	switch {
 	case !run:
@@ -1154,6 +1223,11 @@ func (s *projfilesSvc) tick(ctx context.Context, reason string) {
 			}
 			s.clearSwitchBusy()
 			s.noteOnce("同步主机/同步根/同步目录/工作目录改了，已整套重建")
+		}
+		// 会话在重建之后才开（评审 14-1）：换主机时 rebuild 已关掉旧会话，这里在新生效的主机上开一条，
+		// 保证这一轮往正确的机器传；同一台且还活着则复用，不重开。
+		if err := s.attachSFTP(); err != nil {
+			s.noteOnce("开 SFTP 会话失败（要传文件时会失败）：" + err.Error())
 		}
 		sched := s.getSched()
 		// SetSettings 是整体替换，会把网络状态一起洗掉，所以紧跟着把已上报的网络补回去。
@@ -1344,12 +1418,13 @@ func (s *projfilesSvc) Close() {
 	s.detachSFTP()
 }
 
+// detachSFTP 关掉并清空当前 SFTP 会话（整套重建 / 换主机 / 收尾时调）；没挂着会话时空转。
 func (s *projfilesSvc) detachSFTP() {
 	s.sftpFS.mu.Lock()
-	c := s.sftpFS.c
-	s.sftpFS.c = nil
+	sess := s.sftpFS.sess
+	s.sftpFS.sess = nil
 	s.sftpFS.mu.Unlock()
-	if c != nil {
-		c.Close()
+	if sess != nil {
+		sess.Close()
 	}
 }

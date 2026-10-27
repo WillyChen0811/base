@@ -522,19 +522,23 @@ func (s *PFSched) RunRound(ctx context.Context, opt PFSchedRoundOptions) *PFSche
 		rep.Units = append(rep.Units, PFSchedUnitReport{Code: d.Code, Rel: d.Rel, Action: PFSchedActNotDone, Why: "duplicate",
 			Note: PFNoteDuplicate + "：同编号还在 " + strings.Join(d.DupRels, "、")})
 	}
+	// §14.2：同编号但 rel 不是任何登记单元的目录 = 没配置的目录，只报告（PFNoteUnconfigured），不停整个项目。
+	for _, u := range cls.Unconfigured {
+		rep.Units = append(rep.Units, PFSchedUnitReport{Code: u.Code, Rel: u.Rel, Action: PFSchedActNotDone, Why: "unconfigured", Note: PFNoteUnconfigured})
+	}
 
 	// 6. 挑 syncing 单元（含 Missing）
 	var cands []pfscCand
 	pollBy := map[string]PFRemotePollUnit{}
 	for _, u := range poll.Units {
-		pollBy[u.Code] = u
+		pollBy[u.Rel] = u // §14.4：Ubuntu 侧对应关系按 rel（同编号可能有多个目录）
 	}
 	addCand := func(rec PFUnitRecord, ubRel string) {
 		if len(only) > 0 && !only[rec.Code] {
 			return
 		}
 		c := pfscCand{rec: rec, ubRel: ubRel, reqs: reqsBy[rec.Code]}
-		if pu, ok := pollBy[rec.Code]; ok {
+		if pu, ok := pollBy[ubRel]; ok {
 			c.ubFP, c.ubUnk = pu.Fingerprint, pu.Summary.Unknown
 			if pu.Error != "" {
 				c.ubUnk++ // 扫描失败：当作有不明，不跳过

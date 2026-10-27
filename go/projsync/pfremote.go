@@ -130,7 +130,8 @@ type PFRemotePollRequest struct {
 	QuietSeconds int    `json:"quiet_seconds,omitempty"` // 缺省 10；只影响 summary 里的「未静止」计数，不影响指纹
 }
 
-// PFRemotePollUnit 是 poll 里的一个单元。Dup 的单元（同编号多个目录，G4）不扫描，没有指纹。
+// PFRemotePollUnit 是 poll 里的一个单元。Dup 是同一编号在 Ubuntu 上认出多个目录（§14.2：登记单元按 rel 配对，
+// 同编号的别的目录只报告、不停），Dup 的单元照常扫描、给指纹——登记的单元要靠指纹跳过没变化的轮次。
 type PFRemotePollUnit struct {
 	Code        string          `json:"code"`
 	Rel         string          `json:"rel"`

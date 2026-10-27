@@ -593,6 +593,7 @@ func (r *pfrdRun) pfldStageSide(i int, a PFAction, dir string) (pfldStaged, bool
 	if a.Src == PFSideMac {
 		app := r.applier()
 		if app == nil {
+			r.markNotRun(i, a)
 			return pfldStaged{}, false
 		}
 		staged, res := pflStage(r.ctx, app, dir)
@@ -624,6 +625,7 @@ func (r *pfrdRun) pfldInstallSide(i int, a PFAction, dir string, req pfldInstall
 	if a.Dst == PFSideMac {
 		app := r.applier()
 		if app == nil {
+			r.markNotRun(i, a)
 			return false
 		}
 		return r.macResult(i, a, pflInstallPair(r.ctx, app, dir, req), nil)

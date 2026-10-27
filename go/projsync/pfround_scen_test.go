@@ -659,26 +659,26 @@ func TestPFRoundHashCacheCorrupt(t *testing.T) {
 
 // ── 台账、暂存区残留、输入检查 ─────────────────────────
 
-func TestPFRoundLedgerSkipped(t *testing.T) {
+func TestPFRoundLedgerSynced(t *testing.T) {
 	f := newPFRDFix(t)
 	f.macPut("a.txt", "A\n", pfrtOld)
+	js := `{"schema_version":1,"versions":[]}`
 	f.macPut("历史版本/档案台账.sqlite3", "sqlite 内容", pfrtOld)
-	f.macPut("历史版本/档案索引.json", `{"versions":[]}`, pfrtOld)
+	f.macPut("历史版本/档案索引.json", js, pfrtOld)
 	r := f.mustDone(f.run())
-	todo := 0
 	for _, s := range r.Skipped {
-		if s.Source == PFRoundSrcTodo && strings.Contains(s.Reason, "T10") {
-			todo++
+		if strings.Contains(s.Reason, "T10") {
+			t.Fatalf("台账已实现，不该再有 T10 跳过:\n%s", pfrdDump(r))
 		}
 	}
-	if todo != 1 {
-		t.Fatalf("台账动作应记成跳过「台账同步待做（T10）」:\n%s", pfrdDump(r))
-	}
-	if _, err := os.Lstat(f.ub.abs("历史版本/档案台账.sqlite3")); err == nil {
-		t.Fatal("本任务不同步台账")
+	if f.ub.read("历史版本/档案台账.sqlite3") != "sqlite 内容" || f.ub.read("历史版本/档案索引.json") != js {
+		t.Fatal("台账一对应当原样搬到 Ubuntu")
 	}
 	if f.ub.read("a.txt") != "A\n" {
 		t.Fatal("别的文件照常同步")
+	}
+	if h := f.loadBase().Ledger().Hash; h != pfrtSHA("sqlite 内容")+pfrtSHA(js) {
+		t.Fatalf("base 应记台账合并哈希: %s", h)
 	}
 }
 

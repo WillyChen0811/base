@@ -64,12 +64,12 @@ type projfilesFresh interface {
 
 // projfilesRecycleResult 是一次每日回收清理的结果，记进状态给人看。
 type projfilesRecycleResult struct {
-	At         time.Time `json:"at"`
-	Days       int       `json:"days"` // 实际用的保留天数（不少于 7）
-	LocalRemoved []string `json:"local_removed,omitempty"`
-	LocalFiles   int     `json:"local_files,omitempty"`
-	LocalBytes   int64   `json:"local_bytes,omitempty"`
-	LocalError   string  `json:"local_error,omitempty"`
+	At           time.Time `json:"at"`
+	Days         int       `json:"days"` // 实际用的保留天数（不少于 7）
+	LocalRemoved []string  `json:"local_removed,omitempty"`
+	LocalFiles   int       `json:"local_files,omitempty"`
+	LocalBytes   int64     `json:"local_bytes,omitempty"`
+	LocalError   string    `json:"local_error,omitempty"`
 	// Remote 是 Ubuntu apply 的原始结果；连不上/被拒只记 RemoteError，不影响本机清理。
 	Remote      *projsync.PFRemoteApplyResult `json:"remote,omitempty"`
 	RemoteError string                        `json:"remote_error,omitempty"`
@@ -175,9 +175,9 @@ type projfilesAPI struct {
 	// newFresh 建「取最新」；测试换成假的（假 PFSched 不必真连机器）。
 	newFresh func(s *projsync.PFSched, syncDir string) (projfilesFresh, error)
 
-	mu    sync.Mutex
-	fresh projfilesFresh // PFFresh 复用；整套重建（builtGen 变了）后作废重建
-	freshGen uint64       // h.fresh 建出来时对应的 svc.builtGen
+	mu       sync.Mutex
+	fresh    projfilesFresh // PFFresh 复用；整套重建（builtGen 变了）后作废重建
+	freshGen uint64         // h.fresh 建出来时对应的 svc.builtGen
 }
 
 func newProjfilesAPI(s *projfilesSvc, rec *projfilesRecycler) *projfilesAPI {
@@ -557,7 +557,7 @@ func (h *projfilesAPI) dirSwitchWhy() string {
 	}
 	st, _ := loadProjfilesSettings(h.svc.prep.settingsPath)
 	if h.svc.needRebuild(st) {
-		return "同步目录或工作目录刚改过，正在切换，稍后再试"
+		return "同步根/同步目录/工作目录刚改过，正在切换，稍后再试"
 	}
 	return ""
 }

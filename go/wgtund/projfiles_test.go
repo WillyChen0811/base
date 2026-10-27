@@ -143,9 +143,9 @@ func pfWriteSettings(t *testing.T, path string, v map[string]any) {
 
 // pfRounds 记-download一轮的调用（并发安全）。
 type pfRounds struct {
-	mu   sync.Mutex
-	opts []projsync.PFSchedRoundOptions
-	at   []time.Time
+	mu    sync.Mutex
+	opts  []projsync.PFSchedRoundOptions
+	at    []time.Time
 	block chan struct{}
 }
 
@@ -219,8 +219,8 @@ func TestProjfilesConfig(t *testing.T) {
 	}
 	// 主机不在 hosts 里 / 没有私钥
 	for name, mut := range map[string]func(pf map[string]any, h *hostConf){
-		"主机不在 hosts 里":  func(pf map[string]any, _ *hostConf) { pf["host"] = "别的机器" },
-		"主机没有私钥": func(pf map[string]any, h *hostConf) { h.IdentityFiles = nil },
+		"主机不在 hosts 里": func(pf map[string]any, _ *hostConf) { pf["host"] = "别的机器" },
+		"主机没有私钥":       func(pf map[string]any, h *hostConf) { h.IdentityFiles = nil },
 	} {
 		if _, err := prepareProjfiles(pfConfT(t, mut)); err == nil || !strings.Contains(err.Error(), "hosts.json: projfiles") {
 			t.Errorf("%s 应被拒绝", name)
@@ -409,10 +409,10 @@ func TestProjfilesCadenceGoodExpensiveOffline(t *testing.T) {
 	rr.hook(s)
 	s.setNet(projsync.PFRemoteNetGood, clock.now())
 	steps := []pfStep{
-		{"timer", func() { clock.add(projfilesInitialDelay) }},                  // 启动后 10 秒：第一轮
+		{"timer", func() { clock.add(projfilesInitialDelay) }},                                                   // 启动后 10 秒：第一轮
 		{"timer", func() { clock.add(300 * time.Second); s.setNet(projsync.PFRemoteNetExpensive, clock.now()) }}, // 转热点
-		{"timer", func() { clock.add(300 * time.Second) }},                       // 热点按贵的间隔
-		{"timer", func() { clock.add(3600 * time.Second); s.setNet(projsync.PFRemoteNetOffline, clock.now()) }}, // 断网：不跑
+		{"timer", func() { clock.add(300 * time.Second) }},                                                       // 热点按贵的间隔
+		{"timer", func() { clock.add(3600 * time.Second); s.setNet(projsync.PFRemoteNetOffline, clock.now()) }},  // 断网：不跑
 	}
 	done := make(chan struct{})
 	ctx, cancel := context.WithCancel(context.Background())
@@ -849,5 +849,123 @@ func TestProjfilesLoopStopsCleanly(t *testing.T) {
 		t.Fatalf("没跑过就该是干净的: %+v", s.status())
 	}
 	_ = clock
+	s.Close()
+}
+
+// ── remote_root 从设置读（PF-remote-root）────────────────
+
+// 设置文件里 remote_root 的解析：合法就用（结尾斜杠去掉）、空/没写就留空（交回 hosts）、坏值只报这一个问题。
+func TestProjfilesSettingsRemoteRoot(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "projfiles-settings.json")
+	// 没写这个键：空串，不报错（老配置继续用 hosts.json 的 remote_root）
+	pfWriteSettings(t, p, map[string]any{"enabled": true, "sync_dir": "/srv/sync"})
+	if st, problems := loadProjfilesSettings(p); st.RemoteRoot != "" || len(problems) != 0 {
+		t.Fatalf("没写 remote_root 应留空不报错: %+v %#v", st, problems)
+	}
+	// 合法：照抄（并去掉结尾多余斜杠，与 hosts 段同一处理）
+	pfWriteSettings(t, p, map[string]any{"remote_root": "/srv/XXYI-ubuntu-sync//"})
+	if st, problems := loadProjfilesSettings(p); st.RemoteRoot != "/srv/XXYI-ubuntu-sync" || len(problems) != 0 {
+		t.Fatalf("合法的 remote_root 没照抄/没去斜杠: %+v %#v", st, problems)
+	}
+	// 空串：不算问题（表示交回 hosts）
+	pfWriteSettings(t, p, map[string]any{"remote_root": "   "})
+	if st, problems := loadProjfilesSettings(p); st.RemoteRoot != "" || len(problems) != 0 {
+		t.Fatalf("空 remote_root 应留空不报错: %+v %#v", st, problems)
+	}
+	// 坏值：只报这一个问题、留空；其它键照常
+	for _, bad := range []string{"srv/x", "/srv/../x", "/srv/x y", "/srv/中文"} {
+		pfWriteSettings(t, p, map[string]any{"remote_root": bad, "sync_dir": "/srv/sync", "recycle_days": 7})
+		st, problems := loadProjfilesSettings(p)
+		if st.RemoteRoot != "" {
+			t.Errorf("坏值 remote_root=%q 不该照抄: %+v", bad, st)
+		}
+		if st.SyncDir != "/srv/sync" || st.RecycleDays != 7 {
+			t.Errorf("remote_root 坏了不该连累别的键: %+v", st)
+		}
+		if len(problems) != 1 || !strings.Contains(problems[0], "remote_root") {
+			t.Errorf("应只报一条 remote_root 的问题: %#v", problems)
+		}
+	}
+}
+
+// 生效的 remote_root 与来源：没写时用 hosts 的（来源 hosts）、写了用设置里的（来源 settings），
+// 状态里 remote_root / remote_root_from 与 active_remote_root 都要跟着对。
+func TestProjfilesRemoteRootEffectiveAndSource(t *testing.T) {
+	s, _, _ := pfSvcT(t, nil) // hosts.json 的 remote_root = /srv/XXYI-sync
+	// 没读设置时：生效的是 hosts 里的
+	s.applySettings(projfilesDefaults(), nil)
+	if st := s.status(); st.RemoteRoot != "/srv/XXYI-sync" || st.RemoteRootFrom != "hosts" {
+		t.Fatalf("没配设置里的 remote_root 时应报 hosts 的来源: %+v", st)
+	}
+	// 设置里写了合法的：生效值换成它、来源变 settings
+	path := filepath.Join(t.TempDir(), "s.json")
+	pfWriteSettings(t, path, map[string]any{"remote_root": "/srv/XXYI-new"})
+	st, problems := loadProjfilesSettings(path)
+	if len(problems) != 0 {
+		t.Fatalf("合格设置不该报问题: %#v", problems)
+	}
+	s.applySettings(st, problems)
+	if got := s.status(); got.RemoteRoot != "/srv/XXYI-new" || got.RemoteRootFrom != "settings" {
+		t.Fatalf("设置里的 remote_root 应生效并标来源 settings: %+v", got)
+	}
+	// build 之后：Ubuntu 客户端绑的是生效的那个根，active_remote_root 报的是它
+	if err := s.build(st); err != nil {
+		t.Fatalf("build 失败: %v", err)
+	}
+	if r := s.remoteNow(); r == nil || r.Root != "/srv/XXYI-new" {
+		t.Fatalf("PFRemoteClient.Root 没绑生效的根: %+v", r)
+	}
+	if ar, arf := s.activeRemote(); ar != "/srv/XXYI-new" || arf != "settings" {
+		t.Fatalf("状态里的在用同步根不对: %q %q", ar, arf)
+	}
+	if got := s.status(); got.ActiveRemoteRoot != "/srv/XXYI-new" || got.ActiveRemoteRootFrom != "settings" {
+		t.Fatalf("状态没报在用的根与来源: %+v", got)
+	}
+	s.Close()
+}
+
+// 改了设置里的 remote_root：跟 sync_dir 一样进切换期（写接口拒绝）、下一轮 acquire 后整套重建，
+// 重建后绑的是新根、来源变 settings、切换期结束。
+func TestProjfilesRemoteRootSwitchRebuild(t *testing.T) {
+	s, clock, dir := pfSvcT(t, nil)
+	rec := &pfRecMovers{}
+	s.buildMover = rec.build
+	rr := &pfRounds{}
+	rr.hook(s)
+	s.setNet(projsync.PFRemoteNetGood, clock.now())
+	// 第一轮：设置里没写 remote_root → 用 hosts 的根
+	pfWriteSettings(t, s.prep.settingsPath, map[string]any{
+		"work_dir": filepath.Join(dir, "work"), "sync_dir": filepath.Join(dir, "sync"), "recycle_days": 3,
+	})
+	s.tick(context.Background(), "timer")
+	if got := s.status(); got.RemoteRootFrom != "hosts" || got.ActiveRemoteRoot != "/srv/XXYI-sync" || got.SwitchBusy {
+		t.Fatalf("第一轮应绑 hosts 的根、无切换: %+v", got)
+	}
+	// 改设置里的 remote_root：立刻要重建（含「改了但 tick 还没跑到」的窗口）
+	pfWriteSettings(t, s.prep.settingsPath, map[string]any{
+		"work_dir": filepath.Join(dir, "work"), "sync_dir": filepath.Join(dir, "sync"),
+		"remote_root": "/srv/XXYI-ubuntu-sync", "recycle_days": 3,
+	})
+	st, _ := loadProjfilesSettings(s.prep.settingsPath)
+	if !s.needRebuild(st) {
+		t.Fatal("改了 remote_root 应触发整套重建")
+	}
+	// 重建前状态报的必须还是在用的旧根
+	if got := s.status(); got.ActiveRemoteRoot != "/srv/XXYI-sync" {
+		t.Fatalf("重建前 active_remote_root 必须还是旧根: %+v", got)
+	}
+	// 下一轮：整套重建，绑新根、来源 settings、切换期结束
+	s.tick(context.Background(), "timer")
+	if got := s.status(); got.ActiveRemoteRoot != "/srv/XXYI-ubuntu-sync" || got.ActiveRemoteRootFrom != "settings" ||
+		got.RemoteRoot != "/srv/XXYI-ubuntu-sync" || got.RemoteRootFrom != "settings" || got.SwitchBusy {
+		t.Fatalf("重建后要绑新根、来源 settings、切换期结束: %+v", got)
+	}
+	if r := s.remoteNow(); r == nil || r.Root != "/srv/XXYI-ubuntu-sync" {
+		t.Fatalf("重建后 PFRemoteClient.Root 必须是新根: %+v", r)
+	}
+	if n := rec.n(); n != 2 {
+		t.Fatalf("两轮各建一套搬运器，实为 %d", n)
+	}
+	_ = rr
 	s.Close()
 }

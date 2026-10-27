@@ -275,7 +275,8 @@ func TestItestS13RenameNoRetransfer(t *testing.T) {
 	}
 }
 
-// 边界名：Office 锁 ~$报告.docx、.DS_Store、结尾带空格的文件 → 不同步，排除有账可查。
+// 边界名：Office 锁 ~$报告.docx、.DS_Store → 不同步，排除有账可查；
+// 结尾带空格的文件照常同步（Mac/APFS 和 Ubuntu/ext4 都存得下，排除会让文件只留在一边）。
 func TestItestNamesBoundary(t *testing.T) {
 	c := newCluster(t)
 	doc := []byte("正式报告\n")
@@ -286,9 +287,11 @@ func TestItestNamesBoundary(t *testing.T) {
 	junk := map[string][]byte{
 		"~$报告.docx": []byte("office-lock\n"),
 		".DS_Store":   []byte("ds\n"),
-		"工作笔记 ":      []byte("带尾空格\n"), // 结尾一个空格
 	}
+	// 结尾一个空格：照常同步。
+	trailing := map[string][]byte{"工作笔记 ": []byte("带尾空格\n")}
 	c.writeMacInSync(relA, junk)
+	c.writeMacInSync(relA, trailing)
 	c.sleepQuiet()
 	rep := c.round(true)
 
@@ -301,7 +304,10 @@ func TestItestNamesBoundary(t *testing.T) {
 	if got := ub["报告.docx"]; got != sha256Hex(doc) {
 		t.Errorf("正常文件 报告.docx 反而没传对：sha=%s", got)
 	}
-	// 排除的账：Mac 侧用生产同一套扫描规则能看到这三个被排除（§4.1 排除=不同步、只计数，
+	if got := ub["工作笔记 "]; got != sha256Hex([]byte("带尾空格\n")) {
+		t.Errorf("结尾空格的文件 工作笔记␠ 应照常同步且内容一致：sha=%s Ubuntu清单=%s", got, jsonOf(mapKeys(ub)))
+	}
+	// 排除的账：Mac 侧用生产同一套扫描规则能看到两个垃圾文件被排除（§4.1 排除=不同步、只计数，
 	// 轮报告里没有逐条 Skipped，这是产品的既有口径，日志里给全）。
 	excl := c.macExcluded(relA)
 	for name := range junk {
@@ -313,6 +319,11 @@ func TestItestNamesBoundary(t *testing.T) {
 		}
 		if !hit {
 			t.Errorf("扫描排除清单里没有 %q：%s", name, jsonOf(excl))
+		}
+	}
+	for _, p := range excl {
+		if p == "工作笔记 " {
+			t.Errorf("结尾空格的文件不该进排除清单：%s", jsonOf(excl))
 		}
 	}
 	t.Logf("本轮报告：%s", jsonOf(rep))

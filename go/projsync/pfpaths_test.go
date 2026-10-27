@@ -52,12 +52,12 @@ func TestPFLoadConfiguredPaths(t *testing.T) {
 
 func TestPFLoadConfiguredPathsReject(t *testing.T) {
 	for name, body := range map[string]string{
-		"坏 JSON":       `{`,
-		"版本不认识":      `{"version":2,"units":[]}`,
+		"坏 JSON":      `{`,
+		"版本不认识":       `{"version":2,"units":[]}`,
 		"缺 units 键之外": `{"version":1,"units":[],"extra":1}`,
-		"键不是编号前缀":    `{"version":1,"units":[{"key":"XXYI2","code":"260403J1301","rel":"2026/260403J1301-己"}]}`,
-		"键 R 后不是数字":  `{"version":1,"units":[{"key":"260403J1301RB","code":"260403J1301","rel":"2026/260403J1301-己"}]}`,
-		"编号不合法":      `{"version":1,"units":[{"key":"没有编号","code":"没有编号","rel":"2026/没有编号"}]}`,
+		"键不是编号前缀":     `{"version":1,"units":[{"key":"XXYI2","code":"260403J1301","rel":"2026/260403J1301-己"}]}`,
+		"键 R 后不是数字":   `{"version":1,"units":[{"key":"260403J1301RB","code":"260403J1301","rel":"2026/260403J1301-己"}]}`,
+		"编号不合法":       `{"version":1,"units":[{"key":"没有编号","code":"没有编号","rel":"2026/没有编号"}]}`,
 		"rel 逃逸":      `{"version":1,"units":[{"key":"260403J1301","code":"260403J1301","rel":"../逃逸"}]}`,
 		"rel 太深":      `{"version":1,"units":[{"key":"260403J1301","code":"260403J1301","rel":"a/b/c/d/e/260403J1301-己"}]}`,
 		"同 rel 两条":    `{"version":1,"units":[{"key":"260403J1301","code":"260403J1301","rel":"r"},{"key":"260403J1301R2","code":"260403J1301","rel":"r"}]}`,

@@ -77,17 +77,17 @@ type projfilesConf struct {
 
 // projfilesPrep 是校验通过后的 projfiles 配置。
 type projfilesPrep struct {
-	enabled      bool
-	host         string
-	remoteRoot   string
-	remoteMeta   string
-	xxyiMsg      string
-	coordID      string
-	coordHost    string // 给人看的主机名（原样）
-	metaDir      string // ~/.xxyi/projfiles：units.json、staging、回收、status 都在里面
-	settingsPath string // ~/.xxyi/projfiles-settings.json
+	enabled       bool
+	host          string
+	remoteRoot    string
+	remoteMeta    string
+	xxyiMsg       string
+	coordID       string
+	coordHost     string // 给人看的主机名（原样）
+	metaDir       string // ~/.xxyi/projfiles：units.json、staging、回收、status 都在里面
+	settingsPath  string // ~/.xxyi/projfiles-settings.json
 	pathsListPath string // ~/.xxyi/projfiles-paths.json：XXYI 导出的配置路径清单（§14.4 开始同步的闸）
-	statusPath   string // ~/.xxyi/projfiles/status/_round.json
+	statusPath    string // ~/.xxyi/projfiles/status/_round.json
 	// fromSettings：hosts.json 没写 projfiles 段——host/remote_root/remote_meta 不再固定在 prep 里，
 	// 每轮从设置文件取（effRemote），缺项/不合法这一轮不跑并写明原因；总开关是设置文件的 enabled（缺省关）。
 	fromSettings bool

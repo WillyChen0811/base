@@ -699,7 +699,7 @@ func TestPFValidateUnitSameCodeTwoUnits(t *testing.T) {
 	}
 	// 序列化带 project_code，往返不丢
 	b, err = PFMarshalUnits([]PFUnitRecord{r2})
-	if err != nil || !strings.Contains(string(b), `"project_code":"260403J1301"`) {
+	if err != nil || !strings.Contains(string(b), `"project_code": "260403J1301"`) { // PFMarshalUnits 输出带缩进
 		t.Errorf("序列化应带 project_code: %s %v", b, err)
 	}
 	us, err := PFParseUnits(b)
@@ -709,8 +709,8 @@ func TestPFValidateUnitSameCodeTwoUnits(t *testing.T) {
 
 	// 不合格的键与 project_code
 	for name, mut := range map[string]func(u *PFUnitRecord){
-		"R 后不是数字":   func(u *PFUnitRecord) { u.Code = "260403J1301RB" },
-		"键是别的编号加R": func(u *PFUnitRecord) { u.Code = "260403J1302R2" },
+		"R 后不是数字":          func(u *PFUnitRecord) { u.Code = "260403J1301RB" },
+		"键是别的编号加R":         func(u *PFUnitRecord) { u.Code = "260403J1302R2" },
 		"project_code不是编号": func(u *PFUnitRecord) { u.ProjectCode = "260403J1302" },
 		"project_code带空格":  func(u *PFUnitRecord) { u.ProjectCode = " 260403J1301" },
 	} {

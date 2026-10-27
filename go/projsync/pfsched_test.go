@@ -178,8 +178,26 @@ func (f *pfscFix) round(opt PFSchedRoundOptions) *PFSchedReport {
 }
 
 func (r *PFSchedReport) unit(code string) *PFSchedUnitReport {
+	var first *PFSchedUnitReport
 	for i := range r.Units {
-		if r.Units[i].Code == code {
+		if r.Units[i].Code != code {
+			continue
+		}
+		if first == nil {
+			first = &r.Units[i]
+		}
+		// §14.2：同编号可能有「只报告 unconfigured」和真正跑过的登记单元两条，取真正有结果的那条。
+		if r.Units[i].Result != nil {
+			return &r.Units[i]
+		}
+	}
+	return first
+}
+
+// unitRel 按编号 + rel 取报告条目（同编号多个单元时用）。
+func (r *PFSchedReport) unitRel(code, rel string) *PFSchedUnitReport {
+	for i := range r.Units {
+		if r.Units[i].Code == code && r.Units[i].Rel == rel {
 			return &r.Units[i]
 		}
 	}

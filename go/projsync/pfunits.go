@@ -622,7 +622,7 @@ func PFValidateUnit(u PFUnitRecord) error {
 	}
 	relCode, ok := PFCodeFromName(segs[len(segs)-1])
 	if !ok {
-		return fmt.Errorf("projsync: rel %q 最后一段认不出项目编号", u.Rel)
+		return fmt.Errorf("projsync: 编号 %s 与 rel %q 不一致：最后一段认不出项目编号", u.Code, u.Rel)
 	}
 	if !pfUnitKeyMatchesRel(u.Code, relCode) {
 		return fmt.Errorf("projsync: 编号 %s 与 rel %q 最后一段认出的编号 %q 不一致（也不是 %sR+流水号）", u.Code, u.Rel, relCode, relCode)

@@ -50,13 +50,13 @@ type pfumEnv struct {
 	syn  string // 同步目录
 	meta string
 
-	skipSnap bool // expectRefused 不比对项目内容（钩子里会改文件）
-	nowFn    func() time.Time
-	lstatMod func(path string, st *PFStat) // 改 Lstat 的结果（模拟占位、不同卷）
-	symlink  func(target, link string) error
-	rename   func(oldPath, newPath string) error
-	sleep    func(ctx context.Context, d time.Duration) error
-	hook     PFUnitMoveHook
+	skipSnap  bool // expectRefused 不比对项目内容（钩子里会改文件）
+	nowFn     func() time.Time
+	lstatMod  func(path string, st *PFStat) // 改 Lstat 的结果（模拟占位、不同卷）
+	symlink   func(target, link string) error
+	rename    func(oldPath, newPath string) error
+	sleep     func(ctx context.Context, d time.Duration) error
+	hook      PFUnitMoveHook
 	pathsList string // 非空 = 配置路径清单（§14.4 开始同步的闸）
 }
 
@@ -1578,6 +1578,6 @@ func TestPFUnitMove_PathsGate(t *testing.T) {
 	if st, err := os.Lstat(e.P(relCopy)); err != nil || !st.IsDir() {
 		t.Errorf("取消后 %s 应搬回桌面原位", relCopy)
 	}
-	e.noUnit(t, code+"R2")
+	e.wantUnit(t, code+"R2", PFUnitStopped) // 取消同步后登记留着，状态是 stopped（与主目录单元一样）
 	e.noTmp(t)
 }

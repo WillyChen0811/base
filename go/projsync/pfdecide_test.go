@@ -667,8 +667,7 @@ func TestPFDecideFirstTimeNeverDeletes(t *testing.T) {
 	}
 	pfdtWantLines(t, pl,
 		"mkdir d mac>ubuntu", "mkdir e ubuntu>mac",
-		"conflict diff.txt ubuntu>mac",
-		"copy_new d/only-mac.txt mac>ubuntu", "copy_new e/only-ub.txt ubuntu>mac",
+		"copy_new d/only-mac.txt mac>ubuntu", "conflict diff.txt ubuntu>mac", "copy_new e/only-ub.txt ubuntu>mac",
 		"copy_new m.txt mac>ubuntu", "base_set same.txt", "copy_new u.txt ubuntu>mac")
 	for _, a := range pl.Actions {
 		switch a.Kind {
@@ -688,14 +687,14 @@ func TestPFDecideFirstTimeNeverDeletes(t *testing.T) {
 func TestPFDecideFirstTimeIgnoresOldBaseEntries(t *testing.T) {
 	b := pfdtNewBase(map[string]string{"a.txt": "v1", "b.txt": "v1", "c.txt": "v1", "d.txt": "v1"}, "dir")
 	mac := []PFScanItem{pfdtF("a.txt", "v1"), pfdtF("b.txt", "改了"), pfdtD("dir")}
-	ub := []PFScanItem{pfdtF("c.txt", "v1")}
+	ub := []PFScanItem{pfdtF("c.txt", "v9")}
 	in := pfdtIn(b, mac, ub)
 	in.UbuntuDirID = PFDirID{Dev: 2, Ino: 12345}
 	pl := PFDecide(in)
 	if !pl.Verdict.ResetBase {
 		t.Fatal("应要求重置 base")
 	}
-	pfdtWantLines(t, pl, "copy_new a.txt mac>ubuntu", "copy_new b.txt mac>ubuntu", "copy_new c.txt ubuntu>mac", "mkdir dir mac>ubuntu")
+	pfdtWantLines(t, pl, "mkdir dir mac>ubuntu", "copy_new a.txt mac>ubuntu", "copy_new b.txt mac>ubuntu", "copy_new c.txt ubuntu>mac")
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -874,14 +873,15 @@ func TestPFDecideDirRenameReusesLocalFiles(t *testing.T) {
 }
 
 func TestPFDecideRenameSingleFileAndSameContentChoice(t *testing.T) {
-	// 两个内容相同的文件在 Ubuntu 上改了名：各自配一个，同名的优先。
+	// 两个内容相同的文件在 Ubuntu 上互换了名字：每个新名字配一个要删的旧文件，文件名相同的优先
+	// （内容一样，配谁都对；这里只锁住「各配一个、不重传、结果确定」）。
 	b := pfdtNewBase(map[string]string{"x/same.bin": "SAME", "y/same2.bin": "SAME"}, "x", "y")
 	mac := []PFScanItem{pfdtD("x"), pfdtD("y"), pfdtF("x/same.bin", "SAME"), pfdtF("y/same2.bin", "SAME")}
 	ub := []PFScanItem{pfdtD("x"), pfdtD("y"), pfdtF("x/same2.bin", "SAME"), pfdtF("y/same.bin", "SAME")}
 	pl := PFDecide(pfdtIn(b, mac, ub))
 	pfdtWantLines(t, pl,
-		"rename_local x/same2.bin ubuntu>mac from=x/same.bin",
-		"rename_local y/same.bin ubuntu>mac from=y/same2.bin")
+		"rename_local x/same2.bin ubuntu>mac from=y/same2.bin",
+		"rename_local y/same.bin ubuntu>mac from=x/same.bin")
 }
 
 func TestPFDecideCloneLocalReuse(t *testing.T) {
@@ -1457,6 +1457,7 @@ func TestPFDecideRichScenario(t *testing.T) {
 	pfdtWantLines(t, pl,
 		"mkdir copy mac>ubuntu",
 		"mkdir new ubuntu>mac",
+		"copy_new "+pfdtHV+"/文档/f1/V002_bbbbbbbb_附件.docx mac>ubuntu",
 		"copy_over a.txt mac>ubuntu",
 		"clone_local copy/k2.bin mac>ubuntu from=keep/k.bin",
 		"delete gone.txt @mac",
@@ -1464,7 +1465,6 @@ func TestPFDecideRichScenario(t *testing.T) {
 		"rename_local new/x.mp4 ubuntu>mac from=old/x.mp4",
 		"rename_local new/y.mp4 ubuntu>mac from=old/y.mp4",
 		"copy_new only-ub.txt ubuntu>mac",
-		"copy_new "+pfdtHV+"/文档/f1/V002_bbbbbbbb_附件.docx mac>ubuntu",
 		"rmdir old @mac",
 		"ledger_copy "+pfdtSQL+" mac>ubuntu")
 	pfdtSkip(t, pl, "c.docx", PFSkipOfficeLock) // Mac 上 c.docx 有锁，且两边都改了

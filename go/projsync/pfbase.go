@@ -452,8 +452,9 @@ type pfReplayResult struct {
 }
 
 // pfReplay 把日志里 gen == snapGen 的行依次作用到 entries、ledger 上。
-//   - 最后一行写了一半（没有换行结尾，或有换行但不是合规的一行）→ 丢掉，放进 tail，继续。
-//   - 中间某行坏 → *pfCorrupt。
+//   - 最后一行写了一半（没有换行结尾）→ 丢掉，放进 tail，继续。追加写的是「整行+换行」，真正写了一半的行一定没有换行。
+//   - 以换行结尾的行（含最后一行）解析或字段校验不过 → *pfCorrupt：这是已经写完的一行坏了，不是写了一半，
+//     丢掉它会让 base 退回旧值，所以按损坏处理（快照和日志移进 坏/，按首次规则）。
 //   - gen 比快照小：压实写完新快照、还没来得及截断日志时留下的旧行，内容已在新快照里，忽略。
 //   - gen 比快照大：日志来自更新的一代，说明快照被回退过，base 不可信 → *pfCorrupt。
 func pfReplay(data []byte, snapGen uint64, entries map[string]PFBaseEntry, ledger *PFBaseLedger) (pfReplayResult, *pfCorrupt) {
@@ -470,10 +471,6 @@ func pfReplay(data []byte, snapGen uint64, entries map[string]PFBaseEntry, ledge
 		next := pos + nl + 1
 		rec, err := pfParseJournalLine(line)
 		if err != nil {
-			if next == len(data) {
-				res.tail = data[pos:]
-				break
-			}
 			return res, pfCorruptf("日志第 %d 行损坏: %v", lineNo, err)
 		}
 		switch {

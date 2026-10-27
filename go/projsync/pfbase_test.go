@@ -541,7 +541,6 @@ func TestPFBase_TornJournalTail(t *testing.T) {
 	}{
 		{"半行（不完整 JSON）", `{"gen":1,"path":"c","op":"se`},
 		{"完整 JSON 但没有换行结尾", `{"gen":1,"path":"c","op":"del","t":"x"}`},
-		{"有换行但不是合规的一行", "garbage garbage\n"},
 		{"只有半个多字节字符", "{\"gen\":1,\"path\":\"\xe4\xb8"},
 		{"一串 NUL（延迟分配的撕裂尾巴）", strings.Repeat("\x00", 37)},
 	}
@@ -710,6 +709,16 @@ func TestPFBase_Corrupt(t *testing.T) {
 			bad := `{"gen":2,"path":"x","op":"set","entry":{"t":"f","size":1,"sha256":"zz","mac":{"mtime_ns":0,"ino":0},"ub":{"mtime_ns":0,"ino":0}},"t":"x"}` + "\n"
 			os.WriteFile(pfJournalP(meta), append([]byte(bad), journal...), 0o600)
 		}, "日志第 1 行"},
+		{"日志最后一行带换行但解析不了", func(t *testing.T, meta string, snap, journal []byte) {
+			os.WriteFile(pfJournalP(meta), append(append([]byte{}, journal...), []byte("garbage garbage\n")...), 0o600)
+		}, "日志第 2 行"},
+		{"日志最后一行带换行、JSON 对但字段不合规", func(t *testing.T, meta string, snap, journal []byte) {
+			bad := `{"gen":2,"path":"c","op":"set","t":"x"}` + "\n" // set 没有 entry
+			os.WriteFile(pfJournalP(meta), append(append([]byte{}, journal...), []byte(bad)...), 0o600)
+		}, "日志第 2 行"},
+		{"日志最后一行带换行、被截成半个多字节字符", func(t *testing.T, meta string, snap, journal []byte) {
+			os.WriteFile(pfJournalP(meta), append(append([]byte{}, journal...), []byte("{\"gen\":2,\"path\":\"\xe4\xb8\n")...), 0o600)
+		}, "日志第 2 行"},
 		{"日志来自更新的一代（快照被回退）", func(t *testing.T, meta string, snap, journal []byte) {
 			os.WriteFile(pfJournalP(meta), []byte(strings.Replace(string(journal), `"gen":2`, `"gen":9`, 1)), 0o600)
 		}, "第 9 代"},

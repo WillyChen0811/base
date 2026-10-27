@@ -9,8 +9,8 @@ import (
 // 配置路径清单的读取与形状校验（§14.1/§14.4）。内容全部虚构。
 
 const pfcfgGood = `{"version":1,"generated_at":"2026-10-27T10:00:00+08:00","units":[` +
-	`{"key":"260403J1301","code":"260403J1301","serials":[1],"rel":"2026/260403J1301-项目己"},` +
-	`{"key":"260403J1301R2","code":"260403J1301","serials":[2,3],"rel":"2026/260403J1301-项目己-副本"}]}`
+	`{"key":"260403J1301","code":"260403J1301","serials":["01"],"rel":"2026/260403J1301-项目己"},` +
+	`{"key":"260403J1301R2","code":"260403J1301","serials":["02","03"],"rel":"2026/260403J1301-项目己-副本"}]}`
 
 func pfcfgFile(t *testing.T, body string) string {
 	t.Helper()
@@ -90,7 +90,7 @@ func TestPFLoadConfiguredPathsEmptyUnits(t *testing.T) {
 // 评审 22-1：清单的 blocked（编号有配置但不能同步）读得出来；缺省为空；形状不合格就坏。
 func TestPFLoadConfiguredPathsBlocked(t *testing.T) {
 	body := `{"version":1,"units":[` +
-		`{"key":"260403J1301R2","code":"260403J1301","serials":[2],"rel":"2026/260403J1301-项目己-副本"}],` +
+		`{"key":"260403J1301R2","code":"260403J1301","serials":["02"],"rel":"2026/260403J1301-项目己-副本"}],` +
 		`"blocked":[{"code":"260403J1301","reason":"主目录 /别处/260403J1301-正式 不在工作目录下，不能同步"},` +
 		`{"code":"260403J1302"}]}`
 	cp, err := PFLoadConfiguredPaths(pfcfgFile(t, body))
@@ -140,6 +140,51 @@ func TestPFLoadConfiguredPathsBlockedReject(t *testing.T) {
 		"blocked 不是数组": `{"version":1,"units":[],"blocked":{"code":"260403J1301"}}`,
 	} {
 		if _, err := PFLoadConfiguredPaths(pfcfgFile(t, body)); err == nil {
+			t.Errorf("%s：应返回 error", name)
+		}
+	}
+}
+
+// XXYI 实际导出的样子：顶层多一个 problems（字符串数组）、serials 是库里原样的流水号字符串（"01"/"1"/"02"）、
+// 可带 blocked。以前 serials 是 []int 且顶层不认 problems，真实文件被当成清单坏了，开始同步一律被拒。
+func TestPFLoadConfiguredPathsXXYIExport(t *testing.T) {
+	body := `{"version":1,"generated_at":"2026-10-27T12:00:00Z","units":[` +
+		`{"key":"260403J1001R2","code":"260403J1001","serials":["02","03"],"rel":"2026/260403J1001-报告二"},` +
+		`{"key":"260403J1003","code":"260403J1003","serials":["01","1"],"rel":"2026/260403J1003-报告"}],` +
+		`"blocked":[{"code":"260403J1002","reason":"主目录 /别处/260403J1002-正式 不在工作目录下，不能同步"}],` +
+		`"problems":["260403J1002：主目录不在工作目录下","另一条问题"]}`
+	cp, err := PFLoadConfiguredPaths(pfcfgFile(t, body))
+	if err != nil {
+		t.Fatalf("XXYI 实际导出的清单应能读出来: %v", err)
+	}
+	if cp.GeneratedAt != "2026-10-27T12:00:00Z" {
+		t.Errorf("generated_at: %q", cp.GeneratedAt)
+	}
+	us := cp.Units("260403J1001")
+	if len(us) != 1 || us[0].Key != "260403J1001R2" || us[0].Rel != "2026/260403J1001-报告二" ||
+		len(us[0].Serials) != 2 || us[0].Serials[0] != "02" || us[0].Serials[1] != "03" {
+		t.Errorf("键、rel、流水号（字符串原样）不对: %+v", us)
+	}
+	if u, ok := cp.Find("260403J1001", "2026/260403J1001-报告二"); !ok || u.Key != "260403J1001R2" {
+		t.Errorf("Find 配不上: %+v %v", u, ok)
+	}
+	if u := cp.Units("260403J1003"); len(u) != 1 || u[0].Serials[1] != "1" {
+		t.Errorf("流水号字符串 \"01\"/\"1\" 应原样保留: %+v", u)
+	}
+	if r, ok := cp.BlockedReason("260403J1002"); !ok || r == "" {
+		t.Errorf("blocked 应生效: %q %v", r, ok)
+	}
+	if len(cp.Problems) != 2 || cp.Problems[0] != "260403J1002：主目录不在工作目录下" {
+		t.Errorf("problems 应读出来（只展示）: %+v", cp.Problems)
+	}
+	// 其余校验仍严格：problems 不是字符串数组、顶层不认识的键、serials 不是字符串数组都算坏
+	for name, bad := range map[string]string{
+		"problems 不是数组":   `{"version":1,"units":[],"problems":"x"}`,
+		"problems 里有非字符串": `{"version":1,"units":[],"problems":[1]}`,
+		"顶层不认识的键":         `{"version":1,"units":[],"problems":[],"extra":1}`,
+		"serials 不是数组":    `{"version":1,"units":[{"key":"260403J1001","code":"260403J1001","serials":"01","rel":"2026/260403J1001-报告"}]}`,
+	} {
+		if _, err := PFLoadConfiguredPaths(pfcfgFile(t, bad)); err == nil {
 			t.Errorf("%s：应返回 error", name)
 		}
 	}

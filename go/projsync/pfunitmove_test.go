@@ -1687,8 +1687,8 @@ func TestPFUnitMove_PathsGateBlocked(t *testing.T) {
 
 	// 2) blocked 的编号同时有配置的另配单元：整个编号都不开始同步（连另配的目录也拒）
 	pfumWritePathsList(t, e.pathsList, `{"version":1,"units":[`+
-		`{"key":"`+code+`R2","code":"`+code+`","serials":[2],"rel":"`+relCopy+`"}],`+
-		`"blocked":[{"code":"`+code+`","reason":"`+reason+`"}]}`)
+		`{"key":"`+code+`R2","code":"`+code+`","serials":["02"],"rel":"`+relCopy+`"}],`+
+		`"blocked":[{"code":"`+code+`","reason":"`+reason+`"}],"problems":["导出时的一条说明"]}`)
 	e.expectRefused(t, relCopy, PFUnitMoveCodeBlocked)
 	e.expectRefused(t, relOld, PFUnitMoveCodeBlocked)
 	e.noUnit(t, code+"R2")
@@ -1733,8 +1733,8 @@ func TestPFUnitMove_PathsGate(t *testing.T) {
 
 	// 2) 编号在清单里有配置、rel 是配置的那条 → 照常过，键 = 编号
 	pfumWritePathsList(t, e.pathsList, `{"version":1,"units":[`+
-		`{"key":"`+code+`","code":"`+code+`","serials":[1],"rel":"`+relMain+`"},`+
-		`{"key":"`+code+`R2","code":"`+code+`","serials":[2],"rel":"`+relCopy+`"}]}`)
+		`{"key":"`+code+`","code":"`+code+`","serials":["01"],"rel":"`+relMain+`"},`+
+		`{"key":"`+code+`R2","code":"`+code+`","serials":["02"],"rel":"`+relCopy+`"}]}`)
 	r := e.mustStart(t, relMain)
 	if r.Unit != code {
 		t.Errorf("主目录单元的键应是编号，得 %q", r.Unit)

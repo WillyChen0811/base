@@ -4,10 +4,12 @@ package projsync
 //
 // 格式（version 1）：
 //
-//	{"version":1,"generated_at":"…","units":[{"key","code","serials":[…],"rel"}],"blocked":[{"code","reason"}]}
+//	{"version":1,"generated_at":"…","units":[{"key","code","serials":["01","02"],"rel"}],"blocked":[{"code","reason"}],"problems":["…"]}
 //
 //   - code：项目编号（归一化）；key：单元键（code，或 code+R+该目录下最小流水号数字，如 260403J1001R2）；
+//   - serials：这个目录对应的报告流水号，库里原样的字符串（"01"、"1"、"02"…），只用来展示，不参与判断；
 //   - rel：配置目录相对工作目录的路径（/ 分隔）；同编号在主目录里面的另配目录导出时已并掉，不会在这里出现；
+//   - problems（可选）：导出时遇到的问题说明（字符串数组），只给人看，不参与判断；
 //   - blocked（可选，评审 22-1）：编号有配置、但配置不能同步（比如主目录不在工作目录下），导出时不能就这样把整个编号丢掉
 //     （丢了开始同步的闸会把「没配置」当成可以放行）。编号在 blocked 里，开始同步一律拒绝，原因用 reason。
 //
@@ -31,10 +33,10 @@ const PFConfigPathsVersion = 1
 
 // PFConfiguredUnit 是清单里的一条配置目录。
 type PFConfiguredUnit struct {
-	Key     string `json:"key"`
-	Code    string `json:"code"`
-	Serials []int  `json:"serials,omitempty"`
-	Rel     string `json:"rel"`
+	Key     string   `json:"key"`
+	Code    string   `json:"code"`
+	Serials []string `json:"serials,omitempty"` // 库里原样的流水号字符串，只展示
+	Rel     string   `json:"rel"`
 }
 
 // PFBlockedCode 是清单里一条「不能同步的编号」：编号有配置，但配置不能用（如主目录不在工作目录下）。
@@ -50,6 +52,8 @@ type PFConfiguredPaths struct {
 	ByCode map[string][]PFConfiguredUnit `json:"-"`
 	// Blocked：编号 → 不能同步的原因（清单里 blocked 字段；没有这个字段就是空 map）。
 	Blocked map[string]string `json:"-"`
+	// Problems：XXYI 导出时遇到的问题说明（清单里 problems 字段），只给人看，不参与任何判断。
+	Problems []string `json:"-"`
 }
 
 // BlockedReason 报告编号 code 是不是在清单的 blocked 里；在的话返回 reason（可能为空串）。
@@ -85,6 +89,7 @@ type pfcfgDoc struct {
 	GeneratedAt string             `json:"generated_at,omitempty"`
 	Units       []PFConfiguredUnit `json:"units"`
 	Blocked     []PFBlockedCode    `json:"blocked,omitempty"`
+	Problems    []string           `json:"problems,omitempty"` // XXYI 导出时遇到的问题说明，只给人看
 }
 
 // PFLoadConfiguredPaths 读并校验清单文件。文件不存在、读不了、JSON 不合法、条目不合格都返回 error
@@ -109,7 +114,7 @@ func PFLoadConfiguredPaths(path string) (*PFConfiguredPaths, error) {
 	if doc.Version != PFConfigPathsVersion {
 		return nil, fmt.Errorf("projsync: 配置路径清单 %s 版本 %d 不认识（只认 %d）", path, doc.Version, PFConfigPathsVersion)
 	}
-	out := &PFConfiguredPaths{GeneratedAt: doc.GeneratedAt, ByCode: map[string][]PFConfiguredUnit{}, Blocked: map[string]string{}}
+	out := &PFConfiguredPaths{GeneratedAt: doc.GeneratedAt, ByCode: map[string][]PFConfiguredUnit{}, Blocked: map[string]string{}, Problems: doc.Problems}
 	for i, b := range doc.Blocked {
 		if err := pfcfgCheckCode(b.Code); err != nil {
 			return nil, fmt.Errorf("projsync: 配置路径清单 %s blocked 第 %d 条: %w", path, i+1, err)

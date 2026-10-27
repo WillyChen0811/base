@@ -504,7 +504,8 @@ func (s PFUnitState) valid() bool {
 //
 //   - Code：单元键（归一化），等于项目编号，或 编号+`R`+流水号数字（§14.1 的另配目录单元，如 `260403J1001R2`）。
 //     200 多处按它分组、命名状态文件，不改名。
-//   - ProjectCode：这个单元属于哪个项目编号；空 = 等于 Code（主目录单元）。键带 `R` 后缀时必须显式写。
+//   - ProjectCode：这个单元属于哪个项目编号；键带 `R` 后缀时应显式写；空 = 从键推出（键 = 编号时就是 Code，
+//     键带 R 后缀时是 R 前面那段，见 PFUnitProjectCode），读到的记录一律以推出的编号为准、校验时与 Rel 认出的编号核对。
 //   - Rel：同步目录/工作目录下的相对路径（`<年>/<编号-名称>`，/ 分隔）。
 //   - LinkPath：桌面原位置（工作目录/Rel）的绝对路径，开始同步后是指向 SyncPath 的符号链接。
 //   - SyncPath：同步目录/Rel 的绝对路径，项目实际所在。
@@ -521,10 +522,16 @@ type PFUnitRecord struct {
 	StartedAt   time.Time   `json:"started_at"`
 }
 
-// PFUnitProjectCode 返回这条登记的编号（ProjectCode 为空时等于 Code）。
+// PFUnitProjectCode 返回这条登记的项目编号：ProjectCode 非空用它；为空就从单元键推出来（键 = 编号时就是键，
+// 键 = 编号+R+流水号时是 R 前面那段）。无论 ProjectCode 填没填，都不会把带 R 的键本身当编号返回
+// （评审 17-3：按编号归类没配置目录时靠它，空 ProjectCode 的另配单元不能让同编号的没配置目录被当成新项目）。
+// 键认不出（登记本身不合格，PFValidateUnit 会拒）时退回 Code。
 func (u PFUnitRecord) PFUnitProjectCode() string {
 	if u.ProjectCode != "" {
 		return u.ProjectCode
+	}
+	if pc, ok := PFUnitKeyProjectCode(u.Code); ok {
+		return pc
 	}
 	return u.Code
 }
@@ -575,7 +582,9 @@ func pfUnitKeyMatchesRel(key, relCode string) bool {
 // PFValidateUnit 校验一条登记：
 //   - Code 非空、纯 ASCII、已是归一化形式（无空白、大写）、是认得出的项目编号，或 编号+`R`+流水号数字
 //     （§14.4 的另配目录单元键）；
-//   - ProjectCode 为空（= 等于 Code）时不查；非空时必须是 ASCII、归一化，并且等于 Rel 最后一段认出的编号；
+//   - 从 Code 推出项目编号（Code 是编号就是它本身，是 编号+R+流水号 就是 R 前面那段），必须等于 Rel 最后一段认出的编号
+//     （带 R 的键本身从不当编号用，评审 17-3）；
+//   - ProjectCode 为空时用推出的编号；非空时必须是 ASCII、归一化，并且等于推出的编号、也等于 Rel 最后一段认出的编号；
 //   - Rel 最后一段认出的编号必须等于 Code，或 Code = 该编号+`R`+流水号数字（§14.4）；
 //   - State 是四个值之一；
 //   - Rel 过 validRel，不超过 PFUnitMaxDepth 段，没有「.」开头的段，非最后一段的目录名里认不出编号
@@ -627,6 +636,11 @@ func PFValidateUnit(u PFUnitRecord) error {
 	if !pfUnitKeyMatchesRel(u.Code, relCode) {
 		return fmt.Errorf("projsync: 编号 %s 与 rel %q 最后一段认出的编号 %q 不一致（也不是 %sR+流水号）", u.Code, u.Rel, relCode, relCode)
 	}
+	// 项目编号一律从键推出来（键认得出已在上面查过），与 Rel 认出的编号比；ProjectCode 填了就必须同它一致。
+	keyProj, _ := PFUnitKeyProjectCode(u.Code)
+	if keyProj != relCode {
+		return fmt.Errorf("projsync: 编号 %s 推出的项目编号 %q 与 rel %q 最后一段认出的编号 %q 不一致", u.Code, keyProj, u.Rel, relCode)
+	}
 	if u.ProjectCode != "" {
 		if !pfIsASCII(u.ProjectCode) {
 			return fmt.Errorf("projsync: 登记 %s 的 project_code %q 含非 ASCII 字符", u.Code, u.ProjectCode)
@@ -636,6 +650,9 @@ func PFValidateUnit(u PFUnitRecord) error {
 		}
 		if u.ProjectCode != relCode {
 			return fmt.Errorf("projsync: 登记 %s 的 project_code %q 与 rel %q 最后一段认出的编号 %q 不一致", u.Code, u.ProjectCode, u.Rel, relCode)
+		}
+		if u.ProjectCode != keyProj {
+			return fmt.Errorf("projsync: 登记 %s 的 project_code %q 与键推出的项目编号 %q 不一致", u.Code, u.ProjectCode, keyProj)
 		}
 	}
 	if u.State != PFUnitStopped || u.LinkPath != "" {

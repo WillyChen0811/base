@@ -697,6 +697,9 @@ func TestPFValidateUnitSameCodeTwoUnits(t *testing.T) {
 	if err := PFValidateUnit(nopc); err != nil {
 		t.Errorf("不带 project_code 的 R2 键应合格: %v", err)
 	}
+	if nopc.PFUnitProjectCode() != "260403J1301" {
+		t.Errorf("不带 project_code 的 R2 键，项目编号应从键推出 260403J1301，不能拿带 R 的键当编号，得 %q", nopc.PFUnitProjectCode())
+	}
 	// 序列化带 project_code，往返不丢
 	b, err = PFMarshalUnits([]PFUnitRecord{r2})
 	if err != nil || !strings.Contains(string(b), `"project_code": "260403J1301"`) { // PFMarshalUnits 输出带缩进
@@ -709,10 +712,16 @@ func TestPFValidateUnitSameCodeTwoUnits(t *testing.T) {
 
 	// 不合格的键与 project_code
 	for name, mut := range map[string]func(u *PFUnitRecord){
-		"R 后不是数字":          func(u *PFUnitRecord) { u.Code = "260403J1301RB" },
-		"键是别的编号加R":         func(u *PFUnitRecord) { u.Code = "260403J1302R2" },
-		"project_code不是编号": func(u *PFUnitRecord) { u.ProjectCode = "260403J1302" },
-		"project_code带空格":  func(u *PFUnitRecord) { u.ProjectCode = " 260403J1301" },
+		"R 后不是数字":            func(u *PFUnitRecord) { u.Code = "260403J1301RB" },
+		"键是别的编号加R":           func(u *PFUnitRecord) { u.Code = "260403J1302R2" },
+		"project_code不是编号":   func(u *PFUnitRecord) { u.ProjectCode = "260403J1302" },
+		"project_code带空格":    func(u *PFUnitRecord) { u.ProjectCode = " 260403J1301" },
+		"project_code就是带R的键": func(u *PFUnitRecord) { u.ProjectCode = "260403J1301R2" },
+		"rel 认出的编号与键推出的不同（project_code 留空）": func(u *PFUnitRecord) {
+			u.ProjectCode = ""
+			u.Rel = "2026/260403J1302-己-副本"
+			u.LinkPath, u.SyncPath = "/x/"+u.Rel, "/y/"+u.Rel
+		},
 	} {
 		u := pfUnit("260403J1301", "己-副本", PFUnitSyncing)
 		u.Code, u.ProjectCode = "260403J1301R2", "260403J1301"
@@ -761,6 +770,39 @@ func TestPFClassifySameCodeTwoUnits(t *testing.T) {
 	}
 	if len(got.Missing) != 1 || got.Missing[0].Code != "260403J1305" {
 		t.Errorf("Missing 应只剩壬: %+v", got.Missing)
+	}
+}
+
+// 评审 17-3：另配单元（键带 R）没填 project_code 时，按编号归类没配置目录也得用从键推出的编号，
+// 不能拿带 R 的键当编号——否则同编号的没配置目录认不出已登记，被当成 Ubuntu 新项目。
+func TestPFClassifyUnconfiguredWithRKeyWithoutProjectCode(t *testing.T) {
+	r2 := pfUnit("260403J1301", "己-副本", PFUnitSyncing)
+	r2.Code = "260403J1301R2" // 故意不填 ProjectCode
+	for _, withPC := range []bool{false, true} {
+		u := r2
+		if withPC {
+			u.ProjectCode = "260403J1301"
+		}
+		if err := PFValidateUnit(u); err != nil {
+			t.Fatalf("withPC=%v：登记应合格：%v", withPC, err)
+		}
+		found := PFDiscoverResult{Units: []PFFoundUnit{
+			pfFound("260403J1301", "2026/260403J1301-己-副本"),
+			pfFound("260403J1301", "2026/260403J1301-旧资料"),
+		}}
+		got, err := PFClassifyUnits(found, []PFUnitRecord{u})
+		if err != nil {
+			t.Fatalf("withPC=%v：%v", withPC, err)
+		}
+		if len(got.New) != 0 || len(got.Duplicates) != 0 {
+			t.Errorf("withPC=%v：同编号的没配置目录不能当新项目/重复: New=%+v Dup=%+v", withPC, got.New, got.Duplicates)
+		}
+		if len(got.Unconfigured) != 1 || got.Unconfigured[0].Rel != "2026/260403J1301-旧资料" {
+			t.Errorf("withPC=%v：没配置的目录应进 Unconfigured: %+v", withPC, got.Unconfigured)
+		}
+		if len(got.Syncing) != 1 || got.Syncing[0].Reg.Code != "260403J1301R2" {
+			t.Errorf("withPC=%v：登记的另配单元仍按 rel 配上: %+v", withPC, got.Syncing)
+		}
 	}
 }
 

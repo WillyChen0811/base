@@ -123,7 +123,9 @@ func hostPort(t *testing.T, addr string) (string, int) {
 	return h, n
 }
 
-// 没命中规则走直连：真发到目的（IP 与域名），回包带头，流量计入「其他（直连）」
+// 没命中规则走直连：真发到目的（两个回环地址），回包带头，流量计入「其他（直连）」。
+// 目的用字面 127.0.0.1 而不是 localhost：macOS 上 localhost 优先解析成 IPv6 的 ::1，
+// 而 udpEcho 只监听 IPv4 回环；UDP 没有 TCP 那样的逐地址重试，包发往 ::1 就没人应答，回包为空。
 func TestProxyUDPDirect(t *testing.T) {
 	real := udpEcho(t, "real")
 	a, _ := udpFwd(t, "smb", []string{"10.116.7.250"}, udpEcho(t, "A"))
@@ -133,8 +135,8 @@ func TestProxyUDPDirect(t *testing.T) {
 	if got, ok := udpAsk(t, u, h, port, "hi", 3*time.Second); !ok || got != "real:hi" {
 		t.Errorf("直连回包 = %q, %v", got, ok)
 	}
-	if got, ok := udpAsk(t, u, "localhost", port, "dn", 3*time.Second); !ok || got != "real:dn" {
-		t.Errorf("域名直连回包 = %q, %v", got, ok)
+	if got, ok := udpAsk(t, u, "127.0.0.1", port, "dn", 3*time.Second); !ok || got != "real:dn" {
+		t.Errorf("回环直连回包 = %q, %v", got, ok)
 	}
 	if v := p.direct.tc.view(); v.UpTotal != 4 || v.DownTotal != 14 { // 上行 2+2，下行 "real:hi"+"real:dn" 各 7
 		t.Errorf("直连流量 = %+v", v)

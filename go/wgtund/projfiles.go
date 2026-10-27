@@ -398,6 +398,7 @@ type projfilesStatus struct {
 	LastAction string    `json:"last_action,omitempty"` // 最近一次到点/唤醒时做了什么或为什么没跑
 
 	Settings         projfilesSettings `json:"settings"`
+	LimitBps         int64             `json:"limit_bps"` // 当前生效的限速（字节/秒），两方向同值，0 = 不限
 	SettingsProblems []string          `json:"settings_problems,omitempty"`
 	Notices          []string          `json:"notices,omitempty"`
 
@@ -538,6 +539,8 @@ func (s *projfilesSvc) build(st projfilesSettings) error {
 	s.mu.Lock()
 	s.remote, s.transfer, s.mover, s.sched, s.built, s.buildErr = remote, transfer, mover, sched, true, ""
 	s.mu.Unlock()
+	// 新建的传输器立刻按当前网络挂上限：启动恢复那一轮在第一次 tick 之前就会传文件。
+	s.applyLimits(st, s.effNet())
 	return nil
 }
 
@@ -576,7 +579,8 @@ func (s *projfilesSvc) attachSFTPReal() error {
 
 // ── 网络 ────────────────────────────────────────────────
 
-// setNet 是唯一对外的网络入口（HTTP 接口归 T11b）：转给 PFSched.SetNet，网络从差变好时立刻触发一轮。
+// setNet 是唯一对外的网络入口（HTTP 接口归 T11b）：转给 PFSched.SetNet，网络从差变好时立刻触发一轮；
+// 网络一变就把对应的限速刷到传输器上（断网不动限速，跟 tick 里的门槛一致）。
 func (s *projfilesSvc) setNet(net string, at time.Time) {
 	if !projfilesNetValid(net) {
 		net = projsync.PFRemoteNetUnknown
@@ -585,10 +589,14 @@ func (s *projfilesSvc) setNet(net string, at time.Time) {
 	wasGood := s.effNetLocked() == projsync.PFRemoteNetGood
 	s.net, s.netAt = net, at
 	becameGood := s.effNetLocked() == projsync.PFRemoteNetGood
-	sched := s.sched
+	eff := s.effNetLocked()
+	sched, st := s.sched, s.settings
 	s.mu.Unlock()
 	if sched != nil {
 		sched.SetNet(net, at)
+	}
+	if eff != projsync.PFRemoteNetOffline {
+		s.applyLimits(st, eff)
 	}
 	if becameGood && !wasGood {
 		s.kick()
@@ -915,6 +923,10 @@ func (s *projfilesSvc) status() projfilesStatus {
 	}
 	if s.sched != nil {
 		out.PendingTouched = s.sched.PendingTouched()
+	}
+	// 生效限速报传输器上实际挂着的值（setNet/每轮都会刷）；还没建传输器时是 0（不限）。
+	if tr := s.transfer; tr != nil {
+		out.LimitBps = tr.Limit(projsync.PFUpload)
 	}
 	return out
 }

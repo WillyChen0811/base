@@ -10,6 +10,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"io/fs"
 	"os"
@@ -17,6 +18,7 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -1516,5 +1518,70 @@ func TestPFApplyResultStrings(t *testing.T) {
 	}
 	if runtime.GOOS == "" {
 		t.Skip()
+	}
+}
+
+func TestPFApplyResultJSONRoundTrip(t *testing.T) {
+	e := newPFAEnv(t)
+	e.put("a.docx", "旧")
+	res, err := e.a.InstallOver(bg, "a.docx", e.stage("新"), 5, e.expect("a.docx"))
+	e.wantDone(res, err)
+	b, err := json.Marshal(res)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(b), `"status":"完成"`) {
+		t.Errorf("状态应编码成中文名：%s", b)
+	}
+	var back PFApplyResult
+	if err := json.Unmarshal(b, &back); err != nil {
+		t.Fatal(err)
+	}
+	if back.Status != PFApplyDone || back.Recycled == nil || back.Recycled.SHA256 != res.Recycled.SHA256 || back.Installed == nil || *back.Installed != *res.Installed {
+		t.Errorf("往返后不一致：%+v", back)
+	}
+	// 错误编码成文本
+	ab := PFApplyResult{Status: PFApplyAbandoned, Code: PFApplyCodeIO, Err: errors.New("底层错误")}
+	b, _ = json.Marshal(ab)
+	var ab2 PFApplyResult
+	if err := json.Unmarshal(b, &ab2); err != nil || ab2.ErrText != "底层错误" || ab2.Err != nil {
+		t.Errorf("Err 编码：%s %+v %v", b, ab2, err)
+	}
+	var st PFApplyStatus
+	if err := json.Unmarshal([]byte(`"乱写"`), &st); err == nil {
+		t.Error("不认识的状态应报错")
+	}
+	// 前提和 part 的 JSON 字段名
+	b, _ = json.Marshal(PFExpectFile(1, 2, 3, "ab"))
+	if string(b) != `{"size":1,"mtime_ns":2,"ino":3,"sha256":"ab"}` {
+		t.Errorf("PFExpect JSON = %s", b)
+	}
+	b, _ = json.Marshal(PFExpectAbsent())
+	if !strings.Contains(string(b), `"absent":true`) {
+		t.Errorf("PFExpectAbsent JSON = %s", b)
+	}
+}
+
+func TestPFApplyClassifyErrno(t *testing.T) {
+	cases := []struct {
+		err    error
+		status PFApplyStatus
+		code   string
+	}{
+		{syscall.EACCES, PFApplyOutOfScope, PFApplyCodeReadOnly},
+		{syscall.EPERM, PFApplyOutOfScope, PFApplyCodeReadOnly},
+		{syscall.EROFS, PFApplyOutOfScope, PFApplyCodeReadOnly},
+		{syscall.EINVAL, PFApplyOutOfScope, PFApplyCodeUnsupportedFS},
+		{syscall.ENOTSUP, PFApplyOutOfScope, PFApplyCodeUnsupportedFS},
+		{syscall.ENOSPC, PFApplyAbandoned, PFApplyCodeDiskFull},
+		{syscall.ENOENT, PFApplyAbandoned, PFApplyCodeTargetMissing},
+		{syscall.EIO, PFApplyAbandoned, PFApplyCodeIO},
+		{&os.LinkError{Op: "rename", Old: "a", New: "b", Err: syscall.EPERM}, PFApplyOutOfScope, PFApplyCodeReadOnly},
+	}
+	for _, c := range cases {
+		r := pfClassifyErr("x", "测试", c.err)
+		if r.Status != c.status || r.Code != c.code || r.Reason == "" || r.Err == nil {
+			t.Errorf("%v → %v", c.err, r)
+		}
 	}
 }

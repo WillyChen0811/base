@@ -210,6 +210,8 @@ func TestPFLinuxPrimitives(t *testing.T) {
 		{"PFApplyStageCopySourceMismatch", TestPFApplyStageCopySourceMismatch},
 		{"PFApplyStageCopyExistingPart", TestPFApplyStageCopyExistingPart},
 		{"PFApplyCanceledBeforeStart", TestPFApplyCanceledBeforeStart},
+		{"PFApplyResultJSONRoundTrip", TestPFApplyResultJSONRoundTrip},
+		{"PFApplyClassifyErrno", TestPFApplyClassifyErrno},
 		{"PFRecycleLayoutAndIndex", TestPFRecycleLayoutAndIndex},
 		{"PFRecycleNameCollisions", TestPFRecycleNameCollisions},
 		{"PFRecycleCaseInsensitiveCollision", TestPFRecycleCaseInsensitiveCollision},

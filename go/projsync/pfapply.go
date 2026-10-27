@@ -49,6 +49,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -118,26 +119,54 @@ const (
 )
 
 // PFApplyResult 是一步写原语的结果。
+//
+// 可以直接 JSON 编码（给 xxyi-msg 回给 Mac 用）：Status 编码成中文名字符串，Err 编码成 err 字段的文本，
+// 解码后 Err 为 nil、文本在 ErrText。
 type PFApplyResult struct {
-	Status    PFApplyStatus
-	Code      string // 原因代码；完成时是 PFApplyCodeOK
-	Reason    string // 中文原因；完成时可空
-	Rel       string // 主要路径（单元内相对路径）
-	Uncertain bool   // 放弃时：没能完全恢复原状，上层要停下这个单元本轮后续写入并报告
-	Err       error  // 底层错误（如果有）
+	Status    PFApplyStatus `json:"status"`
+	Code      string        `json:"code"`                // 原因代码；完成时是 PFApplyCodeOK
+	Reason    string        `json:"reason,omitempty"`    // 中文原因；完成时可空
+	Rel       string        `json:"rel,omitempty"`       // 主要路径（单元内相对路径）
+	Uncertain bool          `json:"uncertain,omitempty"` // 放弃时：没能完全恢复原状，上层要停下这个单元本轮后续写入并报告
+	Err       error         `json:"-"`                   // 底层错误（如果有）
+	ErrText   string        `json:"err,omitempty"`       // Err 的文本（编码时自动填，解码后只有它）
 
 	// Installed 是完成后目标位置上那份文件的现状（安装、改名后），给上层写 base 用。
-	Installed *PFFileInfo
+	Installed *PFFileInfo `json:"installed,omitempty"`
 	// Recycled 是进了同步回收的那一份的记录（覆盖、删除）；放弃时也可能有（内容留在回收里，见 Residue）。
-	Recycled *PFRecycleEntry
+	Recycled *PFRecycleEntry `json:"recycled,omitempty"`
 	// Existed 在 Mkdir 时表示目录本来就有。
-	Existed bool
+	Existed bool `json:"existed,omitempty"`
 	// StaleLocks 是被当作残留、没有挡住这一步的 Office 锁文件（超过 12 小时）。
-	StaleLocks []string
+	StaleLocks []string `json:"stale_locks,omitempty"`
 	// Notes 是不影响结果的提示（如回收记账写失败、目录 fsync 失败）。
-	Notes []string
+	Notes []string `json:"notes,omitempty"`
 	// Residue 说明放弃但没能完全恢复时，内容现在在哪。
-	Residue []string
+	Residue []string `json:"residue,omitempty"`
+}
+
+// MarshalText 把状态编码成中文名（JSON 里是字符串）。
+func (s PFApplyStatus) MarshalText() ([]byte, error) { return []byte(s.String()), nil }
+
+// UnmarshalText 是 MarshalText 的逆。
+func (s *PFApplyStatus) UnmarshalText(b []byte) error {
+	for _, c := range []PFApplyStatus{PFApplyDone, PFApplyAbandoned, PFApplyDeferred, PFApplyOutOfScope} {
+		if c.String() == string(b) {
+			*s = c
+			return nil
+		}
+	}
+	return fmt.Errorf("projsync: 不认识的结果种类 %q", b)
+}
+
+// MarshalJSON 编码时把 Err 的文本填进 err 字段。
+func (r PFApplyResult) MarshalJSON() ([]byte, error) {
+	type plain PFApplyResult // 没有方法，避免递归
+	p := plain(r)
+	if p.ErrText == "" && r.Err != nil {
+		p.ErrText = r.Err.Error()
+	}
+	return json.Marshal(p)
 }
 
 func (r PFApplyResult) String() string {
@@ -156,19 +185,19 @@ func (r PFApplyResult) String() string {
 
 // PFFileInfo 是一份文件落盘后的现状。
 type PFFileInfo struct {
-	Size    int64
-	MtimeNs int64
-	Ino     uint64
-	SHA256  string
+	Size    int64  `json:"size"`
+	MtimeNs int64  `json:"mtime_ns"`
+	Ino     uint64 `json:"ino"`
+	SHA256  string `json:"sha256"`
 }
 
 // PFExpect 是判定时看到的「目标现状」，原语执行前后都要核对。
 type PFExpect struct {
-	Absent  bool   // true：期望目标不存在（其余字段忽略）
-	Size    int64  // 期望的大小
-	MtimeNs int64  // 期望的 mtime（纳秒）
-	Ino     uint64 // 期望的 ino；0 表示不核对 ino
-	SHA256  string // 期望的内容哈希（小写十六进制）
+	Absent  bool   `json:"absent,omitempty"` // true：期望目标不存在（其余字段忽略）
+	Size    int64  `json:"size"`             // 期望的大小
+	MtimeNs int64  `json:"mtime_ns"`         // 期望的 mtime（纳秒）
+	Ino     uint64 `json:"ino"`              // 期望的 ino；0 表示不核对 ino
+	SHA256  string `json:"sha256"`           // 期望的内容哈希（小写十六进制）
 }
 
 // PFExpectAbsent 返回「目标不存在」的前提。
@@ -181,16 +210,16 @@ func PFExpectFile(size, mtimeNs int64, ino uint64, sha256hex string) PFExpect {
 
 // PFPart 是暂存区里已核验的 part：路径必须是 <暂存区>/<sha256>.part。
 type PFPart struct {
-	Path   string
-	SHA256 string
-	Size   int64
+	Path   string `json:"path"`
+	SHA256 string `json:"sha256"`
+	Size   int64  `json:"size"`
 }
 
 // PFCopySrc 是本机复制复用的来源：项目里别处、回收区或暂存区里的一份文件，内容必须是 SHA256。
 type PFCopySrc struct {
-	Path   string
-	SHA256 string
-	Size   int64
+	Path   string `json:"path"`
+	SHA256 string `json:"sha256"`
+	Size   int64  `json:"size"`
 }
 
 // PFApplyConfigError 是配置错误（参数不合法、不同文件系统等）：此时什么都没动，上层整个停下报告。

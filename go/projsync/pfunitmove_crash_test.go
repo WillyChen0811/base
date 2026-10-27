@@ -182,7 +182,7 @@ func pfumStartScenario() pfumCrashScenario {
 				e.wantUnit(t, pfumCode, PFUnitSyncing)
 				return
 			}
-			if cs, err := e.mover().CheckLinks(bg); err != nil || len(cs) != 1 || cs[0].Status != PFUnitLinkOK {
+			if cs, err := e.mover().CheckLinks(bg); err != nil || len(cs) != 1 || cs[0].Status != PFUnitMoveLinkOK {
 				t.Errorf("链接检查：%v %+v", err, cs)
 			}
 			e.mustStop(t, pfumCode)
@@ -273,7 +273,7 @@ func pfumCreateScenario() pfumCrashScenario {
 				}
 				return
 			}
-			if cs, err := e.mover().CheckLinks(bg); err != nil || len(cs) != 1 || cs[0].Status != PFUnitLinkOK {
+			if cs, err := e.mover().CheckLinks(bg); err != nil || len(cs) != 1 || cs[0].Status != PFUnitMoveLinkOK {
 				t.Errorf("链接检查：%v %+v", err, cs)
 			}
 			e.mustStop(t, pfumCode)
@@ -738,7 +738,7 @@ func TestPFUnitMove_StopRenameFailsRelinks(t *testing.T) {
 	if st := e.logState(t, pfumCode); st != "" {
 		t.Errorf("日志应清掉：%q", st)
 	}
-	if cs, err := e.mover().CheckLinks(bg); err != nil || len(cs) != 1 || cs[0].Status != PFUnitLinkOK {
+	if cs, err := e.mover().CheckLinks(bg); err != nil || len(cs) != 1 || cs[0].Status != PFUnitMoveLinkOK {
 		t.Errorf("链接检查：%v %+v", err, cs)
 	}
 	// 之后条件好了可以再取消

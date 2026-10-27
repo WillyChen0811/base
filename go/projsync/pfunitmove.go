@@ -165,6 +165,15 @@ type PFUnitMoveResult struct {
 // PFUnitMoveHook 是测试钩子：每个窗口调用一次，参数是窗口名（"start:logged-begin"、"start:after-rename" 这样）。
 // 返回 error 表示「进程恰好在这里死掉」：操作立刻带着这个 error 返回，不做任何清理，磁盘停在真实崩溃会留下的样子。
 // 钩子里也可以改文件系统（模拟「这时有人动了」）后返回 nil。生产代码传 nil。
+//
+// 窗口按发生顺序（"logged-X" 是写完「即将做 X」的日志之后，"after-X" 是 X 做完之后）：
+//
+//	start:  logged-begin, after-mkdir, logged-rename, after-rename, logged-link, after-link, after-verify,
+//	        logged-register, after-register, after-done；另有 before-rollback（建链接失败、准备改回去之前）
+//	stop:   after-stopping, logged-begin, after-unlink, logged-rename, after-rename, after-verify,
+//	        logged-register, after-register, after-done；另有 before-relink（改名失败、准备把链接建回去之前）
+//	create: logged-begin, after-mkdir, logged-link, after-link, after-verify, logged-register, after-register, after-done
+//	recover: 前缀 recover:，窗口名同上（logged-link/after-link/…、logged-rename/after-rename/…），只经过实际做的那几步
 type PFUnitMoveHook func(window string) error
 
 // PFUnitMoveConfigError 是配置错误（同步目录不合格等）：什么都没动，上层整个停下报告。
@@ -1144,6 +1153,8 @@ func (m *PFUnitMover) StartSync(ctx context.Context, rel string) (PFUnitMoveResu
 		rf.addf(PFUnitMoveCodeNotRealDir, "%s 已经是符号链接（可能已经在同步），不是真实目录", p)
 	case pst.Kind != PFKindDir:
 		rf.addf(PFUnitMoveCodeNotRealDir, "%s 不是目录", p)
+	case pst.Dataless():
+		rf.add(PFUnitMoveCodePlaceholder, "项目目录本身是 iCloud 占位（内容还只在云端），挪出桌面会丢；先让它下载到本机", []string{"."})
 	default:
 		pOK = true
 	}
@@ -1794,6 +1805,7 @@ func (m *PFUnitMover) CreateSynced(ctx context.Context, rel string) (PFUnitMoveR
 // 链接和 S 都完好就退回 syncing；其他现场停下报告。
 // 临时文件（moves/ 下 .tmp-* ）是上次写日志崩溃留下的，这里删掉。
 // 返回的 error 只用于 moves/ 目录读不了（此时什么都没做）或测试钩子模拟的崩溃（此时已处理的结果仍在返回值里）。
+// 恢复不响应 ctx 取消（半途停下只会多留一份要再恢复的现场），ctx 只为与其他方法一致。
 func (m *PFUnitMover) RecoverMoves(ctx context.Context) ([]PFUnitMoveResult, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -1992,40 +2004,40 @@ func (m *PFUnitMover) createdByUs(lg *PFUnitMoveLog, s string, st PFStat) bool {
 // 九、链接检查（§12.2）
 // ============================================================================
 
-// PFUnitLinkStatus 是链接检查的结果种类。
-type PFUnitLinkStatus string
+// PFUnitMoveLinkStatus 是链接检查的结果种类。
+type PFUnitMoveLinkStatus string
 
 const (
-	PFUnitLinkOK          PFUnitLinkStatus = "ok"           // 链接在、指向 sync_path
-	PFUnitLinkRebuilt     PFUnitLinkStatus = "rebuilt"      // 链接没了、原位置空：已重建
-	PFUnitLinkOccupied    PFUnitLinkStatus = "occupied"     // 原位置被别的占了（真实目录、文件）：只报告
-	PFUnitLinkWrongTarget PFUnitLinkStatus = "wrong_target" // 是链接但指向别处：只报告
-	PFUnitLinkSyncMissing PFUnitLinkStatus = "sync_missing" // 同步目录里的项目不见了（G1：停下，不当删除）：只报告
-	PFUnitLinkSkipped     PFUnitLinkStatus = "skipped"      // 有没做完的移动日志，这一轮不管
-	PFUnitLinkError       PFUnitLinkStatus = "error"        // 读不了或重建失败
+	PFUnitMoveLinkOK          PFUnitMoveLinkStatus = "ok"           // 链接在、指向 sync_path
+	PFUnitMoveLinkRebuilt     PFUnitMoveLinkStatus = "rebuilt"      // 链接没了、原位置空：已重建
+	PFUnitMoveLinkOccupied    PFUnitMoveLinkStatus = "occupied"     // 原位置被别的占了（真实目录、文件）：只报告
+	PFUnitMoveLinkWrongTarget PFUnitMoveLinkStatus = "wrong_target" // 是链接但指向别处：只报告
+	PFUnitMoveLinkSyncMissing PFUnitMoveLinkStatus = "sync_missing" // 同步目录里的项目不见了（G1：停下，不当删除）：只报告
+	PFUnitMoveLinkSkipped     PFUnitMoveLinkStatus = "skipped"      // 有没做完的移动日志，这一轮不管
+	PFUnitMoveLinkError       PFUnitMoveLinkStatus = "error"        // 读不了或重建失败
 )
 
-// PFUnitLinkCheck 是一个单元的检查结果。
-type PFUnitLinkCheck struct {
-	Unit     string           `json:"unit"`
-	Rel      string           `json:"rel"`
-	LinkPath string           `json:"link_path"`
-	SyncPath string           `json:"sync_path"`
-	Status   PFUnitLinkStatus `json:"status"`
-	Detail   string           `json:"detail,omitempty"`
+// PFUnitMoveLinkCheck 是一个单元的检查结果。
+type PFUnitMoveLinkCheck struct {
+	Unit     string               `json:"unit"`
+	Rel      string               `json:"rel"`
+	LinkPath string               `json:"link_path"`
+	SyncPath string               `json:"sync_path"`
+	Status   PFUnitMoveLinkStatus `json:"status"`
+	Detail   string               `json:"detail,omitempty"`
 }
 
 // CheckLinks 对登记表里状态是 syncing 的每个单元检查桌面链接：lstat(link_path) 应是指向 sync_path 的符号链接；
 // 链接没了且原位置空 → 重建；原位置被别的占了（真实目录、文件、指向别处的链接）→ 只报告，不动。
 // 同步目录里的项目不见了 → 只报告（不重建链接，也不当作删除）。登记表读不了返回 error。
-func (m *PFUnitMover) CheckLinks(ctx context.Context) ([]PFUnitLinkCheck, error) {
+func (m *PFUnitMover) CheckLinks(ctx context.Context) ([]PFUnitMoveLinkCheck, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	us, err := PFUnitMoveLoadUnits(m.meta)
 	if err != nil {
 		return nil, err
 	}
-	var out []PFUnitLinkCheck
+	var out []PFUnitMoveLinkCheck
 	for _, u := range us {
 		if u.State != PFUnitSyncing {
 			continue
@@ -2033,63 +2045,63 @@ func (m *PFUnitMover) CheckLinks(ctx context.Context) ([]PFUnitLinkCheck, error)
 		if err := ctx.Err(); err != nil {
 			return out, err
 		}
-		c := PFUnitLinkCheck{Unit: u.Code, Rel: u.Rel, LinkPath: u.LinkPath, SyncPath: u.SyncPath}
+		c := PFUnitMoveLinkCheck{Unit: u.Code, Rel: u.Rel, LinkPath: u.LinkPath, SyncPath: u.SyncPath}
 		c.Status, c.Detail = m.checkOneLink(u)
 		out = append(out, c)
 	}
 	return out, nil
 }
 
-func (m *PFUnitMover) checkOneLink(u PFUnitRecord) (PFUnitLinkStatus, string) {
+func (m *PFUnitMover) checkOneLink(u PFUnitRecord) (PFUnitMoveLinkStatus, string) {
 	p, s := u.LinkPath, u.SyncPath
 	if _, pending := m.pendingLog(u.Code); pending {
-		return PFUnitLinkSkipped, "有没做完的移动日志，这一轮不检查"
+		return PFUnitMoveLinkSkipped, "有没做完的移动日志，这一轮不检查"
 	}
 	sst, sEx, err := m.lstat(s)
 	if err != nil {
-		return PFUnitLinkError, fmt.Sprintf("读 %s 失败：%v", s, err)
+		return PFUnitMoveLinkError, fmt.Sprintf("读 %s 失败：%v", s, err)
 	}
 	if !sEx || sst.Kind != PFKindDir {
-		return PFUnitLinkSyncMissing, fmt.Sprintf("同步目录里的项目 %s 现在是：%s", s, m.describe(s))
+		return PFUnitMoveLinkSyncMissing, fmt.Sprintf("同步目录里的项目 %s 现在是：%s", s, m.describe(s))
 	}
 	pst, pEx, err := m.lstat(p)
 	if err != nil {
-		return PFUnitLinkError, fmt.Sprintf("读 %s 失败：%v", p, err)
+		return PFUnitMoveLinkError, fmt.Sprintf("读 %s 失败：%v", p, err)
 	}
 	if pEx {
 		if pst.Kind != PFKindSymlink {
-			return PFUnitLinkOccupied, fmt.Sprintf("桌面位置 %s 被别的东西占了：%s", p, m.describe(p))
+			return PFUnitMoveLinkOccupied, fmt.Sprintf("桌面位置 %s 被别的东西占了：%s", p, m.describe(p))
 		}
 		target, err := os.Readlink(p)
 		if err != nil {
-			return PFUnitLinkError, fmt.Sprintf("读 %s 的链接目标失败：%v", p, err)
+			return PFUnitMoveLinkError, fmt.Sprintf("读 %s 的链接目标失败：%v", p, err)
 		}
 		if target != s {
-			return PFUnitLinkWrongTarget, fmt.Sprintf("桌面位置 %s 是链接，但指向 %q，不是 %q", p, target, s)
+			return PFUnitMoveLinkWrongTarget, fmt.Sprintf("桌面位置 %s 是链接，但指向 %q，不是 %q", p, target, s)
 		}
-		return PFUnitLinkOK, ""
+		return PFUnitMoveLinkOK, ""
 	}
 	// 链接没了，原位置空：重建（桌面一侧缺的上级目录也补）
 	missing, prob, err := m.walkChain(m.work, filepath.Dir(p))
 	if err != nil {
-		return PFUnitLinkError, fmt.Sprintf("读 %s 的上级目录失败：%v", p, err)
+		return PFUnitMoveLinkError, fmt.Sprintf("读 %s 的上级目录失败：%v", p, err)
 	}
 	if prob != "" {
-		return PFUnitLinkOccupied, "桌面一侧：" + prob
+		return PFUnitMoveLinkOccupied, "桌面一侧：" + prob
 	}
 	if len(missing) > 0 && missing[0] == m.work {
-		return PFUnitLinkError, fmt.Sprintf("工作目录 %s 不存在，不重建链接", m.work)
+		return PFUnitMoveLinkError, fmt.Sprintf("工作目录 %s 不存在，不重建链接", m.work)
 	}
 	if err := m.mkdirs(missing); err != nil {
-		return PFUnitLinkError, fmt.Sprintf("补建 %s 的上级目录失败：%v", p, err)
+		return PFUnitMoveLinkError, fmt.Sprintf("补建 %s 的上级目录失败：%v", p, err)
 	}
 	if err := m.cfg.Symlink(s, p); err != nil {
 		m.undoDirs(missing)
-		return PFUnitLinkError, fmt.Sprintf("重建链接 %s 失败：%v", p, err)
+		return PFUnitMoveLinkError, fmt.Sprintf("重建链接 %s 失败：%v", p, err)
 	}
 	m.syncParents(p)
 	if prob := m.verifyLinked(p, s, 0, 0); prob != "" {
-		return PFUnitLinkError, "重建链接后核对不符：" + prob
+		return PFUnitMoveLinkError, "重建链接后核对不符：" + prob
 	}
-	return PFUnitLinkRebuilt, fmt.Sprintf("链接 %s 不见了，已重建，指向 %s", p, s)
+	return PFUnitMoveLinkRebuilt, fmt.Sprintf("链接 %s 不见了，已重建，指向 %s", p, s)
 }

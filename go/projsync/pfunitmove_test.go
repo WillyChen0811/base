@@ -530,7 +530,7 @@ func TestPFUnitMove_RoundTrip(t *testing.T) {
 	}
 	e.noTmp(t)
 	checks, err := e.mover().CheckLinks(bg)
-	if err != nil || len(checks) != 1 || checks[0].Status != PFUnitLinkOK {
+	if err != nil || len(checks) != 1 || checks[0].Status != PFUnitMoveLinkOK {
 		t.Errorf("链接检查应为 ok：%v %+v", err, checks)
 	}
 	// 同步中的项目不能再开始
@@ -575,6 +575,28 @@ func TestPFUnitMove_RoundTrip(t *testing.T) {
 	e.wantUnit(t, pfumCode, PFUnitSyncing)
 	if len(e.units(t)) != 1 {
 		t.Errorf("再次开始不能多出登记：%+v", e.units(t))
+	}
+}
+
+// 项目里自带符号链接：随目录一起挪过去挪回来，链接本身原样（不跟随、不改写），提示里说明同步不处理它们。
+func TestPFUnitMove_InnerSymlinkTravelsUnchanged(t *testing.T) {
+	e := newPFUMEnv(t)
+	p := e.project(pfumRel)
+	if err := os.Symlink("备注.txt", filepath.Join(p, "快捷方式")); err != nil {
+		t.Fatal(err)
+	}
+	want := e.want(t, p)
+	res := e.mustStart(t, pfumRel)
+	if !strings.Contains(strings.Join(res.Notes, ""), "符号链接") {
+		t.Errorf("应提示项目里有符号链接：%v", res.Notes)
+	}
+	e.assertOneCopy(t, pfumRel, want, false)
+	e.mustStop(t, pfumCode)
+	if where := e.assertOneCopy(t, pfumRel, want, false); where != "desktop" {
+		t.Errorf("应回到桌面：%s", where)
+	}
+	if tgt, err := os.Readlink(filepath.Join(p, "快捷方式")); err != nil || tgt != "备注.txt" {
+		t.Errorf("项目里的链接应原样：%q %v", tgt, err)
 	}
 }
 
@@ -1136,19 +1158,19 @@ func TestPFUnitMove_CheckLinks(t *testing.T) {
 		e.project(r)
 		e.mustStart(t, r)
 	}
-	statuses := func() map[string]PFUnitLinkCheck {
+	statuses := func() map[string]PFUnitMoveLinkCheck {
 		cs, err := e.mover().CheckLinks(bg)
 		if err != nil {
 			t.Fatal(err)
 		}
-		out := map[string]PFUnitLinkCheck{}
+		out := map[string]PFUnitMoveLinkCheck{}
 		for _, c := range cs {
 			out[c.Unit] = c
 		}
 		return out
 	}
 	for _, c := range statuses() {
-		if c.Status != PFUnitLinkOK {
+		if c.Status != PFUnitMoveLinkOK {
 			t.Fatalf("起点应全是 ok：%+v", c)
 		}
 	}
@@ -1169,25 +1191,25 @@ func TestPFUnitMove_CheckLinks(t *testing.T) {
 	os.Rename(sD, hold)
 
 	got := statuses()
-	if got["260403J1001"].Status != PFUnitLinkRebuilt {
+	if got["260403J1001"].Status != PFUnitMoveLinkRebuilt {
 		t.Errorf("甲应重建：%+v", got["260403J1001"])
 	}
 	if tgt, err := os.Readlink(e.P(relA)); err != nil || tgt != e.S(relA) {
 		t.Errorf("甲的链接应指向 S：%q %v", tgt, err)
 	}
-	if got["260403J1002"].Status != PFUnitLinkOccupied {
+	if got["260403J1002"].Status != PFUnitMoveLinkOccupied {
 		t.Errorf("乙应是被占：%+v", got["260403J1002"])
 	}
 	if data, _ := os.ReadFile(filepath.Join(e.P(relB), "用户放的.txt")); string(data) != "mine" {
 		t.Errorf("乙原位置的东西不能被动")
 	}
-	if got["260403J1003"].Status != PFUnitLinkWrongTarget {
+	if got["260403J1003"].Status != PFUnitMoveLinkWrongTarget {
 		t.Errorf("丙应是指向别处：%+v", got["260403J1003"])
 	}
 	if tgt, _ := os.Readlink(e.P(relC)); tgt != e.home {
 		t.Errorf("丙的链接不能被改：%q", tgt)
 	}
-	if got["260403J1004"].Status != PFUnitLinkSyncMissing {
+	if got["260403J1004"].Status != PFUnitMoveLinkSyncMissing {
 		t.Errorf("丁应是同步目录里不见了：%+v", got["260403J1004"])
 	}
 	if _, err := os.Lstat(sD); err == nil {
@@ -1205,7 +1227,7 @@ func TestPFUnitMove_CheckLinks(t *testing.T) {
 	}
 	got = statuses()
 	for _, c := range got {
-		if c.Status != PFUnitLinkRebuilt {
+		if c.Status != PFUnitMoveLinkRebuilt {
 			t.Errorf("年份层没了也应重建：%+v", c)
 		}
 	}
@@ -1221,7 +1243,7 @@ func TestPFUnitMove_CheckLinks(t *testing.T) {
 	if _, ok := got["260403J1002"]; ok {
 		t.Errorf("stopped 的不该检查")
 	}
-	if got["260403J1001"].Status != PFUnitLinkSkipped {
+	if got["260403J1001"].Status != PFUnitMoveLinkSkipped {
 		t.Errorf("有没做完的日志应跳过：%+v", got["260403J1001"])
 	}
 	if _, err := os.Lstat(e.P(relA)); err == nil {
@@ -1259,7 +1281,7 @@ func TestPFUnitMove_CreateSynced(t *testing.T) {
 	if data, err := os.ReadFile(filepath.Join(s, "01 合同", "合同.docx")); err != nil || string(data) != "v1" {
 		t.Errorf("经链接写的文件应落在 S：%q %v", data, err)
 	}
-	if cs, err := e.mover().CheckLinks(bg); err != nil || len(cs) != 1 || cs[0].Status != PFUnitLinkOK {
+	if cs, err := e.mover().CheckLinks(bg); err != nil || len(cs) != 1 || cs[0].Status != PFUnitMoveLinkOK {
 		t.Errorf("链接检查：%v %+v", err, cs)
 	}
 	e.noTmp(t)

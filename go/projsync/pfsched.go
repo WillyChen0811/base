@@ -221,6 +221,33 @@ func (s *PFSched) lockUnit(ctx context.Context, code string, wait time.Duration)
 	}
 }
 
+// LockUnit 是对 lockUnit 的导出包装：让 wgtund 之类的调用方能在开始/取消同步、新建项目之前
+// 拿到与本轮跑（runOne）、取最新（PFFresh.online）**同一把单元锁**，做到这三件事与轮次、取最新互斥。
+// 调用方必须在调用 StartSync/StopSync/CreateSynced 之前拿到它、结束后再解锁（unlock 是非空时调用）。
+// ctx 取消或 wait 超时返回 false。
+func (s *PFSched) LockUnit(ctx context.Context, code string, wait time.Duration) (unlock func(), ok bool) {
+	return s.lockUnit(ctx, code, wait)
+}
+
+// PFSchedSkipReasonRegChanged 是拿到单元锁之后重读登记表发现「刚开始/取消同步、Rel 或 SyncPath 变了」时
+// 统一用的一句话原因（runOne 与 PFFresh.online 都用它）。
+const PFSchedSkipReasonRegChanged = "项目刚开始/取消同步，这一轮跳过"
+
+// pfscUnitSyncingOnDisk 从磁盘重读登记表，确认某个单元还在登记、仍是 syncing、Rel 与 SyncPath 没变；
+// 拿到单元锁之后调它，能挡住「拿锁前有人改了登记」的窗口（例如刚点取消同步、或改了 Rel/SyncPath）。
+// 读登记表出错时返回 error（不能把读不出来当成「没了」）；单元不存在或状态变了返回 ok=false + 统一原因。
+func (s *PFSched) pfscUnitSyncingOnDisk(code, rel, syncPath string) (bool, string, error) {
+	reg, err := PFUnitMoveLoadUnits(s.cfg.MetaDir)
+	if err != nil {
+		return false, "", err
+	}
+	rec, found := PFFindUnit(reg, code)
+	if !found || rec.State != PFUnitSyncing || rec.Rel != rel || rec.SyncPath != syncPath {
+		return false, PFSchedSkipReasonRegChanged, nil
+	}
+	return true, "", nil
+}
+
 // ── touched ─────────────────────────────────────────────
 
 // MarkTouched 记下这些单元刚被写过，去抖（缺省 10 秒）后让调度跑它们；每次调用重新计时。
@@ -716,12 +743,24 @@ func (s *PFSched) account(rep *PFSchedReport, r *PFRoundResult) {
 }
 
 // runOne 拿单元锁，跑一个单元的一轮。第二个返回值为假表示没拿到锁（被取消）。
+// 拿到锁之后会重读登记表：单元这时若已被取消同步、或 Rel/SyncPath 变了，这一轮跳过不跑。
 func (s *PFSched) runOne(ctx context.Context, c pfscCand, st PFSchedSettings, leftovers []PFRemoteLeftover) (*PFRoundResult, bool) {
 	unlock, ok := s.lockUnit(ctx, c.rec.Code, 0)
 	if !ok {
 		return nil, false
 	}
 	defer unlock()
+	// 拿锁之后重读登记表：挡「拿锁前刚点了 start/stop、改了 Rel 或 SyncPath」——
+	// 拿锁前的候选快照这时可能已经过期，只有磁盘上的登记才是最新的真相。
+	if stillOK, reason, err := s.pfscUnitSyncingOnDisk(c.rec.Code, c.rec.Rel, c.rec.SyncPath); !stillOK || err != nil {
+		why := reason
+		if err != nil {
+			why = "重读登记表失败，这一轮跳过：" + err.Error()
+		}
+		res := &PFRoundResult{Unit: c.rec.Code, Outcome: PFRoundSkipped, Reason: why,
+			StartedAt: s.cfg.Now(), EndedAt: s.cfg.Now()}
+		return res, true
+	}
 	in := s.roundInput(c.rec, c.ubRel, st)
 	in.UbuntuLeftovers = leftovers
 	var fetch []string

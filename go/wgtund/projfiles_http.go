@@ -176,7 +176,8 @@ type projfilesAPI struct {
 	newFresh func(s *projsync.PFSched, syncDir string) (projfilesFresh, error)
 
 	mu    sync.Mutex
-	fresh projfilesFresh // PFFresh 只建一次，之后复用
+	fresh projfilesFresh // PFFresh 复用；整套重建（builtGen 变了）后作废重建
+	freshGen uint64       // h.fresh 建出来时对应的 svc.builtGen
 }
 
 func newProjfilesAPI(s *projfilesSvc, rec *projfilesRecycler) *projfilesAPI {
@@ -252,26 +253,33 @@ func (h *projfilesAPI) ensureBuilt() error {
 	return nil
 }
 
-// getFresh 拿到复用的 PFFresh（第一次用时建）。
+// getFresh 拿到复用的 PFFresh（第一次用时建，之后复用同一套）。跟 build 共用 buildMu，
+// 保证「检查 built → 建 → 发布」串行；切换期（目录改了还没重建完）一律拒绝，避免拿旧 sched 建新 fresh。
+// builtGen 变了说明整套已重建（旧 sched 已被关掉），缓存的 fresh 必须作废重建，不能继续绑旧的。
 func (h *projfilesAPI) getFresh() (projfilesFresh, error) {
+	// 切换期先拒（含「改了设置但 tick 还没跑到」的窗口）——已缓存的 fresh 绑的是旧目录那一套，
+	// 这时命中缓存也不能给用。
+	if why := h.dirSwitchWhy(); why != "" {
+		return nil, errors.New(why)
+	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if h.fresh != nil {
+	if h.fresh != nil && h.freshGen == h.svc.builtGen.Load() {
 		return h.fresh, nil
 	}
+	h.fresh = nil
 	if err := h.ensureBuilt(); err != nil {
 		return nil, err
 	}
-	sched := h.svc.getSched()
+	// sched 与代次同刻取：ensureBuilt 之后若又并发重建了一次，代次对不上就重来，
+	// 不会把旧 sched 绑进缓存。
+	sched, gen := h.svc.schedGen()
 	if sched == nil {
 		return nil, errors.New("调度器还没建起来")
 	}
-	syncDir := h.svc.settingsNow().SyncDir
-	if syncDir == "" {
-		// 定时循环还没跑过（enabled=false 或还没到第一轮）：设置文件是唯一的真相，直接读它
-		st, _ := loadProjfilesSettings(h.svc.prep.settingsPath)
-		syncDir = st.SyncDir
-	}
+	// 用「实际在用」的 sync_dir（build 已经记下来的），不拿设置文件的旧值——
+	// tick 刚改过设置但还没重建时，设置里的 sync_dir 已经不是当前 sched 用的那个。
+	_, syncDir := h.svc.activeDirs()
 	if syncDir == "" {
 		return nil, errors.New("设置里没有 sync_dir，取最新用不了")
 	}
@@ -279,7 +287,7 @@ func (h *projfilesAPI) getFresh() (projfilesFresh, error) {
 	if err != nil {
 		return nil, err
 	}
-	h.fresh = f
+	h.fresh, h.freshGen = f, gen
 	return f, nil
 }
 
@@ -486,8 +494,18 @@ func (h *projfilesAPI) localHandler(ctx context.Context) http.Handler {
 	return mux
 }
 
-// unitMove 跑一个单元搬运操作：先占住轮次（占不到回 busy），再调搬运器，结果原样返回。
+// unitMove 跑一个单元搬运操作：
+//  1. 切换期（目录改了还没重建完）一律 busy——不只看 svc.switchPending 的记号，
+//     也主动对比一次磁盘上的设置与已建成的目录，让「改了设置文件但 tick 还没跑到」这段窗口也拒绝；
+//  2. 再占住轮次（占不到回 busy，避免与定时的一轮同时动）；
+//  3. 若认得出单元编号，再拿住**调度器里的同一把单元锁**——它跟 runOne / PFFresh.online 是同一把，
+//     能让「开始/取消同步、新建项目」跟「本轮跑 / 取最新」互斥；
+//  4. 调搬运器，结果原样返回。
 func (h *projfilesAPI) unitMove(ctx context.Context, w http.ResponseWriter, op, arg string) {
+	if why := h.dirSwitchWhy(); why != "" {
+		busyJSON(w, why)
+		return
+	}
 	if !h.svc.acquire() {
 		busyJSON(w, "有一轮同步或别的单元操作在进行，稍后再试")
 		return
@@ -504,6 +522,16 @@ func (h *projfilesAPI) unitMove(ctx context.Context, w http.ResponseWriter, op, 
 	}
 	mctx, cancel := context.WithTimeout(ctx, projfilesMoveTimeout)
 	defer cancel()
+	// 拿住这个单元在调度器里的同一把锁：认不出编号就不加锁（此时 StartSync 自己也进不去），
+	// 拿不到锁（ctx 取消）就走超时/取消。
+	if code, ok := pfUnitCodeOf(op, arg); ok {
+		unlock, ok2 := h.svc.unitLock(mctx, code)
+		if !ok2 {
+			errJSON(w, http.StatusServiceUnavailable, "拿单元锁失败或请求已取消")
+			return
+		}
+		defer unlock()
+	}
 	var res projsync.PFUnitMoveResult
 	var err error
 	switch op {
@@ -519,6 +547,30 @@ func (h *projfilesAPI) unitMove(ctx context.Context, w http.ResponseWriter, op, 
 		return
 	}
 	writeJSON(w, res)
+}
+
+// dirSwitchWhy 返回「目录刚改过、正在切换」的一句话；不需要切换时空串。
+// 同时看 svc 已标记的切换期，和磁盘上设置与 activeDirs 的差异（覆盖「改了设置但 tick 还没跑到」）。
+func (h *projfilesAPI) dirSwitchWhy() string {
+	if h.svc.switchPending() {
+		return h.svc.switchReason()
+	}
+	st, _ := loadProjfilesSettings(h.svc.prep.settingsPath)
+	if h.svc.needRebuild(st) {
+		return "同步目录或工作目录刚改过，正在切换，稍后再试"
+	}
+	return ""
+}
+
+// pfUnitCodeOf 从 op 的参数里认出单元编号：unit/stop 的 arg 就是 code；unit/start / unit/create 的 arg 是 rel，
+// 认 rel 的最后一段（跟 projsync.PFUnitMover.prepare 的编号来源一致）。认不出返回 ok=false。
+func pfUnitCodeOf(op, arg string) (string, bool) {
+	if op == "stop" {
+		code := projsync.PFNormCode(arg)
+		return code, code != ""
+	}
+	last := filepath.Base(filepath.ToSlash(arg))
+	return projsync.PFCodeFromName(last)
 }
 
 // ── 服务的只读/释放入口（不动 projfiles.go，方法定义在这里）──
@@ -556,6 +608,16 @@ func (s *projfilesSvc) settingsNow() projfilesSettings {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.settings
+}
+
+// unitLock 拿到当前调度器里那个单元的锁（跟 runOne / PFFresh.online 是同一把）。
+// 调度器还没建起来、或 ctx 取消 → ok=false；调用方必须在 unlock 之后再返回。
+func (s *projfilesSvc) unitLock(ctx context.Context, code string) (func(), bool) {
+	sched := s.getSched()
+	if sched == nil {
+		return nil, false
+	}
+	return sched.LockUnit(ctx, code, 0)
 }
 
 // ── 启动信息文件 ────────────────────────────────────────

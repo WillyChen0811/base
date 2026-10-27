@@ -307,10 +307,18 @@ func (s *PFSched) lastAligned(code string, saved *PFRoundSaved) (time.Time, bool
 
 // ── Ubuntu 在线 ─────────────────────────────────────────
 
+// pfffRun 是 online 那一轮 goroutine 的返回：跑出来的结果、拿没拿到锁、是否跳过（登记变了或超时被取消）、
+// 以及给人看的一句话原因。
 type pfffRun struct {
-	res    *PFRoundResult
-	locked bool
+	res     *PFRoundResult
+	locked  bool
+	skipped bool   // 拿到锁后重读登记表发现项目刚开始/取消同步；或预算用完那一轮被取消
+	reason  string // 给人看的一句话（skipped 时用）
 }
+
+// pfffCancelStopGrace 是取消后等那一轮真正停下的兜底时间。假传输/假 Runner 通常秒级回，真传输被 cancel 之后
+// 也是每个 block 检查一次；给到 30 秒是防止某个环节拖太久让 HTTP 应答挂死。
+const pfffCancelStopGrace = 30 * time.Second
 
 func (f *PFFresh) online(ctx context.Context, out *PFFreshResult, g []*pfffTarget, pollBy map[string]PFRemotePollUnit, net string, st PFSchedSettings, deadline time.Time) string {
 	s := f.s
@@ -336,16 +344,35 @@ func (f *PFFresh) online(ctx context.Context, out *PFFreshResult, g []*pfffTarge
 	in.UbuntuLeftovers = s.currentLeftovers()
 
 	done := make(chan pfffRun, 1)
-	lockCtx, cancelLock := context.WithCancel(s.baseCtx)
-	defer cancelLock()
+	// 拿锁 + 那一轮跑都用同一个可取消的 runCtx（从 baseCtx 派生）：
+	// 预算用完或调用方断开都 cancelRun()，让正在等锁或正在传的 block 都停下，
+	// 免得调用方（解析层指令）已按旧文件继续写回、后台却还在把新版装进来把新版盖掉。
+	runCtx, cancelRun := context.WithCancel(s.baseCtx)
+	defer cancelRun()
 	go func() {
-		unlock, ok := s.lockUnit(lockCtx, rec.Code, 0)
+		unlock, ok := s.lockUnit(runCtx, rec.Code, 0)
 		if !ok {
 			done <- pfffRun{}
 			return
 		}
 		defer unlock()
-		r, err := PFRoundRunUnit(s.baseCtx, in)
+		// 拿到锁之后重读登记表：拿锁前若刚点了 start/stop、改了 Rel/SyncPath，这一轮不跑。
+		if stillOK, why, err := s.pfscUnitSyncingOnDisk(rec.Code, rec.Rel, rec.SyncPath); !stillOK || err != nil {
+			if err != nil {
+				why = "重读登记表失败，这一轮跳过：" + err.Error()
+			}
+			r := &PFRoundResult{Unit: rec.Code, Outcome: PFRoundSkipped, Reason: why,
+				StartedAt: s.cfg.Now(), EndedAt: s.cfg.Now()}
+			done <- pfffRun{res: r, skipped: true, reason: why}
+			return
+		}
+		r, err := PFRoundRunUnit(runCtx, in)
+		if runCtx.Err() != nil {
+			// 那一轮被取消：无论 PFRoundRunUnit 是回了结果还是抛了错，都不能记进内存印象
+			// （半截的 macFP 不能代表本机），也不能让调用方以为已经拿到最新。
+			done <- pfffRun{res: r, locked: true, skipped: true, reason: "预算用完或调用方断开，这一轮已取消"}
+			return
+		}
 		if err != nil {
 			r = &PFRoundResult{Unit: rec.Code, Outcome: PFRoundFailed, Reason: err.Error(), StartedAt: s.cfg.Now(), EndedAt: s.cfg.Now()}
 			r.Errors = append(r.Errors, PFRoundError{Code: "bad_input", Message: err.Error()})
@@ -360,9 +387,40 @@ func (f *PFFresh) online(ctx context.Context, out *PFFreshResult, g []*pfffTarge
 	select {
 	case run = <-done:
 	case <-timer.C:
-		return f.noAnswer(out, g, "预算内没跑完，那一轮还在后台继续，稍后再取一次就是最新的")
+		// 预算用完：取消那一轮，**等它真正停下**（正在装的那个文件装完或放弃），
+		// 再答「未能确认」——不能让后台继续把新版装进 Mac、而调用方（解析层指令）已按旧文件继续写回。
+		cancelRun()
+		gctx, gcancel := context.WithTimeout(context.Background(), pfffCancelStopGrace)
+		defer gcancel()
+		select {
+		case run = <-done:
+		case <-gctx.Done():
+			// 兜底：真传输出问题没能停下来时不能永远挂着，等满宽限期后照样答未确认。
+			return f.noAnswer(out, g, "没取完，等它停下也没等到，用的是本机现有的文件")
+		}
+		return f.noAnswer(out, g, "没取完，已停下，用的是本机现有的文件")
 	case <-ctx.Done():
+		cancelRun()
+		// 调用方（HTTP 请求）已断开，等它停下同样上限。
+		gctx, gcancel := context.WithTimeout(context.Background(), pfffCancelStopGrace)
+		defer gcancel()
+		select {
+		case <-done:
+		case <-gctx.Done():
+		}
 		return f.noAnswer(out, g, "已取消")
+	}
+	if run.skipped {
+		// 拿到锁之后重读登记表：项目刚开始/取消同步/Rel 或 SyncPath 变了；或预算用完那一轮被取消。
+		// 都不写盘、也不把这一轮记进内存印象——反正没跑成或已停下。
+		why := run.reason
+		if why == "" && run.res != nil {
+			why = run.res.Reason
+		}
+		if why == "" {
+			why = "这一轮没跑成，已停下"
+		}
+		return f.noAnswer(out, g, why)
 	}
 	if !run.locked {
 		return f.noAnswer(out, g, "这个项目正在同步")

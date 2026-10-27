@@ -59,6 +59,7 @@ func (f *pfMergeFix) put(base, rel, content string) string {
 func (f *pfMergeFix) cfg() PFMergeConfig {
 	return PFMergeConfig{
 		WorkDir: f.work, SyncDir: f.sync, MetaDir: f.meta,
+		RecycleDir: PFRoundMacRecycleDir(f.meta),
 		QuietSeconds: 10, Now: func() time.Time { return f.now },
 	}
 }
@@ -235,6 +236,10 @@ func TestPFMergeTooLongAsk(t *testing.T) {
 // Office 锁：自身是 ~$ 锁、以及有保护它的兄弟锁 → 都 ask。
 func TestPFMergeOfficeLockAsk(t *testing.T) {
 	f := pfMergeSetup(t)
+	// 目标目录本身要存在（合并进的是已配置的目录）；这里只关心 src 的锁判断
+	if err := os.MkdirAll(filepath.Join(f.work, "dst"), 0o755); err != nil {
+		t.Fatal(err)
+	}
 	f.put(f.work, "src/报告.docx", "正文")
 	f.put(f.work, "src/~$报告.docx", "锁") // 自身是锁
 	f.put(f.work, "src/only-lock.docx", "")
@@ -356,10 +361,16 @@ func TestPFMergeTargetSyncedUnitHoldsLock(t *testing.T) {
 	if !ok {
 		t.Fatal("拿单元锁")
 	}
-	done := make(chan PFMergeRunResult, 1)
+	done := make(chan struct {
+		res PFMergeRunResult
+		err error
+	}, 1)
 	go func() {
-		r, _ := PFMergeRun(context.Background(), cfg, "src-copy", rel, plan.Fingerprint)
-		done <- r
+		r, err := PFMergeRun(context.Background(), cfg, "src-copy", rel, plan.Fingerprint)
+		done <- struct {
+			res PFMergeRunResult
+			err error
+		}{r, err}
 	}()
 	select {
 	case <-done:
@@ -368,9 +379,12 @@ func TestPFMergeTargetSyncedUnitHoldsLock(t *testing.T) {
 	}
 	unlock()
 	select {
-	case r := <-done:
-		if r.Rejected {
-			t.Fatalf("松锁后 run 不该再被拒: %s", r.Reason)
+	case out := <-done:
+		if out.err != nil {
+			t.Fatalf("松锁后 run 应正常完成: %v", out.err)
+		}
+		if out.res.Rejected {
+			t.Fatalf("松锁后 run 不该再被拒: %s", out.res.Reason)
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("松锁后 run 必须往下走")
@@ -380,6 +394,10 @@ func TestPFMergeTargetSyncedUnitHoldsLock(t *testing.T) {
 // 注入「目标凭空出现」的竞态：那一条失败、其余照常，绝不覆盖。
 func TestPFMergeRaceNoOverwrite(t *testing.T) {
 	f := pfMergeSetup(t)
+	// dst 目录先建好（凭空出现的是文件，不是目录）
+	if err := os.MkdirAll(filepath.Join(f.work, "dst"), 0o755); err != nil {
+		t.Fatal(err)
+	}
 	f.put(f.work, "src/m1.txt", "挪一")
 	f.put(f.work, "src/m2.txt", "挪二")
 

@@ -110,6 +110,10 @@ func PFExclude(name string, isDir bool, parentRel string) (reason string, exclud
 		return "Windows 文件夹设置（desktop.ini）", true
 	case name == "Icon\r":
 		return "Mac 文件夹图标（Icon\\r）", true
+	// 结尾空格：SMB/跨系统同步里这类名字最容易出问题（Windows 资源管理器不认、命令行引号里丢），
+	// 排除不同步、只计数；开头/中间有空格仍算正常（见 pfnames_test.go）。目录不在此排除。
+	case strings.HasSuffix(name, " "):
+		return "名字结尾有空格", true
 	case strings.HasSuffix(lower, ".part"):
 		return "未下载完的临时文件（*.part）", true
 	case strings.HasSuffix(lower, ".tmp"):

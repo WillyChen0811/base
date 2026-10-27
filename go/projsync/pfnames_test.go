@@ -68,6 +68,10 @@ func TestPFExclude(t *testing.T) {
 		{"x.TMP", false, "", true, ".tmp"},
 		{"video.crdownload", false, "", true, ".crdownload"},
 		{"file.download", false, "", true, ".download"},
+		// 结尾空格：不同步（SMB/Windows 侧最容易出问题的一类名字）
+		{"工作笔记 ", false, "", true, "结尾有空格"},
+		{"报告.docx ", false, "a/b", true, "结尾有空格"},
+		{"note.txt ", false, "", true, "结尾有空格"},
 		// 历史版本内部文件
 		{".lock", false, hist, true, "历史版本内部"},
 		{".index-3f2a9c", false, hist, true, "历史版本内部"},
@@ -96,6 +100,9 @@ func TestPFExclude(t *testing.T) {
 		{"tmp", false, "", false, ""},
 		{"part", false, "", false, ""},
 		{"x.download.docx", false, "", false, ""},
+		{"笔记 箱.txt", false, "", false, ""},  // 中间空格正常
+		{" 工作笔记", false, "", false, ""},   // 开头空格正常（§4.1 只排结尾空格）
+		{"资料 ", true, "", false, ""},        // 目录不按名字规则排除
 		// 历史版本内的正常文件：台账一对和快照要同步（§7）
 		{"档案台账.sqlite3", false, hist, false, ""},
 		{"档案索引.json", false, hist, false, ""},

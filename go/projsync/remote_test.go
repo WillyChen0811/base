@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -102,6 +103,10 @@ func TestRemoteFactsOutOfScopeIsNotFailure(t *testing.T) {
 }
 
 func TestRemoteFactsNonUTF8Branch(t *testing.T) {
+	if runtime.GOOS == "darwin" {
+		t.Skip("APFS/macOS 上 git 拒绝含非 UTF-8 字节的引用名（Illegal byte sequence），refs/heads/bad\\xff 建不出来；" +
+			"非 UTF-8 分支名只会出现在 Linux 仓库，这个情形只在 Linux 出现")
+	}
 	dir, c1, _ := ffRepo(t)
 	ag(t, dir, "update-ref", "refs/heads/bad\xff", c1)
 	_, err := RemoteFacts(context.Background(), &localRunner{}, testBin, FactsRequest{Repo: dir, Side: SideUbuntu})

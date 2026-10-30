@@ -1,8 +1,11 @@
 """本机自测：假 TH 目录 + 已有环境作替身，走完 sync→snapshot→prepare→run→fetch→clean。"""
 import json
 import os
+import shlex
+import signal
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -282,6 +285,166 @@ def test_task_rejects(tmp_path, monkeypatch):
     for cmd in ["run ev toy2 -- a", "run ev toy2 --task ../x", "run ev toy2 --task mk t.py", "run ev toy2 --task mk -k x"]:
         with pytest.raises(client.THError):
             tr.call(cmd)
+
+
+def _pids_matching(pattern):
+    """命令行含指定路径的进程（macOS/Linux 通用）。"""
+    out = subprocess.run(["ps", "-axo", "pid=,command="], capture_output=True, text=True).stdout
+    hits = []
+    for line in out.splitlines():
+        parts = line.strip().split(None, 1)
+        if len(parts) == 2 and pattern in parts[1]:
+            hits.append(int(parts[0]))
+    return hits
+
+
+def _alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    st = subprocess.run(["ps", "-o", "state=", "-p", str(pid)], capture_output=True, text=True).stdout.strip()
+    return st != "" and st[0] != "Z"
+
+
+def _kill_soft(pids):
+    for pid in sorted(pids):
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except (ProcessLookupError, ValueError):
+            pass
+
+
+# ---------- cancel：停止运行
+# 长跑测试体：p1 命令行带 run 目录路径（子进程）；p2 纯 sleep 不带路径（只能靠进程树）；
+# 再起一个 nohup 脱离父链的孤儿（模拟测试起的临时 PG postmaster），命令行带 run 目录路径。
+LONG_SRC = '''import os, subprocess, sys, time
+
+
+def test_long():
+    tmp = os.environ["TMPDIR"]
+    path = os.path.join(tmp, "orphan.py")
+    with open(path, "w") as f:
+        f.write("import time\\ntime.sleep(300)\\n")
+    p1 = subprocess.Popen([sys.executable, path])
+    p2 = subprocess.Popen(["sh", "-c", "exec sleep 300"])
+    subprocess.Popen(["sh", "-c", "nohup %s %s >/dev/null 2>&1 & exit 0" % (sys.executable, path)])
+    with open(os.path.join(tmp, "kids.txt"), "w") as f:
+        f.write("%d %d\\n" % (p1.pid, p2.pid))
+    time.sleep(120)
+'''
+
+
+@pytest.fixture
+def toy_long(tmp_path, monkeypatch):
+    r = tmp_path / "longrepo"
+    (r / "tests").mkdir(parents=True)
+    (r / "testhost.json").write_text(json.dumps({"python": "3.12", "pip": [], "env": {}}))
+    (r / "tests/test_long.py").write_text(LONG_SRC)
+    subprocess.run(["git", "init", "-q", str(r)], check=True)
+    _git(r, "add", "-A")
+    _git(r, "commit", "-qm", "i")
+    th = tmp_path / "th"
+    monkeypatch.setenv("TESTHOST_LOCAL", str(th))
+    monkeypatch.setenv("TESTHOST_ENV_STUB", sys.prefix)
+    yield r, th
+    # 兜底：kids.txt 记录的裸 sleep + 命令行含假 TH 路径的一切残留
+    for kf in th.glob("runs/*/tmp/kids.txt"):
+        _kill_soft(int(x) for x in kf.read_text().split())
+    _kill_soft(_pids_matching(str(th) + "/"))
+
+
+def _start_long_run(tr, th, r, sha, rid):
+    """不走 client 的 run 编排（那会一直等）：prepare + run 直接起，等它进入 running 且孩子都起来了。"""
+    tr.call(" ".join(shlex.quote(x) for x in ["prepare", rid, f"longrepo={sha}", "--env", "testhost.json"]))
+    tr.call(f"run {rid} longrepo -n 1 tests/test_long.py")
+    R = th / "runs" / rid
+    for _ in range(120):
+        if (R / "tmp" / "kids.txt").exists():
+            time.sleep(0.5)     # 再等孤儿起稳
+            return [int(x) for x in (R / "tmp" / "kids.txt").read_text().split()]
+        st = tr.call(f"status {rid}")
+        assert st["state"] in ("prepared", "running")
+        time.sleep(0.5)
+    raise AssertionError("长跑 run 没起来")
+
+
+def _wait_gone(th, pat, secs=15):
+    """等命令行含 pat 的进程全部消失（僵尸由 init 回收，可能慢半拍）。"""
+    for _ in range(secs * 2):
+        if not _pids_matching(pat):
+            return
+        time.sleep(0.5)
+    raise AssertionError(f"残留进程：{_pids_matching(pat)}")
+
+
+def test_cancel_kills_run_and_spares_other(toy_long):
+    r, th = toy_long
+    tr = client.Transport("x", "x")
+    sha = client.resolve(r, "HEAD")
+    tr.call("sync longrepo", stdin=client.make_bundle(r, sha, []))
+    kids1 = _start_long_run(tr, th, r, sha, "a1")
+    kids2 = _start_long_run(tr, th, r, sha, "a2")
+    assert tr.call("status a1")["state"] == "running"
+
+    pat1 = str(th / "runs/a1") + "/"
+    # 孤儿确已脱离父链（kids.txt 之外的路径匹配进程），靠命令行路径识别
+    assert any(pid not in kids1 for pid in _pids_matching(pat1))
+
+    res = tr.call("cancel a1")
+    assert res["success"] and res["state"] == "cancelled" and res["survivors"] == 0
+    assert res["killed"] >= 2
+    for pid in kids1:
+        assert not _alive(pid), f"pid {pid} 还活着"
+    _wait_gone(th, pat1)
+    # 另一个 run 不受影响
+    assert all(_alive(pid) for pid in kids2), "不该按进程名乱杀别的 run"
+    assert tr.call("status a2")["state"] == "running"
+    # 状态与清理
+    st = tr.call("status a1")
+    assert st["state"] == "cancelled" and st["finished"] and st["exit"] == 143
+    assert (th / "runs/a1/out/cancelled").read_text().strip().isdigit()
+    assert tr.call("clean run a1")["success"]
+
+    res = tr.call("cancel a2")     # 收尾：收掉第二个 run
+    assert res["success"] and res["killed"] >= 2 and res["survivors"] == 0
+    for pid in kids2:
+        assert not _alive(pid)
+    _wait_gone(th, str(th / "runs/a2") + "/")
+    assert tr.call("clean runs")["success"]
+
+
+def test_cancel_finished_run(toy):
+    r, th = toy
+    assert client.main(["run", "--repo", f"{r}=toy", "--workdir", "toy", "-n", "1",
+                       "--run-id", "fc", "tests/test_a.py"]) == 1
+    tr = client.Transport("x", "x")
+    res = tr.call("cancel fc")
+    assert res["success"] and res["state"] == "finished" and res["killed"] == 0
+    assert "已经结束" in res["note"]
+    assert not (th / "runs/fc/out/cancelled").exists()
+
+
+def test_cancel_running_then_result(toy_long, capsys):
+    r, th = toy_long
+    tr = client.Transport("x", "x")
+    sha = client.resolve(r, "HEAD")
+    tr.call("sync longrepo", stdin=client.make_bundle(r, sha, []))
+    kids = _start_long_run(tr, th, r, sha, "b1")
+    assert client.main(["cancel", "b1"]) == 0
+    assert '"state": "cancelled"' in capsys.readouterr().out
+    assert not any(_alive(p) for p in kids)
+    assert client.main(["result", "b1"]) == 130
+    assert "已取消" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("cmd", ["cancel a/../b", "cancel nope", "cancel 'bad id'"])
+def test_cancel_rejects(toy_long, cmd):
+    tr = client.Transport("x", "x")
+    with pytest.raises(client.THError):
+        tr.call(cmd)
 
 
 def test_ancestor_commit_skips_bundle(toy, capsys, monkeypatch):

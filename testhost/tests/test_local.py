@@ -396,7 +396,11 @@ def test_cancel_kills_run_and_spares_other(toy_long):
     tr.call("sync longrepo", stdin=client.make_bundle(r, sha, []))
     kids1 = _start_long_run(tr, th, r, sha, "a1")
     kids2 = _start_long_run(tr, th, r, sha, "a2")
-    assert tr.call("status a1")["state"] == "running"
+    st1 = tr.call("status a1")
+    print(f"[a1] 双跑后 status={st1} pid={open(th/'runs/a1/out/pid').read().strip()} "
+          f"logtail={(th/'runs/a1/out/log').read_text(errors='replace')[-500:] if (th/'runs/a1/out/log').exists() else '无log'}",
+          flush=True)
+    assert st1["state"] == "running"
 
     pat1 = str(th / "runs/a1") + "/"
     # 孤儿确已脱离父链（kids.txt 之外的路径匹配进程），靠命令行路径识别

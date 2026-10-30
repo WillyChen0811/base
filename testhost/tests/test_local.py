@@ -359,22 +359,13 @@ def toy_long(tmp_path, monkeypatch):
 def _start_long_run(tr, th, r, sha, rid):
     """不走 client 的 run 编排（那会一直等）：prepare + run 直接起，等它进入 running 且孩子都起来了。"""
     tr.call(" ".join(shlex.quote(x) for x in ["prepare", rid, f"longrepo={sha}", "--env", "testhost.json"]))
-    t0 = time.time()
     tr.call(f"run {rid} longrepo -n 1 tests/test_long.py")
-    print(f"[{rid}] run 调用返回 +{time.time() - t0:.1f}s", flush=True)
     R = th / "runs" / rid
     for i in range(120):
         if (R / "tmp" / "kids.txt").exists():
             time.sleep(0.5)     # 再等孤儿起稳
-            kids = [int(x) for x in (R / "tmp" / "kids.txt").read_text().split()]
-            print(f"[{rid}] kids={kids} +{time.time() - t0:.1f}s "
-                  f"matched={_pids_matching(str(R) + '/')}", flush=True)
-            return kids
+            return [int(x) for x in (R / "tmp" / "kids.txt").read_text().split()]
         st = tr.call(f"status {rid}")
-        if st["state"] not in ("prepared", "running"):
-            print(f"[{rid}] 异常状态 +{time.time() - t0:.1f}s：{st}", flush=True)
-        elif i % 6 == 0:
-            print(f"[{rid}] poll{i} state={st['state']}", flush=True)
         assert st["state"] in ("prepared", "running"), st
         time.sleep(0.5)
     raise AssertionError("长跑 run 没起来")
@@ -396,27 +387,19 @@ def test_cancel_kills_run_and_spares_other(toy_long):
     tr.call("sync longrepo", stdin=client.make_bundle(r, sha, []))
     kids1 = _start_long_run(tr, th, r, sha, "a1")
     kids2 = _start_long_run(tr, th, r, sha, "a2")
-    st1 = tr.call("status a1")
-    print(f"[a1] 双跑后 status={st1} pid={open(th/'runs/a1/out/pid').read().strip()} "
-          f"logtail={(th/'runs/a1/out/log').read_text(errors='replace')[-500:] if (th/'runs/a1/out/log').exists() else '无log'}",
-          flush=True)
-    assert st1["state"] == "running"
+    assert tr.call("status a1")["state"] == "running"
 
     pat1 = str(th / "runs/a1") + "/"
     # 孤儿确已脱离父链（kids.txt 之外的路径匹配进程），靠命令行路径识别
     assert any(pid not in kids1 for pid in _pids_matching(pat1))
-    print(f"[a1] cancel 前 matched={_pids_matching(pat1)} kids1={kids1}", flush=True)
 
     res = tr.call("cancel a1")
-    print(f"[a1] cancel res={res} set={(th / 'runs/a1/out/cancelled.set').read_text() if (th / 'runs/a1/out/cancelled.set').exists() else '无'}", flush=True)
     assert res["success"] and res["state"] == "cancelled" and res["survivors"] == 0
     assert res["killed"] >= 2
     for pid in kids1:
         assert not _alive(pid), f"pid {pid} 还活着"
     _wait_gone(th, pat1)
     # 另一个 run 不受影响
-    print(f"[a2] a1 取消后 kids2={[p for p in kids2 if _alive(p)]} "
-          f"matched2={_pids_matching(str(th / 'runs/a2') + '/')}", flush=True)
     assert all(_alive(pid) for pid in kids2), "不该按进程名乱杀别的 run"
     assert tr.call("status a2")["state"] == "running"
     # 状态与清理
@@ -450,8 +433,6 @@ def test_cancel_running_then_result(toy_long, capsys):
     sha = client.resolve(r, "HEAD")
     tr.call("sync longrepo", stdin=client.make_bundle(r, sha, []))
     kids = _start_long_run(tr, th, r, sha, "b1")
-    print(f"[b1] cancel 前 kids 存活={[p for p in kids if _alive(p)]} "
-          f"matched={_pids_matching(str(th / 'runs/b1') + '/')}", flush=True)
     assert client.main(["cancel", "b1"]) == 0
     assert '"state": "cancelled"' in capsys.readouterr().out
     assert not any(_alive(p) for p in kids)

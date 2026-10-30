@@ -6,7 +6,7 @@ TH="${TESTHOST_HOME:-$HOME/xxyi-testhost}"
 export PATH="$TH/miniforge/bin:${PATH:-/usr/bin:/bin}:/usr/bin:/bin:/usr/sbin:/sbin"
 PY="$TH/miniforge/bin/python"; [ -x "$PY" ] || PY=python3
 CONDA="$TH/miniforge/bin/conda"; [ -x "$CONDA" ] || CONDA=conda
-VERSION=3
+VERSION=4
 mkdir -p "$TH"/{bin,repos,snapshots,envs,runs,dl} 2>/dev/null
 
 jstr() { printf '%s' "$1" | tr '\n\t' '  ' | sed 's/\\/\\\\/g; s/"/\\"/g'; }
@@ -299,6 +299,88 @@ a_run() {
   printf '{"success":true,"run_id":"%s","started":true,"workers":%s}\n' "$rid" "${n:-1}"
 }
 
+# ---------- cancel：停止一个 run。只认本 run 目录路径与 pid 进程树，绝不按进程名（postgres/python/sleep）杀
+run_alive() { [ -d "/proc/$1" ] && [ "$(ps -o state= -p "$1" 2>/dev/null)" != Z ]; }
+# 自杀防护：脚本自身与整条父进程链（fake TH 自测时祖先的命令行里也带 run 目录路径）
+self_excl() {
+  local p=$$ out=" $$" pp
+  while [ -n "$p" ] && [ "$p" -gt 1 ]; do
+    pp=$(ps -o ppid= -p "$p" 2>/dev/null | tr -dc '0-9')
+    [ -n "$pp" ] || break
+    [ "$pp" -eq "$p" ] && break
+    out="$out $pp"
+    p=$pp
+  done
+  printf '%s' "$out"
+}
+# 进程树：用 ps 全表自己算闭包（macOS/Linux 行为一致，且对已 reparent 的父链无效——那类靠命令行匹配）
+tree_pids() {
+  local roots="$1" seen="" front="$roots" tbl p x q pass next
+  tbl=$(ps -axo pid=,ppid= 2>/dev/null)
+  pass=0
+  while [ -n "$front" ] && [ $pass -lt 8 ]; do
+    pass=$((pass + 1)); next=""
+    for p in $front; do
+      for x in $tbl; do
+        set -- $x
+        [ "$2" = "$p" ] || continue
+        q="$1"
+        case " $seen $roots " in *" $q "*) continue;; esac
+        seen="$seen $q"; next="$next $q"
+      done
+    done
+    front="$next"
+  done
+  printf '%s' "$seen"
+}
+# 非僵尸的存活 pid 列表（僵尸已死，launchd/init 回收前不该算幸存者）
+live_pids() {
+  local s="" p st
+  for p in $1; do
+    st=$(ps -o state= -p "$p" 2>/dev/null)
+    [ -n "$st" ] && [ "$st" != Z ] && s="$s $p"
+  done
+  printf '%s' "$s"
+}
+a_cancel() {
+  safe "${1:-}" || fail "run_id 不合法"
+  local R="$TH/runs/$1"; [ -d "$R/out" ] || fail "没有这个 run"
+  guard_th
+  local excl tset pg p left="" secs killed=0 survivors=0
+  excl=$(self_excl)
+  tset=""
+  pg=$(cat "$R/out/pid" 2>/dev/null | tr -dc '0-9')
+  [ -n "$pg" ] && run_alive "$pg" && tset="$pg"
+  # (a) pid 文件进程树（含正常子进程与 xdist worker）
+  [ -n "${tset// /}" ] && tset="$tset $(tree_pids "$tset")"
+  # (b) 命令行含 "$R/"（带尾斜杠防 run1 前缀误中 run10）：抓已孤儿化的进程（如临时 PG postmaster）
+  for pg in $(pgrep -f -- "$R/" 2>/dev/null); do
+    case " $excl " in *" $pg "*) continue;; esac
+    case " $tset " in *" $pg "*) continue;; esac
+    tset="$tset $pg"
+  done
+  if [ -z "${tset// /}" ] && [ -e "$R/out/exit" ]; then
+    printf '{"success":true,"run_id":"%s","state":"finished","killed":0,"survivors":0,"note":"这个 run 已经结束"}\n' "$1"
+    return
+  fi
+  for p in $tset; do kill -TERM "$p" 2>/dev/null; done
+  secs=0
+  while [ $secs -lt 10 ]; do
+    left=$(live_pids "$tset"); left="${left// /}"
+    [ -z "$left" ] && break
+    sleep 0.5; secs=$((secs + 1))
+  done
+  for p in $left; do kill -KILL "$p" 2>/dev/null; done
+  sleep 1
+  for p in $tset; do
+    if run_alive "$p"; then survivors=$((survivors + 1)); else killed=$((killed + 1)); fi
+  done
+  [ -e "$R/out/exit" ] || echo 143 >"$R/out/exit"
+  [ -e "$R/out/exit.end" ] || date +%s >"$R/out/exit.end"
+  date +%s >"$R/out/cancelled"
+  printf '{"success":true,"run_id":"%s","state":"cancelled","killed":%s,"survivors":%s}\n' "$1" "$killed" "$survivors"
+}
+
 # 日志计数：只数顶层 pytest 的结果行。xdist 下 `[gw3] [ 12%] FAILED x.py::t`，单进程 `x.py::t FAILED  [ 12%]`；
 # 内层子进程 pytest 的输出只会出现在末尾 FAILURES/ERRORS 报告的 Captured 段里，读到该段标题就停。
 log_counts() {
@@ -327,6 +409,7 @@ a_status() {
   if [ -e "$R/out/exit" ]; then state=finished; ex=$(cat "$R/out/exit")
   elif alive "$R"; then state=running
   elif [ -e "$R/out/pid" ]; then state=dead; fi
+  [ -e "$R/out/cancelled" ] && state=cancelled
   now=$(date +%s); st=$(cat "$R/out/start" 2>/dev/null || echo "$now"); en=$(cat "$R/out/exit.end" 2>/dev/null || echo "$now")
   [ "$state" = finished ] && [ -s "$R/out/junit.xml" ] && cnt=$(junit_counts "$R/out/junit.xml")
   [ -n "$cnt" ] || cnt=$(log_counts "$R/out/log")
@@ -418,6 +501,7 @@ case "${ARGS[0]:-}" in
   fetch) a_fetch "${ARGS[@]:1}";;
   fetchx) a_fetchx "${ARGS[@]:1}";;
   plugin) a_plugin "${ARGS[@]:1}";;
+  cancel) a_cancel "${ARGS[@]:1}";;
   clean) a_clean "${ARGS[@]:1}";;
   *) fail "不认识的动作：${ARGS[0]:-（空）}"; ;;
 esac

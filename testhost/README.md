@@ -16,6 +16,7 @@ python client.py run --repo <本地路径>[=<名>] ... [--commit-of 名=commit�
        [--plugin 外挂.py]... [--plugin-file 配套.py]... [--plugin-env KEY=VALUE]... [--out-dir 目录]
 python client.py run --repo ... --workdir <名> --task <任务名> [--plugin-env KEY=VALUE]... [--out-dir 目录] [-- 追加参数...]
 python client.py status <run_id> | result <run_id> [--out-dir 目录] | fetch <run_id> --out-dir 目录 | inventory
+python client.py cancel <run_id>     # 停止 run（见 Mac 端动作 cancel：只杀属于该 run 的进程）
 python client.py clean runs [--keep N] | run <id> | envs | snapshots | repos
 ```
 
@@ -68,11 +69,19 @@ prepare 会在环境的 site-packages 里写 `testhost_extra.pth`，把环境变
 | `prepare <id> <repo>=<commit>... [--env 路径] [--snap 键=名]` | git archive 检出到 runs/<id>/src/<repo>；描述路径缺省 testhost.json 再 cmdproto/testenv.json；按描述 hash 建/复用 envs/<hash>；输出 JSON |
 | `run <id> <子目录> [-n N] [-k] [-m] [--plugin 模块] [--plugin-env K=V] <文件...>` | nohup 后台跑 pytest -v，立即返回 |
 | `run <id> <子目录> --task <名> [--plugin-env K=V] [-- 追加参数...]` | 跑描述里的任务，其余同上 |
-| `status <id>` | state（prepared/running/finished/dead）、已跑通过/失败/跳过（进行中数日志里顶层 pytest 的结果行，不数内层子进程 pytest 的输出；结束后以 junit 为准）、百分比、退出码 |
+| `status <id>` | state（prepared/running/finished/dead/cancelled）、已跑通过/失败/跳过（进行中数日志里顶层 pytest 的结果行，不数内层子进程 pytest 的输出；结束后以 junit 为准）、百分比、退出码 |
 | `plugin <id> <名.py>` | stdin 是外挂文件，落到 runs/<id>/plugins/（prepare 后、run 前） |
 | `fetch <id>` | tar：junit.xml、log.tail、exit、start |
 | `fetchx <id>` | tar：外挂写在 run 目录顶层与 out/ 里的普通文件 |
+| `cancel <id>` | 停止该 run，回 killed/survivors 计数（找进程与记状态的规则见下） |
 | `clean runs [--keep N] / run <id> / envs / snapshots / repos` | 手动清理，只删 ~/xxyi-testhost 下；有 run 在跑时不清缓存 |
+
+`cancel <id>`：要停的进程按**本 run 的目录路径**找——`out/pid` 里那个进程及其全部后代（`ps` 自己算进程树），
+加上命令行里含 `runs/<id>/`（带尾斜杠，防 run1 误中 run10）的进程（抓已孤儿化、父进程变 launchd 的，如测试起的临时 PG postmaster）；
+**绝不按进程名（postgres/python/sleep）杀**，别的 run 的进程不受影响。先 SIGTERM、每 0.5 秒查一次共 5 秒，还活着的 SIGKILL 再等 1 秒。
+记 `out/cancelled`（时间戳），`out/exit` 没有补 143、`out/exit.end` 没有补当前时间；status 此后报 state=cancelled。
+run 已自己结束且无残留时只回 `state:"finished"` 不写 cancelled。之后 `clean runs`/`clean run <id>` 正常删除。
+客户端 `run`/`result` 等待中遇到 cancelled 报「已取消」退出码 130。
 
 ## 目录（~/xxyi-testhost）
 

@@ -313,25 +313,23 @@ self_excl() {
   done
   printf '%s' "$out"
 }
-# 进程树：用 ps 全表自己算闭包（macOS/Linux 行为一致，且对已 reparent 的父链无效——那类靠命令行匹配）
+# 进程树：ps 全表交给 awk 求后代闭包（输出不含 roots 自身；逐行读两列）
 tree_pids() {
-  local roots="$1" seen="" front="$roots" tbl p x q pass next
-  tbl=$(ps -axo pid=,ppid= 2>/dev/null)
-  pass=0
-  while [ -n "$front" ] && [ $pass -lt 8 ]; do
-    pass=$((pass + 1)); next=""
-    for p in $front; do
-      for x in $tbl; do
-        set -- $x
-        [ "$2" = "$p" ] || continue
-        q="$1"
-        case " $seen $roots " in *" $q "*) continue;; esac
-        seen="$seen $q"; next="$next $q"
-      done
-    done
-    front="$next"
-  done
-  printf '%s' "$seen"
+  ps -axo pid=,ppid= 2>/dev/null | awk -v roots=" $1 " '
+    { ppid[$1] = $2 }
+    END {
+      n = split(roots, r, " ")
+      for (i = 1; i <= n; i++) if (r[i] != "") { seed[r[i]] = 1; keep[r[i]] = 1 }
+      ch = 1
+      while (ch) {
+        ch = 0
+        for (p in ppid)
+          if (!(p in keep) && (ppid[p] in keep)) { keep[p] = 1; ch = 1 }
+      }
+      out = ""
+      for (p in keep) if (!(p in seed)) out = out " " p
+      printf "%s", out
+    }'
 }
 # 非僵尸的存活 pid 列表（僵尸已死，launchd/init 回收前不该算幸存者）
 live_pids() {

@@ -311,6 +311,9 @@ def wait(tr, rid, timeout, interval=15):
             log(f"status 失败（{bad}）：{e}")
             time.sleep(interval)
             continue
+        if st["state"] == "cancelled":   # 被别处 cancel：正常收尾，不再轮询
+            log(f"{rid} 已被取消")
+            return st
         if st.get("task"):
             last = (st.get("log_tail") or "").split("\n")[-1][:100]
             log(f"{st['state']}（任务 {st['task']}）：{last}")
@@ -369,8 +372,11 @@ def cmd_run(tr, a):
         if v:
             rc += [flag, v]
     tr.call(" ".join(shlex.quote(x) for x in rc + (["--"] + a.tests if a.task else a.tests)))
-    log(f"已开跑 {rid}（Ctrl-C 不会停远端，之后 python client.py result {rid}）")
-    wait(tr, rid, a.timeout)
+    log(f"已开跑 {rid}（Ctrl-C 不会停远端，之后 python client.py result {rid}；要停远端用 cancel {rid}）")
+    st = wait(tr, rid, a.timeout)
+    if st["state"] == "cancelled":
+        print(f"\n{rid}: 已取消（测试机上的进程已停止）")
+        return 130
     code = summarize(tr, rid, a.task)
     if a.out_dir:
         fetch_extras(tr, rid, a.out_dir, tree=bool(a.task))
@@ -393,6 +399,8 @@ def main(argv=None):
     f = sp.add_parser("fetch", help="只取回外挂写出的文件（run 须已结束）")
     f.add_argument("run_id")
     f.add_argument("--out-dir", required=True)
+    x = sp.add_parser("cancel", help="停止 run：结束其进程树与命令行含该 run 目录路径的残留进程（不按进程名杀）")
+    x.add_argument("run_id")
     c = sp.add_parser("clean")
     c.add_argument("rest", nargs=argparse.REMAINDER)
     r = sp.add_parser("run")
@@ -428,13 +436,18 @@ def main(argv=None):
         elif a.cmd == "status":
             print(json.dumps(tr.call(f"status {a.run_id}")))
         elif a.cmd == "result":
-            wait(tr, a.run_id, a.timeout)
-            code = summarize(tr, a.run_id, tr.call(f"status {a.run_id}").get("task"))
+            st = wait(tr, a.run_id, a.timeout)
+            if st["state"] == "cancelled":
+                print(f"{a.run_id}: 已取消（测试机上的进程已停止）")
+                return 130
+            code = summarize(tr, a.run_id, st.get("task"))
             if a.out_dir:
                 fetch_extras(tr, a.run_id, a.out_dir)
             return code
         elif a.cmd == "fetch":
             fetch_extras(tr, a.run_id, a.out_dir)
+        elif a.cmd == "cancel":
+            print(json.dumps(tr.call(f"cancel {a.run_id}"), ensure_ascii=False))
         elif a.cmd == "clean":
             print(json.dumps(tr.call("clean " + " ".join(shlex.quote(x) for x in a.rest))))
         else:

@@ -294,8 +294,10 @@ a_run() {
     cmd+=("${files[@]}")
   fi
   date +%s >"$R/out/start"
-  ( cd "$cwd" && nohup env -i "${ev[@]}" bash -c 'rc=0; "$@" || rc=$?; date +%s >"$0.end"; echo $rc >"$0"' \
-      "$R/out/exit" "${cmd[@]}" >"$R/out/log" 2>&1 </dev/null & echo $! >"$R/out/pid" )
+  # 后台化必须只贴 nohup 这一条简单命令（fork+exec 立刻带重定向）；若把 cd&&nohup 整条放后台，
+  # bash 起的作业 shell 会全程握着调用方的 stdout 管道（ssh/capture 要等 run 跑完才返回）
+  ( cd "$cwd" && { nohup env -i "${ev[@]}" bash -c 'rc=0; "$@" || rc=$?; date +%s >"$0.end"; echo $rc >"$0"' \
+      "$R/out/exit" "${cmd[@]}" >"$R/out/log" 2>&1 </dev/null & echo $! >"$R/out/pid"; } )
   printf '{"success":true,"run_id":"%s","started":true,"workers":%s}\n' "$rid" "${n:-1}"
 }
 

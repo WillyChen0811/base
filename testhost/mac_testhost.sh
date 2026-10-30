@@ -300,7 +300,7 @@ a_run() {
 }
 
 # ---------- cancel：停止一个 run。只认本 run 目录路径与 pid 进程树，绝不按进程名（postgres/python/sleep）杀
-run_alive() { [ -d "/proc/$1" ] && [ "$(ps -o state= -p "$1" 2>/dev/null)" != Z ]; }
+run_alive() { local s; s=$(ps -o state= -p "$1" 2>/dev/null); [ -n "$s" ] && [ "$s" != Z ]; }
 # 自杀防护：脚本自身与整条父进程链（fake TH 自测时祖先的命令行里也带 run 目录路径）
 self_excl() {
   local p=$$ out=" $$" pp
@@ -363,6 +363,7 @@ a_cancel() {
     printf '{"success":true,"run_id":"%s","state":"finished","killed":0,"survivors":0,"note":"这个 run 已经结束"}\n' "$1"
     return
   fi
+  echo "$tset" >"$R/out/cancelled.set"     # 审计：本次准备结束的 pid 集合
   for p in $tset; do kill -TERM "$p" 2>/dev/null; done
   secs=0
   while [ $secs -lt 10 ]; do

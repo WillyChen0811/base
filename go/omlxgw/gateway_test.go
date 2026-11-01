@@ -377,3 +377,26 @@ func TestPutConfigInvalid(t *testing.T) {
 		t.Fatal("非法配置不应改动")
 	}
 }
+
+func TestNonV1PathForbidden(t *testing.T) {
+	up := newFakeUp(t)
+	_, ts, _ := newGW(t, up, nil)
+	for _, p := range []string{"/admin/api/stats", "/admin/", "/", "/v1", "/health", "/v1/../admin/api/stats"} {
+		req, _ := http.NewRequest("GET", ts.URL+p, nil)
+		req.Header.Set("Authorization", "Bearer fake-agent-key")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		b, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != 403 || !strings.Contains(string(b), "网关不转发此路径") {
+			t.Fatalf("%s: %d %s", p, resp.StatusCode, b)
+		}
+	}
+	select {
+	case a := <-up.auth:
+		t.Fatalf("请求不该到上游: %s", a)
+	default:
+	}
+}

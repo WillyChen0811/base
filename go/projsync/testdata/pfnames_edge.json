@@ -1,0 +1,210 @@
+{
+  "_说明": "来自 /home/chenwy/xxyi-agentrun/synctest/data-small/manifest.json 里 kind 为 edge/lock/system/symlink 的路径（虚构数据）。字符串字段全部用 \\u 转义，保证 NFC/NFD 字节原样（café、が 各有两种写法）。excluded/out_of_scope/fold_key 是手写（fold_key 由 Python casefold+NFC 独立算出）的期望结果，不是被测代码的输出。",
+  "parent": "Projects/2026/261002J0202-\u6d4b\u8bd5\u9879\u76ee\u4e01-\u6587\u4ef6\u540d\u8fb9\u754c/6-\u5176\u4ed6/\u8fb9\u754c",
+  "entries": [
+    {
+      "kind": "edge",
+      "path": "Projects/2026/261002J0202-\u6d4b\u8bd5\u9879\u76ee\u4e01-\u6587\u4ef6\u540d\u8fb9\u754c/6-\u5176\u4ed6/\u8fb9\u754c/ \u524d\u9762\u6709\u7a7a\u683c.txt",
+      "desc": "名字开头有空格，正常",
+      "excluded": false,
+      "exclude_reason": "",
+      "out_of_scope": false,
+      "fold_key": " \u524d\u9762\u6709\u7a7a\u683c.txt"
+    },
+    {
+      "kind": "system",
+      "path": "Projects/2026/261002J0202-\u6d4b\u8bd5\u9879\u76ee\u4e01-\u6587\u4ef6\u540d\u8fb9\u754c/6-\u5176\u4ed6/\u8fb9\u754c/.DS_Store",
+      "desc": "Mac 系统文件，. 开头排除",
+      "excluded": true,
+      "exclude_reason": "隐藏",
+      "out_of_scope": false
+    },
+    {
+      "kind": "lock",
+      "path": "Projects/2026/261002J0202-\u6d4b\u8bd5\u9879\u76ee\u4e01-\u6587\u4ef6\u540d\u8fb9\u754c/6-\u5176\u4ed6/\u8fb9\u754c/.~lock.\u9700\u6c42\u8868.xlsx#",
+      "desc": "LibreOffice 锁，. 开头排除",
+      "excluded": true,
+      "exclude_reason": "隐藏",
+      "out_of_scope": false
+    },
+    {
+      "kind": "edge",
+      "path": "Projects/2026/261002J0202-\u6d4b\u8bd5\u9879\u76ee\u4e01-\u6587\u4ef6\u540d\u8fb9\u754c/6-\u5176\u4ed6/\u8fb9\u754c/Report.docx",
+      "desc": "与 report.docx 只差大小写",
+      "excluded": false,
+      "exclude_reason": "",
+      "out_of_scope": false,
+      "fold_key": "report.docx"
+    },
+    {
+      "kind": "system",
+      "path": "Projects/2026/261002J0202-\u6d4b\u8bd5\u9879\u76ee\u4e01-\u6587\u4ef6\u540d\u8fb9\u754c/6-\u5176\u4ed6/\u8fb9\u754c/Thumbs.db",
+      "desc": "Windows 缩略图缓存，排除",
+      "excluded": true,
+      "exclude_reason": "Thumbs.db",
+      "out_of_scope": false
+    },
+    {
+      "kind": "edge",
+      "path": "Projects/2026/261002J0202-\u6d4b\u8bd5\u9879\u76ee\u4e01-\u6587\u4ef6\u540d\u8fb9\u754c/6-\u5176\u4ed6/\u8fb9\u754c/cafe\u0301.txt",
+      "desc": "café（NFD：e + U+0301），与 NFC 同折叠键",
+      "excluded": false,
+      "exclude_reason": "",
+      "out_of_scope": false,
+      "fold_key": "caf\u00e9.txt"
+    },
+    {
+      "kind": "edge",
+      "path": "Projects/2026/261002J0202-\u6d4b\u8bd5\u9879\u76ee\u4e01-\u6587\u4ef6\u540d\u8fb9\u754c/6-\u5176\u4ed6/\u8fb9\u754c/caf\u00e9.txt",
+      "desc": "café（NFC：U+00E9）",
+      "excluded": false,
+      "exclude_reason": "",
+      "out_of_scope": false,
+      "fold_key": "caf\u00e9.txt"
+    },
+    {
+      "kind": "edge",
+      "path": "Projects/2026/261002J0202-\u6d4b\u8bd5\u9879\u76ee\u4e01-\u6587\u4ef6\u540d\u8fb9\u754c/6-\u5176\u4ed6/\u8fb9\u754c/report.docx",
+      "desc": "与 Report.docx 只差大小写",
+      "excluded": false,
+      "exclude_reason": "",
+      "out_of_scope": false,
+      "fold_key": "report.docx"
+    },
+    {
+      "kind": "lock",
+      "path": "Projects/2026/261002J0202-\u6d4b\u8bd5\u9879\u76ee\u4e01-\u6587\u4ef6\u540d\u8fb9\u754c/6-\u5176\u4ed6/\u8fb9\u754c/~$\u59d4\u6258\u5355.docx",
+      "desc": "Word 锁，~$ 排除",
+      "excluded": true,
+      "exclude_reason": "Office 锁",
+      "out_of_scope": false
+    },
+    {
+      "kind": "edge",
+      "path": "Projects/2026/261002J0202-\u6d4b\u8bd5\u9879\u76ee\u4e01-\u6587\u4ef6\u540d\u8fb9\u754c/6-\u5176\u4ed6/\u8fb9\u754c/\u304b\u3099.txt",
+      "desc": "が（NFD：か + U+3099）",
+      "excluded": false,
+      "exclude_reason": "",
+      "out_of_scope": false,
+      "fold_key": "\u304c.txt"
+    },
+    {
+      "kind": "edge",
+      "path": "Projects/2026/261002J0202-\u6d4b\u8bd5\u9879\u76ee\u4e01-\u6587\u4ef6\u540d\u8fb9\u754c/6-\u5176\u4ed6/\u8fb9\u754c/\u304c.txt",
+      "desc": "が（NFC：U+304C）",
+      "excluded": false,
+      "exclude_reason": "",
+      "out_of_scope": false,
+      "fold_key": "\u304c.txt"
+    },
+    {
+      "kind": "edge",
+      "path": "Projects/2026/261002J0202-\u6d4b\u8bd5\u9879\u76ee\u4e01-\u6587\u4ef6\u540d\u8fb9\u754c/6-\u5176\u4ed6/\u8fb9\u754c/\u4ee5\u70b9\u7ed3\u5c3e.",
+      "desc": "名字以点结尾，正常",
+      "excluded": false,
+      "exclude_reason": "",
+      "out_of_scope": false,
+      "fold_key": "\u4ee5\u70b9\u7ed3\u5c3e."
+    },
+    {
+      "kind": "edge",
+      "path": "Projects/2026/261002J0202-\u6d4b\u8bd5\u9879\u76ee\u4e01-\u6587\u4ef6\u540d\u8fb9\u754c/6-\u5176\u4ed6/\u8fb9\u754c/\u50a3\u53dd\u52a7\u54a7\u5401\u4e31\u5433\u4e94\u55cb\u53fe\u54ed\u4e46\u5179\u4f3a\u5203\u53cf\u51e3\u550d\u512e\u507e\u4e27\u53c8\u4e1d\u4f18\u5429\u5391\u4e71\u5061\u5163\u5305\u520c\u55e8\u52ed\u5014\u515c\u4e09\u54a0\u51cf\u5380\u5133\u5191\u51d7\u53e0\u51ff\u5499\u5564\u54cd\u4f37\u52db\u4e89\u4fee\u52f4\u51cf\u535f\u537d\u5401\u4feb\u509a\u5517\u507c\u5405\u4f62\u54bf\u55ce\u4e80\u4e7c\u50e9\u54b0\u538c\u4f1b\u5509\u55c6\u5037\u5546\u4edb\u5499\u518a\u513f\u4f22\u5419.txt",
+      "desc": "80 个汉字 + .txt，UTF-8 共 244 字节（≤255，正常）",
+      "excluded": false,
+      "exclude_reason": "",
+      "out_of_scope": false,
+      "fold_key": "\u50a3\u53dd\u52a7\u54a7\u5401\u4e31\u5433\u4e94\u55cb\u53fe\u54ed\u4e46\u5179\u4f3a\u5203\u53cf\u51e3\u550d\u512e\u507e\u4e27\u53c8\u4e1d\u4f18\u5429\u5391\u4e71\u5061\u5163\u5305\u520c\u55e8\u52ed\u5014\u515c\u4e09\u54a0\u51cf\u5380\u5133\u5191\u51d7\u53e0\u51ff\u5499\u5564\u54cd\u4f37\u52db\u4e89\u4fee\u52f4\u51cf\u535f\u537d\u5401\u4feb\u509a\u5517\u507c\u5405\u4f62\u54bf\u55ce\u4e80\u4e7c\u50e9\u54b0\u538c\u4f1b\u5509\u55c6\u5037\u5546\u4edb\u5499\u518a\u513f\u4f22\u5419.txt"
+    },
+    {
+      "kind": "edge",
+      "path": "Projects/2026/261002J0202-\u6d4b\u8bd5\u9879\u76ee\u4e01-\u6587\u4ef6\u540d\u8fb9\u754c/6-\u5176\u4ed6/\u8fb9\u754c/\u540e\u9762\u6709\u7a7a\u683c .txt",
+      "desc": "扩展名前有空格，正常",
+      "excluded": false,
+      "exclude_reason": "",
+      "out_of_scope": false,
+      "fold_key": "\u540e\u9762\u6709\u7a7a\u683c .txt"
+    },
+    {
+      "kind": "edge",
+      "path": "Projects/2026/261002J0202-\u6d4b\u8bd5\u9879\u76ee\u4e01-\u6587\u4ef6\u540d\u8fb9\u754c/6-\u5176\u4ed6/\u8fb9\u754c/\u59d4\u6258 \u5355 \u526f\u672c.docx",
+      "desc": "中文+空格，主名 7 个字符",
+      "excluded": false,
+      "exclude_reason": "",
+      "out_of_scope": false,
+      "fold_key": "\u59d4\u6258 \u5355 \u526f\u672c.docx"
+    },
+    {
+      "kind": "edge",
+      "path": "Projects/2026/261002J0202-\u6d4b\u8bd5\u9879\u76ee\u4e01-\u6587\u4ef6\u540d\u8fb9\u754c/6-\u5176\u4ed6/\u8fb9\u754c/\u5d4c\u5957\u76ee\u5f55/\u5d4c\u595701/\u5d4c\u595702/\u5d4c\u595703/\u5d4c\u595704/\u5d4c\u595705/\u5d4c\u595706/\u5d4c\u595707/\u5d4c\u595708/\u5d4c\u595709/\u5d4c\u595710/\u6700\u6df1\u5c42\u6587\u4ef6.txt",
+      "desc": "10 层嵌套的最深层文件",
+      "excluded": false,
+      "exclude_reason": "",
+      "out_of_scope": false,
+      "fold_key": "\u6700\u6df1\u5c42\u6587\u4ef6.txt"
+    },
+    {
+      "kind": "symlink",
+      "path": "Projects/2026/261002J0202-\u6d4b\u8bd5\u9879\u76ee\u4e01-\u6587\u4ef6\u540d\u8fb9\u754c/6-\u5176\u4ed6/\u8fb9\u754c/\u6307\u5411\u59d4\u6258\u5355\u7684\u94fe\u63a5.docx",
+      "desc": "符号链接（名字本身正常；链接类型归扫描层判断）",
+      "excluded": false,
+      "exclude_reason": "",
+      "out_of_scope": false,
+      "fold_key": "\u6307\u5411\u59d4\u6258\u5355\u7684\u94fe\u63a5.docx"
+    },
+    {
+      "kind": "edge",
+      "path": "Projects/2026/261002J0202-\u6d4b\u8bd5\u9879\u76ee\u4e01-\u6587\u4ef6\u540d\u8fb9\u754c/6-\u5176\u4ed6/\u8fb9\u754c/\u7a7a\u6587\u4ef6.txt",
+      "desc": "零字节文件",
+      "excluded": false,
+      "exclude_reason": "",
+      "out_of_scope": false,
+      "fold_key": "\u7a7a\u6587\u4ef6.txt"
+    },
+    {
+      "kind": "edge",
+      "path": "Projects/2026/261002J0202-\u6d4b\u8bd5\u9879\u76ee\u4e01-\u6587\u4ef6\u540d\u8fb9\u754c/6-\u5176\u4ed6/\u8fb9\u754c/\u9700\u6c42\u8868\uff08\u7b2c\u4e8c\u7248\uff09\u3010\u7ec8\u7a3f\u3011\u3001\u786e\u8ba4.xlsx",
+      "desc": "全角标点，不能判超出范围",
+      "excluded": false,
+      "exclude_reason": "",
+      "out_of_scope": false,
+      "fold_key": "\u9700\u6c42\u8868\uff08\u7b2c\u4e8c\u7248\uff09\u3010\u7ec8\u7a3f\u3011\u3001\u786e\u8ba4.xlsx"
+    },
+    {
+      "kind": "edge",
+      "path": "Projects/2026/261002J0202-\u6d4b\u8bd5\u9879\u76ee\u4e01-\u6587\u4ef6\u540d\u8fb9\u754c/6-\u5176\u4ed6/\u8fb9\u754c/\ud83d\udcce\u9644\u4ef6.txt",
+      "desc": "emoji 开头，不能判超出范围",
+      "excluded": false,
+      "exclude_reason": "",
+      "out_of_scope": false,
+      "fold_key": "\ud83d\udcce\u9644\u4ef6.txt"
+    }
+  ],
+  "dir_names": [" \u524d\u9762\u6709\u7a7a\u683c.txt", ".DS_Store", ".~lock.\u9700\u6c42\u8868.xlsx#", "Report.docx", "Thumbs.db", "cafe\u0301.txt", "caf\u00e9.txt", "report.docx", "~$\u59d4\u6258\u5355.docx", "\u304b\u3099.txt", "\u304c.txt", "\u4ee5\u70b9\u7ed3\u5c3e.", "\u50a3\u53dd\u52a7\u54a7\u5401\u4e31\u5433\u4e94\u55cb\u53fe\u54ed\u4e46\u5179\u4f3a\u5203\u53cf\u51e3\u550d\u512e\u507e\u4e27\u53c8\u4e1d\u4f18\u5429\u5391\u4e71\u5061\u5163\u5305\u520c\u55e8\u52ed\u5014\u515c\u4e09\u54a0\u51cf\u5380\u5133\u5191\u51d7\u53e0\u51ff\u5499\u5564\u54cd\u4f37\u52db\u4e89\u4fee\u52f4\u51cf\u535f\u537d\u5401\u4feb\u509a\u5517\u507c\u5405\u4f62\u54bf\u55ce\u4e80\u4e7c\u50e9\u54b0\u538c\u4f1b\u5509\u55c6\u5037\u5546\u4edb\u5499\u518a\u513f\u4f22\u5419.txt", "\u540e\u9762\u6709\u7a7a\u683c .txt", "\u59d4\u6258 \u5355 \u526f\u672c.docx", "\u5d4c\u5957\u76ee\u5f55", "\u6307\u5411\u59d4\u6258\u5355\u7684\u94fe\u63a5.docx", "\u7a7a\u6587\u4ef6.txt", "\u7a7a\u76ee\u5f55", "\u9700\u6c42\u8868\uff08\u7b2c\u4e8c\u7248\uff09\u3010\u7ec8\u7a3f\u3011\u3001\u786e\u8ba4.xlsx", "\ud83d\udcce\u9644\u4ef6.txt"],
+  "same_side_groups": [
+    ["Report.docx", "report.docx"],
+    ["cafe\u0301.txt", "caf\u00e9.txt"],
+    ["\u304b\u3099.txt", "\u304c.txt"]
+  ],
+  "lock_cases": [
+    {
+      "x": "\u9700\u6c42\u8868.xlsx",
+      "want": [".~lock.\u9700\u6c42\u8868.xlsx#"],
+      "desc": "LibreOffice 锁（manifest 里的 .~lock.需求表.xlsx#）"
+    },
+    {
+      "x": "\u59d4\u6258\u5355.docx",
+      "want": ["~$\u59d4\u6258\u5355.docx"],
+      "desc": "Word 锁，主名 3 个字符：直接加 ~$（manifest 里的 ~$委托单.docx）"
+    },
+    {
+      "x": "Report.docx",
+      "want": [],
+      "desc": "这个目录里没有 Report.docx 的锁"
+    },
+    {
+      "x": "\u59d4\u6258 \u5355 \u526f\u672c.docx",
+      "want": [],
+      "desc": "主名 7 个字符，此目录没有对应的锁（~$委托单.docx 是另一个文件的锁）"
+    }
+  ]
+}

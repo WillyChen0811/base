@@ -7,8 +7,6 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -270,37 +268,6 @@ func TestHostRoutesLabels(t *testing.T) {
 	}
 	if one := hostRoutes(hostConf{Tunnel: "home", Addr: "x:22"}); len(one) != 1 || one[0].Addr != "x:22" || one[0].Tunnel != "home" {
 		t.Errorf("旧配置应视为一条线路: %+v", one)
-	}
-}
-
-// 协助 + 多线路：写 git_tunnel 要报错，不写则正常启动
-func TestSupportMultiRoute(t *testing.T) {
-	multi := func(f *fixture) {
-		p := filepath.Join(f.dir, "hosts.json")
-		b, _ := os.ReadFile(p)
-		var cfg map[string]any
-		json.Unmarshal(b, &cfg)
-		h := cfg["hosts"].([]any)[0].(map[string]any)
-		delete(h, "tunnel")
-		delete(h, "addr")
-		h["routes"] = []any{
-			map[string]any{"tunnel": "home", "addr": "10.99.0.1:2222"},
-			map[string]any{"tunnel": "home", "addr": "10.99.0.1:22"},
-		}
-		b, _ = json.Marshal(cfg)
-		os.WriteFile(p, b, 0o600)
-	}
-	f, _, _ := supportFixture(t, func(s, _ map[string]any) { s["git_tunnel"] = "home" })
-	multi(f)
-	if err := runErr(t, f.dir); err == nil || !strings.Contains(err.Error(), "git_tunnel 不用写") {
-		t.Errorf("多线路写 git_tunnel 应报错，得到 %v", err)
-	}
-
-	f, _, _ = supportFixture(t, nil)
-	multi(f)
-	st, _, _ := run(t, f.dir)
-	if resp, b := get(t, st, "/support", true); resp.StatusCode != 200 {
-		t.Fatalf("多线路、不写 git_tunnel 应能启动: %d %s", resp.StatusCode, b)
 	}
 }
 

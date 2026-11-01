@@ -1,0 +1,11 @@
+{
+  "_说明": "testhost 自己的环境描述：testhost/tests 用；tasks 里 demo 是端到端示例任务。",
+  "python": "3.12",
+  "pip": [],
+  "tasks": {
+    "demo": {
+      "cmd": ["python", "-c", "import sys; open(sys.argv[1], 'w').write(' '.join(sys.argv[2:])); print('wrote', sys.argv[1])", "{run}/out/demo.txt"],
+      "outputs": ["out/demo.txt"]
+    }
+  }
+}

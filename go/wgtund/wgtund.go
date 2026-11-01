@@ -74,8 +74,8 @@ type fileConf struct {
 	AllowedOrigins []string          `json:"allowed_origins"`
 	Socks          map[string]string `json:"socks"`
 	Hosts          []hostConf        `json:"hosts"`
-	Support        *supportConf      `json:"support"`
 	Projsync       *projsyncConf     `json:"projsync"`
+	Projfiles      *projfilesConf    `json:"projfiles"` // 可选：项目文件同步（见 projfiles.go），缺省关闭
 	Forwards       []forwardConf     `json:"forwards"`
 	Proxy          string            `json:"proxy"`         // 可选：SOCKS5 代理口（回环），按各转发的 target 规则选线路
 	ProxyDefault   string            `json:"proxy_default"` // 没命中规则的目的：direct（默认）或某条转发的名字
@@ -202,11 +202,11 @@ func Run(ctx context.Context, dir string, stdin io.Reader, stdout io.Writer) (er
 	if err := validateProxy(conf); err != nil {
 		return err
 	}
-	prep, err := prepareSupport(conf, dir)
+	pjPrep, err := prepareProjsync(conf)
 	if err != nil {
 		return err
 	}
-	pjPrep, err := prepareProjsync(conf)
+	pfPrep, err := prepareProjfiles(conf)
 	if err != nil {
 		return err
 	}
@@ -312,6 +312,21 @@ func Run(ctx context.Context, dir string, stdin io.Reader, stdout io.Writer) (er
 		closers = append(closers, closerFunc(func() { v2cancel(); <-v2done }))
 	}
 
+	// 项目文件同步：定时跑 PFSched 的一轮（见 projfiles.go）。有 projfiles 段且 enabled=false 时协程不起；
+	// 没这段也照样起（host/remote_root/remote_meta 与总开关每轮从设置文件读，缺项/没启用就在状态里说清楚）
+	var projFiles *projfilesSvc
+	var pfAPI *projfilesAPI
+	if pfPrep != nil {
+		projFiles = newProjfilesSvc(pfPrep, pool)
+		pfRec := newProjfilesRecycler(projFiles)
+		projFiles.runRound = pfRec.wrapRound(projFiles.runRound) // 每天第一轮结束后清回收区（见 projfiles_http.go）
+		pfAPI = newProjfilesAPI(projFiles, pfRec)
+		pfctx, pfcancel := context.WithCancel(ctx)
+		pfdone := make(chan struct{})
+		go func() { defer close(pfdone); projFiles.loop(pfctx) }()
+		closers = append(closers, closerFunc(func() { pfcancel(); <-pfdone; projFiles.Close() }))
+	}
+
 	open := func(r *http.Request, cols, rows int) (*sshterm.Session, error) {
 		q := r.URL.Query()
 		name := q.Get("host")
@@ -337,54 +352,7 @@ func Run(ctx context.Context, dir string, stdin io.Reader, stdout io.Writer) (er
 	}
 	closers = append(closers, ln)
 
-	// 协助服务（可选）：本机 HTTP 地址和钩子令牌都要在写合并设置文件前拿到
-	// （projV2 必须在这之前建好：协助的 ProjSync 要直接用它）
-	var supportLocal, supportHook http.Handler
-	var autostart *autostarter // 未启用自动开时为 nil（markManual 对 nil 安全）
-	if prep != nil {
-		svc, fwd, err := startSupport(prep, dir, expand(conf.KnownHosts), ln.Addr().String(), socksAddrs, pool, projV2)
-		if err != nil {
-			return err
-		}
-		closers = append(closers, closerFunc(svc.Close))
-		if fwd != nil {
-			closers = append(closers, fwd)
-		}
-		supportLocal, supportHook = svc.LocalHandler(), svc.HookHandler()
-		if prep.conf.autostartOn() {
-			autostart = startAutostart(svc, autostartRetry, prep.conf.AutostartMinutes)
-			closers = append(closers, autostart) // 在 svc.Close 之前关（closers 逆序执行）
-		}
-	}
-
 	mux := http.NewServeMux()
-	supportRoute := func(w http.ResponseWriter, r *http.Request) {
-		if supportLocal == nil {
-			errJSON(w, http.StatusNotFound, "没有配置协助")
-			return
-		}
-		// 开始/停止/批准只许从 xxyi 页面发起：要求带白名单内的 Origin（curl 等没有 Origin 的调用拿主令牌也不行）
-		if r.Method == http.MethodPost {
-			switch r.URL.Path {
-			case "/support/start", "/support/stop", "/support/decide", "/msg/decide", "/msg/auto", "/approval/decide":
-				if o := r.Header.Get("Origin"); o == "" || !originAllowed(o, conf.AllowedOrigins) {
-					errJSON(w, http.StatusForbidden, "需要从 xxyi 页面操作")
-					return
-				}
-				if r.URL.Path == "/support/start" || r.URL.Path == "/support/stop" {
-					autostart.markManual() // 用户手动开/关过，本次运行不再自动开
-				}
-			}
-		}
-		supportLocal.ServeHTTP(w, r)
-	}
-	mux.HandleFunc("/support", supportRoute)
-	mux.HandleFunc("/support/", supportRoute)
-	mux.HandleFunc("/msg", supportRoute)
-	mux.HandleFunc("/msg/", supportRoute)
-	// 通用审批（任意会话的 PermissionRequest）：同样整段转给 support；decide 的 Origin 校验在上面
-	mux.HandleFunc("/approval", supportRoute)
-	mux.HandleFunc("/approval/", supportRoute)
 	type hostItem struct {
 		Name      string `json:"name"`
 		Tunnel    string `json:"tunnel"`
@@ -490,6 +458,22 @@ func Run(ctx context.Context, dir string, stdin io.Reader, stdout io.Writer) (er
 		mux.HandleFunc("/projsync/v2/commit", noProj)
 	}
 
+	// 项目文件同步的本机接口：/projfiles/*，只认令牌、不查 Origin（调用方是 cmdproto 子进程与本机命令行）；
+	// 没配 projfiles 段也照样挂（XXYI 的「项目同步」窗口要靠 /projfiles/status 显示「没启用/缺什么」），
+	// 只有 prep 都算不出来（拿不到家目录/主机名）才 404。地址与令牌原子写 ~/.xxyi/projfiles-api.json（0600）。
+	if pfAPI != nil {
+		mux.Handle("/projfiles/", pfAPI.localHandler(ctx))
+		if p, err := projfilesAPIPath(); err != nil {
+			logf("算 %s 路径失败: %v", projfilesAPIFileName, err)
+		} else if err := writeProjfilesAPI(p, "http://"+ln.Addr().String(), token); err != nil {
+			logf("写 %s 失败: %v", p, err)
+		}
+	} else {
+		mux.HandleFunc("/projfiles/", func(w http.ResponseWriter, r *http.Request) {
+			errJSON(w, http.StatusNotFound, "没有配置项目文件同步")
+		})
+	}
+
 	// tmux 会话管理。写操作用 POST 但不带请求体和自定义头，
 	// 这样浏览器跨域时属于"简单请求"，不会先发预检（OPTIONS）。
 	mux.HandleFunc("/sessions", func(w http.ResponseWriter, r *http.Request) {
@@ -515,16 +499,25 @@ func Run(ctx context.Context, dir string, stdin io.Reader, stdout io.Writer) (er
 			errJSON(w, http.StatusBadGateway, "解析会话列表失败: "+err.Error())
 			return
 		}
+		// 忙闲灯：远端钩子写的本地状态文件，同一条 SSH 连接上顺带读回来；读不到不影响列表（busy 为空串）。
+		// 只给 tmux 列表里还在的会话挂状态，会话没了留下的文件忽略。
+		var busy map[string]busyInfo
+		if len(list) > 0 {
+			busy = readBusyStates(r.Context(), pool, r.URL.Query().Get("host"))
+		}
 		type item struct {
 			Name     string `json:"name"`
 			Attached int    `json:"attached"`
 			Windows  int    `json:"windows"`
 			Created  int64  `json:"created"`
 			Activity int64  `json:"activity"`
+			Busy     string `json:"busy"`      // "busy"、"idle" 或空串（读不到）
+			BusyTime int64  `json:"busy_time"` // 钩子写状态的 unix 秒；Busy 为空时是 0
 		}
 		items := []item{}
 		for _, s := range list {
-			items = append(items, item{s.Name, s.Attached, s.Windows, s.Created.Unix(), s.Activity.Unix()})
+			b := busy[s.Name]
+			items = append(items, item{s.Name, s.Attached, s.Windows, s.Created.Unix(), s.Activity.Unix(), b.State, b.Time})
 		}
 		writeJSON(w, map[string]any{"sessions": items})
 	})
@@ -657,11 +650,6 @@ func Run(ctx context.Context, dir string, stdin io.Reader, stdout io.Writer) (er
 	mux.Handle("/term", sshterm.Handler(open, sshterm.BridgeOptions{OriginPatterns: conf.AllowedOrigins}))
 
 	guarded := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// 钩子入口由 support 自己校验钩子令牌，不走主令牌；只放行这一个精确路径
-		if supportHook != nil && r.URL.Path == "/support/hook" {
-			supportHook.ServeHTTP(w, r)
-			return
-		}
 		// 页面（如 xxyi 的 127.0.0.1:8765）和本服务端口不同，fetch /hosts、/status 属于跨域：
 		// 只对 allowed_origins 里的来源放行；WebSocket 不受 CORS 管，由 sshterm 自己校验 Origin
 		if o := r.Header.Get("Origin"); o != "" && originAllowed(o, conf.AllowedOrigins) {

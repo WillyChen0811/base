@@ -1,0 +1,51 @@
+{
+  "_说明": "Mac 测试机上跑 Go 的环境描述：client.py run --repo .=base --env-file go/testenv.json --workdir base --task gotest --out-dir <目录> -- -count=1 ./cmd/xxyi-msg/ ./wgtund/；另有任务 govet（go vet ./...）、gobuild（go build ./...）。任务在 env -i 里跑、HOME 指进 run 目录，所以先换回真实家目录，Go 的模块缓存与编译缓存才用得上；go 固定 /usr/local/go/bin/go，并去掉 TMUX/TMUX_PANE。完整输出写在 {run}/out/go.log（--out-dir 取回），终端只打过滤后的失败/摘要行。",
+  "python": "3.12",
+  "pip": [],
+  "repos": {},
+  "pythonpath": [],
+  "tasks": {
+    "gotest": {
+      "cmd": [
+        "bash",
+        "-c",
+        "export HOME=\"$(eval echo ~$(id -un))\"; R=\"$1\"; shift; env -u TMUX -u TMUX_PANE /usr/local/go/bin/go test \"$@\" >\"$R/out/go.log\" 2>&1; rc=$?; echo \"== go test 退出码 $rc，完整输出在 out/go.log ==\"; grep -E \"^(--- FAIL|FAIL|ok |panic:|# |.*_test\\.go:[0-9]+|.*\\.go:[0-9]+:[0-9]+)\" \"$R/out/go.log\" | tail -n 30; exit $rc",
+        "gotest",
+        "{run}"
+      ],
+      "cwd": "go"
+    },
+    "goitest": {
+      "cmd": [
+        "bash",
+        "-c",
+        "export HOME=\"$(eval echo ~$(id -un))\"; R=\"$1\"; shift; env -u TMUX -u TMUX_PANE /usr/local/go/bin/go test -tags itest \"$@\" >\"$R/out/go.log\" 2>&1; rc=$?; echo \"== go test 退出码 $rc，完整输出在 out/go.log ==\"; grep -E \"^(--- FAIL|FAIL|ok |panic:|# |.*_test\\.go:[0-9]+|.*\\.go:[0-9]+:[0-9]+)\" \"$R/out/go.log\" | tail -n 30; exit $rc",
+        "goitest",
+        "{run}"
+      ],
+      "cwd": "go"
+    },
+    "govet": {
+      "cmd": [
+        "bash",
+        "-c",
+        "export HOME=\"$(eval echo ~$(id -un))\"; R=\"$1\"; shift; env -u TMUX -u TMUX_PANE /usr/local/go/bin/go vet \"$@\" >\"$R/out/go.log\" 2>&1; rc=$?; echo \"== go vet 退出码 $rc，完整输出在 out/go.log ==\"; grep -E \"^(--- FAIL|FAIL|ok |panic:|# |.*_test\\.go:[0-9]+|.*\\.go:[0-9]+:[0-9]+)\" \"$R/out/go.log\" | tail -n 30; exit $rc",
+        "govet",
+        "{run}",
+        "./..."
+      ],
+      "cwd": "go"
+    },
+    "gobuild": {
+      "cmd": [
+        "bash",
+        "-c",
+        "export HOME=\"$(eval echo ~$(id -un))\"; R=\"$1\"; shift; env -u TMUX -u TMUX_PANE /usr/local/go/bin/go build \"$@\" >\"$R/out/go.log\" 2>&1; rc=$?; echo \"== go build 退出码 $rc，完整输出在 out/go.log ==\"; grep -E \"^(--- FAIL|FAIL|ok |panic:|# |.*_test\\.go:[0-9]+|.*\\.go:[0-9]+:[0-9]+)\" \"$R/out/go.log\" | tail -n 30; exit $rc",
+        "gobuild",
+        "{run}",
+        "./..."
+      ],
+      "cwd": "go"
+    }
+  }
+}

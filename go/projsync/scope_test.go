@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -97,6 +98,10 @@ func TestScopeEquals(t *testing.T) {
 }
 
 func TestScopeNormalizationClash(t *testing.T) {
+	if runtime.GOOS == "darwin" {
+		t.Skip("APFS/macOS 上文件系统不区分 NFC/NFD：建了 café(NFC) 再建 café(NFD) 被 git 拒绝「已存在」，" +
+			"这种只差编码的分支对建不出来，该情形只在 Linux 仓库出现")
+	}
 	dir, c1, c2 := ffRepo(t)
 	ag(t, dir, "branch", nfcName, c1)
 	ag(t, dir, "branch", nfdName, c1)
@@ -223,7 +228,14 @@ func TestScopeMultipleReasonsAtOnce(t *testing.T) {
 	ag(t, dir, "config", "core.sparseCheckout", "true")
 	ag(t, dir, "update-index", "--assume-unchanged", "README.md") // 开着 sparse 时 git 会自动清掉 skip-worktree
 	ag(t, dir, "config", "--add", "branch."+name+".mergeOptions", "--squash")
-	wantOOS(t, dir, ffPlan(dir, name, c1, c2), "NFC", "含 =", "mergeoptions", "sparse-checkout", "assume-unchanged")
+	wants := []string{"NFC", "含 =", "mergeoptions", "sparse-checkout", "assume-unchanged"}
+	if runtime.GOOS == "darwin" {
+		// macOS/APFS 不保留 NFD 字节：分支建出来是规范化的（列表里出现「café=x 与 café=x 规范化后相同但字节不同」），
+		// branch.<NFD 名>.mergeOptions 的配置键与测试传的 NFD 串对不上字节，「配置了 mergeoptions」这条原因收不到；
+		// 这种字节级组合只在 Linux 仓库出现，macOS 上不依赖那一条。
+		wants = []string{"NFC", "含 =", "sparse-checkout", "assume-unchanged"}
+	}
+	wantOOS(t, dir, ffPlan(dir, name, c1, c2), wants...)
 }
 
 func TestScopeReadFailureIsOutOfScope(t *testing.T) {
@@ -299,6 +311,10 @@ func TestNormalizationClashesAndMerge(t *testing.T) {
 }
 
 func TestScopeAnyUnsafeLocalBranchStopsRepo(t *testing.T) {
+	if runtime.GOOS == "darwin" {
+		t.Skip("APFS/macOS \u4e0a\u6587\u4ef6\u7cfb\u7edf\u4e0d\u533a\u5206 NFC/NFD\uff1a\u0100(U+0100) \u4e0e A+U+0304 \u53ea\u5dee\u7f16\u7801\uff0c\u7b2c\u4e8c\u4e2a\u88ab git \u62d2\u7edd\u300c\u5df2\u5b58\u5728\u300d\uff0c" +
+			"\u8fd9\u79cd\u5206\u652f\u5bf9\u5728 macOS \u4e0a\u5efa\u4e0d\u51fa\u6765\uff0c\u8be5\u60c5\u5f62\u53ea\u5728 Linux \u4ed3\u5e93\u51fa\u73b0")
+	}
 	dir, c1, c2 := ffRepo(t)
 	ag(t, dir, "branch", "\u0100", c1)
 	ag(t, dir, "branch", "A\u0304", c1)

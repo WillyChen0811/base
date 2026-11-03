@@ -119,6 +119,14 @@
 - 事件的 `source` 只表示"哪台机器"（本机 local）；监听来源 route/store 并进 kind（`live_route_*`/`live_store_*`）
 - `diff.py` 比的是"配置"：忽略 `expire`、带 `%` 的链路本地路由、mihomo 连接/流量计数、owners 的 evidence
 
+### cmdproto
+- 只有机制：注册表数据、实现表 `impls`、原子表 `atoms`、`computed_defaults` 全由调用方注入，不内置任何指令/原子/缺省；
+  项目策略（来源筛选、路径白名单、取最新）写在 `Session` 子类的钩子里（`prepare`/`check`/`before_execute`/`after_execute`/`finish`），别加回本库
+- `MISSING` 与 `None` 分开：None 是合法空值，MISSING 是"没有这个值"；原子算不出返回 MISSING，解析层据此回退/报缺参数，不猜
+- 条件为假/取不到的名字 = 这行不用（回退到下一行），与"缺参数要报清楚"是两套口径，不要合并
+- `prio` 空当 1，0 是合法值（不能 `or 1`）；人工值的缺省行是 `call` 为空的绑定行
+- 注册表的 kind/layer/required 用中文字面量（「原子输出」「人工」「L0原子」「是」），是数据约定的一部分，改了要连带改调用方的注册表
+
 ### cdpnet / playwright_launch
 - 纯映射/判断函数，无状态、不带项目默认值；有状态的编排（事件聚合、并发控制、落库）留给调用方
 

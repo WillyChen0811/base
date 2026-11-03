@@ -58,6 +58,12 @@
   再"同名+大小"两级比对；只看元数据，不是内容证明
 - `pybase.timemachine`：macOS Time Machine：备份路径识别（`inspect_selection`）、APFS 快照列表、复用系统已挂载的快照、
   其余只读挂载（`ensure_mounted`）
+- `pybase.cmdproto`：零业务的指令解析层（零依赖）。一行 `/动作 -组 --参数 值` → 按调用方给的注册表（JSON：指令/参数/输出/
+  绑定/人工值/上下文/配置/步骤/调用/流转边）把每个参数的值找出来（用户给 > 带条件的绑定 > 按优先级回退：常量/配置/上下文/
+  上一步输出/原子输出/人工值，缺了报清楚可从哪来、不猜）→ 调实现（`impls: cmd -> Impl(fn, args)`）→ 记 history/prev/上下文/
+  走过的步骤；`Flow` 按流转边走程序步与人步（可暂停续走、条件分流、失败边、逐个循环）。注册表、实现表、原子表、
+  随另一参数算的缺省都由调用方注入；来源筛选、路径白名单等项目策略写在 `Session` 子类的钩子里。
+  `python -m pybase.cmdproto --registry reg.json plan "/x -y"` 可看一条指令的参数各从哪来
 - `pybase.dictionary`：词典查询统一模型（`Entry`，必带出处与授权说明）+ 数据源适配器。**不内置任何词典数据**；
   目前有 `macos`（系统『词典』App 里已下载的词典，ctypes 直调，零依赖，仅限本机个人使用）
 

@@ -1,6 +1,7 @@
 // proxy.go：程序级接管的入口——回环上的 SOCKS5 代理口（无认证，支持 CONNECT 和 UDP ASSOCIATE（见 proxy_udp.go），地址类型 IPv4/域名/IPv6）。
 // 程序照常写真实地址，收到 CONNECT 目的 D 后按各转发的 target 规则选最具体的一条（见 proxy_rule.go），
-// 用它的当前线路拨到 D 本身（target 是精确 主机:端口 时它是该转发的别名，改拨线路的 addr），复用转发的登记、流量统计和切线路关连接；没命中任何规则走 proxy_default：
+// 用它的当前线路拨到 D 本身（target 是精确 主机:端口 时它是该转发的别名，改拨线路的 addr），复用转发的登记、流量统计和切线路关连接；
+// 没命中规则、但 D 的主机部分是 hosts 里的主机名（代号）时，按该主机当前线路换成线路 addr 的 IP 拨（见 proxy_host.go）；其余走 proxy_default：
 // direct（默认，计入「其他（直连）」）或某条转发的名字。域名不先解析，交给最终拨号的那条线路解析。
 package wgtund
 
@@ -27,6 +28,7 @@ type proxySvc struct {
 	rules  []proxyRule
 	dflt   *forwardSvc // 未命中规则时借用的转发（direct 时就是 direct 自己）
 	direct *forwardSvc // 「其他（直连）」：只有一条直连线路、不监听；仅 proxy_default 为 direct 时有
+	pool   *sshPool    // 主机代号（目的主机是 hosts 里的名字）用；nil 表示不认代号
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -40,9 +42,9 @@ type proxySvc struct {
 
 const directName = "其他（直连）"
 
-func newProxy(listen, dflt string, forwards map[string]*forwardSvc) *proxySvc {
+func newProxy(listen, dflt string, forwards map[string]*forwardSvc, pool *sshPool) *proxySvc {
 	ctx, cancel := context.WithCancel(context.Background())
-	p := &proxySvc{ctx: ctx, cancel: cancel}
+	p := &proxySvc{ctx: ctx, cancel: cancel, pool: pool}
 	host, port, _ := net.SplitHostPort(listen)
 	if host != "127.0.0.1" {
 		host = "127.0.0.1" // localhost 也固定绑回环 IPv4
@@ -170,7 +172,13 @@ func (p *proxySvc) serve(c net.Conn) {
 		p.serveUDP(c) // 请求里的目的只是客户端将用的源地址，不用
 		return
 	}
-	f, target := p.pick(dest)
+	f, target, matched := p.pick(dest)
+	if !matched && p.pool != nil {
+		if host, port, err := net.SplitHostPort(dest); err == nil && p.pool.hasHost(host) {
+			p.serveCode(c, host, port) // 主机代号：按这台主机当前选中的线路拨（见 proxy_host.go）
+			return
+		}
+	}
 	up, gen, err := f.dialTo(target)
 	if err != nil {
 		socksReply(c, dialRep(err))

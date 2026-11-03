@@ -158,6 +158,7 @@
 - `copy_file` 目标已存在且判定不同一律 `conflict`，不加"强制覆盖"开关；正式名只在临时文件写完后 `replace`
 - `retry_call` 资源不可用期间不计次数；等待间隔没有默认值（交互几秒、过夜批处理十几分钟，由调用方定）
 - 可续传拷贝是 `copy_file_resumable`（不是 `copy_file` 的开关）：续传只信 `ResumeState` 里调用方持久化的块哈希，且必须先读回最后一块核对；暂停/取消靠进度回调抛异常
+- `transfer` 队列：断线 `waiting` 的任务在每次探测之间也要检查更高优先级的 queued 任务并让出，否则连不上的任务把串行队列堵死
 - `transfer` 队列：库是唯一真相（暂停/取消直接写库，worker 每块读一次状态）；恢复 running/waiting 只在抢到 advisory lock 之后做，否则会把别的进程正在跑的任务踢回队列；非连接 `OSError`（权限/不存在/磁盘满）不能进 waiting，否则会无限等
 - inventory 的"同名+大小"只是快速判断，不是内容证明；修改时间不参与比对
 

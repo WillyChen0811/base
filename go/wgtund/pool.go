@@ -81,6 +81,12 @@ func (p *sshPool) Close() error {
 	p.mu.Unlock()
 	for _, e := range entries {
 		e.drop(nil)
+		e.mu.Lock()
+		cs := e.takeCodeConnsLocked()
+		e.mu.Unlock()
+		for _, c := range cs {
+			c.Close()
+		}
 	}
 	return nil
 }
@@ -144,9 +150,13 @@ func (p *sshPool) switchRoute(host string, idx int) error {
 		e.probing = true
 		go e.probeLoop(routeProbeInterval, routeProbeTimeout)
 	}
+	codeConns := e.takeCodeConnsLocked()
 	e.mu.Unlock()
 	if old != nil {
 		old.Close()
+	}
+	for _, c := range codeConns {
+		c.Close()
 	}
 	return nil
 }
@@ -292,6 +302,8 @@ type hostConn struct {
 	probing       bool // 已有探测协程在跑
 	gen           int  // 每次切换线路加一，用来作废切换前发起的拨号
 	dialed        bool // 拨过号了（再拨记为重拨）
+
+	codeConns map[net.Conn]struct{} // 经代理口「主机代号」建立的连接（见 proxy_host.go），切换线路时一起关
 }
 
 // dialCall 是一次在途拨号，等它的人从 done 读同一个结果。

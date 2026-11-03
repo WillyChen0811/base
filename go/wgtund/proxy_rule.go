@@ -104,8 +104,8 @@ func (r proxyRule) alias() bool {
 }
 
 // pick 选出目的 主机:端口 该走的转发：规则里最具体的一条，没命中则 proxy_default。
-// 同时返回交给 dialTo 的拨号目的：别名规则为空（用线路的 addr），其余原样是请求目的。
-func (p *proxySvc) pick(dest string) (*forwardSvc, string) {
+// 同时返回交给 dialTo 的拨号目的：别名规则为空（用线路的 addr），其余原样是请求目的；matched 表示命中了某条规则。
+func (p *proxySvc) pick(dest string) (f *forwardSvc, target string, matched bool) {
 	host, ps, _ := net.SplitHostPort(dest)
 	port, _ := strconv.Atoi(ps)
 	best, bestScore, target := p.dflt, -1, dest
@@ -117,7 +117,7 @@ func (p *proxySvc) pick(dest string) (*forwardSvc, string) {
 			}
 		}
 	}
-	return best, target
+	return best, target, bestScore >= 0
 }
 
 // validateProxy 校验 proxy 口（只许回环）、各转发的 target 规则互不重复、proxy_default 有效。

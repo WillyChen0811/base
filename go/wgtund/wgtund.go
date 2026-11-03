@@ -283,7 +283,7 @@ func Run(ctx context.Context, dir string, stdin io.Reader, stdout io.Writer) (er
 	// 代理口（可选）：SOCKS5，按 CONNECT 目的找 target 相同的转发；监听失败只记错并重试，不影响启动
 	var proxy *proxySvc
 	if conf.Proxy != "" {
-		proxy = newProxy(conf.Proxy, conf.ProxyDefault, forwardMap)
+		proxy = newProxy(conf.Proxy, conf.ProxyDefault, forwardMap, pool)
 		if d := proxy.direct; d != nil { // 「其他（直连）」当一条只有直连线路的转发登记，流量和状态照常显示
 			hub.forward(d.name, d.tc)
 			closers = append(closers, d)

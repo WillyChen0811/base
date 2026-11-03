@@ -126,7 +126,7 @@ func (a *udpAssoc) readLoop() {
 			continue // 分片或头不合法：丢
 		}
 		key := udpKey{src.String(), dest}
-		f, target := a.p.pick(dest)
+		f, target, _ := a.p.pick(dest)
 		s := a.sockFor(key, f, target, append([]byte(nil), buf[:hdrLen]...), src)
 		if s == nil {
 			continue

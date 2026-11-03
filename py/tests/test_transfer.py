@@ -242,6 +242,27 @@ def test_断线时源端先不可用也进waiting(env):
     until(lambda: status(q, tid) == "done")
 
 
+def test_断线等待中_有更高优先级任务就让出_回来再续(env):
+    """连不上的低优先级任务在等网络时不能堵死串行队列：高优先级的照跑，跑完低优先级的回去接着等。"""
+    make, src, dst, tmp, _ = env
+    (tmp / "s/a.bin").write_bytes(DATA)
+    (tmp / "s/b.bin").write_bytes(b"b" * 20)
+    (tmp / "d2").mkdir()
+    dead = Flaky(tmp / "d2")
+    dead.up = False
+    q = make()
+    q._factory = lambda spec, _f=q._factory: dead if spec == storage_to_spec(dead) else _f(spec)
+    low = q.submit("连不上", [(src, "a.bin", dead, "a.bin")], priority=0)
+    until(lambda: status(q, low) == "waiting")
+    hi = q.submit("要紧", [(src, "b.bin", dst, "b.bin")], priority=100)
+    until(lambda: status(q, hi) == "done", timeout=5)
+    assert (tmp / "d/b.bin").read_bytes() == b"b" * 20
+    until(lambda: status(q, low) == "waiting")                # 回去接着等，不算失败
+    dead.up = True
+    until(lambda: status(q, low) == "done")
+    assert (tmp / "d2/a.bin").read_bytes() == DATA
+
+
 def test_非连接错误_该项failed_任务继续_如实汇总(env):
     make, src, dst, tmp, _ = env
     (tmp / "s/ok1.bin").write_bytes(b"1" * 20)

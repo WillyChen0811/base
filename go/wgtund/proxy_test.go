@@ -84,7 +84,7 @@ func startProxy(t *testing.T, dflt string, fs ...*forwardSvc) (string, *proxySvc
 	for _, f := range fs {
 		m[f.name] = f
 	}
-	p := newProxy("127.0.0.1:0", dflt, m)
+	p := newProxy("127.0.0.1:0", dflt, m, nil)
 	p.start()
 	t.Cleanup(func() { p.Close() })
 	return p.status().Addr, p

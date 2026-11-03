@@ -19,7 +19,7 @@
   ``pybase.smbstorage.set_credential_provider`` 注册的回调在连接时提供。
 - **优先级**：``submit(..., priority=0)``，数字越大越先；同优先级先到先得（``id`` 序）。
   约定：用户主动要求的同步用最高优先级（如 100），放入用 50，后台自动同步用 0 且受空闲闸控制。
-  **抢占**：worker 每写完一块（以及项与项之间）检查有没有**更高优先级**的 queued 任务，有就把当前任务
+  **抢占**：worker 每写完一块（以及项与项之间、断线等待的每次探测之间）检查有没有**更高优先级**的 queued 任务，有就把当前任务
   置回 ``queued``（进度保留），去跑高优先级的；高优先级的跑完，调度自然回到它，从断点续传。
   **空闲闸**：构造参数 ``busy`` / ``idle_threshold``（缺省 0）。``priority < idle_threshold`` 的任务只在
   ``busy()`` 为 False 时才开始/继续；跑着时 ``busy()`` 变 True，写完当前块就让出（置回 ``queued``，进度保留）。
@@ -585,14 +585,14 @@ class TransferQueue:
             except SQLAlchemyError:
                 raise
             except _Disconnected:
-                if self._wait_for_connection(tid, src_spec, dst_spec) == "stopped":
+                if self._wait_for_connection(tid, src_spec, dst_spec, prio) == "stopped":
                     return self._stopped(tid, iid)
                 continue
             except OSError as e:
                 if _is_fatal_os(e):
                     return self._fail_item(iid, f"{type(e).__name__}: {e}")
                 if not self._both_available(src_spec, dst_spec):
-                    if self._wait_for_connection(tid, src_spec, dst_spec) == "stopped":
+                    if self._wait_for_connection(tid, src_spec, dst_spec, prio) == "stopped":
                         return self._stopped(tid, iid)
                     continue
                 retries += 1
@@ -649,8 +649,10 @@ class TransferQueue:
         except Exception:
             return False
 
-    def _wait_for_connection(self, tid: int, src_spec: str, dst_spec: str) -> str:
-        """任务置 waiting，等两端都回来（间隔递增封顶）；回来返回 'ok'，被暂停/取消/关闭返回 'stopped'。"""
+    def _wait_for_connection(self, tid: int, src_spec: str, dst_spec: str, prio: int = 0) -> str:
+        """任务置 waiting，等两端都回来（间隔递增封顶）；回来返回 'ok'，被暂停/取消/关闭返回 'stopped'。
+        等的期间有更高优先级的 queued 任务（或自己被空闲闸挡住）就让出：置回 ``queued``（进度保留）、返回 'stopped'，
+        worker 去跑别的——否则一个连不上的任务会把整个串行队列堵死。"""
         if not self._guard_set(tid, "waiting", "running"):
             return "stopped"
         interrupted = False
@@ -658,6 +660,9 @@ class TransferQueue:
         def ready() -> bool:
             nonlocal interrupted
             if self._closed.is_set() or self._task_status(tid) != "waiting":
+                interrupted = True
+                return True
+            if self._should_yield(prio) and self._guard_set(tid, "queued", "waiting"):
                 interrupted = True
                 return True
             return self._both_available(src_spec, dst_spec)

@@ -674,7 +674,8 @@ func Run(ctx context.Context, dir string, stdin io.Reader, stdout io.Writer) (er
 	go func() { served <- srv.Serve(ln) }()
 	closers = append(closers, srv)
 
-	infoMap := map[string]any{"http": ln.Addr().String(), "token": token, "socks": socksAddrs}
+	// features：调用方据此判断这个 wgtund 有没有某项能力（老版没有这个字段）。host_code：代理口认主机代号（proxy_host.go）
+	infoMap := map[string]any{"http": ln.Addr().String(), "token": token, "socks": socksAddrs, "features": []string{"host_code"}}
 	if proxy != nil {
 		infoMap["proxy"] = proxy.status()
 	}

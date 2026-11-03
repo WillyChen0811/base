@@ -81,7 +81,7 @@
                           {"label": "家里", "tunnel": "home", "addr": "10.116.7.250:445"}]}]
   ```
 
-就绪后往 stdout 写一行 `{"http":"127.0.0.1:端口","token":"…","socks":{…}}`；stdin 关闭即退出。
+就绪后往 stdout 写一行 `{"http":"127.0.0.1:端口","token":"…","socks":{…},"features":["host_code"]}`（`features` 列出能力，老版没有；`host_code` = 代理口认主机代号）；stdin 关闭即退出。
 HTTP 接口都要带 `token` 参数；每台主机共用一条 SSH 连接（第一次用到才拨，断了自动重拨）：
 - `GET /hosts`：主机清单，每项 `{"name","tunnel","connected","error","routes","active","preferred_down","preferred_back"}`；
   `tunnel` 是当前线路的隧道名，`connected` 是共用连接当前是否连着，`error` 是最近一次拨号/断开的原因（没有则空串）；

@@ -19,4 +19,5 @@
 - retry: 等资源恢复（间隔由调用方给）+ 断线不计次的重试
 - inventory: 基于 storage 的目录树清单与"路径+大小 / 同名+大小"两级比对
 - timemachine: macOS Time Machine 备份路径识别、APFS 快照列表与只读挂载
+- cmdproto: 指令解析层（指令行 → 参数绑定回退 → 调实现 → 流程编排），注册表与实现由调用方注入
 """

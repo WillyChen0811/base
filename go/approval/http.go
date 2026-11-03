@@ -12,7 +12,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/WillyChen0811/base/go/xxyica"
+	"github.com/WillyChen0811/base/go/permca"
 )
 
 const (
@@ -22,7 +22,7 @@ const (
 	maxDecideMessage = 500
 )
 
-// certAuthHeader 是客户端带证书与请求签名的头（xxyica.SignRequest 的产物）。
+// certAuthHeader 是客户端带证书与请求签名的头（permca.SignRequest 的产物）。
 const certAuthHeader = "X-XXYI-Auth"
 
 // addrNameIllegal 匹配地址名字里不许出现的字符：名字只许 ASCII 字母数字和 . _ -。
@@ -76,20 +76,20 @@ func readBody(w http.ResponseWriter, r *http.Request) []byte {
 // certCheck 校验客户端接口的请求证书：用请求头对 method+RequestURI+body 验签，
 // 时间戳/nonce/吊销由 Verifier 管。Verifier 未配置时直接放行（返回空证书，权限检查一并跳过）。
 // 失败已写好 401，返回 false。
-func (c *Channel) certCheck(w http.ResponseWriter, r *http.Request, body []byte) (xxyica.Cert, bool) {
+func (c *Channel) certCheck(w http.ResponseWriter, r *http.Request, body []byte) (permca.Cert, bool) {
 	if c.cfg.Verifier == nil {
-		return xxyica.Cert{}, true
+		return permca.Cert{}, true
 	}
 	cert, err := c.cfg.Verifier.Verify(r.Header.Get(certAuthHeader), r.Method, r.URL.RequestURI(), body, time.Now())
 	if err != nil {
 		errJSON(w, http.StatusUnauthorized, "证书校验失败："+err.Error())
-		return xxyica.Cert{}, false
+		return permca.Cert{}, false
 	}
 	return cert, true
 }
 
 // certAddrPerm 检查上报的地址是否落在证书前缀内。
-func certAddrPerm(perm xxyica.Perm, addr string) (int, string) {
+func certAddrPerm(perm permca.Perm, addr string) (int, string) {
 	if !strings.HasPrefix(addr, perm.AddrPrefix) {
 		return http.StatusForbidden, fmt.Sprintf("地址 %s 不符合证书前缀 %s", addr, perm.AddrPrefix)
 	}

@@ -1,4 +1,4 @@
-package xxyica
+package permca
 
 import (
 	"bytes"
@@ -494,7 +494,7 @@ func TestSigningPrefixesSeparateDomains(t *testing.T) {
 	msgBytes := MessageSigningBytes(f)
 	certBytes := certSigningBytes(cert)
 	reqStr := requestSigningString("GET", "/x", now.Unix(), "nonce0", nil)
-	if !bytes.HasPrefix(msgBytes, []byte("xxyi-msg-v1\n")) {
+	if !bytes.HasPrefix(msgBytes, []byte("peerctl-v1\n")) {
 		t.Errorf("消息签名原文前缀不对: %q", msgBytes[:24])
 	}
 	if !bytes.HasPrefix(certBytes, []byte("xxyi-cert-v1\n")) {

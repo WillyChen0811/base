@@ -645,7 +645,7 @@ var helperProcesses = []struct {
 }{
 	{"codex", []string{"app-server"}, nil, "Codex 的 app-server 守护进程（含 daemon pid-update-loop）"},
 	{"codex-code-mode-host", nil, nil, "Codex 的 code mode 宿主进程"},
-	{"xxyi-msg", nil, []string{"mcp", "state"}, "XXYI 的 MCP 服务与状态钩子"},
+	{"peerctl", nil, []string{"mcp", "state"}, "XXYI 的 MCP 服务与状态钩子"},
 }
 
 func isHelperProcess(cmdline string) bool {

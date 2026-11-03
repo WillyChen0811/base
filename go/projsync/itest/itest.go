@@ -3,11 +3,11 @@
 // Package itest：项目文件同步的两机联调（T14a），只在 -tags itest 下编译。
 //
 // Studio 测试机扮演 MacBook：work_dir（桌面）/sync_dir/meta 全在 t.TempDir() 下；
-// 经 SSH+SFTP 真连 Ubuntu 测试机（地址、账号、钥匙、主机公钥、同步根、meta、xxyi-msg 路径全部由
+// 经 SSH+SFTP 真连 Ubuntu 测试机（地址、账号、钥匙、主机公钥、同步根、meta、peerctl 路径全部由
 // 环境变量 PROJFILES_ITEST_* 注入，缺任何一个整体 t.Skip）。
 // 主机校验固定用注入的公钥（FixedHostKey），绝不 InsecureIgnoreHostKey；连不上/校验不过如实失败。
 //
-// 接线照 wgtund/projfiles.go 的 build()：PFRemoteClient(Runner+XxyiMsg+Meta+Root+CoordID) →
+// 接线照 wgtund/projfiles.go 的 build()：PFRemoteClient(Runner+RemoteCmd+Meta+Root+CoordID) →
 // PFTransfer(LocalStaging/RemoteStaging/Remote=PFTransferFS(SFTP)/VerifyUp=remote.TargetVerify()) →
 // PFSched(MetaDir/WorkDir/Remote/Transfer/Mover/Settings)。
 // RemoteRunner 每次 Run 新开一条 SSH 连接和会话（不共享长连接，联调要的是每次都走真握手）。
@@ -80,7 +80,7 @@ func (r *itRunner) Run(ctx context.Context, cmd string, stdin []byte) (stdout, s
 
 // ── 环境 ────────────────────────────────────────────────
 
-// itEnv 是一次联调的 Ubuntu 侧现场：连接、同步根、meta、xxyi-msg。
+// itEnv 是一次联调的 Ubuntu 侧现场：连接、同步根、meta、peerctl。
 type itEnv struct {
 	t      *testing.T
 	addr   string
@@ -89,7 +89,7 @@ type itEnv struct {
 	runner *itRunner
 	root   string // Ubuntu 同步根（roots.json 已包含）
 	meta   string // Ubuntu meta（除 roots.json 外每场景清空）
-	msg    string // Ubuntu 上的 linux 版 xxyi-msg
+	msg    string // Ubuntu 上的 linux 版 peerctl
 }
 
 func envReq(t *testing.T, name string) string {
@@ -418,7 +418,7 @@ func newClusterAddr(t *testing.T, addr string, opts ...itOpt) *cluster {
 		t.Fatalf("建 PFUnitMover 失败：%v", err)
 	}
 	remote := &projsync.PFRemoteClient{
-		Runner: e.runner, XxyiMsg: e.msg, Meta: e.meta, Root: e.root,
+		Runner: e.runner, RemoteCmd: e.msg, Meta: e.meta, Root: e.root,
 		CoordID: "itest-mac", CoordHost: "studio-itest",
 	}
 	transfer, err := projsync.NewPFTransfer(projsync.PFTransferConfig{

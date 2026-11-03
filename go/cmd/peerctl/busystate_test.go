@@ -37,7 +37,7 @@ func newBusyEnv(t *testing.T, sess string) *busyEnv {
 	return e
 }
 
-func (e *busyEnv) dir() string { return filepath.Join(e.home, ".xxyi-state") }
+func (e *busyEnv) dir() string { return filepath.Join(e.home, ".peerctl-state") }
 
 func (e *busyEnv) file(sess string) string { return filepath.Join(e.dir(), sess+".json") }
 
@@ -83,9 +83,9 @@ func TestBusyStateBusyIdleWriteFile(t *testing.T) {
 	procCmdline = func(pid int) (string, error) {
 		switch pid {
 		case me:
-			return "xxyi-msg state busy", nil
+			return "peerctl state busy", nil
 		case 90:
-			return "sh -c /home/u/.local/bin/xxyi-msg state busy", nil
+			return "sh -c /home/u/.local/bin/peerctl state busy", nil
 		case 80:
 			return "claude --resume", nil
 		}
@@ -214,7 +214,7 @@ func TestBusyStateProcTreeCodex(t *testing.T) {
 	procCmdline = func(pid int) (string, error) {
 		switch pid {
 		case 90:
-			return "sh -c xxyi-msg state busy", nil
+			return "sh -c peerctl state busy", nil
 		case 80:
 			return "node /usr/lib/node_modules/@openai/codex/bin/codex.js", nil
 		}
@@ -331,7 +331,7 @@ func TestBusyStateBadArgs(t *testing.T) {
 	}
 }
 
-// 写不进去（~/.xxyi-state 是个普通文件）：照样静默退出 0。
+// 写不进去（~/.peerctl-state 是个普通文件）：照样静默退出 0。
 func TestBusyStateWriteFailureIsSilent(t *testing.T) {
 	e := newBusyEnv(t, "sess1")
 	if err := os.WriteFile(e.dir(), []byte("挡路的文件"), 0o600); err != nil {
@@ -377,8 +377,8 @@ func TestAgentOfCmdline(t *testing.T) {
 		{"vim claude", ""},
 		{"node /opt/tools/other.js claude", ""},
 		{"bash -lc claude", ""},
-		{"sh -c /home/u/.local/bin/xxyi-msg state busy", ""},
-		{"xxyi-msg state busy", ""},
+		{"sh -c /home/u/.local/bin/peerctl state busy", ""},
+		{"peerctl state busy", ""},
 		{"tmux new-session", ""},
 		{"", ""},
 		{"node /x/@anthropic-ai/claude-code/cli.js /y/@openai/codex/bin/codex.js", ""}, // 两种都出现：不认

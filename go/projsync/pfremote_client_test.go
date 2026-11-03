@@ -230,9 +230,9 @@ func TestPFRemoteClientLocalChecks(t *testing.T) {
 	if f.run.calls != 0 || !strings.Contains(err.Error(), "分批") {
 		t.Fatalf("太大的请求不该发出去: calls=%d %v", f.run.calls, err)
 	}
-	// xxyi-msg 路径不合规：不发
+	// peerctl 路径不合规：不发
 	c := *f.cl
-	c.XxyiMsg = "/usr/bin/x; rm -rf /"
+	c.RemoteCmd = "/usr/bin/x; rm -rf /"
 	_, err = c.Poll(ctx, PFRemotePollOptions{})
 	local("路径不合规", err)
 	// 没有 Runner

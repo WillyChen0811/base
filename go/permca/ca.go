@@ -1,6 +1,6 @@
-// Package xxyica 实现 XXYI 体系的证书签发与请求签名校验：CA 给客户端签发带权限声明的
+// Package permca 实现 XXYI 体系的证书签发与请求签名校验：CA 给客户端签发带权限声明的
 // Ed25519 证书，客户端用它签请求头，服务端只拿 CA 公钥就能验真、验权限。纯标准库、无状态副作用（除文件读写）。
-package xxyica
+package permca
 
 import (
 	"crypto/ed25519"
@@ -30,7 +30,7 @@ const (
 // 签名跨域复用从第一个字节就对不上——拿消息签名冒充证书签名或请求签名一律验不过。
 const (
 	certSigningPrefix    = "xxyi-cert-v1\n"
-	msgSigningPrefix     = "xxyi-msg-v1\n"
+	msgSigningPrefix     = "peerctl-v1\n"
 	requestSigningPrefix = "xxyi-req-v1\n"
 )
 

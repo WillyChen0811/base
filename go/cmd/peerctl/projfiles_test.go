@@ -167,7 +167,7 @@ func TestProjfilesUsageMentionsNewCommands(t *testing.T) {
 	}
 }
 
-// pfRunner 是跑真正的 run()（和 xxyi-msg 的 main 同一条路径）的 RemoteRunner。
+// pfRunner 是跑真正的 run()（和 peerctl 的 main 同一条路径）的 RemoteRunner。
 type pfRunner struct{}
 
 func (pfRunner) Run(ctx context.Context, cmd string, stdin []byte) ([]byte, []byte, int, error) {
@@ -180,12 +180,12 @@ func (pfRunner) Run(ctx context.Context, cmd string, stdin []byte) ([]byte, []by
 	return out.Bytes(), errb.Bytes(), code, nil
 }
 
-// 端到端：Mac 侧客户端 → 假 RemoteRunner → xxyi-msg 的 run() → 服务端，poll、facts、apply、verify_part 都走一遍。
+// 端到端：Mac 侧客户端 → 假 RemoteRunner → peerctl 的 run() → 服务端，poll、facts、apply、verify_part 都走一遍。
 func TestProjfilesClientEndToEnd(t *testing.T) {
 	meta, root := pfSetup(t)
 	pfPut(t, root, "报告/a.docx", "AAA")
 	ctx := context.Background()
-	c := &projsync.PFRemoteClient{Runner: pfRunner{}, XxyiMsg: "/usr/local/bin/xxyi-msg", Meta: meta, Root: root, CoordID: "mac-A", CoordHost: "测试"}
+	c := &projsync.PFRemoteClient{Runner: pfRunner{}, RemoteCmd: "/usr/local/bin/peerctl", Meta: meta, Root: root, CoordID: "mac-A", CoordHost: "测试"}
 
 	pr, err := c.Poll(ctx, projsync.PFRemotePollOptions{})
 	if err != nil || len(pr.Units) != 1 || pr.Units[0].Fingerprint == "" {

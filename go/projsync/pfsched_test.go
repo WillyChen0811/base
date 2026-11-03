@@ -2,7 +2,7 @@ package projsync
 
 // T9b 测试：全部项目的一轮（PFSched.RunRound）和取最新（PFFresh）的单机模拟。
 //
-// 做法同 T9a：「Ubuntu」的根和 meta 在临时目录里，假 RemoteRunner 在进程内直接调 xxyi-msg 的处理函数；传输器两端都用本机文件系统。
+// 做法同 T9a：「Ubuntu」的根和 meta 在临时目录里，假 RemoteRunner 在进程内直接调 peerctl 的处理函数；传输器两端都用本机文件系统。
 // Mac 侧：home/Desktop/Projects 是工作目录（里面是指向同步目录的链接），home/XXYI-sync 是同步目录，home/.xxyi/projfiles 是 meta。
 // 时钟是固定的假时钟（可手动拨），文件的 mtime 都设在过去。需要 PFUnitMover（建新项目、检查链接）的场景只在 macOS 上跑。
 

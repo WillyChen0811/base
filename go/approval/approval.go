@@ -3,13 +3,13 @@
 //   - Queue（approval.go）：待批队列，Ask 阻塞到用户 Decide、ctx 到期或 CancelAll，纯内存；
 //   - ParseHookInput / HookOutput（hook.go）：Claude Code PermissionRequest 钩子的输入解析与输出生成；
 //   - Channel（approvals.go）：通用审批通道。客户端经证书接口 POST /approval/ask 提交钩子输入并阻塞等决定，
-//     界面经本机接口 GET /approval 查看、POST /approval/decide 批准或拒绝；证书与请求签名校验用 xxyica.Verifier。
+//     界面经本机接口 GET /approval 查看、POST /approval/decide 批准或拒绝；证书与请求签名校验用 permca.Verifier。
 //
 // 现在没有接线：2026-10-26 拆除协助/消息/审批时，从 go/support 里原样挪出这几份代码留下来，
 // 没有任何程序在用它们。留作以后「辨别一个操作是不是用户本人发出的」时用——
-// 用户发出的批准要经证书签名、带权限声明、防重放，这里和 xxyica 是现成的那一套。
+// 用户发出的批准要经证书签名、带权限声明、防重放，这里和 permca 是现成的那一套。
 //
-// 只依赖标准库和 go/xxyica。
+// 只依赖标准库和 go/permca。
 package approval
 
 import (

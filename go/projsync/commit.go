@@ -122,7 +122,7 @@ func statusEntries(raw []byte) (paths []string, unmerged bool, nested []string) 
 	return
 }
 
-// defaultCommitMessage：「XXYI 自动提交：<最多 10 个文件名>」，超出写「等 N 个」。名字里的控制字符与非法 UTF-8 做替换。
+// defaultCommitMessage：「projsync 自动提交：<最多 10 个文件名>」，超出写「等 N 个」。名字里的控制字符与非法 UTF-8 做替换。
 func defaultCommitMessage(paths []string) string {
 	const maxNames = 10
 	show := paths
@@ -139,7 +139,7 @@ func defaultCommitMessage(paths []string) string {
 			return r
 		}, p)
 	}
-	msg := "XXYI 自动提交：" + strings.Join(clean, "、")
+	msg := "projsync 自动提交：" + strings.Join(clean, "、")
 	if len(paths) > maxNames {
 		msg += fmt.Sprintf(" 等 %d 个", len(paths))
 	}

@@ -8,7 +8,7 @@
 - `wgtunnel/socks`：只监听回环地址的 SOCKS5 口（只支持 CONNECT），域名交给隧道那一侧解析。
 - `sshterm`：经任意 Dialer 的 SSH 终端（PTY、窗口大小、退出码），以及把终端桥接到 WebSocket 的 HTTP Handler。
 - `wgtund` + `cmd/wgtund`：助手程序，把上面三块组合起来给桌面应用用（见下）。
-- `cmd/xxyi-msg`：Ubuntu 一侧的小命令，只剩 `state`（钩子用，把忙闲状态写进本机 `~/.xxyi-state`，不联网）
+- `cmd/peerctl`：Ubuntu 一侧的小命令，只剩 `state`（钩子用，把忙闲状态写进本机 `~/.peerctl-state`，不联网）
   和 `projsync-facts` / `projsync-apply`（项目同步的远程协议，Mac 的 wgtund 经 SSH 调用）。
 - `xxyica`：Ed25519 CA，签发带权限声明的证书、请求签名与校验、时间戳+nonce 防重放（纯标准库）。目前没有接线，留着以后辨别「操作是不是用户本人发出的」。
 - `approval`：待批队列、Claude Code PermissionRequest 钩子格式转换、通用审批通道（证书接口 ask + 本机列表/决定）。目前没有接线，用途同上。

@@ -2,7 +2,7 @@ package projsync
 
 // 项目文件同步 T8：Ubuntu 侧服务端的公共部分和 poll（技术设计 §5.2 第 2 步、§8.3、§12.1、§12.2）。
 //
-// xxyi-msg 的 projfiles-poll / projfiles-facts / projfiles-apply 都落到这里的 PFRemoteServer.Serve：
+// peerctl 的 projfiles-poll / projfiles-facts / projfiles-apply 都落到这里的 PFRemoteServer.Serve：
 // 读 JSON 请求（严格解码）→ 对照 <meta>/roots.json 白名单确认根 → 干活 → 写 JSON 响应。facts 在 pfremote_facts.go，
 // apply 在 pfremote_apply.go。
 //
@@ -35,7 +35,7 @@ type PFRemoteServer struct {
 	ApplyHook PFApplyHook                              // 写原语的钩子（测试模拟竞态、崩溃）
 }
 
-// PFRemoteServe 用缺省服务端处理一个子命令的请求（xxyi-msg 调这个）。
+// PFRemoteServe 用缺省服务端处理一个子命令的请求（peerctl 调这个）。
 // err 非 nil = 协议层失败：stdout 不该有输出，原因写 stderr；调用方对 apply 不得假定没写过。
 func PFRemoteServe(ctx context.Context, sub string, in []byte) ([]byte, error) {
 	return (&PFRemoteServer{}).Serve(ctx, sub, in)

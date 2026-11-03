@@ -20,7 +20,7 @@ import (
 )
 
 // 真 SSH（sshtest 回环服务器）+ 真 sshPool：经 sshRemoteRunner 走完整的 facts / apply 往返。
-// 服务端的 exec 处理里直接调用 projsync.ServeFacts/ServeApply（相当于对方机器上的 xxyi-msg 子命令），
+// 服务端的 exec 处理里直接调用 projsync.ServeFacts/ServeApply（相当于对方机器上的 peerctl 子命令），
 // 并记录收到的命令串，证明请求内容只走 stdin。
 func TestSSHRemoteRunnerRoundTrip(t *testing.T) {
 	repo := filepath.Join(t.TempDir(), "含 空格's \"仓库\"$(x)")
@@ -48,7 +48,7 @@ func TestSSHRemoteRunnerRoundTrip(t *testing.T) {
 	c2 := git("rev-parse", "HEAD")
 	git("checkout", "-q", "main")
 
-	const bin = "/opt/xxyi/bin/xxyi-msg"
+	const bin = "/opt/xxyi/bin/peerctl"
 	var mu sync.Mutex
 	var cmds []string
 	clientKey, clientPriv := sshtest.NewKey()
@@ -115,7 +115,7 @@ func TestSSHRemoteRunnerRoundTrip(t *testing.T) {
 		t.Fatal("坏请求应报错")
 	}
 	// 命令不存在 → 退出码 127 也是 error
-	if _, err := projsync.RemoteFacts(ctx, r, "/nope/xxyi-msg", projsync.FactsRequest{Repo: repo, Side: projsync.SideUbuntu}); err == nil {
+	if _, err := projsync.RemoteFacts(ctx, r, "/nope/peerctl", projsync.FactsRequest{Repo: repo, Side: projsync.SideUbuntu}); err == nil {
 		t.Fatal("退出码 127 应报错")
 	}
 	mu.Lock()

@@ -52,7 +52,7 @@ const (
 	projfilesSettingsName   = "projfiles-settings.json"
 	projfilesPathsListName  = "projfiles-paths.json" // XXYI 导出的配置路径清单（§14.1/§14.4，开始同步的闸用它）
 	projfilesStatusFileName = "_round.json"
-	defaultProjfilesXxyiMsg = "~/.local/bin/xxyi-msg"
+	defaultProjfilesRemoteCmd = "~/.local/bin/peerctl"
 )
 
 // 设置文件的缺省值（文件不在或不合法时用；键没写也用它们）。
@@ -71,7 +71,7 @@ type projfilesConf struct {
 	Host       string `json:"host"`        // 必须是 hosts 里的主机，且有 identity_files
 	RemoteRoot string `json:"remote_root"` // Ubuntu 的同步根（绝对路径）
 	RemoteMeta string `json:"remote_meta"` // Ubuntu 的 meta 目录（绝对路径）
-	XxyiMsg    string `json:"xxyi_msg"`    // Ubuntu 上 xxyi-msg 的路径，缺省 ~/.local/bin/xxyi-msg
+	RemoteCmd    string `json:"remote_cmd"`    // Ubuntu 上 peerctl 的路径，缺省 ~/.local/bin/peerctl
 	CoordID    string `json:"coord_id"`    // 协调者编号，缺省用本机主机名（不合规的字符换成 -）
 }
 
@@ -81,7 +81,7 @@ type projfilesPrep struct {
 	host          string
 	remoteRoot    string
 	remoteMeta    string
-	xxyiMsg       string
+	remoteCmd       string
 	coordID       string
 	coordHost     string // 给人看的主机名（原样）
 	metaDir       string // ~/.xxyi/projfiles：units.json、staging、回收、status 都在里面
@@ -126,7 +126,7 @@ func prepareProjfiles(c *fileConf) (*projfilesPrep, error) {
 		}
 		return &projfilesPrep{
 			fromSettings: true, hosts: hosts,
-			xxyiMsg: defaultProjfilesXxyiMsg, coordID: coordID, coordHost: coordHost,
+			remoteCmd: defaultProjfilesRemoteCmd, coordID: coordID, coordHost: coordHost,
 			metaDir:       filepath.Join(dir, projfilesMetaDirName),
 			settingsPath:  filepath.Join(dir, projfilesSettingsName),
 			pathsListPath: filepath.Join(dir, projfilesPathsListName),
@@ -153,12 +153,12 @@ func prepareProjfiles(c *fileConf) (*projfilesPrep, error) {
 			return nil, bad("的 %s %q 不合规：必须以 / 开头、只允许字母数字和 . _ / -、不能含 ..", f.name, f.v)
 		}
 	}
-	xxyiMsg := pc.XxyiMsg
-	if xxyiMsg == "" {
-		xxyiMsg = defaultProjfilesXxyiMsg
+	remoteCmd := pc.RemoteCmd
+	if remoteCmd == "" {
+		remoteCmd = defaultProjfilesRemoteCmd
 	}
-	if !projfilesMsgRe.MatchString(xxyiMsg) || strings.HasPrefix(xxyiMsg, "-") {
-		return nil, bad("的 xxyi_msg %q 不合规：只允许 [A-Za-z0-9._/~-]，且不能以 - 开头", xxyiMsg)
+	if !projfilesMsgRe.MatchString(remoteCmd) || strings.HasPrefix(remoteCmd, "-") {
+		return nil, bad("的 remote_cmd %q 不合规：只允许 [A-Za-z0-9._/~-]，且不能以 - 开头", remoteCmd)
 	}
 	coordHost, err := os.Hostname()
 	if err != nil {
@@ -179,7 +179,7 @@ func prepareProjfiles(c *fileConf) (*projfilesPrep, error) {
 	return &projfilesPrep{
 		enabled: pc.Enabled, host: host.Name,
 		remoteRoot: projfilesCleanRemote(pc.RemoteRoot), remoteMeta: projfilesCleanRemote(pc.RemoteMeta),
-		xxyiMsg: xxyiMsg, coordID: coordID, coordHost: coordHost,
+		remoteCmd: remoteCmd, coordID: coordID, coordHost: coordHost,
 		metaDir:       filepath.Join(dir, projfilesMetaDirName),
 		settingsPath:  filepath.Join(dir, projfilesSettingsName),
 		pathsListPath: filepath.Join(dir, projfilesPathsListName),
@@ -747,7 +747,7 @@ func (s *projfilesSvc) buildLocked(st projfilesSettings) error {
 	// 没这段时 host/remote_root/remote_meta 全来自设置文件（build 已挡过缺项，这里一定齐）。
 	cfg := s.effRemote(st)
 	remote := &projsync.PFRemoteClient{
-		Runner: runner, XxyiMsg: s.prep.xxyiMsg,
+		Runner: runner, RemoteCmd: s.prep.remoteCmd,
 		Meta: cfg.remoteMeta, Root: cfg.remoteRoot, CoordID: s.prep.coordID, CoordHost: s.prep.coordHost,
 	}
 	transfer, err := projsync.NewPFTransfer(projsync.PFTransferConfig{

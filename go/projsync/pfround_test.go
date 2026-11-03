@@ -2,7 +2,7 @@ package projsync
 
 // T9a 测试：单元一轮同步 PFRoundRunUnit 的单机全流程模拟（技术设计 §9.3 的 S1–S16 在单机上的对应）。
 //
-// 做法同 T8 的测试：「Ubuntu」的根和 meta 在临时目录里，假 RemoteRunner 在进程内直接调 xxyi-msg 的处理函数（PFRemoteServer）；
+// 做法同 T8 的测试：「Ubuntu」的根和 meta 在临时目录里，假 RemoteRunner 在进程内直接调 peerctl 的处理函数（PFRemoteServer）；
 // 传输器的远端文件系统用本机文件系统（PFLocalFS）；Mac 的同步目录和 meta 也在临时目录。
 // 时钟是固定的假时钟（2026-10-27 12:00），文件的 mtime 都设在过去，所以默认都已静止。
 // 不依赖 Linux 专有系统调用，Studio（darwin）上能跑。

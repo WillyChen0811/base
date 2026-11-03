@@ -46,9 +46,9 @@ func tmuxSessionArgs(pane string) []string {
 	return []string{"display-message", "-p", "-t", pane, "#S"}
 }
 
-const usage = "用法：xxyi-msg state busy|idle|gone [--check|--start]（钩子用，只写本机 ~/.xxyi-state）" +
-	" | xxyi-msg projsync-facts|projsync-apply（stdin 读 JSON 请求，项目同步内部用）" +
-	" | xxyi-msg projfiles-poll|projfiles-facts|projfiles-apply（stdin 读 JSON 请求，项目文件同步内部用）"
+const usage = "用法：peerctl state busy|idle|gone [--check|--start]（钩子用，只写本机 ~/.peerctl-state）" +
+	" | peerctl projsync-facts|projsync-apply（stdin 读 JSON 请求，项目同步内部用）" +
+	" | peerctl projfiles-poll|projfiles-facts|projfiles-apply（stdin 读 JSON 请求，项目文件同步内部用）"
 
 // errNoSession 是找不到自己所在 tmux 会话时的统一说法（state 据此什么都不写）。
 var errNoSession = errors.New("找不到自己所在的 tmux 会话")

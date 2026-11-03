@@ -1,4 +1,4 @@
-package xxyica
+package permca
 
 import (
 	"bytes"
@@ -324,7 +324,7 @@ func TestEnsureClientBundleUnreadableGetsNewKey(t *testing.T) {
 	if err != nil {
 		t.Fatalf("EnsureClientBundle: %v", err)
 	}
-	if !strings.Contains(stderr, "读不了") || !strings.HasPrefix(stderr, "xxyica: ") || !strings.HasSuffix(stderr, "\n") {
+	if !strings.Contains(stderr, "读不了") || !strings.HasPrefix(stderr, "permca: ") || !strings.HasSuffix(stderr, "\n") {
 		t.Errorf("logf 为 nil 时该写 stderr 一行并带前缀：%q", stderr)
 	}
 	cert, _, _, err := LoadClientBundle(path)

@@ -1,5 +1,5 @@
 {
-  "_说明": "Mac 测试机上跑 Go 的环境描述：client.py run --repo .=base --env-file go/testenv.json --workdir base --task gotest --out-dir <目录> -- -count=1 ./cmd/xxyi-msg/ ./wgtund/；另有任务 govet（go vet ./...）、gobuild（go build ./...）。任务在 env -i 里跑、HOME 指进 run 目录，所以先换回真实家目录，Go 的模块缓存与编译缓存才用得上；go 固定 /usr/local/go/bin/go，并去掉 TMUX/TMUX_PANE。完整输出写在 {run}/out/go.log（--out-dir 取回），终端只打过滤后的失败/摘要行。",
+  "_说明": "Mac 测试机上跑 Go 的环境描述：client.py run --repo .=base --env-file go/testenv.json --workdir base --task gotest --out-dir <目录> -- -count=1 ./cmd/peerctl/ ./wgtund/；另有任务 govet（go vet ./...）、gobuild（go build ./...）。任务在 env -i 里跑、HOME 指进 run 目录，所以先换回真实家目录，Go 的模块缓存与编译缓存才用得上；go 固定 /usr/local/go/bin/go，并去掉 TMUX/TMUX_PANE。完整输出写在 {run}/out/go.log（--out-dir 取回），终端只打过滤后的失败/摘要行。",
   "python": "3.12",
   "pip": [],
   "repos": {},

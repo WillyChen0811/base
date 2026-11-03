@@ -194,7 +194,7 @@ func TestProjfilesConfig(t *testing.T) {
 	if !p.fromSettings || p.enabled || p.host != "" || p.remoteMeta != "" {
 		t.Fatalf("没这段应是 fromSettings、host/remote_meta 留空等设置文件补: %+v", p)
 	}
-	if p.xxyiMsg != defaultProjfilesXxyiMsg || p.coordID == "" || p.coordHost == "" {
+	if p.remoteCmd != defaultProjfilesRemoteCmd || p.coordID == "" || p.coordHost == "" {
 		t.Fatalf("没这段时缺省值也要照规则补: %+v", p)
 	}
 	if p.hosts["ubuntu"].Name != "ubuntu" || len(p.hosts["ubuntu"].IdentityFiles) == 0 {
@@ -209,7 +209,7 @@ func TestProjfilesConfig(t *testing.T) {
 	if !p.enabled || p.host != "ubuntu" || p.remoteRoot != "/srv/XXYI-sync" || p.remoteMeta != "/srv/.xxyi/projfiles" {
 		t.Fatalf("配置没照抄: %+v", p)
 	}
-	if p.xxyiMsg != defaultProjfilesXxyiMsg || p.coordID == "" || p.coordHost == "" {
+	if p.remoteCmd != defaultProjfilesRemoteCmd || p.coordID == "" || p.coordHost == "" {
 		t.Fatalf("缺省值不对: %+v", p)
 	}
 	if !strings.HasSuffix(p.metaDir, filepath.Join(".xxyi", "projfiles")) ||
@@ -251,14 +251,14 @@ func TestProjfilesConfig(t *testing.T) {
 	if err != nil || p.remoteRoot != "/srv/XXYI-sync" {
 		t.Fatalf("结尾斜杠没去掉: %v %+v", err, p)
 	}
-	// xxyi_msg
+	// remote_cmd
 	for _, bad := range []string{"a b", "x;rm -rf /", "$(id)", "-x", "a'b", "a\nb"} {
-		if _, err := prepareProjfiles(pfConfT(t, func(pf map[string]any, _ *hostConf) { pf["xxyi_msg"] = bad })); err == nil {
-			t.Errorf("xxyi_msg=%q 应被拒绝", bad)
+		if _, err := prepareProjfiles(pfConfT(t, func(pf map[string]any, _ *hostConf) { pf["remote_cmd"] = bad })); err == nil {
+			t.Errorf("remote_cmd=%q 应被拒绝", bad)
 		}
 	}
-	p, err = prepareProjfiles(pfConfT(t, func(pf map[string]any, _ *hostConf) { pf["xxyi_msg"] = "/opt/bin/xxyi-msg_2.x~" }))
-	if err != nil || p.xxyiMsg != "/opt/bin/xxyi-msg_2.x~" {
+	p, err = prepareProjfiles(pfConfT(t, func(pf map[string]any, _ *hostConf) { pf["remote_cmd"] = "/opt/bin/peerctl_2.x~" }))
+	if err != nil || p.remoteCmd != "/opt/bin/peerctl_2.x~" {
 		t.Fatalf("%v %+v", err, p)
 	}
 	// coord_id

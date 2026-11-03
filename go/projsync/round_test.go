@@ -30,7 +30,7 @@ func newPair(t *testing.T) rpair {
 	return rpair{mac: mac, ubu: ubu}
 }
 
-// ubuRunner 在进程内模拟 Ubuntu 的 xxyi-msg；可注入「第 N 次 apply 执行后通信失败」。
+// ubuRunner 在进程内模拟 Ubuntu 的 peerctl；可注入「第 N 次 apply 执行后通信失败」。
 type ubuRunner struct {
 	mu          sync.Mutex
 	verdict     string // 所有工作区的 agent 结论，默认 unknown
@@ -76,7 +76,7 @@ func (u *ubuRunner) Run(ctx context.Context, cmd string, stdin []byte) ([]byte, 
 }
 
 func (p rpair) env(r RemoteRunner) RoundEnv {
-	return RoundEnv{Project: "proj", Repo: p.mac, RemoteRepo: p.ubu, XxyiMsg: "/x/xxyi-msg", Remote: r,
+	return RoundEnv{Project: "proj", Repo: p.mac, RemoteRepo: p.ubu, RemoteCmd: "/x/peerctl", Remote: r,
 		Exchange: func(ctx context.Context) error {
 			_, err := SyncGit(ctx, p.mac, p.ubu, nil, "mac", "ubuntu")
 			return err
@@ -200,7 +200,7 @@ func TestRoundCommitsFinishedUbuntuThenSyncs(t *testing.T) {
 		t.Fatalf("%+v", res.Worktrees)
 	}
 	head := rev(t, p.ubu, "main")
-	if head == rev(t, p.ubu, "main~1") || !strings.Contains(ag(t, p.ubu, "log", "-1", "--format=%s"), "XXYI 自动提交") {
+	if head == rev(t, p.ubu, "main~1") || !strings.Contains(ag(t, p.ubu, "log", "-1", "--format=%s"), "projsync 自动提交") {
 		t.Fatal("Ubuntu 应已自动提交")
 	}
 	if rev(t, p.mac, "main") != head {
@@ -508,7 +508,7 @@ func TestRoundSecondPreflightAfterAutoCommitReportsWrites(t *testing.T) {
 func failExchangeWhenTmp(p rpair, env RoundEnv) RoundEnv {
 	orig := env.Exchange
 	env.Exchange = func(ctx context.Context) error {
-		out, _ := exec.Command("git", "-C", p.mac, "for-each-ref", "refs/heads/xxyi-tmp-merge-*").Output()
+		out, _ := exec.Command("git", "-C", p.mac, "for-each-ref", "refs/heads/projsync-tmp-merge-*").Output()
 		if len(out) > 0 {
 			return fmt.Errorf("注入：传送失败")
 		}
@@ -531,7 +531,7 @@ func TestRoundAutoMergeTransferFailureUpdatesNeitherSide(t *testing.T) {
 	if !res.Stopped || !res.NeedsAttention {
 		t.Fatalf("应停止并提示: %+v", res)
 	}
-	out := ag(t, p.mac, "for-each-ref", "refs/heads/xxyi-tmp-merge-*")
+	out := ag(t, p.mac, "for-each-ref", "refs/heads/projsync-tmp-merge-*")
 	if out != "" {
 		t.Fatalf("临时引用应已删除: %s", out)
 	}

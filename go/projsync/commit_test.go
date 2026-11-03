@@ -70,7 +70,7 @@ func TestAutoCommitSuccess(t *testing.T) {
 	if st := ag(t, dir, "status", "--porcelain"); st != "" {
 		t.Fatalf("提交后仍有改动: %s", st)
 	}
-	if msg := ag(t, dir, "log", "-1", "--format=%s"); !strings.HasPrefix(msg, "XXYI 自动提交：") || !strings.Contains(msg, "new.txt") {
+	if msg := ag(t, dir, "log", "-1", "--format=%s"); !strings.HasPrefix(msg, "projsync 自动提交：") || !strings.Contains(msg, "new.txt") {
 		t.Fatalf("默认提交信息: %q", msg)
 	}
 	// 自定义信息
@@ -246,7 +246,7 @@ func TestAutoCommitLinkedWorktree(t *testing.T) {
 }
 
 func TestDefaultCommitMessage(t *testing.T) {
-	if m := defaultCommitMessage([]string{"a", "b"}); m != "XXYI 自动提交：a、b" {
+	if m := defaultCommitMessage([]string{"a", "b"}); m != "projsync 自动提交：a、b" {
 		t.Fatal(m)
 	}
 	var ps []string

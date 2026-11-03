@@ -480,7 +480,7 @@ func TestLateProcess(t *testing.T) {
 	resident := Proc{PID: 3, Args: "mcp-server --stdio", Start: agentAt.Add(10 * time.Second), StartKnown: true}
 	edge := Proc{PID: 6, Args: "helper-at-edge", Start: agentAt.Add(30 * time.Second), StartKnown: true}
 	midTurn := Proc{PID: 4, Args: "npm run build", Start: agentAt.Add(60 * time.Second), StartKnown: true}
-	whitelisted := Proc{PID: 7, Args: "/usr/bin/xxyi-msg mcp", Start: agentAt.Add(5 * time.Minute), StartKnown: true}
+	whitelisted := Proc{PID: 7, Args: "/usr/bin/peerctl mcp", Start: agentAt.Add(5 * time.Minute), StartKnown: true}
 	noStart := Proc{PID: 5, Args: "mystery"}
 
 	if st, r := JudgePane(mk()); st != Done {
@@ -669,11 +669,11 @@ func TestHelperWhitelist(t *testing.T) {
 		"/home/u/.codex/packages/x/bin/codex app-server --listen unix://",
 		"/home/u/.codex/packages/x/bin/codex app-server daemon pid-update-loop",
 		"/home/u/.codex/packages/x/bin/codex-code-mode-host",
-		"/home/u/.local/bin/xxyi-msg mcp",
-		"xxyi-msg state --event stop",
+		"/home/u/.local/bin/peerctl mcp",
+		"peerctl state --event stop",
 	}
 	no := []string{
-		"codex", "codex exec fix bug", "node /usr/bin/codex", "xxyi-msg send hi", "xxyi-msg",
+		"codex", "codex exec fix bug", "node /usr/bin/codex", "peerctl send hi", "peerctl",
 		"vim app-server", "/usr/bin/python3 mcp", "cp codex-code-mode-host-backup x",
 	}
 	for _, c := range yes {
@@ -694,7 +694,7 @@ func TestJudgeOtherWritersWhitelist(t *testing.T) {
 		tab, err := withChild(pid, "mcp-server", time.Now().Add(-time.Hour))()
 		if err == nil {
 			tab.Args[88888881] = "/h/.codex/bin/codex app-server --listen unix://"
-			tab.Args[88888882] = "/h/.local/bin/xxyi-msg mcp"
+			tab.Args[88888882] = "/h/.local/bin/peerctl mcp"
 			tab.Args[88888883] = "vim main.go"
 		}
 		return tab, err
@@ -704,7 +704,7 @@ func TestJudgeOtherWritersWhitelist(t *testing.T) {
 	}
 	r, _ := JudgeDetail(context.Background(), ws, opt)
 	if r.Verdict != VerdictFinished || len(r.Notes) != 1 || !strings.Contains(r.Notes[0], "已忽略") ||
-		!strings.Contains(r.Notes[0], "app-server") || !strings.Contains(r.Notes[0], "xxyi-msg mcp") {
+		!strings.Contains(r.Notes[0], "app-server") || !strings.Contains(r.Notes[0], "peerctl mcp") {
 		t.Errorf("白名单进程不应影响，且应列出: %+v", r)
 	}
 	opt.ProcCwd = func() (map[int]string, error) {

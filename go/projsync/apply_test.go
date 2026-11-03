@@ -439,7 +439,7 @@ func TestAutoMergeCommit(t *testing.T) {
 			t.Fatal("父不是祖先")
 		}
 	}
-	if ag(t, dir, "log", "-1", "--format=%s", m) != "XXYI 自动合并 main：mac "+a+" + ubuntu "+b {
+	if ag(t, dir, "log", "-1", "--format=%s", m) != "projsync 自动合并 main：mac "+a+" + ubuntu "+b {
 		t.Fatal("提交信息不对")
 	}
 	// 两边分别快进到合并提交

@@ -14,7 +14,7 @@ import (
 // 需要不同家目录布局的用例再 t.Setenv("HOME", t.TempDir()) 覆盖。
 func TestMain(m *testing.M) {
 	procCmdline = func(int) (string, error) { return "", errors.New("测试里不读真进程命令行") }
-	home, err := os.MkdirTemp("", "xxyi-msg-home")
+	home, err := os.MkdirTemp("", "peerctl-home")
 	if err != nil {
 		panic(err)
 	}

@@ -28,7 +28,7 @@ import (
 // PFRemoteClient 是调用 Ubuntu 的客户端。
 type PFRemoteClient struct {
 	Runner    RemoteRunner
-	XxyiMsg   string // Ubuntu 上 xxyi-msg 的路径（只许 [A-Za-z0-9._/~-]，见 remoteCommand）
+	RemoteCmd   string // Ubuntu 上 peerctl 的路径（只许 [A-Za-z0-9._/~-]，见 remoteCommand）
 	Meta      string // Ubuntu 的 meta 目录（绝对路径）
 	Root      string // Ubuntu 的同步根（绝对路径，要在 Ubuntu 的 roots.json 里）
 	CoordID   string // 协调者编号（这台 Mac 固定不变）
@@ -50,8 +50,8 @@ func (c *PFRemoteClient) call(ctx context.Context, sub string, req, resp any) er
 	if c.Runner == nil {
 		return c.err(sub, PFRemoteErrLocal, "没有 RemoteRunner", nil)
 	}
-	if _, err := remoteCommand(c.XxyiMsg, sub); err != nil {
-		return c.err(sub, PFRemoteErrLocal, "xxyi-msg 路径不合规", err)
+	if _, err := remoteCommand(c.RemoteCmd, sub); err != nil {
+		return c.err(sub, PFRemoteErrLocal, "peerctl 路径不合规", err)
 	}
 	body, err := json.Marshal(req)
 	if err != nil {
@@ -60,7 +60,7 @@ func (c *PFRemoteClient) call(ctx context.Context, sub string, req, resp any) er
 	if len(body) > PFRemoteMaxInput {
 		return c.err(sub, PFRemoteErrLocal, fmt.Sprintf("请求有 %d 字节，超过 %d 字节上限，请分批", len(body), PFRemoteMaxInput), nil)
 	}
-	if err := remoteCall(ctx, c.Runner, c.XxyiMsg, sub, req, resp); err != nil {
+	if err := remoteCall(ctx, c.Runner, c.RemoteCmd, sub, req, resp); err != nil {
 		return c.err(sub, PFRemoteErrComm, "调用失败，远端结果不确定", err)
 	}
 	return nil

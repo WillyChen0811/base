@@ -2,7 +2,7 @@ package projsync
 
 // 第 5 项（第一版第②项）：经现有 SSH 连接在对方机器（Ubuntu）上采集事实、安全执行一步更新。
 //
-// 对方机器上跑 `xxyi-msg projsync-facts` / `xxyi-msg projsync-apply`：stdin 读一个 JSON 请求，
+// 对方机器上跑 `peerctl projsync-facts` / `peerctl projsync-apply`：stdin 读一个 JSON 请求，
 // stdout 写一个 JSON 响应。退出码 0 = 协议层成功（业务失败放在响应里）；非 0 = 协议层失败（输入坏了、内部 panic 等）。
 //
 // 安全：请求内容（路径、分支名、OID……）只经 stdin 传输，命令串只由「固定可执行路径 + 固定子命令名」组成，
@@ -103,7 +103,7 @@ type ApplyResponse struct {
 }
 
 // AgentJudge 判定一个工作区里 agent 的状态（由 agentstate.JudgeDetail 实现）。
-// agentstate 包依赖本包，所以由调用方（xxyi-msg 子命令）注入，避免循环引用。nil 时一律报 unknown。
+// agentstate 包依赖本包，所以由调用方（peerctl 子命令）注入，避免循环引用。nil 时一律报 unknown。
 type AgentJudge func(ctx context.Context, worktree string) AgentVerdict
 
 func decodeStrict(in []byte, v any) error {
@@ -391,17 +391,17 @@ type RemoteRunner interface {
 	Run(ctx context.Context, cmd string, stdin []byte) (stdout, stderr []byte, exit int, err error)
 }
 
-var xxyiMsgPathRe = regexp.MustCompile(`^[A-Za-z0-9._/~-]+$`)
+var remoteCmdPathRe = regexp.MustCompile(`^[A-Za-z0-9._/~-]+$`)
 
-func remoteCommand(xxyiMsgPath, sub string) (string, error) {
-	if !xxyiMsgPathRe.MatchString(xxyiMsgPath) || strings.HasPrefix(xxyiMsgPath, "-") {
-		return "", fmt.Errorf("xxyi-msg 路径不合规（只允许 [A-Za-z0-9._/~-]）: %q", xxyiMsgPath)
+func remoteCommand(remoteCmdPath, sub string) (string, error) {
+	if !remoteCmdPathRe.MatchString(remoteCmdPath) || strings.HasPrefix(remoteCmdPath, "-") {
+		return "", fmt.Errorf("peerctl 路径不合规（只允许 [A-Za-z0-9._/~-]）: %q", remoteCmdPath)
 	}
-	return xxyiMsgPath + " " + sub, nil
+	return remoteCmdPath + " " + sub, nil
 }
 
-func remoteCall(ctx context.Context, r RemoteRunner, xxyiMsgPath, sub string, req any, resp any) error {
-	cmd, err := remoteCommand(xxyiMsgPath, sub)
+func remoteCall(ctx context.Context, r RemoteRunner, remoteCmdPath, sub string, req any, resp any) error {
+	cmd, err := remoteCommand(remoteCmdPath, sub)
 	if err != nil {
 		return err
 	}
@@ -427,10 +427,10 @@ func remoteCall(ctx context.Context, r RemoteRunner, xxyiMsgPath, sub string, re
 }
 
 // RemoteFacts 经 r 在对方机器上采集事实。采集失败（resp.Error 非空）返回 error；超出范围不是错误（看 Scope*）。
-func RemoteFacts(ctx context.Context, r RemoteRunner, xxyiMsgPath string, req FactsRequest) (FactsResponse, error) {
+func RemoteFacts(ctx context.Context, r RemoteRunner, remoteCmdPath string, req FactsRequest) (FactsResponse, error) {
 	req.Version = RemoteVersion
 	var resp FactsResponse
-	if err := remoteCall(ctx, r, xxyiMsgPath, SubcmdFacts, req, &resp); err != nil {
+	if err := remoteCall(ctx, r, remoteCmdPath, SubcmdFacts, req, &resp); err != nil {
 		return FactsResponse{}, err
 	}
 	if resp.Version != RemoteVersion {
@@ -451,10 +451,10 @@ func RemoteFacts(ctx context.Context, r RemoteRunner, xxyiMsgPath string, req Fa
 // RemoteApply 经 r 在对方机器上执行一步更新。业务失败（OK=false）不是 error，看 ErrKind/Error。
 // 返回 error（通信失败、退出码非 0、响应不合法）时远端可能已经写入，结果不确定：
 // 调用方必须停下并重新确认现场（重新采集），不得假定未写入，更不得盲目重试。
-func RemoteApply(ctx context.Context, r RemoteRunner, xxyiMsgPath string, req ApplyRequest) (ApplyResponse, error) {
+func RemoteApply(ctx context.Context, r RemoteRunner, remoteCmdPath string, req ApplyRequest) (ApplyResponse, error) {
 	req.Version = RemoteVersion
 	var resp ApplyResponse
-	if err := remoteCall(ctx, r, xxyiMsgPath, SubcmdApply, req, &resp); err != nil {
+	if err := remoteCall(ctx, r, remoteCmdPath, SubcmdApply, req, &resp); err != nil {
 		return ApplyResponse{}, err
 	}
 	if resp.Version != RemoteVersion {

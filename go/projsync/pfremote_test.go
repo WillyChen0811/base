@@ -24,7 +24,7 @@ import (
 const (
 	pfrtCode = "260403J1001"
 	pfrtRel  = "2026/260403J1001-测试项目"
-	pfrtBin  = "/usr/local/bin/xxyi-msg"
+	pfrtBin  = "/usr/local/bin/peerctl"
 )
 
 var pfrtOld = time.Date(2026, 10, 20, 9, 0, 0, 0, time.Local)
@@ -97,7 +97,7 @@ func newPFRTFix(t *testing.T) *pfrtFix {
 	}
 	f.srv = &PFRemoteServer{Now: func() time.Time { return f.now }}
 	f.run = &pfrtRunner{srv: f.srv}
-	f.cl = &PFRemoteClient{Runner: f.run, XxyiMsg: pfrtBin, Meta: f.meta, Root: f.root, CoordID: "mac-A", CoordHost: "测试Mac"}
+	f.cl = &PFRemoteClient{Runner: f.run, RemoteCmd: pfrtBin, Meta: f.meta, Root: f.root, CoordID: "mac-A", CoordHost: "测试Mac"}
 	return f
 }
 

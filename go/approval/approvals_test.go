@@ -14,7 +14,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/WillyChen0811/base/go/xxyica"
+	"github.com/WillyChen0811/base/go/permca"
 )
 
 // httpClient 给测试里的后台请求用，不复用 http.DefaultClient 的连接池。
@@ -531,12 +531,12 @@ func TestApprovalDecideCancelRace(t *testing.T) {
 type certFix struct {
 	*approvalsFix
 	ubiP ed25519.PrivateKey
-	ubiC xxyica.Cert
+	ubiC permca.Cert
 }
 
 func newCertFix(t *testing.T) *certFix {
 	t.Helper()
-	ca, err := xxyica.NewCA()
+	ca, err := permca.NewCA()
 	if err != nil {
 		t.Fatalf("NewCA: %v", err)
 	}
@@ -544,18 +544,18 @@ func newCertFix(t *testing.T) *certFix {
 	if err != nil {
 		t.Fatalf("ubuntu 客户端密钥: %v", err)
 	}
-	cert, err := ca.Issue("ubuntu", pub, xxyica.DefaultPerm("ubuntu"), time.Hour, time.Now())
+	cert, err := ca.Issue("ubuntu", pub, permca.DefaultPerm("ubuntu"), time.Hour, time.Now())
 	if err != nil {
 		t.Fatalf("签发 ubuntu 证书: %v", err)
 	}
-	v := xxyica.NewVerifier(ca.Public(), func(string) bool { return false })
+	v := permca.NewVerifier(ca.Public(), func(string) bool { return false })
 	return &certFix{approvalsFix: newApprovalsFix(t, Config{Verifier: v}), ubiP: priv, ubiC: cert}
 }
 
 // sign 对一次请求签名（pathWithQuery 必须与服务端看到的 RequestURI 一致）。
 func (f *certFix) sign(t *testing.T, method, pathWithQuery string, body []byte) string {
 	t.Helper()
-	hdr, err := xxyica.SignRequest(f.ubiP, f.ubiC, method, pathWithQuery, body, time.Now())
+	hdr, err := permca.SignRequest(f.ubiP, f.ubiC, method, pathWithQuery, body, time.Now())
 	if err != nil {
 		t.Fatalf("签名请求 %s %s: %v", method, pathWithQuery, err)
 	}

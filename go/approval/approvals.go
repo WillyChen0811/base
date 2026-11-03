@@ -17,7 +17,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/WillyChen0811/base/go/xxyica"
+	"github.com/WillyChen0811/base/go/permca"
 )
 
 const (
@@ -154,7 +154,7 @@ type Config struct {
 	// Verifier 校验客户端接口（POST /approval/ask）的请求证书：对 method+RequestURI+body 验签，
 	// 时间戳/nonce/吊销由 Verifier 管，并要求 addr 落在证书 Perm.AddrPrefix 内。
 	// nil = 不要证书，也不查证书前缀（只查侧别）。
-	Verifier *xxyica.Verifier
+	Verifier *permca.Verifier
 	// Wait 是 ask 等用户决定的最长时间；0 用 DefaultWait。
 	Wait time.Duration
 	// MaxPending 是待批上限，满了新的 ask 直接 503；0 用 DefaultMaxPending。

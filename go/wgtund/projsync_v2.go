@@ -32,7 +32,7 @@ import (
 const projsyncV2MinMinutes = 5
 
 const (
-	defaultProjsyncV2Msg = "~/.local/bin/xxyi-msg" // 对方 xxyi-msg 的缺省路径
+	defaultProjsyncV2Msg = "~/.local/bin/peerctl" // 对方 peerctl 的缺省路径
 	projsyncV2StatusFile = "projsync-v2-status.json"
 	// 启动后第一轮自动同步的等待时间（不超过一个间隔），避免刚启动就抢网络。
 	projsyncV2InitialDelay = 30 * time.Second
@@ -49,18 +49,18 @@ var projsyncV2MsgRe = regexp.MustCompile(`^[A-Za-z0-9._/~-]+$`)
 type projsyncV2Conf struct {
 	Enabled         bool   `json:"enabled"`          // 缺省 false：不自动跑
 	IntervalMinutes int    `json:"interval_minutes"` // 小于 5 按 5
-	XxyiMsg         string `json:"xxyi_msg"`         // 对方 xxyi-msg 路径，只允许 [A-Za-z0-9._/~-]
+	RemoteCmd         string `json:"remote_cmd"`         // 对方 peerctl 路径，只允许 [A-Za-z0-9._/~-]
 }
 
 type projsyncV2Prep struct {
 	enabled  bool
 	interval time.Duration
-	xxyiMsg  string
+	remoteCmd  string
 }
 
 // prepareProjsyncV2 校验并补缺省；c 为 nil 返回关闭的缺省值。错误文本接在「的 v2 」之后。
 func prepareProjsyncV2(c *projsyncV2Conf) (projsyncV2Prep, error) {
-	p := projsyncV2Prep{interval: projsyncV2MinMinutes * time.Minute, xxyiMsg: defaultProjsyncV2Msg}
+	p := projsyncV2Prep{interval: projsyncV2MinMinutes * time.Minute, remoteCmd: defaultProjsyncV2Msg}
 	if c == nil {
 		return p, nil
 	}
@@ -68,11 +68,11 @@ func prepareProjsyncV2(c *projsyncV2Conf) (projsyncV2Prep, error) {
 	if c.IntervalMinutes > projsyncV2MinMinutes {
 		p.interval = time.Duration(c.IntervalMinutes) * time.Minute
 	}
-	if c.XxyiMsg != "" {
-		if !projsyncV2MsgRe.MatchString(c.XxyiMsg) || strings.HasPrefix(c.XxyiMsg, "-") {
-			return p, fmt.Errorf("的 xxyi_msg %q 不合规：只允许 [A-Za-z0-9._/~-]，且不能以 - 开头", c.XxyiMsg)
+	if c.RemoteCmd != "" {
+		if !projsyncV2MsgRe.MatchString(c.RemoteCmd) || strings.HasPrefix(c.RemoteCmd, "-") {
+			return p, fmt.Errorf("的 remote_cmd %q 不合规：只允许 [A-Za-z0-9._/~-]，且不能以 - 开头", c.RemoteCmd)
 		}
-		p.xxyiMsg = c.XxyiMsg
+		p.remoteCmd = c.RemoteCmd
 	}
 	return p, nil
 }
@@ -168,7 +168,7 @@ func (s *projsyncV2Svc) env(t projsyncTarget, force []projsync.ForceCommit) proj
 			_, err = projsync.SyncGit(ctx, t.local, url, env, prep.localName, prep.remoteName)
 			return err
 		},
-		Remote: s.runner, XxyiMsg: prep.v2.xxyiMsg, LocalJudge: s.localJudge, Now: s.now, Force: force,
+		Remote: s.runner, RemoteCmd: prep.v2.remoteCmd, LocalJudge: s.localJudge, Now: s.now, Force: force,
 	}
 }
 

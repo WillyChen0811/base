@@ -3,7 +3,7 @@ package projsync
 // 项目文件同步的「写原语」（技术设计 §0「写入」、§3.3、§3.4「执行」、§3.5、§4.2 第 7/9/14 条、§5.6）。
 // 这是同步里唯一真正改用户文件的地方：任何一步都不能覆盖或丢掉一份内容。
 //
-// 【都在本机执行】Mac 上 wgtund 直接调；Ubuntu 上以后由 xxyi-msg 调同一套函数。路径都是本机绝对路径，
+// 【都在本机执行】Mac 上 wgtund 直接调；Ubuntu 上以后由 peerctl 调同一套函数。路径都是本机绝对路径，
 // 文件名都是「单元目录下的相对路径（/ 分隔）」。同一个单元同一时间只能有一个调用者（单元锁在上层）。
 //
 // 【原语】
@@ -121,7 +121,7 @@ const (
 
 // PFApplyResult 是一步写原语的结果。
 //
-// 可以直接 JSON 编码（给 xxyi-msg 回给 Mac 用）：Status 编码成中文名字符串，Err 编码成 err 字段的文本，
+// 可以直接 JSON 编码（给 peerctl 回给 Mac 用）：Status 编码成中文名字符串，Err 编码成 err 字段的文本，
 // 解码后 Err 为 nil、文本在 ErrText。
 type PFApplyResult struct {
 	Status    PFApplyStatus `json:"status"`

@@ -22,12 +22,12 @@ import (
 // ── 配置 ─────────────────────────────────────────────
 
 func TestProjsyncV2Config(t *testing.T) {
-	// 没有 v2 段：关闭，间隔 5，缺省 xxyi-msg 路径
+	// 没有 v2 段：关闭，间隔 5，缺省 peerctl 路径
 	p, err := prepareProjsync(projConfT(t, nil))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if p.v2.enabled || p.v2.interval != 5*time.Minute || p.v2.xxyiMsg != "~/.local/bin/xxyi-msg" {
+	if p.v2.enabled || p.v2.interval != 5*time.Minute || p.v2.remoteCmd != "~/.local/bin/peerctl" {
 		t.Fatalf("缺省: %+v", p.v2)
 	}
 	// v2 段里没写 enabled：仍然关闭
@@ -44,17 +44,17 @@ func TestProjsyncV2Config(t *testing.T) {
 			t.Fatalf("interval_minutes=%d: %v %+v", c.in, err, p.v2)
 		}
 	}
-	// xxyi_msg 字符集
+	// remote_cmd 字符集
 	for _, bad := range []string{"a b", "x;rm -rf /", "$(id)", "-x", "a'b", "a\nb"} {
-		_, err := prepareProjsync(projConfT(t, func(pj, _ map[string]any, _ *hostConf) { pj["v2"] = map[string]any{"xxyi_msg": bad} }))
-		if err == nil || !strings.Contains(err.Error(), "hosts.json: projsync 的 v2") || !strings.Contains(err.Error(), "xxyi_msg") {
-			t.Errorf("xxyi_msg=%q 应被拒绝: %v", bad, err)
+		_, err := prepareProjsync(projConfT(t, func(pj, _ map[string]any, _ *hostConf) { pj["v2"] = map[string]any{"remote_cmd": bad} }))
+		if err == nil || !strings.Contains(err.Error(), "hosts.json: projsync 的 v2") || !strings.Contains(err.Error(), "remote_cmd") {
+			t.Errorf("remote_cmd=%q 应被拒绝: %v", bad, err)
 		}
 	}
 	p, err = prepareProjsync(projConfT(t, func(pj, _ map[string]any, _ *hostConf) {
-		pj["v2"] = map[string]any{"xxyi_msg": "/opt/bin/xxyi-msg_2.x~"}
+		pj["v2"] = map[string]any{"remote_cmd": "/opt/bin/peerctl_2.x~"}
 	}))
-	if err != nil || p.v2.xxyiMsg != "/opt/bin/xxyi-msg_2.x~" {
+	if err != nil || p.v2.remoteCmd != "/opt/bin/peerctl_2.x~" {
 		t.Fatalf("%v %+v", err, p.v2)
 	}
 }
@@ -373,7 +373,7 @@ func TestProjsyncV2LocalAPI(t *testing.T) {
 		t.Fatalf("run: %d %s", r.StatusCode, b)
 	}
 	env := <-entered
-	if len(env.Force) != 0 || env.Project != "alpha" || env.XxyiMsg != "~/.local/bin/xxyi-msg" || env.RemoteNS != "ubuntu" {
+	if len(env.Force) != 0 || env.Project != "alpha" || env.RemoteCmd != "~/.local/bin/peerctl" || env.RemoteNS != "ubuntu" {
 		t.Fatalf("env: %+v", env)
 	}
 	if r, _ := v2Do(t, srv, http.MethodPost, "/projsync/v2/run?name=alpha", testOrigin); r.StatusCode != 409 {

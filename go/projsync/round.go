@@ -74,7 +74,7 @@ type RoundEnv struct {
 	// Ubuntu refs/heads → Mac refs/remotes/<RemoteNS>/*。
 	Exchange   func(ctx context.Context) error
 	Remote     RemoteRunner
-	XxyiMsg    string     // 对方 xxyi-msg 路径
+	RemoteCmd    string     // 对方 peerctl 路径
 	LocalJudge AgentJudge // 本地 agent 状态判定；nil 一律按 unknown
 	Now        func() time.Time
 	// Force 是用户点「提交并同步」指定的工作区（可空）。
@@ -149,7 +149,7 @@ type RoundResult struct {
 
 // tmpMergePrefix 是 AutoMerge 传送合并提交用的临时分支前缀。它只是传送载体，不是用户分支：
 // 采集、判定、范围预检时一律忽略（Mac 与 Ubuntu 两侧都忽略），以免中断后的残留被当成新分支同步。
-const tmpMergePrefix = "xxyi-tmp-merge-"
+const tmpMergePrefix = "projsync-tmp-merge-"
 
 func isTmpMerge(name string) bool { return strings.HasPrefix(name, tmpMergePrefix) }
 
@@ -390,7 +390,7 @@ func (r *roundRun) collect(ctx context.Context) bool {
 		}
 		r.localAgent[w.Path] = av
 	}
-	rf, err := RemoteFacts(ctx, r.env.Remote, r.env.XxyiMsg, FactsRequest{Repo: r.env.RemoteRepo, Side: SideUbuntu})
+	rf, err := RemoteFacts(ctx, r.env.Remote, r.env.RemoteCmd, FactsRequest{Repo: r.env.RemoteRepo, Side: SideUbuntu})
 	if err != nil {
 		r.res.Error = "采集 Ubuntu 事实失败: " + err.Error()
 		r.stop("与 Ubuntu 通信失败（"+err.Error()+"）", true, SideUbuntu, "")
@@ -625,7 +625,7 @@ func (r *roundRun) doCommit(ctx context.Context, d dirtyWt, head string, force b
 	} else {
 		plan.RepoDir = r.env.RemoteRepo
 		var resp ApplyResponse
-		resp, err = RemoteApply(ctx, r.env.Remote, r.env.XxyiMsg, ApplyRequest{Repo: r.env.RemoteRepo, Kind: RequestAutoCommit, Commit: &plan})
+		resp, err = RemoteApply(ctx, r.env.Remote, r.env.RemoteCmd, ApplyRequest{Repo: r.env.RemoteRepo, Kind: RequestAutoCommit, Commit: &plan})
 		if err != nil {
 			// 通信失败/响应不合法：远端可能已提交，结果不确定
 			r.wtOutcome(d, force, WtCommitError, "提交结果不确定: "+err.Error(), "")
@@ -830,7 +830,7 @@ func (r *roundRun) applyOn(ctx context.Context, side Side, plan ApplyPlan) apply
 		return o
 	}
 	// Ubuntu
-	resp, err := RemoteApply(ctx, r.env.Remote, r.env.XxyiMsg, ApplyRequest{Repo: r.env.RemoteRepo, Plan: plan})
+	resp, err := RemoteApply(ctx, r.env.Remote, r.env.RemoteCmd, ApplyRequest{Repo: r.env.RemoteRepo, Plan: plan})
 	if err != nil {
 		return applyOutcome{state: applyUncertain, detail: "与 Ubuntu 通信失败，结果不确定: " + err.Error()}
 	}
@@ -846,7 +846,7 @@ func (r *roundRun) applyOn(ctx context.Context, side Side, plan ApplyPlan) apply
 		return applyOutcome{state: applyFailed, detail: resp.Error, refs: true}
 	}
 	// other：看实际效果
-	rf, ferr := RemoteFacts(ctx, r.env.Remote, r.env.XxyiMsg, FactsRequest{Repo: r.env.RemoteRepo, Side: SideUbuntu})
+	rf, ferr := RemoteFacts(ctx, r.env.Remote, r.env.RemoteCmd, FactsRequest{Repo: r.env.RemoteRepo, Side: SideUbuntu})
 	if ferr != nil {
 		return applyOutcome{state: applyUncertain, detail: "写入失败且无法复查 Ubuntu 现场: " + resp.Error}
 	}
@@ -930,10 +930,10 @@ func (r *roundRun) execMerge(ctx context.Context, act BranchAction, bf BranchFac
 		return
 	}
 	// 2) 把合并提交传到 Ubuntu（先传后快进）。v1 的交换只推 refs/heads，所以临时在 Mac 本地建一个专用分支
-	//    xxyi-tmp-merge-<合并提交>（指向合并提交，不碰用户分支），交换后合并对象随它落到 Ubuntu 的
+	//    projsync-tmp-merge-<合并提交>（指向合并提交，不碰用户分支），交换后合并对象随它落到 Ubuntu 的
 	//    refs/remotes/mac/ 下；传完（无论成败）立刻在 Mac 删掉。Ubuntu 上那个远程跟踪引用由下一次交换
 	//    （push --prune）自动清掉，不会出现在 Ubuntu 的 refs/heads。
-	tmp := "refs/heads/xxyi-tmp-merge-" + merged
+	tmp := "refs/heads/projsync-tmp-merge-" + merged
 	if _, err := runGit(ctx, r.env.Repo, nil, "update-ref", tmp, merged, strings.Repeat("0", len(merged))); err != nil {
 		r.addBranch(act, ResultFailed, "建立传送用的临时引用失败，两边分支都未更新: "+err.Error())
 		r.att(AttentionItem{Kind: AttApplyFailed, Side: SideMac, Branch: act.Name,

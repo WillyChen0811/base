@@ -16,7 +16,7 @@ func fakeJudge(ctx context.Context, wt string) AgentVerdict {
 	return AgentVerdict{Verdict: "no_agent", Notes: []string{"测试：" + wt}}
 }
 
-// localRunner 在进程内模拟对方的 xxyi-msg 子命令；记录收到的命令串和 stdin。
+// localRunner 在进程内模拟对方的 peerctl 子命令；记录收到的命令串和 stdin。
 type localRunner struct {
 	cmds   []string
 	stdins [][]byte
@@ -45,7 +45,7 @@ func (l *localRunner) Run(ctx context.Context, cmd string, stdin []byte) ([]byte
 	return out, nil, 0, nil
 }
 
-const testBin = "/usr/local/bin/xxyi-msg"
+const testBin = "/usr/local/bin/peerctl"
 
 func TestRemoteFactsRoundTrip(t *testing.T) {
 	ctx := context.Background()
@@ -254,7 +254,7 @@ func TestRemoteCommandStringNeverContainsRequest(t *testing.T) {
 	}
 }
 
-func TestRemoteXxyiMsgPathValidation(t *testing.T) {
+func TestRemoteRemoteCmdPathValidation(t *testing.T) {
 	ctx := context.Background()
 	r := &recRunner{}
 	for _, p := range []string{"", "x; id", "a b", "$(id)", "a`b`", "a'b", "-rf", "中文", "a|b", "a\nb", "a&b"} {
@@ -268,7 +268,7 @@ func TestRemoteXxyiMsgPathValidation(t *testing.T) {
 	if len(r.cmds) != 0 {
 		t.Fatal("非法路径不该执行任何命令")
 	}
-	for _, p := range []string{"xxyi-msg", "~/bin/xxyi-msg", "/usr/local/bin/xxyi-msg", "./a_b-1.2"} {
+	for _, p := range []string{"peerctl", "~/bin/peerctl", "/usr/local/bin/peerctl", "./a_b-1.2"} {
 		if _, err := RemoteApply(ctx, r, p, ApplyRequest{}); err != nil && strings.Contains(err.Error(), "路径不合规") {
 			t.Errorf("路径 %q 应通过", p)
 		}

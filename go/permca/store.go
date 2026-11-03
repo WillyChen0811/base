@@ -1,8 +1,8 @@
-package xxyica
+package permca
 
 // CA 的磁盘管理：加载或新建 CA 目录、给各侧客户端备好证书包、读吊销表。
 // 从 wgtund/ca.go 的 prepareMsgCA 里挪出来的通用部分（2026-10-26 拆协助/消息/审批时，
-// wgtund 的接线删了，这部分留在 xxyica）：目录路径、各侧的名字与权限都由调用方传，这里不写死任何路径。
+// wgtund 的接线删了，这部分留在 permca）：目录路径、各侧的名字与权限都由调用方传，这里不写死任何路径。
 //
 // 目录布局（dir 由调用方定）：
 //
@@ -28,7 +28,7 @@ import (
 // 自用场景，吊销靠删/换 revoked.json，不搞短期证书轮换。
 const DefaultClientValidFor = 3650 * 24 * time.Hour
 
-// LogFunc 接收告警和说明文字（format 不带换行）。传 nil 的地方一律写 stderr，前缀 "xxyica: "——
+// LogFunc 接收告警和说明文字（format 不带换行）。传 nil 的地方一律写 stderr，前缀 "permca: "——
 // 吊销表读不了这类事不能悄悄吞掉。
 type LogFunc func(format string, args ...any)
 
@@ -37,7 +37,7 @@ func (l LogFunc) printf(format string, args ...any) {
 		l(format, args...)
 		return
 	}
-	fmt.Fprintf(os.Stderr, "xxyica: "+format+"\n", args...)
+	fmt.Fprintf(os.Stderr, "permca: "+format+"\n", args...)
 }
 
 // ClientBundlePath 是 PrepareCA 给名字为 name 的客户端放包的位置：dir/clients/<name>.json。

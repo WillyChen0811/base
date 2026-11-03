@@ -2,7 +2,7 @@ package projsync
 
 // 项目文件同步 T8：Mac 与 Ubuntu 之间的远程协议（技术设计 §0、§1.4、§5.2、§5.6、§6.2、§8.3、§12.1、§12.2）。
 //
-// Mac 的 wgtund 经现有 SSH 连接（RemoteRunner）在 Ubuntu 上跑三个 xxyi-msg 子命令，每次一个 JSON 请求进 stdin、
+// Mac 的 wgtund 经现有 SSH 连接（RemoteRunner）在 Ubuntu 上跑三个 peerctl 子命令，每次一个 JSON 请求进 stdin、
 // 一个 JSON 响应出 stdout：
 //
 //	projfiles-poll   一轮开头：续租协调者租约；列出根下的单元和每个单元的指纹；请求清单；剩余空间；暂存区残留。

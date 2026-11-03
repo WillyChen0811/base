@@ -1,7 +1,7 @@
 package main
 
 // 忙闲灯：Claude/Codex 的钩子（UserPromptSubmit/Stop/SessionStart/SessionEnd）跑
-// `xxyi-msg state busy|idle|gone`，这里只把状态写进本机文件 ~/.xxyi-state/<tmux 会话名>.json，
+// `peerctl state busy|idle|gone`，这里只把状态写进本机文件 ~/.peerctl-state/<tmux 会话名>.json，
 // 永不联网——XXYI 不在线时钩子照样安静地跑完。Mac 一侧的 wgtund 列 tmux 会话时顺带经 SSH 读这些文件
 // （见 wgtund/busystate.go，目录名与文件格式两边要一致）。
 //
@@ -35,7 +35,7 @@ const (
 )
 
 // busyStateDirName 是状态目录名（放在家目录下）；wgtund 读状态时用同一个名字。
-const busyStateDirName = ".xxyi-state"
+const busyStateDirName = ".peerctl-state"
 
 // busyRecord 是状态文件的内容。
 type busyRecord struct {

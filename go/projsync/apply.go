@@ -638,7 +638,7 @@ func AutoMergeCommit(ctx context.Context, p ApplyPlan) (string, error) {
 	}
 	env := []string{"GIT_AUTHOR_NAME=XXYI", "GIT_AUTHOR_EMAIL=xxyi@localhost",
 		"GIT_COMMITTER_NAME=XXYI", "GIT_COMMITTER_EMAIL=xxyi@localhost"}
-	msg := fmt.Sprintf("XXYI 自动合并 %s：mac %s + ubuntu %s", p.Branch, p1, p2)
+	msg := fmt.Sprintf("projsync 自动合并 %s：mac %s + ubuntu %s", p.Branch, p1, p2)
 	co, err := p.writeGit(ctx, p.RepoDir, false, env, "commit-tree", tree, "-p", p1, "-p", p2, "-m", msg)
 	if err != nil {
 		return "", fmt.Errorf("%s：生成合并提交失败，停止: %w", p.tag(), err)

@@ -43,7 +43,7 @@ func TestPFExclude(t *testing.T) {
 		{".Trashes", true, "", true, "隐藏"},
 		{".fseventsd", true, "", true, "隐藏"},
 		{".TemporaryItems", true, "", true, "隐藏"},
-		{".xxyi-state", false, "", true, "隐藏"},
+		{".peerctl-state", false, "", true, "隐藏"},
 		{".projsync-tmp-abc123", false, "x", true, "隐藏"},
 		{".lock", false, "x", true, "隐藏"},   // 历史版本之外，.lock 也是 . 开头
 		{"..icloud", false, "", true, "隐藏"}, // X 为空，不是占位文件

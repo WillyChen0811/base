@@ -54,7 +54,7 @@ func TestRunUsageAndRemovedCommands(t *testing.T) {
 		if code := run(args, nil, &out, &errOut); code != exitErr {
 			t.Errorf("%v：退出码 %d，want %d", args, code, exitErr)
 		}
-		if out.Len() != 0 || !strings.Contains(errOut.String(), "用法：xxyi-msg state") {
+		if out.Len() != 0 || !strings.Contains(errOut.String(), "用法：peerctl state") {
 			t.Errorf("%v：stdout %q stderr %q", args, out.String(), errOut.String())
 		}
 	}

@@ -12,6 +12,8 @@ import subprocess
 import sys
 import textwrap
 import threading
+import time
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -19,6 +21,9 @@ import pytest
 import pybase.asr.apple as apple_module
 import pybase.asr.mlx as mlx_module
 from pybase.asr import AppleSpeech, AsrError, Hypothesis, MlxAudio, Word
+from pybase.asr import Cue, Transcript, TranscriptionCancelled, TranscriptionResult
+from pybase.media import MediaCancelled, ToolNotFoundError
+from pybase.subtitle.models import Cue as SubtitleCue
 from pybase.asr._text import clean, join, segment_cues
 
 
@@ -312,6 +317,180 @@ def test_build_helper_rejects_non_mac(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Apple：便捷入口 apple.transcribe（转 WAV、卡死看门狗、返回 TranscriptionResult）
+# ---------------------------------------------------------------------------
+
+
+def _on_mac(monkeypatch):
+    monkeypatch.setattr(apple_module.sys, "platform", "darwin")
+    monkeypatch.setattr(apple_module, "build_helper", lambda *a, **k: Path("/fake/helper"))
+
+
+def _fake_engine(monkeypatch, behave):
+    """把 AppleSpeech.transcribe 换成 behave(engine, path, kwargs)，记下每次调用。"""
+    calls = []
+
+    def fake(self, path, **kwargs):
+        calls.append({"locale": self.locale, "path": Path(path), **kwargs})
+        return behave(self, Path(path), kwargs)
+
+    monkeypatch.setattr(apple_module.AppleSpeech, "transcribe", fake)
+    return calls
+
+
+def _transcript(locale="zh-CN"):
+    cues = (SubtitleCue(0, 1_200, "第一句。"), SubtitleCue(1_500, 2_000, "第二句。"))
+    return Transcript(text="第一句。第二句。", cues=cues, engine=f"apple-speech:{locale}", language=locale)
+
+
+def _no_ffmpeg(monkeypatch):
+    def forbidden(*args, **kwargs):
+        raise AssertionError("这个格式不该转 WAV")
+
+    monkeypatch.setattr(apple_module, "extract_audio", forbidden)
+
+
+def _fake_convert(monkeypatch):
+    converted = []
+
+    def convert(src, out, **kwargs):
+        converted.append((Path(src), Path(out), kwargs["sample_rate"], kwargs["mono"]))
+        Path(out).write_bytes(b"RIFF fake wav")
+
+    monkeypatch.setattr(apple_module, "extract_audio", convert)
+    return converted
+
+
+def test_apple_convenience_rejects_non_mac(monkeypatch, tmp_path):
+    monkeypatch.setattr(apple_module.sys, "platform", "linux")
+    with pytest.raises(AsrError, match="Apple Speech 只能在 macOS 上用"):
+        apple_module.transcribe(tmp_path / "a.wav", language="zh-CN")
+
+
+def test_apple_convenience_returns_result(monkeypatch, tmp_path):
+    _on_mac(monkeypatch)
+    _no_ffmpeg(monkeypatch)
+    audio = tmp_path / "a.wav"
+    audio.write_bytes(b"x")
+    calls = _fake_engine(monkeypatch, lambda engine, path, kw: _transcript(engine.locale))
+    result = apple_module.transcribe(audio, language="zh_CN")
+    assert result == TranscriptionResult(
+        (Cue(0, 1_200, "第一句。"), Cue(1_500, 2_000, "第二句。")), "apple-speech:zh-CN")
+    (call,) = calls
+    assert call["locale"] == "zh-CN" and call["path"] == audio
+    assert call["max_cue_ms"] == 6000                      # 缺省单条 ≤6 秒
+    assert call["cancel_event"] is not None
+    with pytest.raises(ValueError, match="具体的 locale"):
+        apple_module.transcribe(audio, language="zh")
+
+
+def test_apple_convenience_converts_unreadable_formats_in_temp(monkeypatch, tmp_path):
+    _on_mac(monkeypatch)
+    converted = _fake_convert(monkeypatch)
+    src_dir = tmp_path / "src"
+    src_dir.mkdir()
+    audio = src_dir / "record-mic.webm"
+    audio.write_bytes(b"x")
+    seen = []
+
+    def behave(engine, path, kw):
+        seen.append((path, path.is_file()))
+        return _transcript()
+
+    _fake_engine(monkeypatch, behave)
+    progress = []
+    apple_module.transcribe(audio, language="zh-CN", on_progress=lambda s, f: progress.append((s, f)))
+    ((src, out, rate, mono),) = converted
+    assert (src, rate, mono) == (audio, 16_000, True)
+    assert seen == [(out, True)] and out.parent != src_dir and out.suffix == ".wav"
+    assert not out.parent.exists()                          # 临时目录用完删
+    assert sorted(p.name for p in src_dir.iterdir()) == ["record-mic.webm"]
+    assert progress[0] == ("converting", None)
+
+
+def test_apple_convenience_retries_nil_error_via_wav(monkeypatch, tmp_path):
+    _on_mac(monkeypatch)
+    converted = _fake_convert(monkeypatch)
+    audio = tmp_path / "a.m4a"
+    audio.write_bytes(b"x")
+
+    def behave(engine, path, kw):
+        if path == audio:
+            raise AsrError("识别失败：nilError")
+        return _transcript()
+
+    calls = _fake_engine(monkeypatch, behave)
+    assert len(apple_module.transcribe(audio, language="zh-CN").cues) == 2
+    assert [c["path"] for c in calls] == [audio, converted[0][1]]
+
+    def other_error(engine, path, kw):
+        raise AsrError("别的错")
+
+    _fake_engine(monkeypatch, other_error)
+    with pytest.raises(AsrError, match="别的错"):
+        apple_module.transcribe(audio, language="zh-CN")
+    assert len(converted) == 1                              # 别的错不转 WAV 重试
+
+
+def _wait_for_stop(engine, path, kw):
+    """假识别：一直不报进度，等到内部停止开关被置位，照 run_streaming 的样子抛 MediaCancelled。"""
+    assert kw["cancel_event"].wait(10), "没被停下"
+    raise MediaCancelled("任务已取消")
+
+
+def test_apple_convenience_cancel(monkeypatch, tmp_path):
+    _on_mac(monkeypatch)
+    audio = tmp_path / "a.wav"
+    audio.write_bytes(b"x")
+    calls = _fake_engine(monkeypatch, _wait_for_stop)
+    cancel = threading.Event()
+    threading.Timer(0.3, cancel.set).start()
+    with pytest.raises(TranscriptionCancelled):
+        apple_module.transcribe(audio, language="zh-CN", cancel_event=cancel)
+    assert calls[0]["cancel_event"] is not cancel           # 内部开关，不直接用调用方的
+    already = threading.Event()
+    already.set()
+    with pytest.raises(TranscriptionCancelled):
+        apple_module.transcribe(audio, language="zh-CN", cancel_event=already)
+    assert len(calls) == 1                                   # 已取消就不开跑
+
+
+def test_apple_convenience_stall_watchdog(monkeypatch, tmp_path):
+    _on_mac(monkeypatch)
+    audio = tmp_path / "a.wav"
+    audio.write_bytes(b"x")
+    _fake_engine(monkeypatch, _wait_for_stop)
+    cancel = threading.Event()
+    with pytest.raises(AsrError, match="长时间没有进展") as excinfo:
+        apple_module.transcribe(audio, language="zh-CN", cancel_event=cancel, stall_timeout=0.3)
+    assert not isinstance(excinfo.value, TranscriptionCancelled)
+    assert not cancel.is_set()                               # 卡死不去动调用方的取消开关
+
+    def steady(engine, path, kw):
+        for _ in range(8):                                   # 0.8 秒，每 0.1 秒一次进度
+            time.sleep(0.1)
+            kw["on_progress"]("transcribing", None)
+        return _transcript()
+
+    _fake_engine(monkeypatch, steady)
+    assert len(apple_module.transcribe(audio, language="zh-CN", stall_timeout=0.3).cues) == 2
+
+
+def test_apple_convenience_reports_missing_ffmpeg(monkeypatch, tmp_path):
+    _on_mac(monkeypatch)
+    audio = tmp_path / "a.ogg"
+    audio.write_bytes(b"x")
+
+    def missing(*args, **kwargs):
+        raise ToolNotFoundError("找不到可执行文件 'ffmpeg'")
+
+    monkeypatch.setattr(apple_module, "extract_audio", missing)
+    _fake_engine(monkeypatch, lambda engine, path, kw: _transcript())
+    with pytest.raises(AsrError, match="ffmpeg"):
+        apple_module.transcribe(audio, language="zh-CN")
+
+
+# ---------------------------------------------------------------------------
 # mlx-audio：假模型
 # ---------------------------------------------------------------------------
 
@@ -459,3 +638,37 @@ def test_apple_real_transcribe(tmp_path):
     assert "speech recognition" in result.text.lower()
     assert len(result.cues) == 2
     assert result.cues[0].end <= result.cues[1].start
+
+
+def _assert_monotonic(cues) -> None:
+    assert cues, "没出 cue"
+    for cue in cues:
+        assert 0 <= cue.start_ms <= cue.end_ms
+    for prev, cur in zip(cues, cues[1:]):
+        assert prev.end_ms <= cur.start_ms, (prev, cur)
+
+
+@pytest.mark.skipif(
+    sys.platform != "darwin" or _macos_major() < 26 or not shutil.which("swiftc") or not shutil.which("say"),
+    reason="需要 macOS 26+、swiftc 和 say",
+)
+def test_apple_convenience_real_say(tmp_path):
+    """Studio 上真识别一段 say 合成的短音频（不用真实录音）：能出 cue、时间单调。"""
+    audio = tmp_path / "en.aiff"
+    subprocess.run(
+        ["say", "-o", str(audio), "Speech recognition works. [[slnc 800]] This is the second sentence."],
+        check=True,
+    )
+    result = apple_module.transcribe(audio, language="en-US")
+    assert result.engine == "apple-speech:en-US"
+    assert "speech recognition" in " ".join(c.text for c in result.cues).lower()
+    _assert_monotonic(result.cues)
+
+    if shutil.which("ffmpeg"):                              # AVAudioFile 读不了 Matroska：走转 WAV
+        mka = tmp_path / "en.mka"
+        subprocess.run([shutil.which("ffmpeg"), "-v", "error", "-y", "-i", str(audio), "-c:a", "flac", str(mka)],
+                       check=True)
+        converted = apple_module.transcribe(mka, language="en-US")
+        assert "speech recognition" in " ".join(c.text for c in converted.cues).lower()
+        _assert_monotonic(converted.cues)
+        assert sorted(p.name for p in tmp_path.iterdir()) == ["en.aiff", "en.mka"]

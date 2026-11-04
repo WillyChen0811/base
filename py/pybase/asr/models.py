@@ -10,6 +10,12 @@ class AsrError(RuntimeError):
     """识别失败：引擎不可用、模型不支持、辅助程序报错等。"""
 
 
+class TranscriptionCancelled(AsrError):
+    """调用方置位了 `cancel_event`（`remote` 与 `apple.transcribe` 用；
+    `AppleSpeech.transcribe` 自己仍沿用 `pybase.media.MediaCancelled`）。
+    同 `MediaCancelled` 之于 `MediaError`：要和失败分开处理就先 except 它。"""
+
+
 @dataclass(frozen=True)
 class Word:
     """一个词（中文一般是一个字）。`text` 保留引擎原样的前导空格，直接拼接即得原文。"""

@@ -464,3 +464,241 @@ def test_ancestor_commit_skips_bundle(toy, capsys, monkeypatch):
     assert not called and "Mac 上已有" in capsys.readouterr().out
     assert (th / "runs/a2/src/toy/tests/test_a.py").exists()
     assert not (th / "runs/a2/src/toy/tests/b.txt").exists()     # 检出的是祖先版本
+
+
+# ---------- media 动作（11/04）
+# 上传/去重/校验/清理/参数在任何机器上都跑（不解码媒体）；转音频、抽帧要真 ffmpeg，只在 macOS 且测试环境里有 ffmpeg 时跑
+# （Studio：client.py run --env-file testhost/testenv.json，该环境 conda 装了 ffmpeg）。Ubuntu 的 CPU 不做媒体处理，本机一律跳过。
+FF_BIN = Path(sys.prefix) / "bin"
+HAVE_FF = sys.platform == "darwin" and (FF_BIN / "ffmpeg").exists() and (FF_BIN / "ffprobe").exists()
+need_ff = pytest.mark.skipif(not HAVE_FF, reason="要真 ffmpeg：只在 Studio（macOS + 测试环境里的 conda ffmpeg）跑")
+
+
+@pytest.fixture
+def mth(tmp_path, monkeypatch):
+    th = tmp_path / "th"
+    monkeypatch.setenv("TESTHOST_LOCAL", str(th))
+    monkeypatch.setenv("TESTHOST_ENV_STUB", sys.prefix)      # media 环境软链到当前环境（Studio 上它有 ffmpeg）
+    return th, client.Transport("x", "x")
+
+
+def _sha(b):
+    import hashlib
+    return hashlib.sha256(b).hexdigest()
+
+
+def _code(tr, cmd, stdin=None):
+    with pytest.raises(client.THError) as e:
+        tr.call(cmd, stdin=stdin)
+    return e.value.code
+
+
+def test_media_put_dedupe_and_verify(mth, tmp_path, capsys):
+    th, tr = mth
+    f = tmp_path / "会议 录像.bin"
+    data = os.urandom(3 << 20) + b"tail"
+    f.write_bytes(data)
+    h = _sha(data)
+    res = client.media_put(tr, f)
+    assert res["hash"] == h and res["existed"] is False and res["size"] == len(data)
+    stored = th / "media" / h / "会议 录像.bin"
+    assert stored.read_bytes() == data
+    assert (th / "media" / h / ".last_used").read_text().strip().isdigit()
+    capsys.readouterr()
+    assert client.main(["media", "put", str(f)]) == 0                      # 第二次：已有，不重传
+    assert json.loads(capsys.readouterr().out.strip().splitlines()[-1])["existed"] is True
+    # 已有时不读 stdin：给个不对的内容也直接回已有
+    assert tr.call(f"media-put {h} other.bin --size 1", stdin=b"x")["existed"] is True
+    # 哈希对不上、大小对不上：拒，且不留半成品
+    assert _code(tr, f"media-put {'0' * 64} x.bin --size 4", stdin=b"abcd") == "hash_mismatch"
+    assert _code(tr, f"media-put {_sha(b'abcd')} x.bin --size 5", stdin=b"abcd") == "size_mismatch"
+    left = sorted(p.name for p in (th / "media").iterdir())
+    assert left == [h]
+    # 不给 --size 也行
+    assert tr.call(f"media-put {_sha(b'abcd')} x.bin", stdin=b"abcd")["existed"] is False
+
+
+@pytest.mark.parametrize("cmd", [
+    "media-put abc x.bin", f"media-put {'a' * 64} ../x", f"media-put {'a' * 64} .hidden", f"media-put {'a' * 64} -x",
+    f"media-put {'a' * 64} x.bin --size -1", f"media-put {'A' * 64} x.bin", f"media-put {'a' * 64}",
+    "media-audio zz", f"media-audio {'a' * 64} --segment-min 0", f"media-audio {'a' * 64} --segment-min x",
+    f"media-frames {'a' * 64}", f"media-frames {'a' * 64} --at a,b", f"media-frames {'a' * 64} --at 1 --width 5",
+    f"media-frames {'a' * 64} --at -1", "media-clean", "media-clean --older-than x", "media-clean abc"])
+def test_media_rejects(mth, cmd):
+    _, tr = mth
+    h = _sha(b"abcd")
+    tr.call(f"media-put {h} x.bin", stdin=b"abcd")
+    cmd = cmd.replace("a" * 64, h)        # 参数错要在哈希存在时也报 bad_args
+    assert _code(tr, cmd) == "bad_args"
+
+
+def test_media_not_found_exit_4(mth, tmp_path, capsys):
+    _, tr = mth
+    h = "f" * 64
+    assert _code(tr, f"media-audio {h}") == "not_found"
+    assert _code(tr, f"media-frames {h} --at 1") == "not_found"
+    assert client.main(["media", "audio", h, "--out", str(tmp_path / "o")]) == 4
+    assert client.main(["media", "frames", h, "--at", "1,2", "--out", str(tmp_path / "o")]) == 4
+    assert "先 media put" in capsys.readouterr().err
+
+
+@pytest.mark.skipif(HAVE_FF, reason="测试环境里有 ffmpeg 时由真跑覆盖")
+def test_media_without_ffmpeg_reports(mth):
+    th, tr = mth
+    h = _sha(b"abcd")
+    tr.call(f"media-put {h} x.bin", stdin=b"abcd")
+    with pytest.raises(client.THError) as e:
+        tr.call(f"media-audio {h}")
+    assert "ffmpeg" in str(e.value)
+
+
+def test_media_clean(mth, tmp_path):
+    th, tr = mth
+    hs = []
+    for i in range(3):
+        b = b"file%d" % i
+        hs.append(_sha(b))
+        tr.call(f"media-put {hs[-1]} f{i}.bin", stdin=b)
+    old = int(time.time()) - 10 * 86400
+    (th / "media" / hs[0] / ".last_used").write_text(str(old))
+    (th / "media" / hs[1] / f".busy-{os.getpid()}").write_text("")      # 本进程活着 = 在用
+    (th / "media" / hs[1] / ".last_used").write_text(str(old))
+    (th / "media" / ".tmp-999999-abc").mkdir()                         # 中断上传留下的（进程已不在）
+    res = tr.call("media-clean --older-than 7")
+    assert res["deleted"] == [hs[0]] and res["busy"] == [hs[1]] and res["kept"] == 2 and res["freed_bytes"] > 0
+    assert not (th / "media" / ".tmp-999999-abc").exists()
+    assert _code(tr, f"media-clean {hs[1]}") == "busy"
+    (th / "media" / hs[1] / f".busy-{os.getpid()}").unlink()
+    (th / "media" / hs[1] / ".busy-999999").write_text("")             # 进程不在了：不算在用
+    assert tr.call(f"media-clean {hs[1]}")["deleted"] == [hs[1]]
+    assert tr.call(f"media-clean {hs[1]}")["deleted"] == []            # 再删：幂等
+    assert client.main(["media", "clean", "--older-than", "0"]) == 0
+    assert not [p for p in (th / "media").iterdir()]
+
+
+def test_media_spec_and_push_tool(mth, capsys):
+    th, tr = mth
+    assert _code(tr, "media-spec", stdin=b'{"python": "3.12", "conda": ["nodejs=20"]}') is None
+    assert not (th / "bin/media.json").exists()                        # 没有 ffmpeg 的描述不收
+    assert client.main(["push-tool"]) == 0
+    out = capsys.readouterr().out
+    assert "v5" in out and "media.json 已更新" in out
+    assert (th / "bin/media.json").read_bytes() == client.MEDIA_SPEC.read_bytes()
+    assert (th / "bin/testhost").read_bytes() == client.ENTRY.read_bytes()
+    with pytest.raises(client.THError):
+        tr.call("media-spec", stdin=b"not json")
+    assert (th / "bin/media.json").read_bytes() == client.MEDIA_SPEC.read_bytes()   # 坏的不覆盖
+
+
+def test_media_env_shares_testenv_hash():
+    """media.json 与 testenv.json 的 python/pip/conda 等价：Studio 上共用一个环境（只建一次）。"""
+    import hashlib
+
+    def key(d):
+        pipl = list(d.get("pip", []))
+        for x in ("pytest", "pytest-xdist"):
+            if not any(p.lower().startswith(x) for p in pipl):
+                pipl.append(x)
+        cl = d.get("conda", [])
+        return hashlib.sha256(json.dumps([str(d.get("python", "3.12")), sorted(pipl)] + ([sorted(cl)] if cl else []))
+                              .encode()).hexdigest()[:12]
+    here = Path(client.HERE)
+    assert key(json.loads((here / "media.json").read_text())) == key(json.loads((here / "testenv.json").read_text()))
+
+
+TAR_PY = r'''
+import io, json, sys, tarfile
+mode = sys.argv[1]
+t = tarfile.open(fileobj=sys.stdout.buffer, mode="w|")
+def add(n, b):
+    ti = tarfile.TarInfo(n); ti.size = len(b); t.addfile(ti, io.BytesIO(b))
+add("frames/1.jpg", b"\xff\xd8x")
+if mode == "evil":
+    add("../evil.txt", b"x")
+if mode == "midfail":
+    sys.stdout.buffer.flush()
+    sys.stderr.write(json.dumps({"success": False, "message": "ffmpeg 挂了", "code": "ffmpeg"}) + "\n")
+    sys.exit(1)
+add("index.json", json.dumps({"frames": [{"t_ms": 1, "file": "frames/1.jpg"}], "out_of_range": [], "failed": []}).encode())
+t.close()
+'''
+
+
+@pytest.mark.parametrize("mode", ["ok", "evil", "midfail"])
+def test_call_tar_stream(tmp_path, monkeypatch, mode):
+    tr = client.Transport("x", "x")
+    monkeypatch.setattr(tr, "_argv", lambda cmd: ([sys.executable, "-c", TAR_PY, mode], None))
+    out = tmp_path / "o" / "deep"
+    if mode == "ok":
+        idx = tr.call_tar("media-frames x", out, client.MEDIA_FRAMES_RE)
+        assert idx["_received"] == ["frames/1.jpg"] and (out / "frames/1.jpg").read_bytes() == b"\xff\xd8x"
+        assert json.loads((out / "index.json").read_text())["frames"][0]["t_ms"] == 1
+        assert not list(out.rglob("*.part"))
+        return
+    with pytest.raises(client.THError) as e:
+        tr.call_tar("media-frames x", out, client.MEDIA_FRAMES_RE)
+    if mode == "evil":
+        assert "不认的成员" in str(e.value) and not (tmp_path / "o" / "evil.txt").exists()
+    else:
+        assert e.value.code == "ffmpeg" and "ffmpeg 挂了" in str(e.value)
+        assert not (out / "index.json").exists()
+
+
+# ---- 以下要真 ffmpeg（Studio）
+
+def _ff(*args):
+    subprocess.run([str(FF_BIN / "ffmpeg"), "-nostdin", "-hide_banner", "-loglevel", "error", "-y", *args], check=True)
+
+
+def _jpeg_wh(b):
+    i = 2
+    while i + 9 < len(b) and b[i] == 0xFF:
+        m, ln = b[i + 1], int.from_bytes(b[i + 2:i + 4], "big")
+        if m in (0xC0, 0xC1, 0xC2):
+            return int.from_bytes(b[i + 7:i + 9], "big"), int.from_bytes(b[i + 5:i + 7], "big")
+        i += 2 + ln
+    return None
+
+
+@need_ff
+def test_media_audio_frames_real(mth, tmp_path):
+    import wave
+    th, tr = mth
+    v = tmp_path / "测试 录像.mp4"          # 带空格与中文的文件名
+    _ff("-f", "lavfi", "-i", "testsrc=size=320x240:rate=10", "-f", "lavfi", "-i", "sine=frequency=1000:sample_rate=48000",
+        "-t", "2", "-map", "0:v", "-map", "1:a", "-ac", "2", "-c:v", "mpeg4", "-c:a", "aac", str(v))
+    h = client.media_put(tr, v)["hash"]
+    idx = client.media_audio(tr, h, tmp_path / "a", segment_min=0.01)   # 0.6 秒一段
+    segs = idx["segments"]
+    assert [s["file"] for s in segs] == ["audio/0001.wav", "audio/0002.wav", "audio/0003.wav", "audio/0004.wav"]
+    assert [s["offset_ms"] for s in segs] == [0, 600, 1200, 1800]
+    assert [s["duration_ms"] for s in segs[:3]] == [600, 600, 600] and 100 <= segs[3]["duration_ms"] <= 300
+    assert 1900 <= idx["duration_ms"] <= 2100 and idx["sample_rate"] == 16000
+    for s in segs:
+        with wave.open(str(tmp_path / "a" / s["file"])) as w:
+            assert (w.getnchannels(), w.getframerate(), w.getsampwidth(), w.getnframes()) == (1, 16000, 2, s["samples"])
+    assert json.loads((tmp_path / "a/index.json").read_text())["segments"] == segs
+    fx = client.media_frames(tr, h, [500, 1500, 5000], tmp_path / "f", width=160)
+    assert [x["t_ms"] for x in fx["frames"]] == [500, 1500] and fx["out_of_range"] == [5000] and not fx["failed"]
+    for x in fx["frames"]:
+        b = (tmp_path / "f" / x["file"]).read_bytes()
+        assert b[:2] == b"\xff\xd8" and _jpeg_wh(b) == (160, 120) == (x["width"], x["height"])
+    fx = client.media_frames(tr, h, [0], tmp_path / "f2")                 # 比原片宽的上限不放大
+    assert (fx["frames"][0]["width"], fx["frames"][0]["height"]) == (320, 240)
+    # 用完不留中间产物、不留在用标记
+    assert sorted(p.name for p in (th / "media" / h).iterdir()) == [".last_used", "测试 录像.mp4"]
+    assert not [p for p in (th / "media").iterdir() if p.name.startswith(".")]
+    assert tr.call(f"media-clean {h}")["deleted"] == [h]
+
+
+@need_ff
+def test_media_no_audio_no_video(mth, tmp_path):
+    th, tr = mth
+    a, v = tmp_path / "a.wav", tmp_path / "v.mp4"
+    _ff("-f", "lavfi", "-i", "sine=frequency=500:sample_rate=22050", "-t", "1.5", str(a))
+    _ff("-f", "lavfi", "-i", "testsrc=size=160x120:rate=5", "-t", "1", "-c:v", "mpeg4", str(v))
+    ha, hv = client.media_put(tr, a)["hash"], client.media_put(tr, v)["hash"]
+    idx = client.media_audio(tr, ha, tmp_path / "o")                     # 缺省 10 分钟一段：一段
+    assert len(idx["segments"]) == 1 and 1450 <= idx["duration_ms"] <= 1550
+    assert _code(tr, f"media-frames {ha} --at 0") == "no_video"
+    assert _code(tr, f"media-audio {hv}") == "no_audio"

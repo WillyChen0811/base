@@ -205,7 +205,7 @@ def transcribe(
     helper: str | os.PathLike | None = None,
     on_progress: "Callable[[str, float | None], None] | None" = None,
     cancel_event: "threading.Event | None" = None,
-    max_cue_ms: int | None = 6000,
+    max_cue_ms: int | None = None,
     timeout: float = 6 * 3600,
     stall_timeout: float | None = 300,
     convert_timeout: float = 1800,
@@ -217,7 +217,8 @@ def transcribe(
     - 扩展名不在 AVAudioFile 能读的范围（webm/mkv/ogg 等）先用 ffmpeg 转一份 16k 单声道 WAV
       （放系统临时目录，用完删，不往源文件旁边写）；直接读时报 `nilError`（个别 AAC/m4a 数据块
       读不了）也转 WAV 重试一次。`ffmpeg`/`ffprobe` 只用于这一步，不给就在 PATH 里找。
-    - `max_cue_ms`：单条字幕最长多少毫秒（在词边界切），None 不限。
+    - `max_cue_ms`：单条字幕最长多少毫秒（在词边界切），缺省 None 不限——多长算太长是调用方的
+      产品规则（ai-browser 用 6000），本库不内置。
     - `stall_timeout`：识别连续这么多秒没有任何进度就当卡死中止（`AsrError`），None 不看；
       `timeout` 是识别的总时长上限，`convert_timeout` 是转 WAV 的上限。
     - `on_progress(stage, fraction)`：stage 是 `"converting"`（转 WAV）、`"installing"`

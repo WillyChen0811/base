@@ -127,8 +127,9 @@ result = transcribe_remote(
 )
 save_result(result, "<分析目录>/transcript.qwen.json")
 
-# Mac 本机 Apple Speech（只能 macOS 26+；webm/mkv/ogg 自动先转 WAV；单条缺省 ≤6 秒）
-apple = transcribe_apple("record-mic.webm", language="zh-CN")   # 要具体 locale，裸 zh 不认
+# Mac 本机 Apple Speech（只能 macOS 26+；webm/mkv/ogg 自动先转 WAV）
+apple = transcribe_apple("record-mic.webm", language="zh-CN",  # 要具体 locale，裸 zh 不认
+                         max_cue_ms=6000)  # 单条最长时长缺省不限，ai-browser 用 6000
 
 # 沿用 Apple 的时间轴和说话人，每句交 Qwen 重听换文字
 cues, stats = refine_cues(apple.cues, "record-mic.webm", base_url=..., api_key=...,
@@ -177,7 +178,7 @@ pip install -e "./py[all]"
 |---|---|---|
 | `docx` | python-docx | `pybase.docx.oxml` |
 | `sheets` | openpyxl, xlrd | `pybase.sheets` |
-| `smb` | cryptography, pyspnego, pyasn1, requests, urllib3（smbprotocol/pysmb 已拷进 `pybase/_vendor`） | `pybase.smb` |
+| `smb` | cryptography, pyspnego, pyasn1, requests, urllib3, tqdm（smbprotocol/pysmb 已拷进 `pybase/_vendor`） | `pybase.smb` |
 | `crypto` | cryptography | `pybase.crypto` |
 | `office` | requests | `pybase.office`（`WordPdfClient`，跨平台部分） |
 | `office-word` | pywin32（仅 Windows） | `pybase.office.word` 的 Word COM 驱动 |

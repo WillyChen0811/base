@@ -378,8 +378,10 @@ def test_apple_convenience_returns_result(monkeypatch, tmp_path):
         (Cue(0, 1_200, "第一句。"), Cue(1_500, 2_000, "第二句。")), "apple-speech:zh-CN")
     (call,) = calls
     assert call["locale"] == "zh-CN" and call["path"] == audio
-    assert call["max_cue_ms"] == 6000                      # 缺省单条 ≤6 秒
+    assert call["max_cue_ms"] is None                      # 缺省不限单条时长（产品规则归调用方）
     assert call["cancel_event"] is not None
+    apple_module.transcribe(audio, language="zh-CN", max_cue_ms=6000)
+    assert calls[-1]["max_cue_ms"] == 6000                 # 给了就原样传下去
     with pytest.raises(ValueError, match="具体的 locale"):
         apple_module.transcribe(audio, language="zh")
 

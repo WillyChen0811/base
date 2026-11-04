@@ -6,8 +6,12 @@ TH="${TESTHOST_HOME:-$HOME/xxyi-testhost}"
 export PATH="$TH/miniforge/bin:${PATH:-/usr/bin:/bin}:/usr/bin:/bin:/usr/sbin:/sbin"
 PY="$TH/miniforge/bin/python"; [ -x "$PY" ] || PY=python3
 CONDA="$TH/miniforge/bin/conda"; [ -x "$CONDA" ] || CONDA=conda
-VERSION=4
-mkdir -p "$TH"/{bin,repos,snapshots,envs,runs,dl} 2>/dev/null
+VERSION=5
+mkdir -p "$TH"/{bin,repos,snapshots,envs,runs,dl,media} 2>/dev/null
+# 退出时放掉还握着的环境锁（fail 在任何位置 exit 都会走到这里）
+LOCK_HELD=
+on_exit() { [ -n "$LOCK_HELD" ] && rmdir "$LOCK_HELD" 2>/dev/null; }
+trap on_exit EXIT
 
 jstr() { printf '%s' "$1" | tr '\n\t' '  ' | sed 's/\\/\\\\/g; s/"/\\"/g'; }
 fail() { printf '{"success":false,"message":"%s"}\n' "$(jstr "$*")"; exit 1; }
@@ -30,6 +34,7 @@ mem_gb() {
   local b; b=$(sysctl -n hw.memsize 2>/dev/null)
   if [ -n "$b" ]; then echo $((b / 1073741824)); else awk '/MemTotal/{print int($2/1048576)}' /proc/meminfo; fi
 }
+disk_free_gb() { df -Pk "$TH" 2>/dev/null | awk 'NR == 2 { print int($4 / 1048576) }'; }
 load_avg() {
   local l; l=$(sysctl -n vm.loadavg 2>/dev/null)
   if [ -n "$l" ]; then echo $l | tr -d '{}' | xargs; else cut -d' ' -f1-3 /proc/loadavg; fi
@@ -46,9 +51,10 @@ guard_th() { [ -n "$TH" ] && [ "$TH" != "/" ] && [ -d "$TH/runs" ] || fail "测�
 
 a_ping() {
   local r; r=$(count_running)
-  printf '{"success":true,"host":"%s","user":"%s","macos":"%s","arch":"%s","ncpu":%s,"mem_gb":%s,"load":"%s","python":"%s","node":"%s","running":%s,"idle":%s,"testhost":"v%s"}\n' \
+  printf '{"success":true,"host":"%s","user":"%s","macos":"%s","arch":"%s","ncpu":%s,"mem_gb":%s,"load":"%s","python":"%s","node":"%s","running":%s,"idle":%s,"disk_free_gb":%s,"testhost":"v%s"}\n' \
     "$(jstr "$(host_name)")" "$(id -un)" "$(jstr "$(os_ver)")" "$(uname -m)" "$(ncpu)" "$(mem_gb)" "$(load_avg)" \
-    "$("$PY" -V 2>&1 | awk '{print $2}')" "$(node -v 2>/dev/null)" "$r" "$([ "$r" -eq 0 ] && echo true || echo false)" "$VERSION"
+    "$("$PY" -V 2>&1 | awk '{print $2}')" "$(node -v 2>/dev/null)" "$r" "$([ "$r" -eq 0 ] && echo true || echo false)" \
+    "$(disk_free_gb || echo null)" "$VERSION"
 }
 
 a_update() {
@@ -128,6 +134,26 @@ for k, v in d.get("env", {}).items():
     print("env", k + "=" + v)
 '
 
+# 按描述 hash 建/复用 envs/<hash>。读调用方的 hash、pyv、cpk[]、reqs[]，设调用方的 E、reused（bash 动态作用域）。
+# 同 hash 并发靠 envs/.lock-<hash> 目录锁串行；锁建完就放（不等动作结束），fail 时由 EXIT 陷阱放
+ensure_env() {
+  E="$TH/envs/$hash"; reused=true
+  local lock="$TH/envs/.lock-$hash" i=0
+  [ -e "$E.ok" ] && [ -x "$E/bin/python" ] && return 0
+  reused=false
+  if [ -n "${TESTHOST_ENV_STUB:-}" ]; then ln -sfn "$TESTHOST_ENV_STUB" "$E"; touch "$E.ok"; return 0; fi
+  until mkdir "$lock" 2>/dev/null; do i=$((i + 1)); [ $i -gt 900 ] && fail "等环境锁超时"; sleep 2; done
+  LOCK_HELD="$lock"
+  if [ -e "$E.ok" ] && [ -x "$E/bin/python" ]; then reused=true; else
+    rm -rf "$E" "$E.ok"; local lg="$TH/dl/env-$hash.log"
+    { "$CONDA" create -y -q -p "$E" "python=$pyv" pip ${cpk[@]+"${cpk[@]}"} \
+      && "$E/bin/python" -m pip install -q --disable-pip-version-check ${reqs[@]+"${reqs[@]}"}; } >"$lg" 2>&1 \
+      || { rm -rf "$E"; fail "建环境失败（日志 ${lg}）：$(tail -3 "$lg")"; }
+    touch "$E.ok"
+  fi
+  rmdir "$lock" 2>/dev/null; LOCK_HELD=
+}
+
 # prepare <run_id> <repo>=<commit>... [--env 相对路径] [--snap 键=快照名]
 a_prepare() {
   local rid="${1:-}"; safe "$rid" || fail "run_id 不合法"; shift
@@ -173,23 +199,8 @@ a_prepare() {
   { printf '%s\n' ${envs[@]+"${envs[@]}"}; } >"$R/envvars"
   echo "$hash" >"$R/envhash"; echo "src/$first/$envrel" >"$R/envfile"
 
-  local E="$TH/envs/$hash" reused=true lock="$TH/envs/.lock-$hash" i=0
-  if ! { [ -e "$E.ok" ] && [ -x "$E/bin/python" ]; }; then
-    reused=false
-    if [ -n "${TESTHOST_ENV_STUB:-}" ]; then
-      ln -sfn "$TESTHOST_ENV_STUB" "$E"; touch "$E.ok"
-    else
-      until mkdir "$lock" 2>/dev/null; do i=$((i + 1)); [ $i -gt 900 ] && fail "等环境锁超时"; sleep 2; done
-      trap 'rmdir "$lock" 2>/dev/null' EXIT
-      if [ -e "$E.ok" ] && [ -x "$E/bin/python" ]; then reused=true; else
-        rm -rf "$E" "$E.ok"; local lg="$TH/dl/env-$hash.log"
-        { "$CONDA" create -y -q -p "$E" "python=$pyv" pip ${cpk[@]+"${cpk[@]}"} \
-          && "$E/bin/python" -m pip install -q --disable-pip-version-check ${reqs[@]+"${reqs[@]}"}; } >"$lg" 2>&1 \
-          || { rm -rf "$E"; fail "建环境失败（日志 ${lg}）：$(tail -3 "$lg")"; }
-        touch "$E.ok"
-      fi
-    fi
-  fi
+  local E reused
+  ensure_env
   # 子进程会清掉 PYTHONPATH（如基准子进程）；pythonpath 另走环境变量，由 .pth 并进 sys.path
   local sp; sp=$("$E/bin/python" -c 'import site;print(site.getsitepackages()[0])' 2>/dev/null) \
     && [ -d "$sp" ] && printf '%s\n' 'import os,sys; sys.path.extend(p for p in os.environ.get("TESTHOST_PYPATH","").split(":") if p)' >"$sp/testhost_extra.pth"
@@ -490,6 +501,484 @@ a_clean() {
   esac
 }
 
+# ---------- media：上传的媒体文件按内容 sha256 存 media/<哈希>/<原文件名>，同步动作（不走 prepare/run）
+# ffmpeg/ffprobe 用 media.json 描述的 conda 环境（envs/<hash>/bin 下的绝对路径；没建就当场建一次）。
+# 重活都在下面这段 Python 里（只用标准库，跑在 miniforge 的 python 上）；输出 tar 的动作出错时：
+# 还没开始写 tar 就在 stdout 回 JSON（以 { 开头），已经开始写了就把 JSON 写 stderr、退出码 1、不写 index.json。
+MEDIA_PY='
+import hashlib, io, json, os, re, shutil, signal, struct, subprocess, sys, tarfile, tempfile, time
+from concurrent.futures import ThreadPoolExecutor
+
+MAX_PUT = 20 << 30      # 单文件上限
+RESERVE = 10 << 30      # 写完后磁盘至少还留这么多
+SR = 16000
+HEX = re.compile(r"[0-9a-f]{64}")
+STREAMING = []          # 非空 = stdout 已开始写 tar
+BUSY, PROCS = [], []
+
+def _term(*_):
+    raise SystemExit(1)     # 断连/被杀：走 finally 清临时文件
+for _s in (signal.SIGTERM, signal.SIGHUP):
+    signal.signal(_s, _term)
+
+def say(**kw):
+    sys.stdout.write(json.dumps(dict(success=True, **kw), ensure_ascii=False) + "\n")
+    sys.stdout.flush()
+
+def die(msg, code="error"):
+    out = sys.stderr if STREAMING else sys.stdout
+    out.write(json.dumps({"success": False, "message": msg, "code": code}, ensure_ascii=False) + "\n")
+    out.flush()
+    sys.exit(1)
+
+def tail(b):
+    if hasattr(b, "seek"):
+        b.seek(0); b = b.read()
+    return b.decode("utf-8", "replace").strip()[-300:]
+
+def free_gb():
+    return round(shutil.disk_usage(ROOT).free / 2 ** 30, 1)
+
+def alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True
+    return True
+
+def pid_of(name):     # .tmp-<pid>-xxx / .work-<pid>-xxx / .busy-<pid>
+    try:
+        return int(name.split("-")[1])
+    except (IndexError, ValueError):
+        return None
+
+def media_file(d):
+    try:
+        ns = [n for n in os.listdir(d) if not n.startswith(".")]
+    except OSError:
+        return None
+    ns = [n for n in ns if os.path.isfile(os.path.join(d, n)) and not os.path.islink(os.path.join(d, n))]
+    return os.path.join(d, ns[0]) if len(ns) == 1 else None
+
+def check_hash(h):
+    if not HEX.fullmatch(h or ""):
+        die("哈希要 64 位小写十六进制 sha256", "bad_args")
+    return os.path.join(ROOT, h)
+
+def need(h):
+    d = check_hash(h)
+    f = media_file(d)
+    if not f:
+        die("测试机上没有这个哈希的文件（先 media put）", "not_found")
+    return d, f
+
+def touch(d):
+    with open(os.path.join(d, ".last_used"), "w") as w:
+        w.write(str(int(time.time())))
+
+def last_used(d):
+    try:
+        with open(os.path.join(d, ".last_used")) as r:
+            return int(r.read().strip())
+    except (OSError, ValueError):
+        try:
+            return int(os.path.getmtime(d))
+        except OSError:
+            return 0
+
+def busy(d):
+    p = os.path.join(d, ".busy-%d" % os.getpid())
+    open(p, "w").close()
+    BUSY.append(p)
+
+def in_use(d):
+    try:
+        ns = os.listdir(d)
+    except OSError:
+        return False
+    for n in ns:
+        if n.startswith(".busy-") and pid_of(n) is not None:
+            if alive(pid_of(n)):
+                return True
+            try:
+                os.remove(os.path.join(d, n))
+            except OSError:
+                pass
+    return False
+
+def dir_bytes(d):
+    n = 0
+    for a, _, fs in os.walk(d):
+        for x in fs:
+            try:
+                n += os.lstat(os.path.join(a, x)).st_size
+            except OSError:
+                pass
+    return n
+
+def sweep():
+    """清掉中断留下的 .tmp-*（上传半截）/.work-*（转换中间产物）：进程已不在或超过 2 天。"""
+    now = time.time()
+    for n in os.listdir(ROOT):
+        if not n.startswith((".tmp-", ".work-")):
+            continue
+        p = os.path.join(ROOT, n)
+        pid = pid_of(n)
+        try:
+            old = now - os.path.getmtime(p) > 2 * 86400
+        except OSError:
+            continue
+        if old or pid is None or not alive(pid):
+            shutil.rmtree(p, ignore_errors=True)
+
+def good_name(n):
+    try:
+        b = n.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return (0 < len(b) <= 200 and not n.startswith((".", "-")) and "/" not in n and "\\" not in n
+            and not any(ord(c) < 32 or ord(c) == 127 for c in n))
+
+def cmd_put(a):
+    if len(a) not in (2, 4) or (len(a) == 4 and not (a[2] == "--size" and re.fullmatch(r"[0-9]{1,15}", a[3]))):
+        die("用法：media-put <sha256> <文件名> [--size 字节数]", "bad_args")
+    h, name = a[0], a[1]
+    size = int(a[3]) if len(a) == 4 else None
+    d = check_hash(h)
+    if not good_name(name):
+        die("文件名不合法（不能有 / \\ 和控制字符，不能以 . 或 - 开头，UTF-8 不超过 200 字节）", "bad_args")
+    sweep()
+    f = media_file(d)
+    if f:       # 已有：不读 stdin，客户端那边 ssh 随即收尾
+        touch(d)
+        say(hash=h, name=os.path.basename(f), size=os.path.getsize(f), existed=True, free_gb=free_gb())
+        return
+    if size is not None:
+        if size > MAX_PUT:
+            die("单文件超过上限 %d GiB" % (MAX_PUT >> 30), "too_big")
+        if shutil.disk_usage(ROOT).free - size < RESERVE:
+            die("磁盘不够：写完后要留 %d GiB（现在剩 %s GiB）" % (RESERVE >> 30, free_gb()), "no_space")
+    tmp = tempfile.mkdtemp(prefix=".tmp-%d-" % os.getpid(), dir=ROOT)
+    t0 = time.time()
+    try:
+        sha, n, chk = hashlib.sha256(), 0, 0
+        inp = sys.stdin.buffer
+        with open(os.path.join(tmp, name), "wb") as w:
+            while True:
+                b = inp.read(1 << 20)
+                if not b:
+                    break
+                n += len(b)
+                if n > MAX_PUT:
+                    die("单文件超过上限 %d GiB" % (MAX_PUT >> 30), "too_big")
+                if n - chk >= 256 << 20:
+                    chk = n
+                    if shutil.disk_usage(ROOT).free < RESERVE:
+                        die("磁盘不够：要留 %d GiB" % (RESERVE >> 30), "no_space")
+                sha.update(b)
+                w.write(b)
+        if size is not None and n != size:
+            die("收到 %d 字节，和 --size %d 不一致（传输中断？）" % (n, size), "size_mismatch")
+        got = sha.hexdigest()
+        if got != h:
+            die("哈希校验不一致：收到的内容是 %s" % got, "hash_mismatch")
+        touch(tmp)
+        existed = False
+        if os.path.isdir(d) and not media_file(d) and not in_use(d):
+            shutil.rmtree(d, ignore_errors=True)     # 残缺目录（没有成品文件）
+        try:
+            os.rename(tmp, d)
+        except OSError:
+            if not media_file(d):
+                raise
+            existed = True                          # 并发 put 了同一份，别人先落盘
+        say(hash=h, name=name, size=n, existed=existed, seconds=round(time.time() - t0, 2), free_gb=free_gb())
+    finally:
+        if os.path.isdir(tmp):
+            shutil.rmtree(tmp, ignore_errors=True)
+
+def probe(f):
+    p = subprocess.run([FP, "-v", "error", "-of", "json", "-show_entries",
+                        "format=duration,start_time:stream=index,codec_type,codec_name,duration,width,height"
+                        ":stream_disposition=attached_pic", "file:" + f], capture_output=True)
+    if p.returncode:
+        die("ffprobe 读不了这个文件：" + tail(p.stderr), "bad_media")
+    j = json.loads(p.stdout or b"{}")
+    try:
+        dur = float(j.get("format", {}).get("duration"))
+        dur = int(dur * 1000) if dur == dur and dur > 0 else None
+    except (TypeError, ValueError):
+        dur = None
+    return j.get("streams", []), dur
+
+class Tar:
+    """stdout 上的流式 tar，第一次写成员时才打开（之前出错还能回 JSON）。"""
+    def __init__(self):
+        self.t = None
+    def _open(self):
+        if self.t is None:
+            STREAMING.append(1)
+            self.t = tarfile.open(fileobj=sys.stdout.buffer, mode="w|", format=tarfile.GNU_FORMAT)
+    def add(self, path, arc):
+        self._open()
+        self.t.add(path, arcname=arc, recursive=False)
+    def add_bytes(self, arc, data):
+        self._open()
+        ti = tarfile.TarInfo(arc)
+        ti.size, ti.mtime, ti.mode = len(data), int(time.time()), 0o644
+        self.t.addfile(ti, io.BytesIO(data))
+    def close(self):
+        self._open()
+        self.t.close()
+        sys.stdout.buffer.flush()
+
+def wav_header(nbytes):
+    return (b"RIFF" + struct.pack("<I", 36 + nbytes) + b"WAVEfmt "
+            + struct.pack("<IHHIIHH", 16, 1, 1, SR, SR * 2, 2, 16) + b"data" + struct.pack("<I", nbytes))
+
+def cmd_audio(a):
+    if not a:
+        die("用法：media-audio <sha256> [--segment-min 分钟]", "bad_args")
+    h, rest, seg_min = a[0], a[1:], 10.0
+    if rest:
+        if len(rest) != 2 or rest[0] != "--segment-min" or not re.fullmatch(r"[0-9]{1,3}(\.[0-9]{1,3})?", rest[1]):
+            die("用法：media-audio <sha256> [--segment-min 分钟]", "bad_args")
+        seg_min = float(rest[1])
+    if not 0.01 <= seg_min <= 600:
+        die("--segment-min 要在 0.01..600", "bad_args")
+    d, f = need(h)
+    if FF == "-":
+        return
+    touch(d)
+    busy(d)
+    streams, _ = probe(f)
+    if not any(s.get("codec_type") == "audio" for s in streams):
+        die("这个文件没有音轨", "no_audio")
+    seg = int(round(seg_min * 60 * SR))      # 每段样本数（--segment-min 至多 3 位小数，必是 16 的倍数 = 整毫秒）
+    work = tempfile.mkdtemp(prefix=".work-%d-" % os.getpid(), dir=ROOT)
+    tar, segs, total = Tar(), [], [0]     # total：已切出的样本数
+    errf = open(os.path.join(work, "ffmpeg.err"), "w+b")
+    # 时间轴与 -ss 相同（文件起点 = 0）：first_pts=0 把音轨前面的空缺补静音，中间断档按时间戳补齐
+    p = subprocess.Popen([FF, "-nostdin", "-hide_banner", "-loglevel", "error", "-i", "file:" + f,
+                          "-map", "0:a:0", "-vn", "-sn", "-dn", "-af", "aresample=async=1:first_pts=0",
+                          "-ac", "1", "-ar", str(SR), "-c:a", "pcm_s16le", "-f", "s16le", "-"],
+                         stdout=subprocess.PIPE, stderr=errf)
+    PROCS.append(p)
+    cur = [None, 0]         # 当前段的文件对象、已写字节
+
+    def finish():
+        w, nb = cur
+        nb -= nb % 2
+        w.truncate(44 + nb)
+        w.seek(0)
+        w.write(wav_header(nb))
+        w.close()
+        cur[0], cur[1] = None, 0
+        if nb == 0:
+            return
+        i = len(segs) + 1
+        arc = "audio/%04d.wav" % i
+        path = os.path.join(work, "%04d.wav" % i)
+        tar.add(path, arc)
+        os.remove(path)
+        n = nb // 2
+        segs.append({"file": arc, "offset_ms": total[0] * 1000 // SR, "duration_ms": int(round(n * 1000.0 / SR)),
+                     "samples": n, "bytes": 44 + nb})
+        total[0] += n
+
+    try:
+        while True:
+            b = p.stdout.read(1 << 16)
+            if not b:
+                break
+            while b:
+                if cur[0] is None:
+                    cur[0] = open(os.path.join(work, "%04d.wav" % (len(segs) + 1)), "w+b")
+                    cur[0].write(wav_header(0))
+                take = min(len(b), seg * 2 - cur[1])
+                cur[0].write(b[:take])
+                cur[1] += take
+                b = b[take:]
+                if cur[1] == seg * 2:
+                    finish()
+        if p.wait():
+            die("ffmpeg 转音频失败：" + tail(errf), "ffmpeg")
+        if cur[0] is not None:
+            finish()        # 最后一段不足一段照切
+        idx = {"hash": h, "name": os.path.basename(f), "sample_rate": SR, "channels": 1, "bits": 16,
+               "segment_min": seg_min, "segment_ms": seg * 1000 // SR, "duration_ms": int(round(total[0] * 1000.0 / SR)),
+               "samples": total[0], "segments": segs}
+        tar.add_bytes("index.json", json.dumps(idx, ensure_ascii=False, indent=1).encode())
+        tar.close()
+    finally:
+        if p.poll() is None:
+            p.kill()
+        errf.close()
+        shutil.rmtree(work, ignore_errors=True)
+
+def jpeg_size(path):
+    """读 JPEG 的 SOF 段取宽高；读不出返回 (None, None)。"""
+    try:
+        with open(path, "rb") as r:
+            b = r.read(1 << 16)
+    except OSError:
+        return None, None
+    i = 2
+    while i + 9 < len(b) and b[i] == 0xFF:
+        m = b[i + 1]
+        ln = struct.unpack(">H", b[i + 2:i + 4])[0]
+        if m in (0xC0, 0xC1, 0xC2):
+            hh, ww = struct.unpack(">HH", b[i + 5:i + 9])
+            return ww, hh
+        i += 2 + ln
+    return None, None
+
+def cmd_frames(a):
+    usage = "用法：media-frames <sha256> --at 毫秒,毫秒,... [--width 像素]"
+    if not a:
+        die(usage, "bad_args")
+    h, rest, ats, width = a[0], a[1:], None, 960
+    while rest:
+        if len(rest) < 2:
+            die(usage, "bad_args")
+        k, v, rest = rest[0], rest[1], rest[2:]
+        if k == "--at" and re.fullmatch(r"[0-9]{1,9}(,[0-9]{1,9}){0,499}", v):
+            ats = []
+            for x in v.split(","):
+                if int(x) not in ats:
+                    ats.append(int(x))
+        elif k == "--width" and re.fullmatch(r"[0-9]{2,4}", v) and 16 <= int(v) <= 7680:
+            width = int(v)
+        else:
+            die(usage + "（--at 至多 500 个非负整数，--width 16..7680）", "bad_args")
+    if ats is None:
+        die(usage, "bad_args")
+    d, f = need(h)
+    if FF == "-":
+        return
+    touch(d)
+    busy(d)
+    streams, dur = probe(f)
+    vs = [s for s in streams if s.get("codec_type") == "video" and not (s.get("disposition") or {}).get("attached_pic")]
+    if not vs:
+        die("这个文件没有视频流", "no_video")
+    vi = vs[0].get("index", 0)
+    out_of_range = [t for t in ats if dur is not None and t >= dur]
+    todo = [t for t in ats if t not in out_of_range]
+    work = tempfile.mkdtemp(prefix=".work-%d-" % os.getpid(), dir=ROOT)
+
+    def grab(t):
+        o = os.path.join(work, "%d.jpg" % t)
+        r = subprocess.run([FF, "-nostdin", "-hide_banner", "-loglevel", "error", "-ss", "%.3f" % (t / 1000.0),
+                            "-i", "file:" + f, "-map", "0:%d" % vi, "-frames:v", "1",
+                            "-vf", "scale=w=\x27min(%d,iw)\x27:h=-2" % width, "-q:v", "3",
+                            "-f", "image2", "-update", "1", "-y", o], capture_output=True)
+        if os.path.isfile(o) and os.path.getsize(o) > 0:
+            return t, None
+        return t, (tail(r.stderr) or "没截到帧（时间点可能在最后一帧之后）")
+    try:
+        with ThreadPoolExecutor(max_workers=max(1, min(4, len(todo)))) as ex:
+            res = list(ex.map(grab, todo))
+        tar, frames, failed = Tar(), [], []
+        for t, err in res:
+            if err:
+                failed.append({"t_ms": t, "error": err})
+                continue
+            p = os.path.join(work, "%d.jpg" % t)
+            ww, hh = jpeg_size(p)
+            frames.append({"t_ms": t, "file": "frames/%d.jpg" % t, "bytes": os.path.getsize(p), "width": ww, "height": hh})
+            tar.add(p, "frames/%d.jpg" % t)
+        idx = {"hash": h, "name": os.path.basename(f), "duration_ms": dur, "max_width": width, "video_stream": vi,
+               "frames": frames, "out_of_range": out_of_range, "failed": failed}
+        tar.add_bytes("index.json", json.dumps(idx, ensure_ascii=False, indent=1).encode())
+        tar.close()
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+def cmd_clean(a):
+    usage = "用法：media-clean <sha256> | --older-than 天"
+    sweep()
+    deleted, skipped, freed = [], [], 0
+    now = time.time()
+    if len(a) == 1 and HEX.fullmatch(a[0]):
+        d = os.path.join(ROOT, a[0])
+        if os.path.isdir(d):
+            if in_use(d):
+                die("这个文件正在被 media-audio/media-frames 用，稍后再删", "busy")
+            freed += dir_bytes(d)
+            shutil.rmtree(d, ignore_errors=True)
+            deleted.append(a[0])
+    elif len(a) == 2 and a[0] == "--older-than" and re.fullmatch(r"[0-9]{1,4}(\.[0-9]{1,3})?", a[1]):
+        lim = float(a[1]) * 86400
+        for n in sorted(os.listdir(ROOT)):
+            d = os.path.join(ROOT, n)
+            if not HEX.fullmatch(n) or not os.path.isdir(d) or now - last_used(d) < lim:
+                continue
+            if in_use(d):
+                skipped.append(n)
+                continue
+            freed += dir_bytes(d)
+            shutil.rmtree(d, ignore_errors=True)
+            deleted.append(n)
+    else:
+        die(usage, "bad_args")
+    kept = [n for n in os.listdir(ROOT) if HEX.fullmatch(n)]
+    say(deleted=deleted, busy=skipped, freed_bytes=freed, kept=len(kept), free_gb=free_gb())
+
+sub, ROOT, FF, FP = sys.argv[1:5]
+try:
+    {"put": cmd_put, "audio": cmd_audio, "frames": cmd_frames, "clean": cmd_clean}[sub](sys.argv[5:])
+finally:
+    for _p in BUSY:
+        try:
+            os.remove(_p)
+        except OSError:
+            pass
+'
+
+# 媒体环境：media.json（push-tool 推到 bin/；本机自测时用入口旁的那份）→ envs/<hash>，没建就建（首次要联网，几分钟）
+media_env() {
+  local spec="$TH/bin/media.json" s k v
+  [ -f "$spec" ] || spec="$(dirname "$0")/media.json"
+  [ -f "$spec" ] || fail "测试机上没有 media.json（先 python client.py push-tool）"
+  s=$("$PY" -c "$SPEC_PY" "$spec" "" "$TH" 2>"$TH/dl/media-spec-$$.err") \
+    || { k=$(tail -2 "$TH/dl/media-spec-$$.err"); rm -f "$TH/dl/media-spec-$$.err"; fail "media.json 不可用：$k"; }
+  rm -f "$TH/dl/media-spec-$$.err"
+  hash= pyv= reqs=() cpk=()
+  while read -r k v; do
+    case "$k" in hash) hash="$v";; python) pyv="$v";; pip) reqs+=("$v");; conda) cpk+=("$v");; esac
+  done <<<"$s"
+  ensure_env
+  FF="$E/bin/ffmpeg"; FP="$E/bin/ffprobe"
+  [ -x "$FF" ] && [ -x "$FP" ] || fail "媒体环境 $hash 里没有 ffmpeg/ffprobe（media.json 的 conda 要有 ffmpeg）"
+}
+
+# media-put/-audio/-frames/-clean：参数校验与实现都在 MEDIA_PY（FF 传 - 时 audio/frames 只校验）；audio/frames 再备好 ffmpeg 环境
+a_media() {
+  local sub="$1"; shift
+  guard_th
+  FF=- FP=-
+  case "$sub" in audio|frames)     # 先只校验参数与哈希（FF 为 - 时不干活），不对就不必去建 ffmpeg 环境
+    env PYTHONUTF8=1 "$PY" -c "$MEDIA_PY" "$sub" "$TH/media" - - "$@" || exit 1
+    media_env;;
+  esac
+  exec env PYTHONUTF8=1 "$PY" -c "$MEDIA_PY" "$sub" "$TH/media" "$FF" "$FP" "$@"
+}
+
+# media-spec：stdin 是 media.json（push-tool 在 update 之后推），校验能解析、conda 里有 ffmpeg 再替换 bin/media.json
+a_media_spec() {
+  local tmp="$TH/bin/media.json.incoming-$$" s m
+  cat >"$tmp"
+  s=$("$PY" -c "$SPEC_PY" "$tmp" "" "$TH" 2>"$tmp.err") \
+    || { m=$(tail -2 "$tmp.err"); rm -f "$tmp" "$tmp.err"; fail "media.json 不可用：$m"; }
+  rm -f "$tmp.err"
+  grep -qE '^conda ffmpeg([=<>!]|$)' <<<"$s" || { rm -f "$tmp"; fail "media.json 的 conda 里要有 ffmpeg"; }
+  mv "$tmp" "$TH/bin/media.json"
+  printf '{"success":true,"env":"%s","message":"media.json 已更新"}\n' "$(awk '$1 == "hash" { print $2 }' <<<"$s")"
+}
+
 case "${ARGS[0]:-}" in
   ping) a_ping;;
   update) a_update;;
@@ -504,5 +993,10 @@ case "${ARGS[0]:-}" in
   plugin) a_plugin "${ARGS[@]:1}";;
   cancel) a_cancel "${ARGS[@]:1}";;
   clean) a_clean "${ARGS[@]:1}";;
+  media-put) a_media put "${ARGS[@]:1}";;
+  media-audio) a_media audio "${ARGS[@]:1}";;
+  media-frames) a_media frames "${ARGS[@]:1}";;
+  media-clean) a_media clean "${ARGS[@]:1}";;
+  media-spec) a_media_spec;;
   *) fail "不认识的动作：${ARGS[0]:-（空）}"; ;;
 esac

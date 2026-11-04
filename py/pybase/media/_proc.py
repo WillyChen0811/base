@@ -197,6 +197,77 @@ def run_streaming(
     return subprocess.CompletedProcess(list(cmd), returncode, "", "".join(stderr_chunks))
 
 
+def run_bytes(
+    cmd: Sequence[str],
+    *,
+    timeout: float,
+    cancel_event: "threading.Event | None" = None,
+    poll_interval: float = 0.2,
+) -> tuple[int, bytearray, str]:
+    """跟 `run()` 语义一致（超时/取消都整组杀掉），但 stdout 按**原始字节**收进
+    一个 `bytearray`——给 ffmpeg 往管道吐 PCM 这类二进制输出用，不落中间文件。
+
+    返回 `(returncode, stdout 字节, stderr 文本)`，**不检查返回码**。
+    stdout 在独立线程里按块 `readinto` 追加，不先攒一堆小块再拼，几小时的
+    音频也只占一份内存；`bytearray` 可以直接交给 `numpy.frombuffer`（零拷贝、可写）。
+    """
+    process = subprocess.Popen(
+        list(cmd),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        **_GROUP_KWARGS,
+    )
+    data = bytearray()
+    stderr_chunks: list[bytes] = []
+    read_errors: list[BaseException] = []
+
+    def read_stdout() -> None:
+        buf = bytearray(1 << 20)
+        view = memoryview(buf)
+        try:
+            while True:
+                n = process.stdout.readinto(view)
+                if not n:
+                    break
+                data.extend(view[:n])
+        except BaseException as exc:  # noqa: BLE001 - 转到主线程重新抛出
+            read_errors.append(exc)
+
+    def read_stderr() -> None:
+        stderr_chunks.append(process.stderr.read() or b"")
+
+    out_thread = threading.Thread(target=read_stdout, daemon=True)
+    err_thread = threading.Thread(target=read_stderr, daemon=True)
+    out_thread.start()
+    err_thread.start()
+
+    started = time.monotonic()
+    killed: MediaError | None = None
+    while out_thread.is_alive():
+        out_thread.join(poll_interval)
+        if not out_thread.is_alive():
+            break
+        if cancel_event is not None and cancel_event.is_set():
+            killed = MediaCancelled(f"任务已取消：{cmd[0]}")
+            _kill(process, drain=False)
+            break
+        if time.monotonic() - started > timeout:
+            killed = MediaTimeoutError(f"命令超时（{timeout}s）：{cmd[0]}")
+            _kill(process, drain=False)
+            break
+
+    out_thread.join()
+    returncode = process.wait()
+    err_thread.join()
+    if killed is not None:
+        raise killed
+    if read_errors:
+        raise read_errors[0]
+    stderr = b"".join(stderr_chunks).decode("utf-8", errors="replace")
+    return returncode, data, stderr
+
+
 def discard(tmp: str | os.PathLike) -> None:
     """删掉一个可能不存在的临时文件，静默忽略删不掉的情况。"""
     try:

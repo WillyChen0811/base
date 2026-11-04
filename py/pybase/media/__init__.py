@@ -2,7 +2,7 @@
 
 给"视频字幕学习"类业务提供 subs2srs/mpvacious/asbplayer 式的标准操作：
 探测媒体信息（`probe`）、按字幕时间段截音频/截图（`extract_audio`/
-`snapshot`，含前后 padding）、调 ffsubsync 做字幕自动对齐
+`snapshot`，含前后 padding）、按一串时间点定点抽帧（`frames_at`）、调 ffsubsync 做字幕自动对齐
 （`sync_subtitles`）、判断能否直接喂给网页 `<video>`（`playback_plan`）
 以及只转封装不重新编码（`remux`）。
 
@@ -25,16 +25,19 @@ from ._proc import (
     run,
 )
 from .clip import extract_audio, snapshot
+from .frames import FrameFile, frames_at
 from .playback import playback_plan, remux
 from .probe import probe
 from .sync import sync_subtitles
 
 __all__ = [
+    "FrameFile",
     "MediaCancelled",
     "MediaError",
     "MediaTimeoutError",
     "ToolNotFoundError",
     "extract_audio",
+    "frames_at",
     "playback_plan",
     "probe",
     "remux",

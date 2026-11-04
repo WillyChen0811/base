@@ -1,5 +1,5 @@
 {
-  "_说明": "Mac 测试机上跑 base/py 全量测试的环境描述：client.py run --repo .=base --env-file py/testenv.json --workdir base py/tests。pip 按 extra 装齐测试会 import 的第三方库（tqdm 是拷进 _vendor 的 pysmb 要的）；conda 装 ffmpeg（测试在 env -i 里跑，PATH 只有环境的 bin 和系统目录，看不到 Homebrew 的 ffmpeg），碰 ffmpeg 的用例才不跳过。PostgreSQL 不装：test_db 连不上本机库就跳过。",
+  "_说明": "Mac 测试机上跑 base/py 全量测试的环境描述：client.py run --repo .=base --env-file py/testenv.json --workdir base py/tests。pip 按 extra 装齐测试会 import 的第三方库（tqdm 是拷进 _vendor 的 pysmb 要的）；conda 装 ffmpeg（测试在 env -i 里跑，PATH 只有环境的 bin 和系统目录，看不到 Homebrew 的 ffmpeg），碰 ffmpeg 的用例才不跳过。PostgreSQL 不装：test_db 连不上本机库就跳过。PYBASE_LONG_AUDIO_TEST=1 打开 audio 两小时合成轨的对齐耗时测试（约 1 GB 内存）；音频测试记下的耗时/误差写进 {run}/out/audio-report.txt（加 --out-dir 取回）。",
   "python": "3.12",
   "pip": [
     "python-docx>=1.0.0", "openpyxl>=3.1.0", "xlrd>=2.0.1",
@@ -10,5 +10,5 @@
   "conda": ["ffmpeg"],
   "repos": {},
   "pythonpath": ["py"],
-  "env": {}
+  "env": {"PYBASE_LONG_AUDIO_TEST": "1", "PYBASE_TEST_REPORT_DIR": "{run}/out"}
 }

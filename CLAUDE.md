@@ -64,9 +64,20 @@
 - 子进程必须独立进程组、整组杀：ffsubsync 自己会起 ffmpeg，只杀父进程留孤儿
 - 临时产物名保留扩展名（`x.part.mp3`），ffmpeg/ffsubsync 按扩展名猜格式
 - 解析 ffsubsync 输出只认源码里的原文 `offset seconds:`，别用宽松正则（会吃到质量告警里的数）
+- `frames_at` 抽不到帧（超出时长、末尾无帧）不报错，返回 `skipped` 原因；ffmpeg 非 0 退出才抛——别把两者合并
 - ffprobe 分不清 mkv/webm（都报 `matroska,webm`），按 WebM 编码白名单区分，不能因调用方写了 webm 就放行 h264 的 mkv
 - mp3/m4a 的封面图是一条 `attached_pic` 视频流，判可播性时要忽略，否则播客音频全被判成要转码
 - `playback_plan` 不带默认支持集合（各播放端不同）；`-movflags +faststart` 只能给 mp4 系输出
+
+### audio
+- `offset_ms = 混音时间 - 麦克风时间`，别反过来；`attribute` 输出的是混音时间
+- 对齐的包络是有意不对称的：麦克风用幅度（压回声）、混音用"高出阈值多少 dB"（防更响的远端抢峰），
+  统一成一种会退化（README 里有对比表）
+- 归属里"是不是本机"看 210 ms 平滑后的能量比，"有没有远端"逐帧看；别把前者改成逐帧
+  （回声晚几十毫秒，逐帧比在远端独白里乱跳，会冒出假 both），也别把后者改成平滑（同时说话就看不出来）
+- 阈值改了要重跑 `python tests/audio_synth.py`，把 README 的表一起更新
+- `pybase/audio/__init__` 用 `__getattr__` 延迟加载，import 包不能连带 numpy；两小时长轨测试靠
+  `PYBASE_LONG_AUDIO_TEST=1` 打开（只在 Studio）
 
 ### dictionary
 - 不内置任何词典数据，每条 `Entry` 必带 `source`/`rights`；新数据源先查数据本身的授权，不只看代码协议

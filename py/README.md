@@ -20,9 +20,13 @@
 - `pybase.subtitle`：字幕读写（pysubs2，`pip install "pybase[subtitle]"`）、YouTube 自动字幕滚动折叠、
   时间校准、时间索引（`CueIndex`）、给大模型的 `[MM:SS]` 文本与分块；字幕来源（人工/平台识别/本地识别/机器翻译）
   与用户修正层，存旁车 `.meta.json`，原字幕文件不改。时间单位一律整数毫秒
-- `pybase.media`：ffmpeg/ffprobe/ffsubsync 子进程封装：探测、按句截音频（含 padding）/截图、字幕自动对齐、
+- `pybase.media`：ffmpeg/ffprobe/ffsubsync 子进程封装：探测、按句截音频（含 padding）/截图、按一串时间点定点抽帧
+  （`frames_at`，每点一张 `<t_ms>.jpg`，不扫整片）、字幕自动对齐、
   网页 `<video>` 可播性判断（`playback_plan`，支持集合由调用方给）与转封装（`remux`）。
   外部工具需自行安装，路径可由调用方传入
+- `pybase.audio`：任意音视频解码成 16 kHz 单声道 PCM（经 ffmpeg 管道）、能量 VAD（阈值自适应）、
+  本机麦克风轨与会议混音轨对齐（包络互相关，几小时的轨分块估计）、混音每段话标本机/远端/同时说
+  （`pip install "pybase[audio]"`，numpy）。用法、阈值来历与局限见 `pybase/audio/README.md`
 - `pybase.asr`：语音识别（中文/英文 × 整段/实时），两个后端同一套接口：`AppleSpeech`（macOS 26+ 系统自带
   SpeechAnalyzer，零 pip 依赖，需 swiftc）与 `MlxAudio`（mlx-audio，Apple Silicon，`pip install "pybase[asr-mlx]"`）。
   **不内置任何模型**，模型和 locale 由调用方给
@@ -144,6 +148,7 @@ pip install -e "./py[all]"
 | `db` | sqlalchemy | `pybase.db`（引擎/会话、方言无关的表结构操作、upsert、库身份标记） |
 | `postgres` | `db` + psycopg[binary] | `pybase.db` 连 PostgreSQL |
 | `asr-mlx` | mlx-audio（仅 Apple Silicon） | `pybase.asr.MlxAudio` |
+| `audio` | numpy（解码另需 ffmpeg 可执行文件） | `pybase.audio` |
 | `all` | 以上全部 | —— |
 
 ## 测试
@@ -151,6 +156,10 @@ pip install -e "./py[all]"
 ```bash
 cd py && python -m pytest tests
 ```
+
+碰 ffmpeg 的用例（media、audio）本机没有 ffmpeg 时跳过；在 Studio 测试机上跑全量：
+`python testhost/client.py run --repo <base 工作树>=base --env-file py/testenv.json --workdir base py/tests`
+（环境描述里 conda 装 ffmpeg，并打开两小时合成轨的对齐耗时测试）。
 
 内存盘跨进程测试（`test_ram_disk_multiproc.py`）依赖 macOS 的 RAM disk 挂载语义，office
 模块驱动真实 Word COM 的部分只能在装了 Office 的 Windows 机器上实测；不匹配的平台上相关

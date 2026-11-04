@@ -334,3 +334,35 @@ def test_run_returns_stderr_text_and_does_not_check_returncode():
     assert result.returncode == 3  # 非零不抛，由调用方自己判断
     assert "to-err" in result.stderr
     assert isinstance(result.stderr, str)
+
+
+def test_run_bytes_collects_binary_stdout():
+    from pybase.media._proc import run_bytes
+
+    payload = bytes(range(256)) * 5000  # 1.28 MB，跨好几个读块
+    rc, data, err = run_bytes(
+        [sys.executable, "-c",
+         "import sys; sys.stdout.buffer.write(bytes(range(256)) * 5000); "
+         "sys.stderr.write('note')"],
+        timeout=10,
+    )
+    assert rc == 0 and isinstance(data, bytearray) and bytes(data) == payload
+    assert err == "note"
+
+
+def test_run_bytes_timeout_and_cancel_kill_process(tmp_path):
+    from pybase.media._proc import run_bytes
+
+    script = _sleepy_script(tmp_path)
+    marker = tmp_path / "marker.txt"
+    out = tmp_path / "out.bin"
+    with pytest.raises(MediaTimeoutError):
+        run_bytes([sys.executable, str(script), str(out), str(marker), "2.0"], timeout=0.3)
+    assert not marker.exists()
+
+    cancel_event = threading.Event()
+    threading.Timer(0.2, cancel_event.set).start()
+    with pytest.raises(MediaCancelled):
+        run_bytes([sys.executable, str(script), str(out), str(marker), "2.0"],
+                  timeout=10, cancel_event=cancel_event)
+    assert not marker.exists()

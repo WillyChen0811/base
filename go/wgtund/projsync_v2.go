@@ -6,7 +6,8 @@ package wgtund
 //   - hosts.json projsync.v2 配置（缺省关闭）；
 //   - enabled=true 时每 interval 分钟对每个项目依次跑一轮（不并发）；
 //   - 本机接口 GET /projsync/v2、POST /projsync/v2/run、POST /projsync/v2/commit（鉴权与 Origin 校验同 v1 /projsync）；
-//   - 结果写 ~/.xxyi/projsync-v2-status.json（原子写、0600）便于诊断。
+//   - 结果写 ~/.xxyi/projsync-v2-status.json（原子写、0600）便于诊断；
+//   - 分支对账基线与删除记录放 ~/.xxyi/projsync/base/（RoundEnv.BaseDir，见 projsync/branchbase.go）。
 // enabled=false 时不自动跑，但手动接口照常可用。
 
 import (
@@ -34,6 +35,7 @@ const projsyncV2MinMinutes = 5
 const (
 	defaultProjsyncV2Msg = "~/.local/bin/xxyi-msg" // 对方 xxyi-msg 的缺省路径
 	projsyncV2StatusFile = "projsync-v2-status.json"
+	projsyncV2BaseDir    = "projsync/base" // 相对 ~/.xxyi：分支对账基线与删除记录
 	// 启动后第一轮自动同步的等待时间（不超过一个间隔），避免刚启动就抢网络。
 	projsyncV2InitialDelay = 30 * time.Second
 	// 单个项目一轮（含对话记录同步）的整体上限；v1 仍用 projsyncRunTimeout。
@@ -107,6 +109,8 @@ type projsyncV2Svc struct {
 	claudeSync func(ctx context.Context, t projsyncTarget) (*projsync.FileResult, error)
 	// statusPath 状态文件；空则不写。
 	statusPath string
+	// baseDir 分支对账基线目录；空则不记基线、不同步分支删除。
+	baseDir string
 	// 超时可注入（测试用）；零值用 projsyncV2RunTimeout / projsyncV2ClaudeTimeout。
 	runTimeout    time.Duration
 	claudeTimeout time.Duration
@@ -133,6 +137,7 @@ func newProjsyncV2Svc(v1 *projsyncSvc, pool *sshPool) *projsyncV2Svc {
 	}
 	if dir, err := xxyiDir(); err == nil {
 		s.statusPath = filepath.Join(dir, projsyncV2StatusFile)
+		s.baseDir = filepath.Join(dir, filepath.FromSlash(projsyncV2BaseDir))
 	}
 	if f := projsyncV2InitForTest; f != nil {
 		f(s)
@@ -169,6 +174,7 @@ func (s *projsyncV2Svc) env(t projsyncTarget, force []projsync.ForceCommit) proj
 			return err
 		},
 		Remote: s.runner, XxyiMsg: prep.v2.xxyiMsg, LocalJudge: s.localJudge, Now: s.now, Force: force,
+		BaseDir: s.baseDir,
 	}
 }
 

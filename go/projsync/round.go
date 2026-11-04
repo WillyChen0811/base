@@ -18,6 +18,9 @@ package projsync
 //   - 自动提交失败（含钩子拒绝）——记录完整输出，本轮不再写；
 //   - AutoMerge：Parents[0]=mac、Parents[1]=ubuntu；先在 Mac 本地生成合并提交（只写对象）并传到 Ubuntu，
 //     再分别快进 Mac、Ubuntu（先传后快进），禁止回退；任一步失败，已完成的保留，停止后续写。
+//   - 分支删除也同步（用户 11/04，PLAN 第十九节）：判定前加载对账基线（branchbase.go，RoundEnv.BaseDir），
+//     一边删了、另一边仍停在基线的分支在另一边带旧值删除（branchdel.go）；本轮成功达成一致的分支写回基线
+//     （round_branchbase.go）。BaseDir 为空则不记基线、不删除（只建不删，等同旧行为）。
 
 import (
 	"context"
@@ -56,6 +59,7 @@ const (
 	AttOutOfScope    = "out_of_scope"    // 超出自动同步范围
 	AttNeedRecheck   = "need_recheck"    // 结果不确定，需重新确认
 	AttApplyFailed   = "apply_failed"    // 执行出错（与真实冲突分开）
+	AttDeleteBlocked = "delete_blocked"  // 一边已删分支，另一边受保护或正被检出，未自动删除
 )
 
 // ForceCommit 是用户在界面点「提交并同步」指定的工作区：本轮对它 AutoCommit(Force=true)。
@@ -79,6 +83,8 @@ type RoundEnv struct {
 	Now        func() time.Time
 	// Force 是用户点「提交并同步」指定的工作区（可空）。
 	Force []ForceCommit
+	// BaseDir 是分支对账基线的目录（Mac 本机，wgtund 传 ~/.xxyi/projsync/base）。空 = 不记基线、不同步删除。
+	BaseDir string
 }
 
 // BranchOutcome 是一个分支本轮的动作与结果。两边相同的分支不记录（只计入 Unchanged）。
@@ -89,7 +95,9 @@ type BranchOutcome struct {
 	Sides  []Side     `json:"sides,omitempty"`
 	// Target：目标提交（AutoMerge 为合并提交，失败时可能为空）。
 	Target string `json:"target,omitempty"`
-	Detail string `json:"detail"` // 中文原因/说明
+	// Deleted：DeleteOnOther 删掉（或试图删掉）的分支原提交，用于找回（git branch <名> <提交>）。
+	Deleted string `json:"deleted,omitempty"`
+	Detail  string `json:"detail"` // 中文原因/说明
 }
 
 // WorktreeOutcome 是一个有未提交改动的工作区本轮的处理结果。
@@ -207,6 +215,9 @@ type roundRun struct {
 
 	attSeen map[string]bool
 	written []string // 本轮已完成的写入（中文描述），超出范围时如实报告
+
+	repoKey string      // 仓库锁键（规范化 git common dir），也用于定位对账基线
+	base    *branchBase // 本轮的对账基线；nil = 未配置基线目录
 }
 
 func (r *roundRun) wrote(s string) { r.written = append(r.written, s) }
@@ -275,7 +286,7 @@ func RunRound(ctx context.Context, env RoundEnv) (res RoundResult) {
 	}
 	defer unlockRepo(key)
 
-	r := &roundRun{env: env, res: &res, attSeen: map[string]bool{}}
+	r := &roundRun{env: env, res: &res, attSeen: map[string]bool{}, repoKey: key}
 	r.run(ctx)
 	return
 }
@@ -731,9 +742,16 @@ func (r *roundRun) decideAndApply(ctx context.Context) {
 		kept = append(kept, b)
 	}
 	bfs = kept
+	if !r.loadBase() {
+		return
+	}
+	for i := range bfs {
+		bfs[i].Base = r.base.get(bfs[i].Name)
+	}
 	for _, b := range bfs {
 		facts[b.Name] = b
 	}
+	defer r.finishBase(facts)
 	acts := DecideBranches(repo, bfs)
 	// 写之前（含重新采集后的新事实）再预检一次：所有要写的动作涉及的提交（两边 OID、目标 OID）。
 	var oids []string
@@ -752,8 +770,13 @@ func (r *roundRun) decideAndApply(ctx context.Context) {
 		switch act.Kind {
 		case KindNothing:
 			r.res.Unchanged++
+			r.baseAgree(bf)
 		case KindCreateOnOther, KindFastForward:
 			r.execSimple(ctx, act, bf)
+		case KindDeleteOnOther:
+			r.execDelete(ctx, act, bf)
+		case KindDeleteBlocked:
+			r.deleteBlocked(act)
 		case KindAutoMerge:
 			r.execMerge(ctx, act, bf)
 		case KindConflict:
@@ -802,9 +825,12 @@ func (r *roundRun) applyOn(ctx context.Context, side Side, plan ApplyPlan) apply
 	if side == SideMac {
 		plan.RepoDir = r.env.Repo
 		var err error
-		if plan.Kind == KindCreateOnOther {
+		switch plan.Kind {
+		case KindCreateOnOther:
 			err = CreateBranch(ctx, plan)
-		} else {
+		case KindDeleteOnOther:
+			err = DeleteBranch(ctx, plan)
+		default:
 			err = FastForwardBranch(ctx, plan)
 		}
 		if err == nil {
@@ -824,7 +850,7 @@ func (r *roundRun) applyOn(ctx context.Context, side Side, plan ApplyPlan) apply
 		if rerr != nil {
 			return applyOutcome{state: applyUncertain, detail: "写入失败且无法复查现场: " + err.Error()}
 		}
-		if ex && oid == plan.NewOID {
+		if (ex && oid == plan.NewOID) || (!ex && plan.Kind == KindDeleteOnOther) {
 			return applyOutcome{state: applyUncertain, detail: "已写入、现场需确认: " + err.Error()}
 		}
 		return o
@@ -850,7 +876,7 @@ func (r *roundRun) applyOn(ctx context.Context, side Side, plan ApplyPlan) apply
 	if ferr != nil {
 		return applyOutcome{state: applyUncertain, detail: "写入失败且无法复查 Ubuntu 现场: " + resp.Error}
 	}
-	if rf.Branches[plan.Branch] == plan.NewOID {
+	if rf.Branches[plan.Branch] == plan.NewOID { // 删除时 NewOID 为空：分支已不在即已写入
 		return applyOutcome{state: applyUncertain, detail: "已写入、现场需确认: " + resp.Error}
 	}
 	return applyOutcome{state: applyFailed, detail: resp.Error}
@@ -902,6 +928,7 @@ func (r *roundRun) execSimple(ctx context.Context, act BranchAction, bf BranchFa
 	if r.finishApply(act, side, o) {
 		r.wrote(fmt.Sprintf("分支 %s 在%s已更新到 %s", act.Name, sideNames([]Side{side}), short(act.Target)))
 		r.addBranch(act, ResultDone, act.Reason)
+		r.base.set(act.Name, act.Target)
 	}
 }
 
@@ -967,6 +994,7 @@ func (r *roundRun) execMerge(ctx context.Context, act BranchAction, bf BranchFac
 	switch o.state {
 	case applyOK:
 		r.wrote(fmt.Sprintf("分支 %s 在 Ubuntu 已快进到合并提交 %s", act.Name, short(merged)))
+		r.base.set(act.Name, merged)
 		r.addBranch(act, ResultDone, fmt.Sprintf("两边分叉但可干净合并，已生成合并提交 %s（父提交：mac %s、ubuntu %s），两边都已更新", merged, short(bf.Mac), short(bf.Ubuntu)))
 	case applyUncertain:
 		// 保留 Mac 的结果，不回退；finishApply 记不确定并停止

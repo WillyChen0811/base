@@ -262,8 +262,12 @@ func validateApplyRequest(req *ApplyRequest) error {
 		if !oidRe.MatchString(p.Parents[0]) || !oidRe.MatchString(p.Parents[1]) {
 			return errors.New("AutoMerge 需要两个合法的 Parents")
 		}
+	case KindDeleteOnOther:
+		if !oidRe.MatchString(p.OldOID) || p.NewOID != "" {
+			return errors.New("DeleteBranch 需要合法的 OldOID 和空 NewOID")
+		}
 	default:
-		return fmt.Errorf("不允许的动作类型 %q（只允许 create_on_other / fast_forward / auto_merge）", p.Kind)
+		return fmt.Errorf("不允许的动作类型 %q（只允许 create_on_other / fast_forward / auto_merge / delete_on_other）", p.Kind)
 	}
 	p.RepoDir = req.Repo
 	return nil
@@ -315,6 +319,8 @@ func ServeApplyWith(ctx context.Context, in []byte, judge CommitJudge) (out []by
 		aerr = FastForwardBranch(ctx, req.Plan)
 	case req.Plan.Kind == KindAutoMerge:
 		resp.NewOID, aerr = AutoMergeCommit(ctx, req.Plan)
+	case req.Plan.Kind == KindDeleteOnOther:
+		aerr = DeleteBranch(ctx, req.Plan)
 	}
 	if aerr != nil {
 		resp.NewOID = ""

@@ -1,0 +1,6 @@
+{
+  "_说明": "testhost 的 media-audio/media-frames 用的 ffmpeg 环境（conda-forge 的 ffmpeg，动作里用该环境 bin 下的绝对路径）。push-tool 推到 Studio 的 ~/xxyi-testhost/bin/media.json；改了包要重推，hash 变了下次 media 动作自动重建。与 testenv.json 的 python/pip/conda 一致，两边共用同一个环境。",
+  "python": "3.12",
+  "pip": [],
+  "conda": ["ffmpeg"]
+}

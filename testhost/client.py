@@ -8,6 +8,7 @@ import json
 import re
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -21,11 +22,16 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 ENTRY = HERE / "mac_testhost.sh"
+MEDIA_SPEC = HERE / "media.json"
 GATEWAY = os.environ.get("TESTHOST_GATEWAY", "http://127.0.0.1:18192/gw/status")
 
 
 class THError(Exception):
-    pass
+    """code：Mac 端回的错误类别（not_found、hash_mismatch、bad_args……），没有为 None。"""
+
+    def __init__(self, msg, code=None):
+        super().__init__(msg)
+        self.code = code
 
 
 class Transport:
@@ -35,31 +41,108 @@ class Transport:
         self.host, self.key = host, key
         self.local = os.environ.get("TESTHOST_LOCAL")
 
-    def call(self, cmd, stdin=None, raw=False, timeout=None):
+    def _argv(self, cmd):
         if self.local:
-            env = dict(os.environ, SSH_ORIGINAL_COMMAND=cmd, TESTHOST_HOME=self.local)
-            argv = ["bash", str(ENTRY)]
-        else:
-            ctl = Path.home() / ".cache" / "xxyi-testhost"
-            ctl.mkdir(parents=True, exist_ok=True)
-            env = None
-            argv = ["ssh", "-i", self.key, "-o", "IdentitiesOnly=yes", "-o", "BatchMode=yes",
-                    "-o", "ConnectTimeout=30", "-o", "ServerAliveInterval=30",
-                    "-o", "ControlMaster=auto", "-o", "ControlPersist=120",
-                    "-o", f"ControlPath={ctl}/cm-%C", self.host, cmd]
-        p = subprocess.run(argv, input=stdin, capture_output=True, env=env, timeout=timeout)
+            return ["bash", str(ENTRY)], dict(os.environ, SSH_ORIGINAL_COMMAND=cmd, TESTHOST_HOME=self.local)
+        ctl = Path.home() / ".cache" / "xxyi-testhost"
+        ctl.mkdir(parents=True, exist_ok=True)
+        return ["ssh", "-i", self.key, "-o", "IdentitiesOnly=yes", "-o", "BatchMode=yes",
+                "-o", "ConnectTimeout=30", "-o", "ServerAliveInterval=30",
+                "-o", "ControlMaster=auto", "-o", "ControlPersist=120",
+                "-o", f"ControlPath={ctl}/cm-%C", self.host, cmd], None
+
+    def call(self, cmd, stdin=None, raw=False, timeout=None):
+        """stdin：bytes 整块送；打开的文件对象则把文件描述符直接交给 ssh 读（流式，不进内存）。"""
+        argv, env = self._argv(cmd)
+        feed = {"input": stdin} if stdin is None or isinstance(stdin, (bytes, bytearray)) else {"stdin": stdin}
+        p = subprocess.run(argv, capture_output=True, env=env, timeout=timeout, **feed)
         if raw:
             if p.returncode:
                 raise THError(f"{cmd.split()[0]} 失败：{p.stderr.decode(errors='replace')[-300:]}")
             return p.stdout
-        out = p.stdout.decode(errors="replace").strip().splitlines()
-        try:
-            res = json.loads(out[-1])
-        except (IndexError, ValueError):
-            raise THError(f"{cmd.split()[0]} 无有效返回（rc={p.returncode}）：{p.stderr.decode(errors='replace')[-300:]}")
-        if not res.get("success", False):
-            raise THError(f"{cmd.split()[0]}：{res.get('message')}")
-        return res
+        return _parse_result(cmd, p.stdout, p.stderr, p.returncode)
+
+    def call_tar(self, cmd, out_dir, member_re):
+        """调输出 tar 的动作（media-audio/media-frames），边收边落盘到 out_dir，返回 index.json 的内容。
+        成员名必须整串匹配 member_re（再加 index.json），别的成员、链接、绝对路径一律拒；每个文件先写 .part 再改名。
+        Mac 端还没开始写 tar 就出错时 stdout 是一行 JSON（以 { 开头）；写到一半出错时 JSON 在 stderr、退出码非 0。"""
+        argv, env = self._argv(cmd)
+        out = Path(out_dir).expanduser()
+        out.mkdir(parents=True, exist_ok=True)
+        pat = re.compile(member_re)
+        got, idx, broken = [], None, None
+        with tempfile.TemporaryFile() as err:
+            p = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=err, env=env)
+            try:
+                head = p.stdout.read(1)
+                if head in (b"", b"{"):
+                    rest = p.stdout.read()
+                    p.wait()
+                    err.seek(0)
+                    _parse_result(cmd, head + rest, err.read(), p.returncode)
+                    raise THError(f"{cmd.split()[0]}：没有输出")
+                try:
+                    with tarfile.open(fileobj=_Prefixed(head, p.stdout), mode="r|") as tf:
+                        for m in tf:
+                            if m.name == "index.json" and m.isfile():
+                                idx = json.loads(tf.extractfile(m).read())
+                                continue
+                            if not (m.isfile() and pat.fullmatch(m.name)):
+                                raise THError(f"{cmd.split()[0]}：tar 里有不认的成员 {m.name!r}")
+                            dst = out / m.name
+                            dst.parent.mkdir(parents=True, exist_ok=True)
+                            part = dst.with_name(dst.name + ".part")
+                            with open(part, "wb") as w:
+                                shutil.copyfileobj(tf.extractfile(m), w, 1 << 20)
+                            os.replace(part, dst)
+                            got.append(m.name)
+                except tarfile.TarError as e:
+                    idx, broken = None, e           # 多半是 Mac 端写到一半出错，下面先看它的 stderr
+                p.stdout.read()                     # 收掉 tar 结尾的补齐块，免得对端写不完
+                rc = p.wait()
+            finally:
+                if p.poll() is None:
+                    p.kill()
+                    p.wait()
+            if rc or idx is None:
+                err.seek(0)
+                e = err.read().decode(errors="replace").strip().splitlines()
+                try:
+                    j = json.loads(e[-1])
+                    raise THError(f"{cmd.split()[0]}：{j.get('message')}", j.get("code"))
+                except (IndexError, ValueError):
+                    why = chr(10).join(e)[-300:] or (f"tar 流坏了：{broken}" if broken else "没有 index.json")
+                    raise THError(f"{cmd.split()[0]} 失败（rc={rc}）：{why}")
+        (out / "index.json").write_text(json.dumps(idx, ensure_ascii=False, indent=1))
+        idx["_received"] = got
+        return idx
+
+
+class _Prefixed:
+    """把已经读出的开头几个字节接回管道前面，给 tarfile 的流模式读。"""
+
+    def __init__(self, head, f):
+        self.head, self.f = head, f
+
+    def read(self, n=-1):
+        if not self.head:
+            return self.f.read(n)
+        if n is None or n < 0:
+            b, self.head = self.head + self.f.read(), b""
+            return b
+        b, self.head = self.head[:n], self.head[n:]
+        return b + (self.f.read(n - len(b)) if len(b) < n else b"")
+
+
+def _parse_result(cmd, stdout, stderr, rc):
+    out = stdout.decode(errors="replace").strip().splitlines()
+    try:
+        res = json.loads(out[-1])
+    except (IndexError, ValueError):
+        raise THError(f"{cmd.split()[0]} 无有效返回（rc={rc}）：{stderr.decode(errors='replace')[-300:]}")
+    if not res.get("success", False):
+        raise THError(f"{cmd.split()[0]}：{res.get('message')}", res.get("code"))
+    return res
 
 
 def git(repo, *args, stdin=None):
@@ -326,6 +409,114 @@ def wait(tr, rid, timeout, interval=15):
         time.sleep(interval)
 
 
+# ---------- media：Studio 上的 ffmpeg（Ubuntu 的 CPU 不做媒体处理，抽音频、抽帧交 Studio）
+
+MEDIA_AUDIO_RE = r"audio/[0-9]{4,6}\.wav"
+MEDIA_FRAMES_RE = r"frames/[0-9]{1,9}\.jpg"
+
+
+def file_sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for b in iter(lambda: f.read(1 << 20), b""):
+            h.update(b)
+    return h.hexdigest()
+
+
+def good_media_name(n):
+    """与 Mac 端同一规则：不能有 / \\ 和控制字符，不能以 . 或 - 开头，UTF-8 不超过 200 字节。"""
+    try:
+        b = n.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return (0 < len(b) <= 200 and not n.startswith((".", "-"))
+            and "/" not in n and "\\" not in n and not any(ord(c) < 32 or ord(c) == 127 for c in n))
+
+
+def media_put(tr, path, name=None):
+    """上传本地文件（流式），返回 Mac 端结果（hash、name、size、existed、seconds、free_gb）。已有同哈希的不重传。"""
+    path = Path(path).expanduser()
+    if not path.is_file():
+        raise THError(f"不是文件：{path}")
+    name = name or path.name
+    if not good_media_name(name):
+        raise THError(f"文件名不合法：{name!r}（用 --name 另起一个）")
+    size = path.stat().st_size
+    t0 = time.time()
+    h = file_sha256(path)
+    log(f"sha256 {h}（{size / 1e6:.1f} MB，算哈希 {time.time() - t0:.1f}s）")
+    t1 = time.time()
+    with open(path, "rb") as f:
+        res = tr.call(f"media-put {h} {shlex.quote(name)} --size {size}", stdin=f)
+    res["wall"] = round(time.time() - t1, 2)
+    log(f"{'测试机上已有，没重传' if res['existed'] else '已上传'}：{res['name']}，{res['wall']}s，Studio 剩 {res['free_gb']} GiB")
+    return res
+
+
+def media_audio(tr, h, out_dir, segment_min=10):
+    """转 16 kHz 单声道 16 位 WAV、按 segment_min 分钟切段，落到 out_dir/audio/NNNN.wav + out_dir/index.json。"""
+    seg = f"{float(segment_min):.3f}".rstrip("0").rstrip(".")
+    t0 = time.time()
+    idx = tr.call_tar(f"media-audio {h} --segment-min {seg}", out_dir, MEDIA_AUDIO_RE)
+    for s in idx["segments"]:
+        if s["file"] not in idx["_received"]:
+            raise THError(f"media-audio：index 里的 {s['file']} 没收到")
+    idx["wall"] = round(time.time() - t0, 2)
+    log(f"音频 {len(idx['segments'])} 段，共 {idx['duration_ms'] / 1000:.1f}s，{idx['wall']}s → {out_dir}")
+    return idx
+
+
+def media_frames(tr, h, at_ms, out_dir, width=960):
+    """按毫秒时间点各截一帧（宽不超过 width），落到 out_dir/frames/<t_ms>.jpg + out_dir/index.json。"""
+    ats = [int(x) for x in at_ms]
+    if not ats or any(x < 0 for x in ats):
+        raise THError("--at 要非负整数毫秒")
+    t0 = time.time()
+    idx = tr.call_tar(f"media-frames {h} --at {','.join(map(str, ats))} --width {int(width)}", out_dir, MEDIA_FRAMES_RE)
+    for fr in idx["frames"]:
+        if fr["file"] not in idx["_received"]:
+            raise THError(f"media-frames：index 里的 {fr['file']} 没收到")
+    idx["wall"] = round(time.time() - t0, 2)
+    log(f"帧 {len(idx['frames'])} 张，超出时长 {idx['out_of_range'] or '无'}，失败 {len(idx['failed'])}，{idx['wall']}s → {out_dir}")
+    return idx
+
+
+def media_clean(tr, h=None, older_than=None):
+    if (h is None) == (older_than is None):
+        raise THError("media clean 要么给哈希，要么给 --older-than 天")
+    arg = h if h else f"--older-than {older_than:g}"
+    return tr.call(f"media-clean {arg}")
+
+
+def cmd_media(tr, a):
+    if a.mcmd == "put":
+        res = media_put(tr, a.file, a.name)
+    elif a.mcmd == "audio":
+        res = media_audio(tr, a.hash, a.out, a.segment_min)
+    elif a.mcmd == "frames":
+        try:
+            ats = [int(x) for x in a.at.split(",") if x.strip()]
+        except ValueError:
+            raise THError("--at 要逗号分隔的整数毫秒")
+        res = media_frames(tr, a.hash, ats, a.out, a.width)
+    else:
+        res = media_clean(tr, a.hash, a.older_than)
+    res.pop("_received", None)
+    if a.mcmd in ("audio", "frames"):       # 完整 index 在 --out/index.json，这里只回摘要
+        n = len(res.get("segments") or res.get("frames") or [])
+        res = {k: v for k, v in res.items() if k not in ("segments", "frames")}
+        res.update(count=n, out=str(Path(a.out).expanduser()))
+    print(json.dumps(res, ensure_ascii=False))
+    return 0
+
+
+def push_tool(tr):
+    """先推入口（update），确认新版在了再推 media.json（media-spec；旧入口不认这个动作，不会误替换）。"""
+    print(tr.call("update", stdin=ENTRY.read_bytes())["message"])
+    print(tr.call("ping")["testhost"])
+    print(tr.call("media-spec", stdin=MEDIA_SPEC.read_bytes())["message"])
+
+
 def cmd_run(tr, a):
     if a.task and (a.k or a.m or a.plugin or a.plugin_file or a.n):
         raise THError("--task 不能与 -n -k -m --plugin 并用（任务的参数写在描述里或跟在 -- 后）")
@@ -403,6 +594,23 @@ def main(argv=None):
     x.add_argument("run_id")
     c = sp.add_parser("clean")
     c.add_argument("rest", nargs=argparse.REMAINDER)
+    md = sp.add_parser("media", help="Studio 上的 ffmpeg：上传媒体、转 16k 音频、定点抽帧、清理")
+    ms = md.add_subparsers(dest="mcmd", required=True)
+    m = ms.add_parser("put", help="上传本地文件（按 sha256 存，已有就不传）")
+    m.add_argument("file")
+    m.add_argument("--name", help="存到 Studio 上用的文件名，缺省本地文件名")
+    m = ms.add_parser("audio", help="转 16 kHz 单声道 16 位 WAV 并分段")
+    m.add_argument("hash")
+    m.add_argument("--segment-min", type=float, default=10.0, help="每段分钟数（0.01..600，至多 3 位小数），缺省 10")
+    m.add_argument("--out", required=True, help="落到 <目录>/audio/NNNN.wav 与 <目录>/index.json")
+    m = ms.add_parser("frames", help="按毫秒时间点截帧（jpg）")
+    m.add_argument("hash")
+    m.add_argument("--at", required=True, help="逗号分隔的毫秒时间点，至多 500 个")
+    m.add_argument("--width", type=int, default=960, help="最大宽度（不放大），缺省 960")
+    m.add_argument("--out", required=True, help="落到 <目录>/frames/<毫秒>.jpg 与 <目录>/index.json")
+    m = ms.add_parser("clean", help="按哈希删，或删超过 N 天没用过的")
+    m.add_argument("hash", nargs="?")
+    m.add_argument("--older-than", type=float, metavar="天")
     r = sp.add_parser("run")
     r.add_argument("--repo", action="append", default=[], help="本地路径[=名]，第一个带环境描述")
     r.add_argument("--commit-of", action="append", default=[], metavar="名=commit或分支")
@@ -431,8 +639,9 @@ def main(argv=None):
         elif a.cmd == "inventory":
             print(json.dumps(tr.call("inventory"), ensure_ascii=False, indent=1))
         elif a.cmd == "push-tool":
-            print(tr.call("update", stdin=ENTRY.read_bytes())["message"])
-            print(tr.call("ping")["testhost"])
+            push_tool(tr)
+        elif a.cmd == "media":
+            return cmd_media(tr, a)
         elif a.cmd == "status":
             print(json.dumps(tr.call(f"status {a.run_id}")))
         elif a.cmd == "result":
@@ -454,7 +663,7 @@ def main(argv=None):
             return cmd_run(tr, a)
     except (THError, subprocess.TimeoutExpired) as e:
         print(f"错误：{e}", file=sys.stderr)
-        return 3
+        return 4 if getattr(e, "code", None) == "not_found" else 3
     return 0
 
 

@@ -1,1 +1,17 @@
-{"python": "3.12", "pip": ["pytest", "pytest-xdist"], "env": {}}
+{
+  "_说明": "Studio 跑 testhost 自测用（client.py run --repo <base> --workdir base --env-file testhost/testenv.json testhost/tests/test_local.py）。conda 的 ffmpeg 给 media 动作的自测用；python/pip/conda 与 media.json 一致，两边共用同一个环境。任务 media-sample：用 lavfi 合成 30 秒带音轨的测试视频（testsrc 画面 + 440Hz 正弦，立体声 44.1k），给 media 动作真跑当素材，不碰任何真实录像。",
+  "python": "3.12",
+  "pip": ["pytest", "pytest-xdist"],
+  "conda": ["ffmpeg"],
+  "env": {},
+  "tasks": {
+    "media-sample": {
+      "cmd": ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
+              "-f", "lavfi", "-i", "testsrc=size=640x360:rate=25",
+              "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=44100",
+              "-t", "30", "-map", "0:v", "-map", "1:a", "-ac", "2",
+              "-c:v", "mpeg4", "-q:v", "5", "-c:a", "aac", "-b:a", "96k", "-y", "{run}/out/sample.mp4"],
+      "outputs": ["out/sample.mp4"]
+    }
+  }
+}

@@ -4,13 +4,14 @@ Ubuntu 派活，Mac Studio（omlxwake 账户）跑任意仓库的 pytest 或描�
 
 - `mac_testhost.sh`：Mac 端入口（bash 3.2 兼容，单文件），经 `update` 推到 `~/xxyi-testhost/bin/testhost`
 - `client.py`：Ubuntu 端客户端（标准库 + ssh/git 子进程）
+- `media.json`：media 动作用的 ffmpeg 环境描述（conda-forge ffmpeg），随 `push-tool` 推到 `~/xxyi-testhost/bin/media.json`
 - `tests/test_local.py`：本机自测（假目录模拟 Mac 端）：`python -m pytest testhost/tests`
 
 ## 用法
 
 ```
 python client.py ping                 # 在线、核数、负载、在跑 run 数、是否空闲
-python client.py push-tool            # 把 mac_testhost.sh 推到 Mac（改了入口就推）
+python client.py push-tool            # 把 mac_testhost.sh 与 media.json 推到 Mac（改了入口或 media.json 就推）
 python client.py run --repo <本地路径>[=<名>] ... [--commit-of 名=commit或分支] \
        --workdir <名> [-n N] [-k 表达式] [-m 标记] <测试文件...>
        [--plugin 外挂.py]... [--plugin-file 配套.py]... [--plugin-env KEY=VALUE]... [--out-dir 目录]
@@ -18,6 +19,10 @@ python client.py run --repo ... --workdir <名> --task <任务名> [--plugin-env
 python client.py status <run_id> | result <run_id> [--out-dir 目录] | fetch <run_id> --out-dir 目录 | inventory
 python client.py cancel <run_id>     # 停止 run（见 Mac 端动作 cancel：只杀属于该 run 的进程）
 python client.py clean runs [--keep N] | run <id> | envs | snapshots | repos
+python client.py media put <本地文件> [--name 名]                       # 见「media 动作（11/04）」
+python client.py media audio <哈希> [--segment-min 10] --out <目录>
+python client.py media frames <哈希> --at 1234,5678 [--width 960] --out <目录>
+python client.py media clean <哈希> | --older-than <天>
 ```
 
 `run` 流程：增量 bundle → sync → snapshot → prepare → run → 每 15 秒 status → fetch → 汇总。
@@ -75,6 +80,11 @@ prepare 会在环境的 site-packages 里写 `testhost_extra.pth`，把环境变
 | `fetchx <id>` | tar：外挂写在 run 目录顶层与 out/ 里的普通文件 |
 | `cancel <id>` | 停止该 run，回 killed/survivors 计数（找进程与记状态的规则见下） |
 | `clean runs [--keep N] / run <id> / envs / snapshots / repos` | 手动清理，只删 ~/xxyi-testhost 下；有 run 在跑时不清缓存 |
+| `media-put <sha256> <文件名> [--size 字节]` | stdin 是文件本身，校验 sha256 后存 media/<哈希>/<文件名>；已有同哈希不读 stdin、回 existed |
+| `media-audio <sha256> [--segment-min 分钟]` | tar：`audio/0001.wav…`（16 kHz 单声道 16 位）+ `index.json` |
+| `media-frames <sha256> --at 毫秒,… [--width 像素]` | tar：`frames/<毫秒>.jpg` + `index.json` |
+| `media-clean <sha256> / --older-than <天>` | 按哈希删，或删超过 N 天没用过的（在用的跳过） |
+| `media-spec` | stdin 是 media.json，校验后替换 bin/media.json（push-tool 在 update 之后调） |
 
 `cancel <id>`：要停的进程按**本 run 的目录路径**找——`out/pid` 里那个进程及其全部后代（`ps` 自己算进程树），
 加上命令行里含 `runs/<id>/`（带尾斜杠，防 run1 误中 run10）的进程（抓已孤儿化、父进程变 launchd 的，如测试起的临时 PG postmaster）；
@@ -85,13 +95,60 @@ run 已自己结束且无残留时只回 `state:"finished"` 不写 cancelled。�
 
 ## 目录（~/xxyi-testhost）
 
-`bin/` 入口、`repos/<名>.git` 裸仓库、`snapshots/<名>/`、`envs/<hash>/` 与 `envs/<hash>.ok`（成功标记）、
-`runs/<id>/{src,home,tmp,ramdisk,out}`、`dl/` 日志。隔离：HOME、TMPDIR、CMDPROTO_RAMDISK_ROOT 都指进 run 目录，`env -i` 起 pytest。
+`bin/` 入口（与 `media.json`）、`repos/<名>.git` 裸仓库、`snapshots/<名>/`、`envs/<hash>/` 与 `envs/<hash>.ok`（成功标记）、
+`runs/<id>/{src,home,tmp,ramdisk,out}`、`dl/` 日志、`media/<sha256>/`（上传的媒体，见下）。隔离：HOME、TMPDIR、CMDPROTO_RAMDISK_ROOT 都指进 run 目录，`env -i` 起 pytest。
+
+## media 动作（11/04）
+
+给「Ubuntu 发起、媒体处理交 Studio」用（Ubuntu 的 CPU 不做媒体处理）：录像传上去，要 16k 音频或某几个时间点的画面时同步调一次，
+不走 prepare/run/轮询，不占 run。Studio 不在文件同步里，文件只能经 `media put` 上传。
+
+- **存放**：`~/xxyi-testhost/media/<sha256>/<原文件名>`，旁边 `.last_used`（最后一次 put/audio/frames 的时间戳）。
+  文件名取自 `media put` 的本地文件名（或 `--name`），只用来留扩展名与认人；不能有 `/` `\` 和控制字符、不能以 `.` 或 `-` 开头、UTF-8 ≤200 字节，中文、空格可以。
+  同一内容第二次 put 回「已有」，保留第一次的文件名。
+- **put**：客户端流式算 sha256（1 MB 一块，不整块读进内存），再把文件描述符直接交给 ssh 当 stdin。Mac 端边收边算哈希，
+  哈希或字节数（`--size`）对不上就删掉半成品、拒（`hash_mismatch`/`size_mismatch`）；先写 `media/.tmp-<pid>-*/`，校验过了整目录改名，
+  并发 put 同一份只留一份。已有同哈希时 Mac 端不读 stdin、直接回 `existed:true`（只多传 ssh 窗口里那一点）。
+- **audio**：`ffmpeg -i <文件> -map 0:a:0 -af aresample=async=1:first_pts=0 -ac 1 -ar 16000 -f s16le -`，Mac 端按样本数切段，
+  每段写好 WAV 头就进 tar、随即删掉，磁盘上至多一段（10 分钟一段约 19 MB）。时间轴与 frames 的 `-ss` 相同（文件起点 = 0，
+  音轨开头的空缺补静音）。`--segment-min` 0.01..600、至多 3 位小数（段界都是整毫秒），最后一段不足照切。
+  `index.json`：`{hash, name, sample_rate:16000, channels:1, bits:16, segment_min, segment_ms, duration_ms, samples,
+  segments:[{file:"audio/0001.wav", offset_ms, duration_ms, samples, bytes}]}`。
+- **frames**：每个时间点一条 `ffmpeg -ss <秒> -i <文件> -frames:v 1 -vf scale=w='min(<width>,iw)':h=-2 -q:v 3`（输入前 `-ss`，
+  解码寻址到准确时间；宽度不放大；并发至多 4 条）。`--at` 至多 500 个非负整数毫秒，重复的去掉；`--width` 缺省 960。
+  `index.json`：`{hash, name, duration_ms, max_width, video_stream, frames:[{t_ms, file:"frames/<t>.jpg", bytes, width, height}],
+  out_of_range:[t…]（≥ ffprobe 报的时长，不截）, failed:[{t_ms, error}]（时长未知或最后一帧之后没截到的）}`。有超出/失败也算成功。
+- **clean**：`<sha256>` 删那一份（没有也回成功，`deleted:[]`）；`--older-than <天>` 删 `.last_used` 早于 N 天的（`0` = 全删）。
+  正在被 audio/frames 用的（`.busy-<pid>` 且进程活着）不删：指名删报 `busy`，按天删列在 `busy` 里。顺手清掉中断留下的
+  `.tmp-*`/`.work-*`（进程不在了或超过 2 天）。回 `deleted, busy, freed_bytes, kept, free_gb`。保留多久由调用方定（本库不自动删）。
+- **ffmpeg 从哪来**：`media.json`（`python 3.12` + `conda: ["ffmpeg"]`）照 prepare 的环境机制建 `envs/<hash>/`，动作里用
+  `envs/<hash>/bin/ffmpeg`、`ffprobe` 的绝对路径（强制命令的 PATH 不含 /opt/homebrew/bin，也不需要）。audio/frames 第一次调用时环境没建
+  就当场建（conda-forge 联网，Studio 要能上网；建的日志在 `dl/env-<hash>.log`），这一次要几分钟，之后复用。参数和哈希先校验，不对不会去建环境。
+  `media.json` 与 `testenv.json` 的 python/pip/conda 等价，两者共用一个环境（测试守着）。`clean envs` 会连它一起删，下次 media 动作再建。
+- **推到 Studio**：Studio 上不用装任何东西。`python client.py push-tool` 先 `update` 推入口（语法检查后替换，旧版留 .prev），
+  `ping` 确认版本（v5 起有 media 动作），再 `media-spec` 推 media.json（v4 的旧入口不认 media-spec，只会回「不认识的动作」，
+  不会把 JSON 当入口换上去）。改了 media.json 的包，重推后 hash 变了，下次 audio/frames 自动建新环境。
+- **出错的形状**：Mac 端 JSON 带 `code`（`bad_args`、`not_found`、`hash_mismatch`、`size_mismatch`、`too_big`、`no_space`、`busy`、
+  `bad_media`、`no_audio`、`no_video`、`ffmpeg`）。audio/frames 还没开始写 tar 就出错时 stdout 是一行 JSON；写到一半出错时
+  JSON 写 stderr、退出码 1、不写 index.json。客户端只认 `audio/NNNN.wav`、`frames/<毫秒>.jpg`、`index.json` 三种成员（别的、链接、
+  `..` 一律拒），每个文件先写 `.part` 再改名，收完核对 index 里列的文件都到了，index.json 写进 `--out`（不清 `--out` 里原有的文件，每次用新目录或以 index 为准）。
+- **客户端退出码**（media 子命令）：0 成功；4 = Studio 上没有这个哈希（先 `media put`）；3 = 其余（通道、校验不过、参数、ffmpeg）。
+  最后一行打印 JSON 结果（audio/frames 只打摘要，完整 index 在 `--out/index.json`）。Python 里可直接调 `media_put`/`media_audio`/
+  `media_frames`/`media_clean`（返回同样的字典）。
+- **限制**：单文件 ≤20 GiB；写完后磁盘至少还剩 10 GiB（给了 `--size` 先查，收的过程中每 256 MB 再查），`ping` 回 `disk_free_gb`。
+  没有排队：每次调用是一条 ssh 会话里的同步活，几个客户端同时调就同时跑 ffmpeg（不看网关忙不忙）。上传的录像不会自己过期，要调用方
+  `media clean --older-than N`。`clean envs` 与正在跑的 audio/frames 不互斥（会删掉正在用的 ffmpeg）。
+- **Studio 实测（11/04，v5）**：第一次 audio 当场建 ffmpeg 环境连同调用共约 50 秒，之后复用；30 秒合成样片（1.5 MB mp4）
+  put 0.2 s、再 put（已有）0.2 s、audio 切 3 段 0.3 s、frames 三个点（一个超出）0.35 s、clean 0.2 s（都是客户端墙钟，含 ssh）；
+  300 MB 上传 1.1 s，客户端常驻内存 28 MB。testhost 自测 59 过 / 0 败 / 1 跳（跳的是「没有 ffmpeg 时报错」那条）。
 
 ## 本机自测与已知差异
 
 - `TESTHOST_LOCAL=<目录>` 让客户端直接本机执行入口（不走 ssh）；`TESTHOST_ENV_STUB=<conda 环境前缀>` 让 prepare 不建环境、
-  软链已有环境。Mac 上不要设这两个变量。
+  软链已有环境（media 环境同理）。Mac 上不要设这两个变量。本机模式下入口在假目录 `bin/` 里找不到 media.json 时用入口旁的那份。
+- media 的上传/去重/校验/清理/参数自测哪里都跑；转音频、抽帧要真 ffmpeg，只在 macOS 且测试环境里有 ffmpeg 时跑（Studio：
+  `client.py run --repo <base> --workdir base --env-file testhost/testenv.json testhost/tests/test_local.py`），Ubuntu 上跳过。
+  `testenv.json` 的任务 `media-sample` 用 lavfi 合成 30 秒带音轨的测试视频（`--task media-sample --out-dir 目录` 取回 sample.mp4），真跑用它，不用真实录像。
 - 入口里 sysctl/sw_vers/scutil 有 Linux 兜底；bash 3.2 不支持的语法（mapfile、关联数组、`${v,,}`）一律不用；变量后接中文要写 `${VAR}`。
 - macOS 的 tar 是 bsdtar，GNU 与 bsd 的 `-x -C -f -` 写法一致；`find`/`paste`/`date` 只用两边共有的选项。
 - 没有防睡处理；没有 setsid，后台进程靠 nohup + 全部重定向，ssh 会话结束后不受影响（无 pty）。

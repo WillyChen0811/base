@@ -83,7 +83,7 @@ frames = frames_at("record.webm", [61000, 75250], "analysis/frames")
 麦克风用幅度：回声比本机低 20 dB，幅度只有十分之一，几乎不进相关（用 dB 时回声会把峰往回声延迟方向拽）。
 混音用"高出阈值多少 dB"：远端比本机响时，幅度包络会让麦克风里的本机话去对混音里更响的远端话。
 
-耗时：两小时的两条 16 kHz 轨，Studio 上见汇报/测试输出（`test_align_two_hour_tracks_under_30s` 打印）。
+耗时（Studio，11/04 实测，`test_align_two_hour_tracks_under_30s`）：两条两小时的 16 kHz 合成轨，对齐 1.0 s（误差 -1 ms，478/479 块同意众数，各块极差 50 ms），两条 VAD 0.1 s，归属 0.2 s；解码不算在内。按录制端/腾讯会议格式编码（webm/opus 48k、m4a/AAC 单声道 32k）再解码，对齐误差 ±1 ms，归属 14/14 段对。
 
 ### 归属（`attribute`）
 

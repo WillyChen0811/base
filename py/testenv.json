@@ -1,5 +1,5 @@
 {
-  "_说明": "Studio 测试机跑 base/py 用的环境描述：python testhost/client.py run --repo <base 工作树>=base --env-file py/testenv.json --workdir base py/tests（单个文件就写 py/tests/test_x.py）。pip 按 pyproject 各 extra 列（Windows 与 mlx 的除外）；ffmpeg 走 conda（测试在 env -i 里跑，PATH 里没有 Homebrew）；PYBASE_LONG_AUDIO_TEST=1 打开两小时合成轨的对齐耗时测试（约 1 GB 内存）；音频测试记下的耗时/误差写进 {run}/out/audio-report.txt（加 --out-dir 取回）。",
+  "_说明": "Studio 测试机跑 base/py 用的环境描述：python testhost/client.py run --repo <base 工作树>=base --env-file py/testenv.json --workdir base py/tests（单个文件就写 py/tests/test_x.py）。pip 按 pyproject 各 extra 列（Windows 与 mlx 的除外），另加 tqdm（拷进 _vendor 的 pysmb 要 import，smb extra 里没列）；ffmpeg 走 conda（测试在 env -i 里跑，PATH 里没有 Homebrew）；PYBASE_LONG_AUDIO_TEST=1 打开两小时合成轨的对齐耗时测试（约 1 GB 内存）；音频测试记下的耗时/误差写进 {run}/out/audio-report.txt（加 --out-dir 取回）。",
   "python": "3.12",
   "pip": [
     "numpy>=1.24",
@@ -12,6 +12,7 @@
     "pyasn1",
     "requests>=2.31.0",
     "urllib3>=2.0.0",
+    "tqdm",
     "fastapi>=0.100.0",
     "paramiko>=3.4",
     "sqlalchemy>=2.0.36",

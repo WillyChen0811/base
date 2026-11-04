@@ -138,6 +138,9 @@ run 已自己结束且无残留时只回 `state:"finished"` 不写 cancelled。�
 - **限制**：单文件 ≤20 GiB；写完后磁盘至少还剩 10 GiB（给了 `--size` 先查，收的过程中每 256 MB 再查），`ping` 回 `disk_free_gb`。
   没有排队：每次调用是一条 ssh 会话里的同步活，几个客户端同时调就同时跑 ffmpeg（不看网关忙不忙）。上传的录像不会自己过期，要调用方
   `media clean --older-than N`。`clean envs` 与正在跑的 audio/frames 不互斥（会删掉正在用的 ffmpeg）。
+- **Studio 实测（11/04，v5）**：第一次 audio 当场建 ffmpeg 环境连同调用共约 50 秒，之后复用；30 秒合成样片（1.5 MB mp4）
+  put 0.2 s、再 put（已有）0.2 s、audio 切 3 段 0.3 s、frames 三个点（一个超出）0.35 s、clean 0.2 s（都是客户端墙钟，含 ssh）；
+  300 MB 上传 1.1 s，客户端常驻内存 28 MB。testhost 自测 59 过 / 0 败 / 1 跳（跳的是「没有 ffmpeg 时报错」那条）。
 
 ## 本机自测与已知差异
 

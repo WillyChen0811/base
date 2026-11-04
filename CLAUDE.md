@@ -83,6 +83,14 @@
 - mlx：MLX 的 GPU stream 绑定线程，加载/识别/流式 `step` 必须在同一个线程（实例的专属线程），
   别改成调用方线程或多线程池
 - 实时会话 with 退出只收尾不取结果，剩下的 final 留给 `results()`——别改回 `close()` 里清队列
+- `AppleSpeech`/`MlxAudio.transcribe` 返回的 `Transcript`（`cues` 是 `pybase.subtitle.Cue`）不改形状：ai-browser 按
+  `isinstance(cue, pybase.subtitle.Cue)` 校验。远程识别和 `apple.transcribe` 用 `types.Cue`（`start_ms`/`end_ms`/`speaker`），
+  两边靠 `from_subtitle`/`from_transcript` 互转，别把一个塞进另一个
+- remote：HTTP 只走 `wgnet.http`（xxyi 进程是 strict，requests/urllib 会绕过 wgtund）；`checkpoint_dir` 必填，
+  清理只删本模块自己的文件名（`seg-NNNN.json`、`refine.json`、`audio-16k.*`），目录空了才 rmdir，绝不 rmtree
+- remote：16k 单声道 16 位 WAV 的路径上不许出现 ffmpeg 调用（调用方会在不许做媒体处理的机器上跑）；
+  ffmpeg 只在输入不是这种 WAV 时转一次。重叠去重按句子**中点**归段，小样余量不出段、不过相邻句空隙一半
+- 语言：remote 发主语言码、None 就不带（不内置语种默认）；`apple.transcribe` 要具体 locale，裸 `zh` 抛错
 
 ### digest
 - 时间戳只能由程序按句子编号从 cues 查回，别改成让模型直接写时间（会编造/对不上）

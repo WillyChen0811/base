@@ -54,6 +54,10 @@ class H(BaseHTTPRequestHandler):
             self._send(500, b"boom")
         elif self.path.startswith("/convert"):
             self._send(200, b"%PDF" + self.path.encode(), "application/pdf", {"X-Page-Count": "3"})
+        elif self.path == "/v1/audio/transcriptions":
+            ok = b"multipart/form-data" in self.headers.get("Content-Type", "").encode() and \
+                self.headers.get("X-Xxyi-Client") == "pybase-asr"
+            self._send(200 if ok else 400, json.dumps({"text": "经 wgnet。"}, ensure_ascii=False).encode())
         elif self.path == "/rpc":
             req = json.loads(data)
             if isinstance(req, list):
@@ -111,3 +115,20 @@ def test_mihomo经wgnet(via):
     r = collect_mihomo("http://clash.lan:9090")
     assert r.get("ok") is not False and r.get("version") == "1.0"
     assert {h for _, h, _ in via.seen} == {"clash.lan"}
+
+
+def test_asr_remote经wgnet(via, tmp_path):
+    import wave
+
+    from pybase.asr import Cue, refine_cues
+
+    audio = tmp_path / "a.wav"
+    with wave.open(str(audio), "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(16000)
+        w.writeframes(b"\x10\x00" * 16000)
+    cues, stats = refine_cues([Cue(100, 600, "原文")], audio, base_url="http://asr.lan:8000",
+                              api_key="", text_model="m", checkpoint_dir=tmp_path / "ckpt")
+    assert cues == [Cue(100, 600, "经 wgnet。")] and stats["changed"] == 1
+    assert {h for _, h, _ in via.seen} == {"asr.lan"}

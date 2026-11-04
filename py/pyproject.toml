@@ -32,6 +32,8 @@ smb = [
     "pyasn1",
     "requests>=2.31.0",
     "urllib3>=2.0.0",
+    # 拷进 _vendor 的 pysmb（smb/base.py、smb/SMBConnection.py）顶层 import tqdm
+    "tqdm",
 ]
 crypto = [
     "cryptography>=44.0.0",

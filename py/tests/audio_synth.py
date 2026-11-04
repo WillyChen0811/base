@@ -164,6 +164,19 @@ def make_long_meeting(hours: float, *, offset_ms: int = 1234, echo_db: float = -
     return Meeting(mic, mix, offset_ms, sr)
 
 
+def report(line: str) -> None:
+    """测试里要记下的数（耗时、误差）：打印，另外 PYBASE_TEST_REPORT_DIR 设了就追加进
+    那里的 audio-report.txt（Studio 上指到 run 的 out/，client.py --out-dir 取回）。"""
+    import os
+
+    print(line)
+    folder = os.environ.get("PYBASE_TEST_REPORT_DIR")
+    if folder:
+        os.makedirs(folder, exist_ok=True)
+        with open(os.path.join(folder, "audio-report.txt"), "a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
+
+
 def coverage(pieces: list[dict], s: int, e: int, who: str, shrink: int = 200) -> float:
     """真值段 [s+shrink, e-shrink] 里被标成 who 的时长占比。"""
     lo, hi = s + shrink, e - shrink

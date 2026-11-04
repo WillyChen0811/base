@@ -12,7 +12,7 @@ import pytest
 
 np = pytest.importorskip("numpy")
 
-from audio_synth import TRUTH, coverage, make_meeting  # noqa: E402
+from audio_synth import TRUTH, coverage, make_meeting, report  # noqa: E402
 from pybase.audio import (  # noqa: E402
     align_detail, attribute, decode_pcm, speech_segments,
 )
@@ -113,11 +113,14 @@ def test_end_to_end_encoded_meeting(tmp_path, echo_db):
 
     mic, mix = decode_pcm(mic_file), decode_pcm(mix_file)
     d = align_detail(mic, mix, 16000)
-    print(f"\n编码后对齐（回声 {echo_db} dB）：{d['offset_ms']} ms，真值 {m.offset_ms}，"
-          f"误差 {d['offset_ms'] - m.offset_ms:+d} ms")
+    report(f"编码后（webm/opus 48k + m4a/AAC 32k）对齐，回声 {echo_db} dB：{d['offset_ms']} ms，"
+           f"真值 {m.offset_ms}，误差 {d['offset_ms'] - m.offset_ms:+d} ms")
     assert abs(d["offset_ms"] - m.offset_ms) <= 20
 
     pieces = attribute(speech_segments(mic, 16000), speech_segments(mix, 16000),
                        d["offset_ms"], mic, mix, 16000)
-    for s, e, who in TRUTH:
-        assert coverage(pieces, s, e, who) >= 0.8, (s, e, who, pieces)
+    covs = [coverage(pieces, s, e, who) for s, e, who in TRUTH]
+    report(f"编码后归属，回声 {echo_db} dB：{sum(c >= 0.8 for c in covs)}/{len(covs)} 段对，"
+           f"最差覆盖 {min(covs):.2f}")
+    for (s, e, who), c in zip(TRUTH, covs):
+        assert c >= 0.8, (s, e, who, pieces)

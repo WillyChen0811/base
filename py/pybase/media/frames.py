@@ -76,9 +76,10 @@ def frames_at(
             "-ss", _seconds(t), "-i", str(video),
             "-map", "0:v:0", "-frames:v", "1", "-q:v", "2",
         ]
-        if width:
-            cmd += ["-vf", f"scale='min({int(width)},iw)':-2"]
-        cmd += [str(tmp)]
+        # 显式转成全范围 yuvj420p：mjpeg 编码器不收有限范围的 yuv420p，平时靠滤镜协商自动转，
+        # 但时间点越过末尾、一帧都没解出来时编码器按输入流的格式初始化，会直接报错退出
+        scale = f"scale='min({int(width)},iw)':-2:" if width else "scale="
+        cmd += ["-vf", scale + "out_range=full", "-pix_fmt", "yuvj420p", str(tmp)]
         try:
             result = run(cmd, timeout=timeout, cancel_event=cancel_event)
         except MediaError:

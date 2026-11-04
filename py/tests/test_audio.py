@@ -15,7 +15,7 @@ np = pytest.importorskip("numpy")
 
 from audio_synth import (  # noqa: E402
     G_SELF_MIC, G_SELF_MIX, REMOTE, SELF, SR, TRUTH, coverage, make_long_meeting,
-    make_meeting,
+    make_meeting, report,
 )
 from pybase.audio import (  # noqa: E402
     AlignError, align_detail, align_offset, attribute, auto_threshold_db,
@@ -148,12 +148,21 @@ def test_align_silent_track_raises():
 @pytest.mark.skipif(not os.environ.get("PYBASE_LONG_AUDIO_TEST"),
                     reason="两小时合成轨要 1 GB 内存，只在 Studio（PYBASE_LONG_AUDIO_TEST=1）跑")
 def test_align_two_hour_tracks_under_30s():
+    t0 = time.perf_counter()
     m = make_long_meeting(2.0)
+    made = time.perf_counter() - t0
     t0 = time.perf_counter()
     d = align_detail(m.mic, m.mix, m.sr)
     took = time.perf_counter() - t0
-    print(f"\n两小时轨对齐耗时 {took:.2f} s，误差 {d['offset_ms'] - m.offset_ms:+d} ms，"
-          f"块 {d['used']}/{d['total']}，极差 {d['spread_ms']} ms")
+    t0 = time.perf_counter()
+    mic_segs, mix_segs = speech_segments(m.mic, m.sr), speech_segments(m.mix, m.sr)
+    vad = time.perf_counter() - t0
+    t0 = time.perf_counter()
+    attribute(mic_segs, mix_segs, d["offset_ms"], m.mic, m.mix, m.sr)
+    attr = time.perf_counter() - t0
+    report(f"两小时轨（16 kHz，两条）：对齐 {took:.2f} s，误差 {d['offset_ms'] - m.offset_ms:+d} ms，"
+           f"块 {d['used']}/{d['total']}，极差 {d['spread_ms']} ms；两条 VAD {vad:.2f} s；"
+           f"归属 {attr:.2f} s（合成信号 {made:.1f} s 不算）")
     assert abs(d["offset_ms"] - m.offset_ms) <= 20
     assert took < 30
 

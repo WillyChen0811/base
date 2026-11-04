@@ -45,6 +45,8 @@ class LlmClient:
         temperature: float = 0.2,
         timeout: float = 600,
         embeddings_path: str = "/v1/embeddings",
+        max_tokens: Optional[int] = None,
+        extra_headers: Optional[dict] = None,
     ):
         if not base_url:
             raise AiRequestError("AI 接口地址未配置,请到 AI 设置页填写")
@@ -55,6 +57,8 @@ class LlmClient:
         self.model = model or None
         self.temperature = temperature
         self.timeout = timeout
+        self.max_tokens = max_tokens                  # None = 不写进请求体（服务端按模型默认）
+        self.extra_headers = dict(extra_headers or {})
 
     def chat(
         self,
@@ -91,6 +95,7 @@ class LlmClient:
         headers = {"Content-Type": "application/json"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
+        headers.update(self.extra_headers)
         try:
             with wgnet.http.post(self.embeddings_endpoint, json.dumps(body).encode("utf-8"), headers,
                                  timeout=self.timeout) as response:
@@ -130,11 +135,14 @@ class LlmClient:
         }
         if self.model:
             body["model"] = self.model
+        if self.max_tokens is not None:
+            body["max_tokens"] = self.max_tokens
         if json_mode:
             body["response_format"] = {"type": "json_object"}
         headers = {"Content-Type": "application/json"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
+        headers.update(self.extra_headers)
         try:
             with wgnet.http.post(self.endpoint, json.dumps(body).encode("utf-8"), headers,
                                  timeout=self.timeout, stream=bool(on_delta)) as response:

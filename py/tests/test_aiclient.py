@@ -111,8 +111,9 @@ def test_chat_json_mode_falls_back_on_error():
 
 
 def test_chat_max_tokens_and_extra_headers():
-    server = _ScriptedServer([_json_response(200, {"choices": [{"message": {"content": "hi"}}]})] * 2
-                             + [_json_response(200, {"data": [{"index": 0, "embedding": [1.0]}]})])
+    server = _ScriptedServer([_json_response(200, {"choices": [{"message": {"content": "hi"}}]}),
+                              _json_response(200, {"data": [{"index": 0, "embedding": [1.0]}]}),
+                              _json_response(200, {"choices": [{"message": {"content": "hi"}}]})])
     try:
         client = LlmClient(server.base_url, max_tokens=123, extra_headers={"X-Xxyi-Priority": "1"})
         client.chat([{"role": "user", "content": "hello"}], json_mode=False)

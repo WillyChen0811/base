@@ -28,7 +28,9 @@
   本机麦克风轨与会议混音轨对齐（包络互相关，几小时的轨分块估计）、混音每段话标本机/远端/同时说
   （`pip install "pybase[audio]"`，numpy）。用法、阈值来历与局限见 `pybase/audio/README.md`
 - `pybase.asr`：语音识别（中文/英文 × 整段/实时），两个后端同一套接口：`AppleSpeech`（macOS 26+ 系统自带
-  SpeechAnalyzer，零 pip 依赖，需 swiftc）与 `MlxAudio`（mlx-audio，Apple Silicon，`pip install "pybase[asr-mlx]"`）。
+  SpeechAnalyzer，零 pip 依赖，需 swiftc）与 `MlxAudio`（mlx-audio，Apple Silicon，`pip install "pybase[asr-mlx]"`）；
+  另有远程识别 `transcribe_remote`/`refine_cues`（服务器上 Whisper 定时间 + Qwen 出文字，零 pip 依赖，带断点）
+  和 Apple 便捷入口 `transcribe_apple`，这两类返回 `TranscriptionResult`（JSON 毫秒整数）。
   **不内置任何模型**，模型和 locale 由调用方给
 - `pybase.digest`：给带时间戳的字幕生成带出处的总结（概览 + 章节 + 要点），模型只引用句子编号，时间由程序查回；
   长字幕自动分块再汇总。模型调用由调用方注入（`complete(messages) -> str`）
@@ -114,6 +116,49 @@ remaining = stream.results()                        # with 退出后收尾出的
 | 整段时间戳 | 句级（按逐字时间切） | 由模型决定：Parakeet 句级，Whisper 段级，Qwen3-ASR 只有分块级 |
 | 实时 | 分段出临时/最终结果 | 仅带 `create_streaming_session` 的模型（Voxtral Realtime 等）；整个会话一段，结束时出 final |
 
+### 远程识别与 Apple 便捷入口（`TranscriptionResult`）
+
+```python
+from pybase.asr import Cue, refine_cues, transcribe_apple, transcribe_remote, save_result
+
+# 服务器（OpenAI 兼容 POST /v1/audio/transcriptions）上 Whisper 定时间、Qwen 出文字
+result = transcribe_remote(
+    "talk.wav", base_url="http://<服务器>:<端口>", api_key="...",
+    timing_model="<whisper 模型名>", text_model="<qwen3-asr 模型名>",
+    language="zh-CN",                    # 发出去取主语言码 zh；None 不带，交给模型判断
+    checkpoint_dir="<分析目录>/asr-ckpt",  # 必填
+    on_progress=lambda stage, frac: ...,  # "converting"（要转码时）/"transcribing"
+)
+save_result(result, "<分析目录>/transcript.qwen.json")
+
+# Mac 本机 Apple Speech（只能 macOS 26+；webm/mkv/ogg 自动先转 WAV）
+apple = transcribe_apple("record-mic.webm", language="zh-CN",  # 要具体 locale，裸 zh 不认
+                         max_cue_ms=6000)  # 单条最长时长缺省不限，ai-browser 用 6000
+
+# 沿用 Apple 的时间轴和说话人，每句交 Qwen 重听换文字
+cues, stats = refine_cues(apple.cues, "record-mic.webm", base_url=..., api_key=...,
+                          text_model="<qwen3-asr 模型名>", checkpoint_dir="<分析目录>/refine-ckpt")
+```
+
+结果 JSON：`{"engine": "omlx:<timing>+<text>", "cues": [{"start_ms": 0, "end_ms": 2400, "text": "…", "speaker": ""}]}`。
+`Cue` 有 `start_ms`/`end_ms`/`text`/`speaker`；和 `AppleSpeech`/`MlxAudio` 返回的 `Transcript`（字幕 `Cue`，
+`start`/`end`）用 `Cue.from_subtitle`/`to_subtitle`、`TranscriptionResult.from_transcript` 互转。
+取消抛 `TranscriptionCancelled`，其余失败抛 `AsrError`。
+
+- **两条路**：输入是 16 kHz 单声道 16 位 PCM WAV（`wave` 能读）时全程不调 ffmpeg——时长读 WAV 头，长静音用
+  纯 Python 能量法（30ms 一帧算 RMS，低于 -35 dBFS 连续 ≥180 秒），切段、切句按帧位置读、在内存里包成小 WAV
+  发出去；其他输入先用 ffmpeg 转一次成 `checkpoint_dir/audio-16k.wav`（续跑时源文件没变就复用），之后同样走纯
+  Python 路。要在不做媒体处理的机器上跑，就让别处先把音频转成 16k 单声道 WAV。
+- **机器分工**（本工作区的部署）：Mac 本机用 Apple Speech（快、不占服务器），服务器在线时再 `refine_cues` 换成
+  Qwen 的文字；Mac Studio 上跑 Whisper + Qwen（`transcribe_remote` 的两个模型）；Ubuntu 没有 Apple Speech，
+  走 `transcribe_remote`，而且音频要先由别处转好 16k WAV。
+- **断点目录**：`checkpoint_dir` 必须给，本库绝不往源文件旁边写东西。`transcribe_remote` 每段（缺省 10 分钟、
+  重叠 5 秒）成功后写 `seg-NNNN.json`，`refine_cues` 每 10 句写 `refine.json`；指纹（源文件大小/修改时间、模型、
+  语言、切段与静音参数）对得上才复用，所以中途掉线、被杀之后再跑不重发已完成的段。全部成功后只删本库写的文件，
+  目录删空才删目录。一个目录同一时间只给一次识别用。
+- **并发**：`concurrency` 缺省 2，是同时在飞的句子请求数（每段的定时间请求串行）。连不上、超时、HTTP 5xx
+  重试 2 次（等 2 秒、5 秒，取消可打断），4xx 不重试。HTTP 经 `pybase.wgnet`，请求头带 `X-Xxyi-Client: pybase-asr`。
+
 ## 安装
 
 `pip install pybase` 本身不拉任何第三方依赖——只装用得到的模块对应的 extra：
@@ -130,14 +175,14 @@ pip install -e "./py[all]"
 ```
 
 模块与 extra 对照表（没列出的模块——`rpc`（stdio/HTTP 部分）、`ramdisk`、`aiclient`、
-`cdpnet`、`playwright_launch`、`media`、`dictionary`、`digest`、`search`、`asr`（Apple 后端）、`net`（密钥生成除外）、
+`cdpnet`、`playwright_launch`、`media`、`dictionary`、`digest`、`search`、`asr`（Apple 后端与远程识别）、`net`（密钥生成除外）、
 `storage`、`fileops`、`retry`、`inventory`、`timemachine`——零第三方依赖，直接 `import` 即可）：
 
 | extra | 第三方依赖 | 覆盖模块 |
 |---|---|---|
 | `docx` | python-docx | `pybase.docx.oxml` |
 | `sheets` | openpyxl, xlrd | `pybase.sheets` |
-| `smb` | cryptography, pyspnego, pyasn1, requests, urllib3（smbprotocol/pysmb 已拷进 `pybase/_vendor`） | `pybase.smb` |
+| `smb` | cryptography, pyspnego, pyasn1, requests, urllib3, tqdm（smbprotocol/pysmb 已拷进 `pybase/_vendor`） | `pybase.smb` |
 | `crypto` | cryptography | `pybase.crypto` |
 | `office` | requests | `pybase.office`（`WordPdfClient`，跨平台部分） |
 | `office-word` | pywin32（仅 Windows） | `pybase.office.word` 的 Word COM 驱动 |

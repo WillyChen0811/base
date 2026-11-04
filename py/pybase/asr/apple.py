@@ -3,6 +3,9 @@
 SpeechAnalyzer 只有 Swift API：随包带 `apple_speech.swift`，首次使用时用 swiftc
 （Xcode Command Line Tools 自带）编译，之后以子进程调用，协议见该文件头部注释。
 识别资源由系统管理，缺了会在首次识别时自动下载，所以首次调用可能很慢。
+
+`transcribe(path, language=...)` 是整段识别的便捷入口（从 ai-browser core/speech.py 搬来）：
+读不了的格式先转 WAV、识别卡住自动中止、单条字幕限长，返回 `types.TranscriptionResult`。
 """
 from __future__ import annotations
 
@@ -10,17 +13,21 @@ import hashlib
 import json
 import os
 import platform
+import shutil
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 from pathlib import Path
 from typing import Callable
 
+from ..media import MediaCancelled, MediaError, MediaTimeoutError, ToolNotFoundError, extract_audio
 from ..media._proc import discard, resolve_tool, run, run_streaming
 from ._stream import Stream
 from ._text import clean, segment_cues
-from .models import AsrError, Hypothesis, Transcript, Word
+from .models import AsrError, Hypothesis, Transcript, TranscriptionCancelled, Word
+from .types import TranscriptionResult
 
 _SOURCE = Path(__file__).with_name("apple_speech.swift")
 
@@ -171,6 +178,142 @@ class AppleSpeech:
         if self.fast_results:
             cmd.append("fast")
         return AppleStream(cmd, sample_rate)
+
+
+# AVAudioFile（AppleSpeech 直接读文件走的是它）实测能读的扩展名；不在里面的（webm、mkv/mka、
+# ogg 等）先用 ffmpeg 转 16k 单声道 WAV 再识别。
+_AVAUDIOFILE_EXTENSIONS = frozenset({
+    ".wav", ".aif", ".aiff", ".aifc", ".caf", ".m4a", ".mp4", ".mov",
+    ".mp3", ".flac", ".opus", ".aac",
+})
+
+
+def _concrete_locale(language: str) -> str:
+    """SpeechAnalyzer 不自动识别语种，要具体 locale：`zh_CN` 写法换成 `zh-CN`，裸 `zh` 不认。"""
+    text = str(language or "").strip().replace("_", "-")
+    if "-" not in text or text.startswith("-") or text.endswith("-"):
+        raise ValueError(f"Apple Speech 要具体的 locale（如 zh-CN、en-US），不认 {language!r}")
+    return text
+
+
+def transcribe(
+    path: str | os.PathLike,
+    *,
+    language: str,
+    ffmpeg: str | None = None,
+    ffprobe: str | None = None,
+    helper: str | os.PathLike | None = None,
+    on_progress: "Callable[[str, float | None], None] | None" = None,
+    cancel_event: "threading.Event | None" = None,
+    max_cue_ms: int | None = None,
+    timeout: float = 6 * 3600,
+    stall_timeout: float | None = 300,
+    convert_timeout: float = 1800,
+) -> TranscriptionResult:
+    """用 Apple Speech 识别整个文件，返回 `TranscriptionResult`（engine `apple-speech:<locale>`，
+    时间毫秒、`speaker` 为空）。只能在 macOS（26+）上用，别的系统抛 `AsrError`。
+
+    - `language`：具体 locale（`zh-CN`、`en-US`；`zh_CN` 也认），裸 `zh` 抛 `ValueError`。
+    - 扩展名不在 AVAudioFile 能读的范围（webm/mkv/ogg 等）先用 ffmpeg 转一份 16k 单声道 WAV
+      （放系统临时目录，用完删，不往源文件旁边写）；直接读时报 `nilError`（个别 AAC/m4a 数据块
+      读不了）也转 WAV 重试一次。`ffmpeg`/`ffprobe` 只用于这一步，不给就在 PATH 里找。
+    - `max_cue_ms`：单条字幕最长多少毫秒（在词边界切），缺省 None 不限——多长算太长是调用方的
+      产品规则（ai-browser 用 6000），本库不内置。
+    - `stall_timeout`：识别连续这么多秒没有任何进度就当卡死中止（`AsrError`），None 不看；
+      `timeout` 是识别的总时长上限，`convert_timeout` 是转 WAV 的上限。
+    - `on_progress(stage, fraction)`：stage 是 `"converting"`（转 WAV）、`"installing"`
+      （下载识别资源）或 `"transcribing"`，fraction 0..1 或 None。
+    - 取消（`cancel_event` 置位）抛 `TranscriptionCancelled`；其余失败一律 `AsrError`。
+    """
+    if sys.platform != "darwin":
+        raise AsrError("Apple Speech 只能在 macOS 上用")
+    source = Path(path)
+    if not source.is_file():
+        raise FileNotFoundError(f"音频文件不存在：{source}")
+    locale = _concrete_locale(language)
+    if cancel_event is not None and cancel_event.is_set():
+        raise TranscriptionCancelled("识别已取消")
+    engine = AppleSpeech(locale, helper=helper)
+
+    # 内部开关：调用方取消或卡死都靠它停子进程；不去动调用方的 cancel_event。
+    stop = threading.Event()
+    stalled = threading.Event()
+    finished = threading.Event()
+    watching = threading.Event()  # 只在识别阶段看「卡死」，转 WAV 有自己的超时
+    last_progress = [time.monotonic()]
+
+    def watchdog() -> None:
+        while not finished.wait(0.2):
+            if cancel_event is not None and cancel_event.is_set():
+                stop.set()
+            if (stall_timeout is not None and watching.is_set()
+                    and time.monotonic() - last_progress[0] > stall_timeout):
+                stalled.set()
+                stop.set()
+
+    def progress(stage: str, fraction: "float | None") -> None:
+        last_progress[0] = time.monotonic()
+        if on_progress is not None:
+            on_progress(stage, fraction)
+
+    temp_dir: str | None = None
+
+    def convert_to_wav() -> Path:
+        nonlocal temp_dir
+        if on_progress is not None:
+            on_progress("converting", None)
+        temp_dir = tempfile.mkdtemp(prefix="pybase-apple-asr-")
+        converted = Path(temp_dir) / "audio.wav"
+        try:
+            extract_audio(source, converted, sample_rate=16000, mono=True, ffmpeg=ffmpeg,
+                          ffprobe=ffprobe, timeout=convert_timeout, cancel_event=stop)
+        except ToolNotFoundError as exc:
+            raise AsrError(f"识别 {source.suffix or '这种'} 格式要先转 WAV，但找不到 ffmpeg：{exc}") from exc
+        except MediaTimeoutError as exc:
+            raise AsrError(f"转 WAV 超时：{exc}") from exc
+        except MediaCancelled:
+            raise
+        except MediaError as exc:
+            raise AsrError(f"转 WAV 失败：{exc}") from exc
+        return converted
+
+    def run_once(target: Path) -> Transcript:
+        last_progress[0] = time.monotonic()
+        watching.set()
+        try:
+            return engine.transcribe(target, timeout=timeout, cancel_event=stop,
+                                     on_progress=progress, max_cue_ms=max_cue_ms)
+        finally:
+            watching.clear()
+
+    guard = threading.Thread(target=watchdog, daemon=True)
+    guard.start()
+    try:
+        engine._helper_path()  # 首次要 swiftc 编译（有自己的超时），放在看「卡死」之前
+        converted = source.suffix.lower() not in _AVAUDIOFILE_EXTENSIONS
+        target = convert_to_wav() if converted else source
+        try:
+            transcript = run_once(target)
+        except AsrError as exc:
+            if converted or "nilError" not in str(exc):
+                raise
+            transcript = run_once(convert_to_wav())
+    except MediaCancelled as exc:
+        if stalled.is_set():
+            raise AsrError(f"识别长时间没有进展（超过 {stall_timeout:g}s 无响应），已中止") from exc
+        raise TranscriptionCancelled("识别已取消") from exc
+    except MediaTimeoutError as exc:
+        raise AsrError(f"识别超时：{exc}") from exc
+    finally:
+        finished.set()
+        guard.join(timeout=2)
+        if temp_dir is not None:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+    try:
+        return TranscriptionResult.from_transcript(transcript)
+    except (TypeError, ValueError) as exc:
+        raise AsrError(f"识别返回的字幕时间不合法：{exc}") from exc
 
 
 class AppleStream(Stream):

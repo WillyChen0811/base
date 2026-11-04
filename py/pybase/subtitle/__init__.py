@@ -26,7 +26,9 @@ from .provenance import (
     detect_origin,
     export,
     load_meta,
+    meta_from_dict,
     meta_path,
+    meta_to_dict,
     record_origin,
     remove_correction,
     save_meta,
@@ -62,6 +64,8 @@ __all__ = [
     "export",
     "Meta",
     "meta_path",
+    "meta_to_dict",
+    "meta_from_dict",
     "load_meta",
     "save_meta",
 ]

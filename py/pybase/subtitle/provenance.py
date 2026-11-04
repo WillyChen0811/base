@@ -383,17 +383,27 @@ def _meta_from_dict(d: dict) -> Meta:
     )
 
 
+def meta_to_dict(meta: Meta) -> dict:
+    """`Meta` 转成可 JSON 序列化的字典（旁车文件里存的就是它）；调用方要把元数据
+    存到别处（如数据库）时用这一对，不必自己拼字段。"""
+    return _meta_to_dict(meta)
+
+
+def meta_from_dict(data: dict, *, source: str = "元数据") -> Meta:
+    """:func:`meta_to_dict` 的逆。`schema_version` 比本库新时报 ValueError——按旧结构
+    读会丢字段，再保存就把用户的修正覆盖掉了。`source` 只用于报错信息。"""
+    version = data.get("schema_version", _SCHEMA_VERSION)
+    if version > _SCHEMA_VERSION:
+        raise ValueError(f"{source} 的 schema_version={version} 比本库支持的 {_SCHEMA_VERSION} 新")
+    return _meta_from_dict(data)
+
+
 def load_meta(subtitle_path: str | Path) -> Meta:
     """读旁车文件；不存在就返回空的 `Meta()`（首次接触某份字幕是正常状态，不报错）。"""
     path = meta_path(subtitle_path)
     if not path.exists():
         return Meta()
-    data = json.loads(path.read_text(encoding="utf-8"))
-    version = data.get("schema_version", _SCHEMA_VERSION)
-    if version > _SCHEMA_VERSION:
-        # 新版本写的文件：按旧结构读会丢字段，再保存就把用户的修正覆盖掉了
-        raise ValueError(f"{path} 的 schema_version={version} 比本库支持的 {_SCHEMA_VERSION} 新")
-    return _meta_from_dict(data)
+    return meta_from_dict(json.loads(path.read_text(encoding="utf-8")), source=str(path))
 
 
 def save_meta(subtitle_path: str | Path, meta: Meta) -> Path:

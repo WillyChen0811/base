@@ -352,3 +352,11 @@ def test_load_meta_refuses_newer_schema(tmp_path):
     meta_path(sub).write_text('{"schema_version": 99}', encoding="utf-8")
     with pytest.raises(ValueError):
         load_meta(sub)
+
+
+def test_meta_dict_roundtrip_and_newer_schema():
+    from pybase.subtitle import Meta, meta_from_dict, meta_to_dict
+    meta = Meta(offset_ms=1200)
+    assert meta_from_dict(meta_to_dict(meta)) == meta
+    with pytest.raises(ValueError):
+        meta_from_dict({"schema_version": 99})

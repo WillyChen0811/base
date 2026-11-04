@@ -2,7 +2,7 @@ package projsync
 
 // 执行器（PLAN-sync-v2.md 第 2 项，单机版，作用于一个本地仓库）。
 //
-// 本文件只提供「校验 + 写入」原语：CreateBranch / FastForwardBranch / AutoMergeCommit。
+// 本文件只提供「校验 + 写入」原语：CreateBranch / FastForwardBranch / AutoMergeCommit（删除原语 DeleteBranch 在 branchdel.go）。
 // 每个原语都先重新读取现场再写，任何读取失败、前提不符都返回带中文原因的 error 且不写。
 //
 // 第八节各条的归属：
@@ -24,7 +24,9 @@ package projsync
 //  8. 提交任务派发 / 9. 冲突只交控制中心：调度层与展示层，本项不做。
 //  10. 集成测试：apply_test.go。
 //
-// 禁用：reset、checkout/switch、branch -d/-D、update-ref -d、--force、--autostash（merge 显式 --no-autostash、--no-overwrite-ignore）、stash。
+// 禁用：reset、checkout/switch、branch -d/-D、--force、--autostash（merge 显式 --no-autostash、--no-overwrite-ignore）、stash。
+// update-ref -d 只允许出现在 DeleteBranch（branchdel.go，带旧值比较交换；用户 11/04 定分支删除也同步）
+// 与 round.go 清理遗留临时传送分支两处。
 // 所有待写分支必须是直接引用（符号引用/悬空符号引用一律拒绝），update-ref 带 --no-deref。
 // 任何写动作前检查仓库全部非 bare 工作区的进行中标记（merge/rebase/cherry-pick/revert/sequencer/bisect）。
 

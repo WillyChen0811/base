@@ -6,6 +6,10 @@
 // 提交派活统一以 WorktreeAction 为入口（执行器按 设备+仓库+规范化路径 去重，并跟踪在途任务）。
 // 派活后相关事实全部失效，执行器必须重新采集后再执行分支动作。
 // BranchAction 不是完整执行凭据：执行上下文要另外带两边旧 OID、目标 OID、工作区映射、事实版本。
+//
+// 只有一边有的分支按对账基线（BranchFacts.Base）区分「一边删了」与「另一边新建了」，规则在 decidedel.go：
+// 没有基线 → 在另一边新建；仍存在的一边等于基线 → 在这边也删除（KindDeleteOnOther）；
+// 仍存在的一边在基线之后有新提交 → 当新分支，在删掉的一边新建。
 package projsync
 
 import (
@@ -33,6 +37,8 @@ type ActionKind string
 const (
 	KindNothing       ActionKind = "nothing"         // 两边相同
 	KindCreateOnOther ActionKind = "create_on_other" // 只有一边有，在另一边建同名分支
+	KindDeleteOnOther ActionKind = "delete_on_other" // 一边已删、另一边仍停在基线：把仍存在的一边也删掉
+	KindDeleteBlocked ActionKind = "delete_blocked"  // 一边已删，但另一边受保护（main/master）或正被检出：不删，交用户处理
 	KindFastForward   ActionKind = "fast_forward"    // 落后的一边快进到前面的提交
 	KindAutoMerge     ActionKind = "auto_merge"      // 分叉且可干净合并，生成合并提交后两边都更新
 	KindConflict      ActionKind = "conflict"        // 分叉且有冲突，交用户手动处理，不更新任何一边
@@ -61,6 +67,9 @@ type BranchFacts struct {
 	MacDirty, UbuntuDirty bool
 	// 未提交改动已连续多少分钟没有变化（不 dirty 时忽略）。
 	MacQuietMinutes, UbuntuQuietMinutes int
+	// Base 是对账基线：上一轮结束时两边一致的提交；空串表示没有基线（从来没同步过）。
+	// 只在只有一边有该分支时参与判定（decidedel.go）。
+	Base string
 }
 
 // RepoFacts 是仓库级事实。Busy 表示该设备上仓库正在 rebase/merge/cherry-pick 等。
@@ -85,7 +94,7 @@ type BranchAction struct {
 // 给出每个分支的动作，按分支名排序，结果确定。
 //
 // 安全约束：本函数从不产生强制更新；FastForward 和 AutoMerge 的语义保证任何
-// 更新都只到现有提交的后代。但执行器不得盲信本函数的输入，执行前必须再次校验
+// 更新都只到现有提交的后代；删除（DeleteOnOther）只针对「仍停在基线」的分支，执行时带旧值比较交换。但执行器不得盲信本函数的输入，执行前必须再次校验
 // （例如 git update-ref 带旧值、merge --ff-only、确认目标是当前值的后代），
 // 校验失败则拒绝更新并记日志。
 func DecideBranches(repo RepoFacts, branches []BranchFacts) []BranchAction {
@@ -135,9 +144,9 @@ func decideOne(repo RepoFacts, b BranchFacts) BranchAction {
 		act.Kind = KindNothing
 		act.Reason = "两边相同"
 	case b.Ubuntu == "":
-		return createOnOther(act, b.Mac, SideUbuntu, b.UbuntuCheckedOut)
+		return decideOneSided(act, b, SideMac)
 	case b.Mac == "":
-		return createOnOther(act, b.Ubuntu, SideMac, b.MacCheckedOut)
+		return decideOneSided(act, b, SideUbuntu)
 	case b.MacIsAncestorOfUbuntu && b.UbuntuIsAncestorOfMac:
 		act.Kind = KindInvalidFacts
 		act.Reason = "事实矛盾（两边提交不同却互为祖先），需重新采集，不更新任何一边"

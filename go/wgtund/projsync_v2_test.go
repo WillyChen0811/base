@@ -77,6 +77,17 @@ func v2Svc(t *testing.T, enabled bool) *projsyncV2Svc {
 	return s
 }
 
+// 分支对账基线目录固定在 ~/.xxyi/projsync/base，并传给每一轮。
+func TestProjsyncV2EnvCarriesBaseDir(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	s := v2Svc(t, false)
+	env := s.env(s.v1.prep.targets[0], nil)
+	if want := filepath.Join(home, ".xxyi", "projsync", "base"); env.BaseDir != want {
+		t.Fatalf("BaseDir=%q，期望 %q", env.BaseDir, want)
+	}
+}
+
 func TestProjsyncV2DisabledDoesNotRunAutomatically(t *testing.T) {
 	s := v2Svc(t, false)
 	var n int

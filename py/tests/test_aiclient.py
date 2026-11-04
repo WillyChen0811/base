@@ -34,6 +34,7 @@ class _ScriptedServer:
     def __init__(self, responses):
         self.responses = list(responses)
         self.requests = []  # 记录每次请求的 path + 解析后的 body
+        self.request_headers = []
         port = _free_port()
         self.port = port
         self.httpd = http.server.HTTPServer(("127.0.0.1", port), self._make_handler())
@@ -59,6 +60,7 @@ class _ScriptedServer:
                 except json.JSONDecodeError:
                     parsed = None
                 outer.requests.append((self.path, parsed))
+                outer.request_headers.append({k.lower(): v for k, v in self.headers.items()})
                 if not outer.responses:
                     self.send_response(500)
                     self.end_headers()
@@ -104,6 +106,25 @@ def test_chat_json_mode_falls_back_on_error():
         assert len(server.requests) == 2
         assert "response_format" in server.requests[0][1]
         assert "response_format" not in server.requests[1][1]
+    finally:
+        server.stop()
+
+
+def test_chat_max_tokens_and_extra_headers():
+    server = _ScriptedServer([_json_response(200, {"choices": [{"message": {"content": "hi"}}]}),
+                              _json_response(200, {"data": [{"index": 0, "embedding": [1.0]}]}),
+                              _json_response(200, {"choices": [{"message": {"content": "hi"}}]})])
+    try:
+        client = LlmClient(server.base_url, max_tokens=123, extra_headers={"X-Xxyi-Priority": "1"})
+        client.chat([{"role": "user", "content": "hello"}], json_mode=False)
+        assert server.requests[0][1]["max_tokens"] == 123
+        assert server.request_headers[0]["x-xxyi-priority"] == "1"
+        client.embed(["a"])
+        assert server.request_headers[-1]["x-xxyi-priority"] == "1"
+        plain = LlmClient(server.base_url)
+        plain.chat([{"role": "user", "content": "hello"}], json_mode=False)
+        assert "max_tokens" not in server.requests[-1][1]
+        assert "x-xxyi-priority" not in server.request_headers[-1]
     finally:
         server.stop()
 

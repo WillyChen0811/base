@@ -70,6 +70,10 @@
   走过的步骤；`Flow` 按流转边走程序步与人步（可暂停续走、条件分流、失败边、逐个循环）。注册表、实现表、原子表、
   随另一参数算的缺省都由调用方注入；来源筛选、路径白名单等项目策略写在 `Session` 子类的钩子里。
   `python -m pybase.cmdproto --registry reg.json plan "/x -y"` 可看一条指令的参数各从哪来
+- `pybase.textsplit`：文本切分的共同底座（不带业务、不调模型）：分句（句与小句带原文位置）、按行号 / 字数 / 时间窗切块
+  （主体不重叠 + 只作参考的前文）、话的重切（只切不并、带起止毫秒）、引文回溯校验（逐字 NFKC 归一带偏移表，只认连着的一段；
+  近似比对装了 RapidFuzz 就用，`pip install "pybase[textsplit]"`）、各块输出合并，和交给调用方去跑模型的语义拆分配方
+  （拆需求 P-ATOM）。见 `pybase/textsplit/README.md`
 - `pybase.dictionary`：词典查询统一模型（`Entry`，必带出处与授权说明）+ 数据源适配器。**不内置任何词典数据**；
   目前有 `macos`（系统『词典』App 里已下载的词典，ctypes 直调，零依赖，仅限本机个人使用）
 
@@ -194,6 +198,7 @@ pip install -e "./py[all]"
 | `postgres` | `db` + psycopg[binary] | `pybase.db` 连 PostgreSQL |
 | `asr-mlx` | mlx-audio（仅 Apple Silicon） | `pybase.asr.MlxAudio` |
 | `audio` | numpy（解码另需 ffmpeg 可执行文件） | `pybase.audio` |
+| `textsplit` | rapidfuzz（可选：没装退回 difflib） | `pybase.textsplit` 回溯校验的近似比对 |
 | `all` | 以上全部 | —— |
 
 ## 测试

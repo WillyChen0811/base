@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "pybase"
 version = "0.1.0"
-description = "零业务依赖的基础模块：RPC 底座、内存盘、AI 客户端、docx 写作、表格读取、SMB、加密、Word→PDF 转换、字幕与音视频、语音识别、音频对齐与说话人归属、词典查询"
+description = "零业务依赖的基础模块：RPC 底座、内存盘、AI 客户端、docx 写作、表格读取、SMB、加密、Word→PDF 转换、字幕与音视频、语音识别、音频对齐与说话人归属、词典查询、文本切分与回溯校验"
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}
@@ -70,9 +70,13 @@ postgres = [
 audio = [
     "numpy>=1.24",
 ]
+# textsplit：回溯校验的近似比对（只作提示）用 RapidFuzz，没装退回标准库 difflib
+textsplit = [
+    "rapidfuzz>=3.0",
+]
 # 引用自身 extras（pip >= 21.2），新增 extra 时只要在这里加名字，不会漏抄依赖
 all = [
-    "pybase[docx,sheets,smb,crypto,office,office-word,rpc-server,subtitle,asr-mlx,net,ssh,db,postgres,audio]",
+    "pybase[docx,sheets,smb,crypto,office,office-word,rpc-server,subtitle,asr-mlx,net,ssh,db,postgres,audio,textsplit]",
 ]
 dev = [
     "pytest>=7.0.0",

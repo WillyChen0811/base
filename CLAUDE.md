@@ -107,6 +107,15 @@
 - 时间戳只能由程序按句子编号从 cues 查回，别改成让模型直接写时间（会编造/对不上）
 - 不 import `aiclient`：模型调用经 `complete` 注入；越界/反向编号的条目丢弃，不猜着修
 
+### textsplit
+- 不调模型、不 import xxyi / `aiclient`：配方（`p_atom`）只交出 prompt/schema/造块/verify/merge，跑块的是调用方的 `taskmodel.run`
+- 给模型看的文字全在 `p_atom_text.py`，逐字照抄 xxyi-work `xxyi_work/biz/PLAN-testrec-v2.md` 第 4 节；改字、补设计稿没写的话都要先经指挥。
+  设计稿没给措辞的门槛（text/方括号/term 字数、text 全空白）只记 `warnings`，不许自己编一句回给模型
+- `trace` 只认「归一后是原文连着的一段」；近似比对（RapidFuzz / difflib）只出「最像的一句」作提示，绝不参与判定，别加「部分匹配也算过」
+- 归一必须**逐字**做并留 `origin` 偏移表（`……` 等会改变长度）；补充表改了要连带看 `resegment` 的词对齐和 P-ATOM 的生词检查
+- `chunk` 主体不重叠；超长行切出的片首尾相接拼回整行；`resegment` 只切不并、无全局状态（行身份是调用方给的 `seq` + `part`）
+- RapidFuzz 每次调用现查（`fuzzy_backend()`），测试屏蔽导入走 difflib；不要在模块顶层缓存后端
+
 ### search
 - FTS5 trigram 对不足 3 字符的查询直接返回空，短词走 LIKE 兜底——中文最常见的 1~2 字查询全靠它
 - 查询词一律包成 FTS5 引号短语转义，不手写语法逃逸表

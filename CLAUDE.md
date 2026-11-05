@@ -109,8 +109,9 @@
 
 ### textsplit
 - 不调模型、不 import xxyi / `aiclient`：配方（`p_atom`）只交出 prompt/schema/造块/verify/merge，跑块的是调用方的 `taskmodel.run`
-- 给模型看的文字全在 `p_atom_text.py`，逐字照抄 xxyi-work `xxyi_work/biz/PLAN-testrec-v2.md` 第 4 节；改字、补设计稿没写的话都要先经指挥。
-  设计稿没给措辞的门槛（text/方括号/term 字数、text 全空白）只记 `warnings`，不许自己编一句回给模型
+- 给模型看的文字全在 `p_atom_text.py`，逐字照抄 xxyi-work `xxyi_work/biz/PLAN-testrec-v2.md` 第 4 节；改字、补设计稿没写的话都要先经指挥，
+  不许自己编一句回给模型。每条校验都有设计稿定的话，超限一律回给模型（`warnings` 只记「照收了最后一次输出」这类给人看的事）
+- P-ATOM 的 schema 只用 taskmodel 自查认的 `minItems`/`maxItems`/`minLength`，不加 `maxLength`（字数上限由 verify 查）；字段顺序 quote、text、terms、doubt
 - `trace` 只认「归一后是原文连着的一段」；近似比对（RapidFuzz / difflib）只出「最像的一句」作提示，绝不参与判定，别加「部分匹配也算过」
 - 归一必须**逐字**做并留 `origin` 偏移表（`……` 等会改变长度）；补充表改了要连带看 `resegment` 的词对齐和 P-ATOM 的生词检查
 - `chunk` 主体不重叠；超长行切出的片首尾相接拼回整行；`resegment` 只切不并、无全局状态（行身份是调用方给的 `seq` + `part`）

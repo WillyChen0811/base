@@ -22,15 +22,15 @@
   和 taskmodel 缺省的重试次数一样）以后就不再回，结果照收，这些小句进 ``AtomizeResult.uncovered`` 给用户看。
   为此 ``verify`` 按块的内容记着回过几次（配方对象里的状态；同一个配方对象再跑同样的块，会直接照收）。
   万一某块因为别的原因重试用完、最后一次输出只剩软错误，``merge`` 也照收它（``warnings`` 里记一句）。
-- 设计稿列了门槛、但**没写回给模型的话**的几条（text 去掉方括号后的字数、方括号里的字数、单个 term 的字数、
-  text 全是空白）：程序照查，超了**不回给模型**，记进 ``AtomizeResult.warnings`` 给人看；措辞由指挥定了以后经
-  ``p_atom(messages={...})`` 给，就会回给模型。项数、text 非空、terms 个数、单个 term 的字数同时写进了 schema
-  （``minItems``/``maxItems``/``minLength``/``maxLength``），这几样由约束解码和 taskmodel 的通用校验管。
+- 项数 1–12、text 非空、terms 至多 3 个写进 schema（``minItems``/``maxItems``/``minLength``，taskmodel 的自查认这几样）；
+  **不用 maxLength**：text 方括号外的字数、方括号里的字数、单个 term 的字数、text 只有空白由 ``verify`` 查，
+  回设计稿写的那几句话。
 """
 from __future__ import annotations
 
 import re
 import threading
+import unicodedata
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping, Sequence
 
@@ -72,17 +72,17 @@ class AtomLimits:
     soft_tries: int = 2              # 没落到的小句最多回给模型几次（之后照收）；和 taskmodel.run 的 retries 一致
 
 
-# 回给模型的话：键 → 模板（None = 设计稿没写措辞，超了只记进 warnings、不回给模型）
-DEFAULT_MESSAGES: dict[str, str | None] = {
-    "quote": T.QUOTE_NOT_TRACED,
-    "skipped": T.SKIPPED_NOT_TRACED,
-    "terms": T.TERMS_NOT_TRACED,
-    "foreign": T.TEXT_FOREIGN,
-    "uncovered": T.UNCOVERED,
-    "text_blank": None,      # text 全是空白（可用占位：{n}）
-    "text_long": None,       # text 去掉方括号后超过 text_max（{n}、{count}、{limit}、{text}）
-    "bracket_long": None,    # 方括号里合计超过 bracket_max（{n}、{count}、{limit}、{text}）
-    "term_long": None,       # 某个 term 超过 term_max（{n}、{count}、{limit}、{term}）
+# 回给模型的话：键 → 模板（都照抄设计稿，见 p_atom_text.py；占位见各句）
+DEFAULT_MESSAGES: dict[str, str] = {
+    "quote": T.QUOTE_NOT_TRACED,        # {n} {best}
+    "skipped": T.SKIPPED_NOT_TRACED,    # {n}（skipped 的第几条）{best}
+    "terms": T.TERMS_NOT_TRACED,        # {n} {term}
+    "term_long": T.TERM_LONG,           # {n} {term} {limit}
+    "text_long": T.TEXT_LONG,           # {n} {count} {limit}
+    "bracket_long": T.BRACKET_LONG,     # {n} {count} {limit}
+    "text_blank": T.TEXT_BLANK,         # {n}
+    "foreign": T.TEXT_FOREIGN,          # {n} {words}
+    "uncovered": T.UNCOVERED,           # {clauses}
 }
 
 
@@ -113,7 +113,7 @@ class AtomizeResult:
     - ``atoms``：各块拆出的项，按出现顺序；``skipped``：模型说只是背景的句子（原文那一段与位置）；
     - ``uncovered``：重试后仍没落到任何 quote / skipped 的小句（汉字 ≥ 门槛），给用户看，不算失败；
     - ``failed``：没拆成的块在说明里的那一段（重试完还有硬错误，或模型没跑）；
-    - ``warnings``：给人看的提醒（超了门槛但没定措辞的、从最后一次输出照收的块）；
+    - ``warnings``：给人看的提醒（从最后一次输出照收的块）；
     - ``empty``：说明为空（没调模型；「整条」项由调用方建）。
     """
 
@@ -138,7 +138,6 @@ def _nonspace(s: str) -> int:
 
 
 def _spoken(c: str) -> bool:
-    import unicodedata
     return unicodedata.category(c)[0] in "LN"
 
 
@@ -192,35 +191,35 @@ def _foreign(parts: Sequence[str], source: set[str]) -> tuple[int, int, list[str
 class _Analysis:
     hard: list[str]
     soft: list[str]
-    warns: list[str]
     quotes: tuple[QuoteTrace, ...]
     skipped: tuple[QuoteTrace, ...]
     terms: list[tuple[QuoteTrace, ...]]
     uncovered: list[Span]
 
 
-def _shape_ok(value: Any, lim: AtomLimits) -> bool:
-    """结构和项数对不对（schema 管的那几样；给照收最后一次输出时用）。"""
+def _shape_ok(value: Any, lim: AtomLimits | None = None) -> bool:
+    """结构（类型）对不对；给了 ``lim`` 还查 schema 管的那几样——项数、text 非空、terms 个数（给照收最后一次输出时用）。"""
     if not isinstance(value, Mapping) or not isinstance(value.get("atoms"), list) \
             or not isinstance(value.get("skipped"), list):
-        return False
-    if not (lim.min_atoms <= len(value["atoms"]) <= lim.max_atoms):
         return False
     if not all(isinstance(s, str) for s in value["skipped"]):
         return False
     for a in value["atoms"]:
-        if not isinstance(a, Mapping) or not all(isinstance(a.get(k), str) for k in ("text", "quote", "doubt")):
+        if not isinstance(a, Mapping) or not all(isinstance(a.get(k), str) for k in ("quote", "text", "doubt")):
             return False
-        if not a["text"] or not isinstance(a.get("terms"), list) or len(a["terms"]) > lim.terms_max \
-                or not all(isinstance(t, str) for t in a["terms"]):
+        if not isinstance(a.get("terms"), list) or not all(isinstance(t, str) for t in a["terms"]):
             return False
-    return True
+    if lim is None:
+        return True
+    if not (lim.min_atoms <= len(value["atoms"]) <= lim.max_atoms):
+        return False
+    return all(a["text"] and len(a["terms"]) <= lim.terms_max for a in value["atoms"])
 
 
 class _PAtom:
     """P-ATOM 的造块、校验、合并（``p_atom()`` 包成 Recipe）。"""
 
-    def __init__(self, limits: AtomLimits, messages: Mapping[str, str | None]):
+    def __init__(self, limits: AtomLimits, messages: Mapping[str, str]):
         self.lim = limits
         self.msg = messages
         self._soft: dict[tuple, int] = {}
@@ -256,38 +255,26 @@ class _PAtom:
         skipped = list(value.get("skipped") or [])
         tq = trace(desc, [a["quote"] for a in atoms], ordered=True)
         ts = trace(desc, skipped, ordered=True)
-        tt = [trace(desc, list(a.get("terms") or [])).results for a in atoms]
+        tt = [trace(desc, list(a.get("terms") or []), hint=False).results for a in atoms]
         source = {k for c in name + desc for k in _keys(c)}
         hard: list[str] = []
-        warns: list[str] = []
-
-        def limit(key: str, human: str, **fields: Any) -> None:
-            tpl = msg.get(key)
-            if tpl:
-                hard.append(tpl.format(**fields))
-            else:
-                warns.append(human)
-
         for n, (a, rq, rts) in enumerate(zip(atoms, tq.results, tt), 1):
             text = a["text"]
             parts, inner = _outside(text)
-            if not text.strip():
-                limit("text_blank", f"第 {n} 项的 text 全是空白", n=n)
-            out_n = sum(_nonspace(p) for p in parts)
-            if out_n > lim.text_max:
-                limit("text_long", f"第 {n} 项的 text 去掉方括号后 {out_n} 字，超过 {lim.text_max}",
-                      n=n, count=out_n, limit=lim.text_max, text=text)
-            if inner > lim.bracket_max:
-                limit("bracket_long", f"第 {n} 项的 text 方括号里合计 {inner} 字，超过 {lim.bracket_max}",
-                      n=n, count=inner, limit=lim.bracket_max, text=text)
             if not rq.ok:
                 hard.append(msg["quote"].format(n=n, best=rq.best.text if rq.best else ""))
+            if not text.strip():
+                hard.append(msg["text_blank"].format(n=n))
+            out_n = sum(_nonspace(p) for p in parts)
+            if out_n > lim.text_max:
+                hard.append(msg["text_long"].format(n=n, count=out_n, limit=lim.text_max))
+            if inner > lim.bracket_max:
+                hard.append(msg["bracket_long"].format(n=n, count=inner, limit=lim.bracket_max))
             for term, rt in zip(a.get("terms") or [], rts):
-                if _nonspace(term) > lim.term_max:
-                    limit("term_long", f"第 {n} 项的 term「{term}」{_nonspace(term)} 字，超过 {lim.term_max}",
-                          n=n, count=_nonspace(term), limit=lim.term_max, term=term)
                 if not rt.ok:
-                    hard.append(msg["terms"].format(n=n, best=rt.best.text if rt.best else ""))
+                    hard.append(msg["terms"].format(n=n, term=term))
+                if _nonspace(term) > lim.term_max:
+                    hard.append(msg["term_long"].format(n=n, term=term, limit=lim.term_max))
             counted, bad, runs = _foreign(parts, source)
             if counted and bad / counted > lim.foreign_max:
                 hard.append(msg["foreign"].format(n=n, words=T.JOIN.join(runs)))
@@ -297,7 +284,7 @@ class _PAtom:
         covered = [sp for r in tq.results + ts.results for sp in r.spans]
         unc = uncovered_clauses(desc, covered, min_hanzi=lim.uncovered_min_hanzi)
         soft = [msg["uncovered"].format(clauses=T.JOIN.join(c.text for c in unc))] if unc else []
-        return _Analysis(hard, soft, warns, tq.results, ts.results, tt, unc)
+        return _Analysis(hard, soft, tq.results, ts.results, tt, unc)
 
     @staticmethod
     def _key(block: Mapping) -> tuple:
@@ -305,7 +292,7 @@ class _PAtom:
 
     def verify(self, block: Mapping, value: Any) -> list[str]:
         """taskmodel 的 verify：→ 回给模型看的错误话（空 = 通过）。软错误（没落到的小句）回过 soft_tries 次就不再回。"""
-        if not _shape_ok(value, AtomLimits(min_atoms=0, max_atoms=10 ** 9, terms_max=10 ** 9)):
+        if not _shape_ok(value):
             # 结构由 schema 管（taskmodel 先按 schema 校验，过了才调这里）；走到这里是调用方没带配方的 schema
             raise TypeError("P-ATOM 的 verify 收到的输出结构不对：调 taskmodel.run 时要带上配方的 schema")
         an = self._analyze(block, value)
@@ -355,7 +342,6 @@ class _PAtom:
             if an is None:
                 failed.append(whole)
                 continue
-            warns.extend(f"{tag}：{w}" if len(blocks) > 1 else w for w in an.warns)
 
             def orig(sp: tuple[int, int]) -> Span:
                 return Span(off + sp[0], off + sp[1], desc[sp[0]:sp[1]])
@@ -370,8 +356,8 @@ class _PAtom:
 
 
 def _schema(lim: AtomLimits) -> dict:
-    """设计稿的 schema ``{"atoms":[{"text":str,"quote":str,"terms":[str],"doubt":str}],"skipped":[str]}``，
-    字段顺序照设计稿；项数、text 非空、terms 个数与每个的字数写成约束。"""
+    """设计稿的 schema ``{"atoms":[{"quote":str,"text":str,"terms":[str],"doubt":str}],"skipped":[str]}``，
+    字段按这个顺序（先抄原文、再写成话），四个都必填；项数、terms 个数、text 非空写成约束，不用 maxLength。"""
     return {
         "type": "object",
         "properties": {
@@ -380,13 +366,12 @@ def _schema(lim: AtomLimits) -> dict:
                 "items": {
                     "type": "object",
                     "properties": {
-                        "text": {"type": "string", "minLength": 1},
                         "quote": {"type": "string"},
-                        "terms": {"type": "array", "maxItems": lim.terms_max,
-                                  "items": {"type": "string", "maxLength": lim.term_max}},
+                        "text": {"type": "string", "minLength": 1},
+                        "terms": {"type": "array", "maxItems": lim.terms_max, "items": {"type": "string"}},
                         "doubt": {"type": "string"},
                     },
-                    "required": ["text", "quote", "terms", "doubt"],
+                    "required": ["quote", "text", "terms", "doubt"],
                     "additionalProperties": False,
                 },
             },
@@ -397,8 +382,8 @@ def _schema(lim: AtomLimits) -> dict:
     }
 
 
-def p_atom(limits: AtomLimits | None = None, messages: Mapping[str, str | None] | None = None) -> Recipe:
-    """P-ATOM（拆需求）的配方。``limits`` 改门槛；``messages`` 改 / 补回给模型的话（键见 ``DEFAULT_MESSAGES``；
+def p_atom(limits: AtomLimits | None = None, messages: Mapping[str, str] | None = None) -> Recipe:
+    """P-ATOM（拆需求）的配方。``limits`` 改门槛；``messages`` 换回给模型的话（键见 ``DEFAULT_MESSAGES``；
     给模型看的文字要经指挥定）。每次调用是一份新的配方（软错误的计数各管各的）。"""
     lim = limits or AtomLimits()
     if lim.min_atoms < 1 or lim.max_atoms < lim.min_atoms or lim.soft_tries < 0 or lim.chunk_chars < 1:
@@ -407,12 +392,9 @@ def p_atom(limits: AtomLimits | None = None, messages: Mapping[str, str | None] 
     for k, v in (messages or {}).items():
         if k not in msg:
             raise ValueError(f"没有这种话：{k}（有 {'、'.join(msg)}）")
-        if v is not None and not isinstance(v, str):
-            raise TypeError(f"{k} 的话要是字符串或 None：{v!r}")
+        if not isinstance(v, str) or not v:
+            raise ValueError(f"{k} 的话要是非空字符串（设计稿写了措辞）：{v!r}")
         msg[k] = v
-    for k in ("quote", "skipped", "terms", "foreign", "uncovered"):
-        if not msg[k]:
-            raise ValueError(f"{k} 的话不能空（设计稿写了措辞）")
     impl = _PAtom(lim, msg)
     return Recipe(prompt=T.PROMPT, user=T.USER, schema=_schema(lim), make_blocks=impl.make_blocks,
                   verify=impl.verify, merge=impl.merge,

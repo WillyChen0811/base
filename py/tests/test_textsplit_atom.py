@@ -21,7 +21,7 @@ S3 = "本功能为了方便管理员日常使用。"
 
 
 def _atom(text, quote, terms=(), doubt=""):
-    return {"text": text, "quote": quote, "terms": list(terms), "doubt": doubt}
+    return {"quote": quote, "text": text, "terms": list(terms), "doubt": doubt}
 
 
 GOOD = {
@@ -77,6 +77,14 @@ def _quote_msg(n, best):
     return f"第 {n} 项的 quote 不是说明里连着的一段原文；说明里最像的是：『{best}』。照原文抄"
 
 
+def _skipped_msg(n, best):
+    return f"skipped 的第 {n} 条不是说明里连着的一段原文；说明里最像的是：『{best}』。照原文抄"
+
+
+def _terms_msg(n, term):
+    return f"第 {n} 项的 terms 里『{term}』不是说明里的原文。专有说法要从说明里原样抄，抄不到就不要写"
+
+
 # ---------------------------------------------------------------- 配方的形状
 def test_recipe_shape_and_template_fill(recipe, block):
     assert recipe.prompt == T.PROMPT and recipe.user == T.USER == "按上面的规则拆这条需求。"
@@ -98,15 +106,14 @@ def test_schema_follows_design_and_limits(recipe):
     atoms = sc["properties"]["atoms"]
     assert (atoms["minItems"], atoms["maxItems"]) == (1, 12)
     item = atoms["items"]
-    assert list(item["properties"]) == ["text", "quote", "terms", "doubt"]
-    assert item["required"] == ["text", "quote", "terms", "doubt"] and item["additionalProperties"] is False
-    assert item["properties"]["text"]["minLength"] == 1
-    assert item["properties"]["terms"]["maxItems"] == 3
-    assert item["properties"]["terms"]["items"]["maxLength"] == 8
+    assert list(item["properties"]) == ["quote", "text", "terms", "doubt"]      # 先抄原文、再写成话
+    assert item["required"] == ["quote", "text", "terms", "doubt"] and item["additionalProperties"] is False
+    assert item["properties"]["text"] == {"type": "string", "minLength": 1}
+    assert item["properties"]["terms"] == {"type": "array", "maxItems": 3, "items": {"type": "string"}}
     assert sc["properties"]["skipped"] == {"type": "array", "items": {"type": "string"}}
+    assert "maxLength" not in repr(sc)                                          # 字数上限由 verify 查
     custom = p_atom(AtomLimits(max_atoms=5, terms_max=2, term_max=6)).schema["properties"]["atoms"]
     assert custom["maxItems"] == 5 and custom["items"]["properties"]["terms"]["maxItems"] == 2
-    assert custom["items"]["properties"]["terms"]["items"]["maxLength"] == 6
 
 
 def test_messages_override_rules():
@@ -114,6 +121,8 @@ def test_messages_override_rules():
         p_atom(messages={"bogus": "x"})
     with pytest.raises(ValueError):
         p_atom(messages={"quote": None})
+    with pytest.raises(ValueError):
+        p_atom(messages={"text_long": ""})
     with pytest.raises(ValueError):
         p_atom(AtomLimits(min_atoms=0))
 
@@ -149,12 +158,16 @@ def test_quote_normalized_counts_and_maps_back(recipe, block):
 
 def test_skipped_not_original(recipe, block):
     errs = recipe.verify(block, _good(skipped=["本功能是为了方便管理员使用。"]))
-    assert "第 1 项的 skipped 不是说明里连着的一段原文；说明里最像的是：『本功能为了方便管理员日常使用。』。照原文抄" in errs
+    assert errs[0] == "skipped 的第 1 条不是说明里连着的一段原文；说明里最像的是：『本功能为了方便管理员日常使用。』。照原文抄"
+    assert errs[0] == _skipped_msg(1, S3)
+    two = recipe.verify(block, _good(skipped=[S3, "每页显示二十五条。"]))    # N 是 skipped 里的第几条
+    assert two == [_skipped_msg(2, S2)]
 
 
 def test_terms_not_original(recipe, block):
-    errs = recipe.verify(block, _good(a3_terms=["列表显示"]))
-    assert errs == ["第 3 项的 terms 不是说明里连着的一段原文；说明里最像的是：『查询结果在列表中显示，每页显示二十条。』。照原文抄"]
+    errs = recipe.verify(block, _good(a3_terms=["列表", "列表显示"]))
+    assert errs == ["第 3 项的 terms 里『列表显示』不是说明里的原文。专有说法要从说明里原样抄，抄不到就不要写"]
+    assert errs == [_terms_msg(3, "列表显示")]
     assert recipe.verify(block, _good(a3_terms=["列表"])) == []
 
 
@@ -225,45 +238,47 @@ def test_item_count_outside_1_to_12_is_not_accepted(recipe, block):
     assert recipe.merge([block], [_good(atoms=[])]).failed == (Span(0, 48, DESC),)
 
 
-# ---------------------------------------------------------------- 设计稿没写措辞的门槛：只记 warnings，给了措辞才回给模型
+# ---------------------------------------------------------------- 字数门槛与空 text：verify 查，回设计稿的话
 def test_text_length_limit(recipe, block):
     long80 = _good(a1_text="查询" * 40)
     assert recipe.verify(block, long80) == []
-    assert recipe.merge([block], [long80]).warnings == ()
     long81 = _good(a1_text="查询" * 40 + "用")
-    assert recipe.verify(block, long81) == []                         # 没定措辞：不回给模型
-    assert recipe.merge([block], [long81]).warnings == ("第 1 项的 text 去掉方括号后 81 字，超过 80",)
+    assert recipe.verify(block, long81) == [
+        "第 1 项的 text 太长：方括号外 81 字，最多 80 字。一项只说一件事，说短些，或拆成几项"]
+    assert recipe.merge([block], [long81]).failed == (Span(0, 48, DESC),)    # 有硬错误的输出不收
+    bracketed = _good(a1_text="[系统]" + "查询" * 40)                        # 方括号里的不算进 80
+    assert recipe.verify(block, bracketed) == []
     told = p_atom(messages={"text_long": "LONG {n} {count} {limit}"})
     assert told.verify(block, long81) == ["LONG 1 81 80"]
-    bracketed = _good(a1_text="[系统]" + "查询" * 40)                  # 方括号里的不算进 80
-    assert recipe.merge([block], [bracketed]).warnings == ()
 
 
 def test_bracket_limit(recipe, block):
     ok = _good(a1_text="[" + "系统" * 6 + "]支持按姓名查询用户")
-    assert recipe.merge([block], [ok]).warnings == ()
+    assert recipe.verify(block, ok) == []
     over = _good(a1_text="[" + "系统" * 7 + "]支持按姓名查询用户")
-    assert recipe.verify(block, over) == []
-    assert recipe.merge([block], [over]).warnings == ("第 1 项的 text 方括号里合计 14 字，超过 12",)
-    told = p_atom(messages={"bracket_long": "B{n}:{count}/{limit}"})
-    assert told.verify(block, over) == ["B1:14/12"]
+    assert recipe.verify(block, over) == [
+        "第 1 项的 text 方括号里补的字太多：14 字，最多 12 字。方括号里只放为了句子完整而补的主语或对象"]
 
 
 def test_term_length_limit(recipe, block):
-    ok = _good(a1_terms=["姓名、手机号查询"])                          # 8 个字
-    assert recipe.merge([block], [ok]).warnings == ()
-    over = _good(a1_terms=["支持按姓名、手机号查询"])
-    assert recipe.verify(block, over) == []
-    assert recipe.merge([block], [over]).warnings == ("第 1 项的 term「支持按姓名、手机号查询」11 字，超过 8",)
-    told = p_atom(messages={"term_long": "T{n}:{term}"})
-    assert told.verify(block, over) == ["T1:支持按姓名、手机号查询"]
+    ok = _good(a1_terms=["姓名、手机号查询"])                                # 8 个字
+    assert recipe.verify(block, ok) == []
+    over = _good(a1_terms=["支持按姓名、手机号查询"])                         # 是原文，但 11 个字
+    assert recipe.verify(block, over) == ["第 1 项的 terms 里『支持按姓名、手机号查询』太长，最多 8 个字。只抄专有说法本身"]
+    both = _good(a2_terms=["按手机号或者邮箱查询用户"])                       # 不是原文，又太长：两句都回
+    assert recipe.verify(block, both) == [
+        _terms_msg(2, "按手机号或者邮箱查询用户"),
+        "第 2 项的 terms 里『按手机号或者邮箱查询用户』太长，最多 8 个字。只抄专有说法本身"]
+    short = p_atom(AtomLimits(term_max=2))                                  # 上限是参数
+    assert short.verify(block, _good(a1_terms=["姓名"], a2_terms=[])) == []
+    assert short.verify(block, _good(a1_terms=["手机号"], a2_terms=[])) == [
+        "第 1 项的 terms 里『手机号』太长，最多 2 个字。只抄专有说法本身"]
 
 
 def test_blank_text(recipe, block):
-    blank = _good(a1_text="   ")
-    assert recipe.verify(block, blank) == []
-    assert recipe.merge([block], [blank]).warnings == ("第 1 项的 text 全是空白",)
-    assert p_atom(messages={"text_blank": "空{n}"}).verify(block, blank) == ["空1"]
+    for blank in ("   ", "\u3000", ""):
+        assert recipe.verify(block, _good(a1_text=blank)) == ["第 1 项的 text 是空的。把这一项说成一句完整的话"]
+    assert recipe.verify(block, _good(a1_text="[系统]支持按姓名查询用户")) == []
 
 
 def test_verify_without_schema_shape_is_a_caller_error(recipe, block):
@@ -336,5 +351,5 @@ def test_verify_messages_same_without_rapidfuzz(monkeypatch, block):
     monkeypatch.setitem(sys.modules, "rapidfuzz.fuzz", None)
     r = p_atom()
     assert r.verify(block, _good(a1_quote="支持按姓名查询用户")) == [_quote_msg(1, S1)]
-    assert r.verify(block, _good(a3_terms=["列表显示"])) == [
-        "第 3 项的 terms 不是说明里连着的一段原文；说明里最像的是：『查询结果在列表中显示，每页显示二十条。』。照原文抄"]
+    assert r.verify(block, _good(skipped=["本功能是为了方便管理员使用。"]))[0] == _skipped_msg(1, S3)
+    assert r.verify(block, _good(a3_terms=["列表显示"])) == [_terms_msg(3, "列表显示")]

@@ -45,9 +45,10 @@ out = r.merge(blocks, res)                        # AtomizeResult(atoms, skipped
 - `verify` 返回回给模型看的错误话；「说明里这几句没有落到…」是软错误，同一块回 `soft_tries`（2）次后照收，
   进 `uncovered` 给用户看。
 - 给模型看的文字（提示词、user 一句、错误话）在 `p_atom_text.py`，逐字照抄设计稿（xxyi-work 的
-  `xxyi_work/biz/PLAN-testrec-v2.md` 第 4 节），改要经指挥。设计稿列了门槛却没写措辞的几条（text 去掉方括号后的字数、
-  方括号里的字数、单个 term 的字数、text 全是空白）程序照查，超了不回给模型、只记进 `warnings`，措辞定了用
-  `p_atom(messages={...})` 给。
+  `xxyi_work/biz/PLAN-testrec-v2.md` 第 4 节），改要经指挥。
+- schema 字段顺序是 quote、text、terms、doubt（先抄原文、再写成话），四个都必填；项数 1–12、terms 至多 3 个、text 非空
+  写成 `minItems`/`maxItems`/`minLength`（taskmodel 的自查认这几样），**不用 maxLength**：text 方括号外的字数、方括号里的字数、
+  单个 term 的字数、text 只有空白由 `verify` 查，回设计稿写的话。
 
 ## 不用哪些库
 

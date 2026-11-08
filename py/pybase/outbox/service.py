@@ -390,6 +390,7 @@ class Outbox:
 
     def _finish(self, inv_id: str, n: int, res: AgentResult) -> None:
         now = self._clock()
+        reply = (res.reply or "").strip()                       # 模型的回复常以空行开头：首尾空白不要
         try:
             with self.store.tx() as c:
                 r = self.store.round(c, inv_id, n)
@@ -397,12 +398,12 @@ class Outbox:
                     return
                 c.execute("UPDATE round SET status=?, reply=?, error=?, session_id=?, finished_at=?, info=? "
                           "WHERE inv_id=? AND n=?",
-                          (R_DONE if res.ok else R_FAILED, res.reply or "", res.error or "", res.session_id, now,
+                          (R_DONE if res.ok else R_FAILED, reply, res.error or "", res.session_id, now,
                            json.dumps(res.info or {}, ensure_ascii=False), inv_id, n))
-                if res.ok and (res.reply or "").strip():
+                if res.ok and reply:
                     c.execute("UPDATE investigation SET status=?, updated_at=?, "
                               "draft=CASE WHEN draft_edited=0 THEN ? ELSE draft END WHERE id=? AND status=?",
-                              (WAITING, now, res.reply, inv_id, RUNNING))
+                              (WAITING, now, reply, inv_id, RUNNING))
                 else:
                     c.execute("UPDATE investigation SET status=?, updated_at=? WHERE id=? AND status=?",
                               (WAITING, now, inv_id, RUNNING))

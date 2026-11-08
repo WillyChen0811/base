@@ -48,7 +48,7 @@ if "慢慢来" in prompt:
     time.sleep(60)
 print("一些不是 JSON 的输出")
 print(json.dumps({"type": "result", "subtype": "success", "is_error": False, "num_turns": 3,
-                  "result": "回复%d：%s" % (n, prompt), "session_id": "sess-%d" % n,
+                  "result": "\n\n回复%d：%s\n" % (n, prompt), "session_id": "sess-%d" % n,
                   "omlx": {"denied": 0, "elapsed": 1, "model": "fake"}}, ensure_ascii=False))
 '''
 
@@ -141,7 +141,7 @@ def test_create_send_reply_followup_resume_draft_gate_approve_delete(box, agent_
     assert got["status"] == WAITING
     r1 = got["rounds"][0]
     assert r1["status"] == "done" and r1["reply"] == "回复1：a.txt 里写了什么？" and r1["error"] == ""
-    assert got["draft"] == r1["reply"] and got["draft_edited"] is False         # 放行稿缺省跟着最新回复
+    assert got["draft"] == r1["reply"] and got["draft_edited"] is False         # 放行稿缺省跟着最新回复（首尾空行去掉）
     c1 = calls(log)[0]
     assert c1["scope"] == scope and c1["resume"] is None and c1["prompt"] == "a.txt 里写了什么？"
     assert c1["system"] == fill_scope(INVESTIGATE_PROMPT, scope) and "、".join(scope) in c1["system"]

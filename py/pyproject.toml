@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "pybase"
 version = "0.1.0"
-description = "零业务依赖的基础模块：RPC 底座、内存盘、AI 客户端、docx 写作、表格读取、SMB、加密、Word→PDF 转换、字幕与音视频、语音识别、音频对齐与说话人归属、词典查询、文本切分与回溯校验"
+description = "零业务依赖的基础模块：RPC 底座、内存盘、AI 客户端、docx 写作、表格读取、SMB、加密、Word→PDF 转换、字幕与音视频、语音识别、音频对齐与说话人归属、词典查询、文本切分与回溯校验、脱敏审核"
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}

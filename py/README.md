@@ -74,9 +74,10 @@
   （主体不重叠 + 只作参考的前文）、话的重切（只切不并、带起止毫秒）、引文回溯校验（逐字 NFKC 归一带偏移表，只认连着的一段；
   近似比对装了 RapidFuzz 就用，`pip install "pybase[textsplit]"`）、各块输出合并，和交给调用方去跑模型的语义拆分配方
   （拆需求 P-ATOM）。见 `pybase/textsplit/README.md`
-- `pybase.outbox`：脱敏审核（零依赖）：一次「调查」= 标题、用途、范围（目录 / 文件）、一轮轮提示词与回复、放行稿；后台起本地代理
-  （照调用契约，如 omlx-agent `--investigate`）只读调查、追问接着上一轮会话（`--resume`），状态存 SQLite 供轮询；敏感串闸门
-  （来源由调用方配：资料目录的文件名、清单文件、直接给的串）；放行 / 退回落盘（目录 0700、文件 0600）。见 `pybase/outbox/README.md`
+- `pybase.outbox`：脱敏审核（零依赖）：一份会话两边——claude CLI（只读给的代码目录、无 MCP 无钩子）和本地代理（照调用契约，
+  如 omlx-agent `--investigate --stream`，只读用户给的范围），每边各自 `--resume` 接着聊、可同时跑，过程逐条存 SQLite 供轮询；
+  发给 Claude 的过敏感串闸门（来源由调用方配：资料目录的文件名、清单文件、直接给的串）；`python -m pybase.outbox.ask`
+  让终端请本地代理协查，只拿得到用户转回的话。见 `pybase/outbox/README.md`
 - `pybase.dictionary`：词典查询统一模型（`Entry`，必带出处与授权说明）+ 数据源适配器。**不内置任何词典数据**；
   目前有 `macos`（系统『词典』App 里已下载的词典，ctypes 直调，零依赖，仅限本机个人使用）
 

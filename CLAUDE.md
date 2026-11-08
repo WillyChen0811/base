@@ -118,11 +118,17 @@
 - RapidFuzz 每次调用现查（`fuzzy_backend()`），测试屏蔽导入走 difflib；不要在模块顶层缓存后端
 
 ### outbox
-- 不带任何目录、代理命令、敏感串来源的缺省（xxyi 传）；提示词、回复、放行稿、命中串都不打印、不写日志，异常文字里不带它们
-- 闸门查不了（来源目录不在、一个串都没取到、来源出错）一律 `GateUnavailable`，放行 / 退回都拒（force 也不行），别改成「查不了就放过」
-- 发出时 `--resume` 用**这一轮之前**最近一个有会话号的轮；重发出错的那一轮不接它自己那次的会话
-- 放行先写文件、库后改状态（条件更新：状态和标题 / 用途 / 放行稿都没变才算），库没改成就删文件；状态和轮的改动一律同一个 `BEGIN IMMEDIATE` 事务
-- 本地代理子进程 `start_new_session`，停下 / 超时 `killpg` 整组；`recover` 只动跑它的进程已经没了的轮
+- 不带任何目录、代理命令、敏感串来源、Claude 能读的目录与附加提示词的缺省（xxyi 传）；提示词、回复、命中串都不打印、不写日志，
+  异常文字里不带它们；`ask` 的范围不在只报个数（路径可能带资料名）
+- 闸门查不了（来源目录不在、一个串都没取到、来源出错）一律 `GateUnavailable`，发给 Claude、转回发起方都拒（force 也不行），
+  别改成「查不了就放过」；发给 omlx 不查
+- 每边的会话号只在这一边某轮跑完**回了**会话号时换（没跑起来 / 停下 / 超时的不换）；每边同时最多一轮，判断和插入同一个 `BEGIN IMMEDIATE` 事务
+- Claude 一边：`--restricted` + `--tools Read,Glob,Grep` + `--strict-mcp-config` + `disableAllHooks`，环境去 `ANTHROPIC_*`/`CLAUDE_CODE_*`；
+  `CLAUDE_CODE_TMPDIR` 一定要指到自己的空目录（claude 自己的临时目录它总能读，缺省是同一工作目录下所有会话共用的 `/tmp/claude-<uid>/…`）；
+  system/init 里工具多了或有 MCP 就停（护栏，别删）
+- 发起方只能经 `take_reply` / `wait_reply` 拿转回的话；`ask` 的 stdout 不许出现两边的回复和过程
+- 子进程 `start_new_session`，停下 / 超时 `killpg` 整组；别的进程跑的轮（`ask` 起的后台进程）停下 = 先标出错、再 `killpg` 它的代理，
+  后台进程记代理进程号时条件更新不成就自己停；`recover` 只动跑它的进程已经没了的轮
 
 ### search
 - FTS5 trigram 对不足 3 字符的查询直接返回空，短词走 LIKE 兜底——中文最常见的 1~2 字查询全靠它

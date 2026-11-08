@@ -179,6 +179,7 @@ class Outbox:
         self._lock = threading.Lock()
         self._runs = {}                         # 调查号 → 在跑的 Run
         self._threads = {}                      # 调查号 → 跑这一轮的线程
+        self._stop_asked = set()                # 点了停下、代理还没起来的调查号（起来马上停）
 
     # ------------------------------------------------------------------ 看
     def _view(self, inv: dict, rounds: List[dict]) -> dict:
@@ -354,6 +355,7 @@ class Outbox:
         t = threading.Thread(target=self._work, args=job, name="outbox-%s-%d" % (inv["id"], n), daemon=True)
         with self._lock:
             self._threads[inv["id"]] = t
+            self._stop_asked.discard(inv["id"])
         t.start()
         return self.get(inv_id)
 
@@ -370,9 +372,13 @@ class Outbox:
             self._finish(inv_id, n, AgentResult(ok=False, error="起不了本地代理：%s: %s" % (type(e).__name__, e)))
             with self._lock:
                 self._threads.pop(inv_id, None)
+                self._stop_asked.discard(inv_id)
             return
         with self._lock:
             self._runs[inv_id] = run
+            stop_now = inv_id in self._stop_asked
+        if stop_now:                                             # 起来之前就点了停下
+            run.stop()
         try:
             with self.store.tx() as c:
                 c.execute("UPDATE round SET agent_pid=? WHERE inv_id=? AND n=? AND status=?",
@@ -387,6 +393,7 @@ class Outbox:
         self._finish(inv_id, n, result)
         with self._lock:
             self._threads.pop(inv_id, None)
+            self._stop_asked.discard(inv_id)
 
     def _finish(self, inv_id: str, n: int, res: AgentResult) -> None:
         now = self._clock()
@@ -419,6 +426,8 @@ class Outbox:
         with self._lock:
             run = self._runs.get(inv["id"])
             t = self._threads.get(inv["id"])
+            if t is not None and run is None:
+                self._stop_asked.add(inv["id"])
         if run is not None:
             run.stop()
         if t is not None:

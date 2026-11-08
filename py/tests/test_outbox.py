@@ -233,6 +233,32 @@ def test_stop_kills_agent(box, agent_env, scope):
         box.stop(iid)
 
 
+def test_stop_before_agent_started(box, agent_env, scope):
+    """点停下时代理还没起来（起子进程那一下）：起来马上停，这一轮记「停下了」。"""
+    import threading
+    inner = box.agent
+
+    class SlowStart:
+        def __init__(self):
+            self.entered, self.go = threading.Event(), threading.Event()
+
+        def start(self, **kw):
+            self.entered.set()
+            self.go.wait(5)
+            return inner.start(**kw)
+    box.agent = slow = SlowStart()
+    iid = box.create("t", "", scope, "慢慢来", send=True)["id"]
+    assert slow.entered.wait(5)
+    out = {}
+    th = threading.Thread(target=lambda: out.setdefault("item", box.stop(iid)))
+    th.start()
+    assert wait_for(lambda: iid in box._stop_asked)
+    slow.go.set()
+    th.join(15)
+    got = out["item"]
+    assert got["status"] == WAITING and got["rounds"][0]["status"] == "failed" and got["rounds"][0]["error"] == "停下了"
+
+
 def test_delete_running_stops_it(box, agent_env, scope):
     _exe, log = agent_env
     iid = box.create("t", "", scope, "慢慢来", send=True)["id"]

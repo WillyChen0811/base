@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 // 项目直接放在工作目录第 1 层（rel 只有一段，没有年份层）时，登记校验、Ubuntu 侧发现单元、
@@ -16,7 +17,8 @@ const (
 )
 
 func TestPFFlat_ValidateUnit(t *testing.T) {
-	u := PFUnitRecord{Code: flatCode, Rel: flatRel, State: PFUnitSyncing}
+	u := PFUnitRecord{Code: flatCode, Rel: flatRel, State: PFUnitSyncing,
+		LinkPath: "/Users/u/Desktop/Projects/" + flatRel, SyncPath: "/Users/u/XXYI-sync/" + flatRel, StartedAt: time.Now()}
 	if err := PFValidateUnit(u); err != nil {
 		t.Fatalf("单段 rel 应是合法登记：%v", err)
 	}

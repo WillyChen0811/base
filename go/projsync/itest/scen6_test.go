@@ -85,3 +85,25 @@ func TestItestS22FirstLayerProject(t *testing.T) {
 		t.Errorf("挪回桌面的目录里应有同步来的文件：%v", err)
 	}
 }
+
+// S23：项目放在非年份的文件夹下一层（rel = 「客户资料/<项目>」），开始同步 → 一轮到 Ubuntu → 取消同步。
+func TestItestS23GroupFolderProject(t *testing.T) {
+	const rel = "客户资料/260403J1402-测试项目辛"
+	c := newCluster(t)
+	c.startUnit(rel, map[string][]byte{"需求.docx": []byte("需求 v1\n"), "现场/记录.txt": []byte("记录 v1\n")})
+	rep := c.round(true)
+	c.assertAligned(rel, rep)
+	if got := c.ubFilesOf(rel)["需求.docx"]; got != sha256Hex([]byte("需求 v1\n")) {
+		t.Fatalf("Ubuntu 的 <root>/%s 下应有需求.docx：sha=%q 本轮=%s", rel, got, jsonOf(rep))
+	}
+	res, err := c.mob.StopSync(context.Background(), "260403J1402")
+	if err != nil || res.Status != projsync.PFUnitMoveDone {
+		t.Fatalf("StopSync 没做成：%v status=%s reason=%s", err, res.Status, res.Reason)
+	}
+	if fi, err := os.Lstat(filepath.Join(c.work, rel)); err != nil || !fi.IsDir() || fi.Mode()&os.ModeSymlink != 0 {
+		t.Errorf("取消后桌面应是真实目录：%v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(c.work, "客户资料")); err != nil {
+		t.Errorf("桌面上的「客户资料」文件夹不能被删：%v", err)
+	}
+}

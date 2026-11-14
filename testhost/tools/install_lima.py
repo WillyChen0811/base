@@ -123,6 +123,9 @@ def main():
     p.add_argument('--start', action='store_true')
     p.add_argument('--archive-file', help='Verified Lima archive supplied through a testhost snapshot')
     p.add_argument('--image-file', help='Verified Ubuntu image supplied through a testhost snapshot')
+    p.add_argument('--instance', default='studio-linux-arm64',
+                   help='Lima instance name; use a new name when changing primary disk size')
+    p.add_argument('--disk', default='100GiB', help='Primary disk size for a new instance')
     args = p.parse_args()
     if not re.fullmatch(r'\d+\.\d+\.\d+', args.version):
         raise SystemExit('Pin a stable numeric release version')
@@ -164,13 +167,17 @@ def main():
             dest.rename(install)
     lima = str(install / 'bin/limactl')
     subprocess.run([lima, '--version'], env=env, check=True)
-    config = root / 'config' / 'studio-linux-arm64.yaml'
+    if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,79}', args.instance):
+        raise SystemExit('Invalid Lima instance name')
+    if not re.fullmatch(r'[1-9][0-9]*(?:GiB|G)', args.disk):
+        raise SystemExit('Disk must be a positive integer GiB size')
+    config = root / 'config' / (args.instance + '.yaml')
     config.parent.mkdir(parents=True, exist_ok=True)
     image = cache / (args.image_sha256.lower() + '.img')
     download(args.image_url, image, args.image_sha256, args.image_file)
     # JSON is valid YAML; explicit mounts prevent default access to the real account home.
     spec = {'vmType': 'vz', 'arch': 'aarch64', 'cpus': 8, 'memory': '16GiB',
-            'disk': '100GiB', 'mounts': [],
+            'disk': args.disk, 'mounts': [],
             'images': [{'location': str(image), 'arch': 'aarch64',
                         'digest': 'sha256:' + args.image_sha256}],
             'containerd': {'system': False, 'user': False},
@@ -185,9 +192,9 @@ apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Ti
     config.write_text(json.dumps(spec, indent=2) + '\n')
     subprocess.run([lima, 'validate', str(config)], env=env, check=True)
     if args.start:
-        subprocess.run([lima, 'start', '--tty=false', '--name=studio-linux-arm64',
+        subprocess.run([lima, 'start', '--tty=false', '--name=' + args.instance,
                         str(config)], env=env, check=True, timeout=1200)
-        subprocess.run([lima, 'shell', 'studio-linux-arm64', 'uname', '-sm'],
+        subprocess.run([lima, 'shell', args.instance, 'uname', '-sm'],
                        env=env, check=True, timeout=60)
     print(json.dumps({'installed': str(install), 'config': str(config),
                       'started': args.start}))

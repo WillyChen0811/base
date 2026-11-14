@@ -1,8 +1,17 @@
 # Target registry contract v1 (foundation only)
 
 This module parses declarations; it does not install VMs, probe runtime architecture,
-dispatch tasks, enforce host budgets or implement a queue. The client CLI is unchanged
-until the coordinator wires this contract into an execution adapter.
+dispatch tasks, enforce host budgets or implement a queue. The client supports an explicit machine-local registry for existing macOS SSH targets:
+
+`python client.py --targets-file ~/.config/testhost/targets.json --target studio-macos-arm64 run ...`
+
+The two options precede the subcommand. With neither option the old host/key path
+is unchanged. Task `requirements` override corresponding top-level `requirements`.
+The selected target and live `ping.runtime` are checked before repository synchronization.
+Older endpoints without runtime native proof are rejected only for native-required tasks.
+Registry `local` and Linux selections are explicitly rejected by this CLI until their
+adapters are integrated. Trusted Python callers may inject `main(..., transport_factory=...)`
+to reuse the same workflow with a controlled adapter; this adds no arbitrary-shell CLI.
 
 Machine-local registry (do not commit connection details into project manifests):
 

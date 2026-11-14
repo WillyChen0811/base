@@ -53,3 +53,13 @@ LIMA_HOME="$REAL_ACCOUNT_HOME/xxyi-testhost/lima" "$REAL_ACCOUNT_HOME/xxyi-testh
 - https://lima-vm.io/docs/installation/
 - https://lima-vm.io/docs/config/vmtype/vz/
 - https://github.com/lima-vm/lima/releases/tag/v2.3.0
+
+## 下载超时与缓存
+
+下载每项最多重试3次，socket超时30秒，每次总耗时上限900秒、大小上限4GiB。
+持续输出阶段和已下载字节，TLS验证保持开启。缓存为真实账户的
+`~/xxyi-testhost/downloads/<SHA256>.tar.gz` 和 `<SHA256>.img`；每次使用前重新验证摘要。
+镜像先由安装工具校验缓存，VM配置引用本地镜像，避免Lima另行不透明下载。
+可通过 `--archive-file`、`--image-file` 提供testhost snapshot中的校验资源；
+本地来源同样验证SHA256，不能将任意本地文件作为未校验资源。快照路径应写在声明cmd中使用
+已有snapshot变量替换，不使用任意SSH或关闭TLS。断点续传尚未实现，失败会删除本次临时文件。

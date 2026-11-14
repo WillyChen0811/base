@@ -12,20 +12,77 @@ import platform
 import pwd
 import re
 import subprocess
+import shutil
 import tarfile
 import tempfile
+import time
 import urllib.request
 from pathlib import Path
 
 
-def download(url, path, expected):
+def sha256(path):
     digest = hashlib.sha256()
-    with urllib.request.urlopen(url, timeout=60) as src, path.open('wb') as dst:
+    with path.open('rb') as src:
         while block := src.read(1024 * 1024):
-            dst.write(block)
             digest.update(block)
-    if digest.hexdigest() != expected.lower():
-        raise RuntimeError('Checksum mismatch: ' + path.name)
+    return digest.hexdigest()
+
+
+def download(url, path, expected, local=None):
+    """Reuse only verified cache entries; keep partial downloads out of the cache."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.is_file() and sha256(path) == expected.lower():
+        print('Verified cached resource: ' + path.name, flush=True)
+        return
+    if local:
+        source = Path(local).resolve(strict=True)
+        if not source.is_file() or sha256(source) != expected.lower():
+            raise RuntimeError('Local resource checksum mismatch: ' + source.name)
+        with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as dst:
+            temp = Path(dst.name)
+            try:
+                with source.open('rb') as src:
+                    shutil.copyfileobj(src, dst, 1024 * 1024)
+            except BaseException:
+                temp.unlink(missing_ok=True)
+                raise
+        if sha256(temp) != expected.lower():
+            temp.unlink(missing_ok=True)
+            raise RuntimeError('Copied resource checksum mismatch')
+        temp.replace(path)
+        print('Verified local resource: ' + path.name, flush=True)
+        return
+    for attempt in range(1, 4):
+        print(f'Download {path.name}: attempt {attempt}/3 (30s socket timeout)', flush=True)
+        temp = None
+        try:
+            started = time.monotonic()
+            progress = started
+            size = 0
+            digest = hashlib.sha256()
+            with urllib.request.urlopen(url, timeout=30) as src, tempfile.NamedTemporaryFile(
+                    dir=path.parent, delete=False) as dst:
+                temp = Path(dst.name)
+                while block := src.read(1024 * 1024):
+                    size += len(block)
+                    if size > 4 * 1024**3 or time.monotonic() - started > 900:
+                        raise RuntimeError('Resource exceeds 4GiB/900s download bound')
+                    dst.write(block)
+                    digest.update(block)
+                    if time.monotonic() - progress > 10:
+                        print(f'Download {path.name}: {size // 1024**2} MiB', flush=True)
+                        progress = time.monotonic()
+            if digest.hexdigest() != expected.lower():
+                raise RuntimeError('Downloaded resource checksum mismatch')
+            temp.replace(path)
+            print(f'Verified download: {path.name} ({size} bytes)', flush=True)
+            return
+        except (OSError, RuntimeError) as exc:
+            if temp:
+                temp.unlink(missing_ok=True)
+            print(f'Download attempt {attempt} failed: {type(exc).__name__}', flush=True)
+            if attempt == 3:
+                raise RuntimeError('Download failed after 3 attempts; supply verified local resource') from exc
 
 
 def installed_files(directory):
@@ -50,6 +107,8 @@ def main():
     for key in ('version', 'archive-sha256', 'image-url', 'image-sha256'):
         p.add_argument('--' + key, required=True)
     p.add_argument('--start', action='store_true')
+    p.add_argument('--archive-file', help='Verified Lima archive supplied through a testhost snapshot')
+    p.add_argument('--image-file', help='Verified Ubuntu image supplied through a testhost snapshot')
     args = p.parse_args()
     if not re.fullmatch(r'\d+\.\d+\.\d+', args.version):
         raise SystemExit('Pin a stable numeric release version')
@@ -64,6 +123,7 @@ def main():
     root = home / 'xxyi-testhost'
     install = root / 'tools' / ('lima-' + args.version)
     state = root / 'lima'
+    cache = root / 'downloads'
     url = f'https://github.com/lima-vm/lima/releases/download/v{args.version}/lima-{args.version}-Darwin-arm64.tar.gz'
     expected_source = {'url': url, 'sha256': args.archive_sha256.lower()}
     env = os.environ.copy()
@@ -80,8 +140,8 @@ def main():
         install.parent.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(dir=install.parent) as tmp:
             stage = Path(tmp)
-            archive = stage / 'lima.tar.gz'
-            download(url, archive, args.archive_sha256)
+            archive = cache / (args.archive_sha256.lower() + '.tar.gz')
+            download(url, archive, args.archive_sha256, args.archive_file)
             dest = stage / 'unpack'
             dest.mkdir()
             with tarfile.open(archive) as tar:
@@ -99,10 +159,12 @@ def main():
     subprocess.run([lima, '--version'], env=env, check=True)
     config = root / 'config' / 'studio-linux-arm64.yaml'
     config.parent.mkdir(parents=True, exist_ok=True)
+    image = cache / (args.image_sha256.lower() + '.img')
+    download(args.image_url, image, args.image_sha256, args.image_file)
     # JSON is valid YAML; explicit mounts prevent default access to the real account home.
     spec = {'vmType': 'vz', 'arch': 'aarch64', 'cpus': 8, 'memory': '16GiB',
             'disk': '100GiB', 'mounts': [],
-            'images': [{'location': args.image_url, 'arch': 'aarch64',
+            'images': [{'location': str(image), 'arch': 'aarch64',
                         'digest': 'sha256:' + args.image_sha256}],
             'containerd': {'system': False, 'user': False}}
     if config.exists() and json.loads(config.read_text()) != spec:

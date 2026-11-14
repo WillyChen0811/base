@@ -102,6 +102,20 @@ def installed_files(directory):
     return result
 
 
+def extract_archive(archive, dest):
+    root = dest.resolve()
+    with tarfile.open(archive) as tar:
+        for member in tar.getmembers():
+            if member.name.startswith('/') or '..' in Path(member.name).parts:
+                raise RuntimeError('Unsafe archive path')
+            if member.issym() or member.islnk():
+                base = root / Path(member.name).parent if member.issym() else root
+                target = (base / member.linkname).resolve()
+                if Path(member.linkname).is_absolute() or not target.is_relative_to(root):
+                    raise RuntimeError('Unsafe archive link')
+        tar.extractall(dest, filter='data')
+
+
 def main():
     p = argparse.ArgumentParser(__doc__)
     for key in ('version', 'archive-sha256', 'image-url', 'image-sha256'):
@@ -144,14 +158,7 @@ def main():
             download(url, archive, args.archive_sha256, args.archive_file)
             dest = stage / 'unpack'
             dest.mkdir()
-            with tarfile.open(archive) as tar:
-                for member in tar.getmembers():
-                    if member.name.startswith('/') or '..' in Path(member.name).parts:
-                        raise RuntimeError('Unsafe archive path')
-                    if member.issym() or member.islnk():
-                        if member.linkname.startswith('/') or '..' in Path(member.linkname).parts:
-                            raise RuntimeError('Unsafe archive link')
-                tar.extractall(dest, filter='data')
+            extract_archive(archive, dest)
             (dest / '.testhost-source.json').write_text(json.dumps({
                 'source': expected_source, 'files': installed_files(dest)}, indent=2) + '\n')
             dest.rename(install)
@@ -166,7 +173,13 @@ def main():
             'disk': '100GiB', 'mounts': [],
             'images': [{'location': str(image), 'arch': 'aarch64',
                         'digest': 'sha256:' + args.image_sha256}],
-            'containerd': {'system': False, 'user': False}}
+            'containerd': {'system': False, 'user': False},
+            'provision': [{'mode': 'system', 'script': '''#!/bin/sh
+set -eu
+export DEBIAN_FRONTEND=noninteractive
+apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update
+apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y --no-install-recommends python3 git bash tar procps coreutils gawk ca-certificates curl bzip2 xz-utils build-essential patchelf ccache
+'''}]}
     if config.exists() and json.loads(config.read_text()) != spec:
         raise SystemExit('Existing VM config differs; refusing silent reconfiguration')
     config.write_text(json.dumps(spec, indent=2) + '\n')

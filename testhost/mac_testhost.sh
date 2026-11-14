@@ -69,11 +69,9 @@ if system == "darwin":
     elif (arch == "arm64" and arm == "1") or (arch == "amd64" and arm == "0"):
         emulated = False
 elif system == "linux":
-    # This compares the executing interpreter with the kernel architecture. It cannot
-    # prove nested virtualization/native hardware or detect every user-mode translator.
-    kernel = {"aarch64":"arm64", "x86_64":"amd64"}.get(platform.uname().machine, platform.uname().machine)
-    if arch in ("arm64", "amd64") and kernel in ("arm64", "amd64"):
-        emulated = arch != kernel
+    # platform.machine() also reads uname; agreement cannot prove native execution.
+    # Leave unknown until a trusted execution adapter can supply that proof.
+    emulated = None
 print(json.dumps({"system":system,"arch":arch,"emulated":emulated}))
 PYRUNTIME
 }

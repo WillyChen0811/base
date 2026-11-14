@@ -105,3 +105,17 @@ def test_ping_runtime_and_numeric_machine_fields(tmp_path, monkeypatch):
     assert result['runtime']['system'] in ('darwin', 'linux')
     assert result['runtime']['arch']
     assert result['runtime']['emulated'] in (True, False, None)
+
+
+@pytest.mark.parametrize('machine', ['aarch64', 'x86_64'])
+def test_linux_uname_cannot_prove_native(machine, monkeypatch, capsys):
+    import platform
+    script = client.ENTRY.read_text().split("<<'PYRUNTIME'\n", 1)[1].split('\nPYRUNTIME', 1)[0]
+    monkeypatch.setattr(platform, 'system', lambda: 'Linux')
+    monkeypatch.setattr(platform, 'machine', lambda: machine)
+    exec(compile(script, str(client.ENTRY), 'exec'), {})
+    runtime = json.loads(capsys.readouterr().out)
+    assert runtime['emulated'] is None
+    assert client.validate_runtime({'runtime': runtime}, {'system': 'linux', 'arch': machine})
+    with pytest.raises(TargetError, match='verified runtime proof'):
+        client.validate_runtime({'runtime': runtime}, {'native': True})

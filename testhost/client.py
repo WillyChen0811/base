@@ -423,6 +423,14 @@ def fetch_artifacts(tr, rid, out_dir, tree):
                     raise THError('artifacts: destination changed')
                 os.replace(temporary, dst)
                 got.append(str(dst.relative_to(out)))
+        except (tarfile.TarError, EOFError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+            if p.poll() is None:
+                p.kill()
+            p.wait()
+            err.seek(0)
+            detail = err.read().decode(errors='replace')[-1000:].strip()
+            raise THError(f'artifacts: invalid or interrupted transfer: {exc}'
+                          + (f'; {detail}' if detail else '')) from exc
         finally:
             if p.poll() is None:
                 p.kill()

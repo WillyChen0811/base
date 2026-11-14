@@ -353,11 +353,96 @@ def summarize(tr, rid, task=None):
     return code
 
 
+def fetch_artifacts(tr, rid, out_dir, tree):
+    """Receive manifest-first tar incrementally; publish validated files only."""
+    out = Path(out_dir).expanduser().resolve()
+    out.mkdir(parents=True, exist_ok=True)
+    argv, env = tr._argv(f"artifacts {rid}")
+    got = []
+    with tempfile.TemporaryDirectory(prefix=".testhost-transfer-", dir=out) as staging, tempfile.TemporaryFile() as err:
+        p = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=err, stdin=subprocess.DEVNULL, env=env)
+        try:
+            with tarfile.open(fileobj=p.stdout, mode="r|") as tf:
+                first = tf.next()
+                if first is None or first.name != '.testhost-artifacts.json' or not first.isfile() or first.size > 8 * 1024**2:
+                    raise THError('artifacts: missing or oversized manifest')
+                manifest = json.load(tf.extractfile(first))
+                if manifest.get('version') != 1:
+                    raise THError('artifacts: unsupported manifest')
+                expected, destinations = {}, set()
+                total = 0
+                for entry in manifest.get('files', []):
+                    name, size, digest = entry['path'], entry['size'], entry['sha256']
+                    parts = Path(name).parts
+                    if not parts or Path(name).is_absolute() or '..' in parts or name in expected or not isinstance(size, int) or size < 0:
+                        raise THError('artifacts: invalid manifest entry')
+                    if not re.fullmatch('[0-9a-f]{64}', digest):
+                        raise THError('artifacts: invalid digest')
+                    relative = Path(*parts[1:]) if tree and parts[0] == 'out' else Path(name) if tree else Path(name).name
+                    dst = out / relative
+                    if dst == out or not dst.resolve().is_relative_to(out) or str(relative) in destinations:
+                        raise THError('artifacts: unsafe or colliding destination')
+                    cur = out
+                    for part in Path(relative).parts:
+                        cur = cur / part
+                        if cur.is_symlink():
+                            raise THError('artifacts: symlink destination')
+                    destinations.add(str(relative))
+                    expected[name] = (entry, Path(staging) / str(len(expected)), dst)
+                    total += size
+                if total != manifest.get('total_bytes') or total > 10 * 1024**3:
+                    raise THError('artifacts: total size exceeds limit or disagrees with manifest')
+                seen = set()
+                for member in tf:
+                    if member is first:
+                        continue
+                    if member.name not in expected or member.name in seen or not member.isfile():
+                        raise THError('artifacts: unexpected member')
+                    entry, temporary, dst = expected[member.name]
+                    if member.size != entry['size']:
+                        raise THError('artifacts: size mismatch')
+                    h = hashlib.sha256()
+                    with tf.extractfile(member) as source, temporary.open('wb') as target:
+                        for chunk in iter(lambda: source.read(1024**2), b''):
+                            target.write(chunk)
+                            h.update(chunk)
+                    if h.hexdigest() != entry['sha256']:
+                        raise THError('artifacts: SHA256 mismatch')
+                    seen.add(member.name)
+                if seen != set(expected):
+                    raise THError('artifacts: missing member')
+            p.stdout.read()
+            if p.wait():
+                err.seek(0)
+                raise THError('artifacts: transfer failed: ' + err.read().decode(errors='replace')[-1000:])
+            for name, (entry, temporary, dst) in expected.items():
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                if not dst.resolve().is_relative_to(out):
+                    raise THError('artifacts: destination changed')
+                os.replace(temporary, dst)
+                got.append(str(dst.relative_to(out)))
+        finally:
+            if p.poll() is None:
+                p.kill()
+                p.wait()
+            p.stdout.close()
+    print(f"取回 {len(got)} 个校验产物到 {out}：{', '.join(got) if got else '（无）'}")
+    return got
+
+
 def fetch_extras(tr, rid, out_dir, tree=None):
     """把外挂/任务在 run 目录里写出的文件取回 out_dir（只取普通文件，不信 tar 里的路径）。
     外挂产出只取名字末段；任务（tree）保留相对路径（去掉开头的 out/），任何 .. 或绝对路径的成员丢弃。"""
     if tree is None:
         tree = bool(tr.call(f"status {rid}").get("task"))
+    try:
+        capabilities = tr.call('capabilities')
+    except THError as exc:
+        if '不认识的动作' not in str(exc):
+            raise
+        capabilities = {}
+    if 'artifacts-v1' in capabilities.get('capabilities', []):
+        return fetch_artifacts(tr, rid, out_dir, tree)
     data = tr.call(f"fetchx {rid}", raw=True)
     out = Path(out_dir).expanduser()
     out.mkdir(parents=True, exist_ok=True)

@@ -154,3 +154,20 @@ run 已自己结束且无残留时只回 `state:"finished"` 不写 cancelled。�
 - 没有防睡处理；没有 setsid，后台进程靠 nohup + 全部重定向，ssh 会话结束后不受影响（无 pty）。
 - 首次 prepare 要联网装 conda/pip 包，慢（本机实测 3~4 分钟）；之后同描述复用。
 - 失败的 prepare 会留下 runs/<id> 半成品目录，`clean runs` 清掉。
+
+## 大产物协议（artifacts-v1）
+
+新增 `capabilities` 返回协议能力列表；支持 `artifacts-v1` 时，客户端的
+`fetch/result --out-dir` 使用 `artifacts <run_id>` 流式取回，无需项目分片。
+旧 `fetchx` 行为保持不变；只有明确“不认识的动作”才回退，连接错误不会被吞掉。
+显式 outputs 可超过 50 MiB；非声明默认文件仍限 50 MiB，总产物限制 10 GiB，
+超限报错而非静默遗漏。可再次 fetch 重试，第一版不做字节偏移续传。
+
+远端只接受 run_id，不接受任意路径。tar 首成员为 `.testhost-artifacts.json`，
+包含版本、总大小、每项 run 相对路径、大小和 SHA256。远端校验文件在哈希与
+传输期间未变化；客户端流式暂存，校验全部成员和远端退出码后才发布文件。
+越界路径、符号链接、重复目标、漏项、错误大小/哈希均拒绝。
+
+`task-context-v1` 表示 prepare 记录 context.json，包含完整提交、平台与环境hash；
+任务获得 TESTHOST_CONTEXT_FILE、TESTHOST_OUT_DIR、TESTHOST_REPO_COMMIT 三个保留变量。
+这些变量在项目环境之后注入，不能被项目伪造；旧 prepared 无context仍按旧方式执行。

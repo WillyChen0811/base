@@ -198,6 +198,16 @@ a_prepare() {
   printf '%s' "$pps" >"$R/pythonpath"
   { printf '%s\n' ${envs[@]+"${envs[@]}"}; } >"$R/envvars"
   echo "$hash" >"$R/envhash"; echo "src/$first/$envrel" >"$R/envfile"
+  "$PY" - "$R" "$rid" "$first" "$hash" "$envrel" "{$res}" <<'PYCONTEXT'
+import json, platform, sys
+from pathlib import Path
+run, rid, primary, env_hash, env_file, repos = sys.argv[1:]
+context = {"version": 1, "run_id": rid, "primary_repo": primary,
+           "repos": json.loads(repos), "env_hash": env_hash, "env_file": env_file,
+           "platform": {"system": platform.system().lower(), "arch": platform.machine()}}
+Path(run, "context.json").write_text(json.dumps(context, indent=2) + "\n")
+Path(run, "context.version").write_text("1\n")
+PYCONTEXT
 
   local E reused
   ensure_env
@@ -284,6 +294,27 @@ a_run() {
             PATH="$E/bin:$PATH" PYTHONUNBUFFERED=1 PYTHONUTF8=1 TESTHOST_RUN_ID="$rid")
   while IFS= read -r p; do [ -n "$p" ] && ev+=("$p"); done <"$R/envvars"
   ev+=(${penv[@]+"${penv[@]}"})
+  # Reserved context variables are injected last so project env cannot override them.
+  local repo_commit
+  if [ -f "$R/context.version" ] || [ -e "$R/context.json" ]; then
+  repo_commit=$("$PY" - "$R/context.json" "$wd" "$task" <<'PYCONTEXT'
+import json, os, sys
+from pathlib import Path
+path, workdir, task = sys.argv[1:]
+p = Path(path)
+d = json.loads(p.read_text())
+repo = workdir.split("/", 1)[0]
+if repo not in d["repos"]:
+    sys.exit("workdir repository missing from task context")
+d.update(workdir=workdir, task=task or None)
+tmp = p.with_suffix(".json.tmp")
+tmp.write_text(json.dumps(d, indent=2) + "\n")
+os.replace(tmp, p)
+print(d["repos"][repo])
+PYCONTEXT
+  ) || fail "任务上下文不可用"
+  ev+=(TESTHOST_CONTEXT_FILE="$R/context.json" TESTHOST_OUT_DIR="$R/out" TESTHOST_REPO_COMMIT="$repo_commit")
+  fi
   local cmd cwd="$R/src/$wd"
   if [ -n "$task" ]; then
     local tl=() cw
@@ -475,6 +506,96 @@ a_fetchx() {
     printf '%s\n' "${x#"$R"/}"
   done
   task_outputs "$R"; } | sort -u | tar -c -C "$R" -T - -f -
+}
+
+a_artifacts() {
+  safe "${1:-}" || fail "run_id 不合法"
+  local R="$TH/runs/$1"; [ -d "$R/out" ] || fail "没有这个 run"
+  "$PY" - "$R" <<'ARTIFACT_PY'
+import glob
+import hashlib
+import io
+import json
+import os
+import stat
+import sys
+import tarfile
+from pathlib import Path
+
+R = Path(sys.argv[1]).resolve()
+LIMIT = 10 * 1024**3
+SMALL = 50 * 1024**2
+INTERNAL = set('pythonpath envvars envhash envfile taskargv spec.err context.json context.version'.split())
+INTERNAL_OUT = set('outputs task log log.tail pid exit exit.end start junit.xml cancelled'.split())
+
+
+def fingerprint(st):
+    return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+
+
+def regular(path):
+    try:
+        rel = path.relative_to(R)
+        cur = R
+        for part in rel.parts:
+            cur = cur / part
+            if cur.is_symlink():
+                return False
+        return stat.S_ISREG(path.stat().st_mode) and path.resolve().is_relative_to(R)
+    except (OSError, ValueError):
+        return False
+
+
+paths = set()
+for folder in (R, R / 'out'):
+    for p in folder.iterdir():
+        if (folder == R and p.name in INTERNAL) or (folder == R / 'out' and p.name in INTERNAL_OUT):
+            continue
+        if regular(p) and p.stat().st_size <= SMALL:
+            paths.add(p)
+spec = R / 'out/outputs'
+if spec.is_file():
+    for pattern in spec.read_text().splitlines():
+        if not pattern:
+            continue
+        if Path(pattern).is_absolute() or '..' in Path(pattern).parts:
+            raise ValueError('unsafe output pattern')
+        for base in (R, R / 'out'):
+            for name in glob.glob(str(base / pattern), recursive=True):
+                p = Path(name)
+                if regular(p):
+                    paths.add(p)
+entries = []
+total = 0
+for p in sorted(paths):
+    st = p.stat()
+    total += st.st_size
+    if total > LIMIT:
+        raise ValueError('artifact total exceeds 10 GiB limit')
+    h = hashlib.sha256()
+    with p.open('rb') as f:
+        for chunk in iter(lambda: f.read(1024**2), b''):
+            h.update(chunk)
+    if fingerprint(p.stat()) != fingerprint(st):
+        raise ValueError('artifact changed while hashing')
+    entries.append((p, st, {'path': str(p.relative_to(R)), 'size': st.st_size, 'sha256': h.hexdigest()}))
+manifest = json.dumps({'version': 1, 'total_bytes': total, 'files': [e[2] for e in entries]}).encode()
+with tarfile.open(fileobj=sys.stdout.buffer, mode='w|') as tar:
+    info = tarfile.TarInfo('.testhost-artifacts.json')
+    info.size = len(manifest)
+    tar.addfile(info, io.BytesIO(manifest))
+    for p, st, entry in entries:
+        if not regular(p) or fingerprint(p.stat()) != fingerprint(st):
+            raise ValueError('artifact changed before transfer')
+        with p.open('rb') as f:
+            if fingerprint(os.fstat(f.fileno())) != fingerprint(st):
+                raise ValueError('artifact changed while opening')
+            info = tarfile.TarInfo(entry['path'])
+            info.size = st.st_size
+            tar.addfile(info, f)
+            if fingerprint(os.fstat(f.fileno())) != fingerprint(st) or not regular(p) or fingerprint(p.stat()) != fingerprint(st):
+                raise ValueError('artifact changed during transfer')
+ARTIFACT_PY
 }
 
 wipe_dir() { guard_th; find "$TH/$1" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null; }
@@ -980,6 +1101,8 @@ a_media_spec() {
 }
 
 case "${ARGS[0]:-}" in
+  capabilities) printf '{"success":true,"protocol":6,"capabilities":["artifacts-v1","task-context-v1"],"artifact_limit_bytes":10737418240}\n';;
+  artifacts) a_artifacts "${ARGS[@]:1}";;
   ping) a_ping;;
   update) a_update;;
   inventory) a_inventory;;

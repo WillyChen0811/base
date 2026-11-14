@@ -16,6 +16,12 @@
         "50e24e1fb79e89116e939d90aa7738f7af48c442fa1bc2510131e0b39c50348e",
         "--start"
       ]
+    },
+    "lima-bootstrap": {
+      "cmd": [
+        "python",
+        "testhost/tools/bootstrap_lima_guest.py"
+      ]
     }
   }
 }

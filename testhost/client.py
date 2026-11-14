@@ -20,6 +20,8 @@ import xml.etree.ElementTree as ET
 from datetime import datetime
 from pathlib import Path
 
+from targets import TargetError, arch_name, check_requirements, load_registry, select_target
+
 HERE = Path(__file__).resolve().parent
 ENTRY = HERE / "mac_testhost.sh"
 MEDIA_SPEC = HERE / "media.json"
@@ -602,13 +604,67 @@ def push_tool(tr):
     print(tr.call("media-spec", stdin=MEDIA_SPEC.read_bytes())["message"])
 
 
+def task_requirements(desc, task):
+    requirements = desc.get("requirements", {})
+    if not isinstance(requirements, dict):
+        raise THError("requirements 必须是对象")
+    merged = dict(requirements)
+    if task:
+        task_spec = desc.get("tasks", {}).get(task, {})
+        extra = task_spec.get("requirements", {}) if isinstance(task_spec, dict) else {}
+        if not isinstance(extra, dict):
+            raise THError("task requirements 必须是对象")
+        merged.update(extra)
+    # Validate even when empty, before remote mutation.
+    check_requirements({"system": merged.get("system"), "arch": merged.get("arch")},
+                       dict(merged, native=False) if "native" in merged else merged)
+    if "native" in merged and type(merged["native"]) is not bool:
+        raise THError("native 必须为 boolean")
+    return merged
+
+
+def validate_runtime(ping, requirements, target=None):
+    runtime = ping.get("runtime")
+    if runtime is None:
+        # Older endpoints can validate OS/arch but cannot prove native execution.
+        version = str(ping.get("macos", ""))
+        system = "linux" if version.startswith("Linux ") else "darwin"
+        runtime = {"system": system, "arch": ping.get("arch"), "emulated": None}
+    if target is not None:
+        check_requirements(target, {"system": target["system"], "arch": target["arch"]}, runtime=runtime)
+        if type(runtime.get("emulated")) is bool and runtime["emulated"] != target.get("emulated", False):
+            raise THError("目标配置与实际转译状态不匹配")
+    check_requirements(target or runtime, requirements, runtime=runtime)
+    return runtime
+
+
+def selected_transport(a):
+    if not a.targets_file and not a.target:
+        a.execution_target = None
+        return Transport(a.host, a.key)
+    registry = load_registry(a.targets_file) if a.targets_file else None
+    target = select_target(registry, a.target, legacy_host=a.host, legacy_key=a.key)
+    if target['backend'] != 'ssh':
+        raise THError("local 执行目标尚未接入；不能派发")
+    if target['system'] != 'darwin':
+        raise THError("Linux 执行目标尚未接入此入口；请使用独立 Linux executor")
+    a.execution_target = target
+    return Transport(target['ssh_host'], target.get('ssh_key') or a.key)
+
+
 def cmd_run(tr, a):
     if a.task and (a.k or a.m or a.plugin or a.plugin_file or a.n):
         raise THError("--task 不能与 -n -k -m --plugin 并用（任务的参数写在描述里或跟在 -- 后）")
     if not a.task and not a.tests:
         raise THError("要给测试文件，或用 --task <任务名>")
     repos, desc, snaps, repos_src = plan(a)
+    requirements = task_requirements(desc, a.task)
+    target = getattr(a, "execution_target", None)
+    if target is not None:
+        check_requirements(target, dict(requirements, native=False) if "native" in requirements else requirements)
     ping = tr.call("ping")
+    if requirements or target is not None:
+        validate_runtime(ping, requirements, target)
     n = a.n
     plugs = [Path(x).expanduser() for x in a.plugin]
     helpers = [Path(x).expanduser() for x in a.plugin_file]
@@ -659,10 +715,12 @@ def cmd_run(tr, a):
     return code
 
 
-def main(argv=None):
+def main(argv=None, transport_factory=None):
     ap = argparse.ArgumentParser(description="Mac 测试机客户端")
     ap.add_argument("--host", default=os.environ.get("TESTHOST_SSH", "omlxwake@192.168.147.196"))
     ap.add_argument("--key", default=os.environ.get("TESTHOST_KEY", str(Path.home() / ".ssh/xxyi_testhost")))
+    ap.add_argument("--targets-file", help="机器本地执行目标 registry JSON（不属于项目配置）")
+    ap.add_argument("--target", help="执行目标 ID；默认沿用现有 Studio")
     sp = ap.add_subparsers(dest="cmd", required=True)
     sp.add_parser("ping")
     sp.add_parser("inventory")
@@ -717,8 +775,8 @@ def main(argv=None):
     r.add_argument("--out-dir", help="结束后把外挂写在 run 目录里的文件取回到这里")
     r.add_argument("tests", nargs="*", help="测试文件；给了 --task 时是任务的追加参数")
     a = ap.parse_args(argv)
-    tr = Transport(a.host, a.key)
     try:
+        tr = (transport_factory or selected_transport)(a)
         if a.cmd == "ping":
             print(json.dumps(tr.call("ping"), ensure_ascii=False, indent=1))
         elif a.cmd == "inventory":
@@ -746,7 +804,7 @@ def main(argv=None):
             print(json.dumps(tr.call("clean " + " ".join(shlex.quote(x) for x in a.rest))))
         else:
             return cmd_run(tr, a)
-    except (THError, subprocess.TimeoutExpired) as e:
+    except (THError, TargetError, subprocess.TimeoutExpired) as e:
         print(f"错误：{e}", file=sys.stderr)
         return 4 if getattr(e, "code", None) == "not_found" else 3
     return 0

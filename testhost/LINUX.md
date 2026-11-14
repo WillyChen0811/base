@@ -63,3 +63,14 @@ LIMA_HOME="$REAL_ACCOUNT_HOME/xxyi-testhost/lima" "$REAL_ACCOUNT_HOME/xxyi-testh
 可通过 `--archive-file`、`--image-file` 提供testhost snapshot中的校验资源；
 本地来源同样验证SHA256，不能将任意本地文件作为未校验资源。快照路径应写在声明cmd中使用
 已有snapshot变量替换，不使用任意SSH或关闭TLS。断点续传尚未实现，失败会删除本次临时文件。
+
+## 来宾基础工具
+
+Lima 首次启动时以 guest system provision 安装 python3、git、bash、tar、procps、coreutils、
+gawk、ca-certificates、curl、bzip2、xz-utils、build-essential、patchelf、ccache。
+仅来宾内使用 root 权限；宿主不运行 sudo。apt 设置非交互模式、3次资源重试、HTTP/HTTPS 30秒超时。
+Nuitka 编译工具也包含在当前初始配方中。若配置已有且内容不同，安装工具拒绝静默替换，
+由维护者审核变更及现有VM状态后处理，不能删库重建来规避。
+
+归档解包允许指向解压目录内部的相对符号链接（如 `bin/tool -> ../lib/tool`），
+先按成员目录解析目标并检查目录包含关系，再使用 Python tar data filter；拒绝绝对和越界链接。

@@ -29,10 +29,14 @@ sys.stdout.write("".join(x+"\0" for x in shlex.split(sys.argv[1])))' "${SSH_ORIG
 # ---------- 系统信息（macOS 命令都有 Linux 兜底，便于本机测）
 host_name() { scutil --get LocalHostName 2>/dev/null || hostname; }
 os_ver() { sw_vers -productVersion 2>/dev/null || uname -sr; }
-ncpu() { sysctl -n hw.ncpu 2>/dev/null || nproc; }
+ncpu() {
+  local n
+  n=$(sysctl -n hw.ncpu 2>/dev/null)
+  if [[ "$n" =~ ^[0-9]+$ ]] && [ "$n" -gt 0 ]; then echo "$n"; else nproc; fi
+}
 mem_gb() {
   local b; b=$(sysctl -n hw.memsize 2>/dev/null)
-  if [ -n "$b" ]; then echo $((b / 1073741824)); else awk '/MemTotal/{print int($2/1048576)}' /proc/meminfo; fi
+  if [[ "$b" =~ ^[0-9]+$ ]] && [ "$b" -gt 0 ]; then echo $((b / 1073741824)); else awk '/MemTotal/{print int($2/1048576)}' /proc/meminfo; fi
 }
 disk_free_gb() { df -Pk "$TH" 2>/dev/null | awk 'NR == 2 { print int($4 / 1048576) }'; }
 load_avg() {
@@ -49,12 +53,37 @@ count_running() {
 }
 guard_th() { [ -n "$TH" ] && [ "$TH" != "/" ] && [ -d "$TH/runs" ] || fail "测试机目录异常"; }
 
+runtime_identity() {
+  "$PY" - <<'PYRUNTIME'
+import json, platform, subprocess
+system = platform.system().lower()
+arch = {"aarch64":"arm64", "x86_64":"amd64"}.get(platform.machine(), platform.machine())
+emulated = None
+if system == "darwin":
+    def flag(name):
+        p = subprocess.run(["sysctl", "-n", name], capture_output=True, text=True)
+        return p.stdout.strip() if p.returncode == 0 else None
+    translated, arm = flag("sysctl.proc_translated"), flag("hw.optional.arm64")
+    if translated == "1":
+        emulated = True
+    elif (arch == "arm64" and arm == "1") or (arch == "amd64" and arm == "0"):
+        emulated = False
+elif system == "linux":
+    # This compares the executing interpreter with the kernel architecture. It cannot
+    # prove nested virtualization/native hardware or detect every user-mode translator.
+    kernel = {"aarch64":"arm64", "x86_64":"amd64"}.get(platform.uname().machine, platform.uname().machine)
+    if arch in ("arm64", "amd64") and kernel in ("arm64", "amd64"):
+        emulated = arch != kernel
+print(json.dumps({"system":system,"arch":arch,"emulated":emulated}))
+PYRUNTIME
+}
+
 a_ping() {
   local r; r=$(count_running)
-  printf '{"success":true,"host":"%s","user":"%s","macos":"%s","arch":"%s","ncpu":%s,"mem_gb":%s,"load":"%s","python":"%s","node":"%s","running":%s,"idle":%s,"disk_free_gb":%s,"testhost":"v%s"}\n' \
+  printf '{"success":true,"host":"%s","user":"%s","macos":"%s","arch":"%s","ncpu":%s,"mem_gb":%s,"load":"%s","python":"%s","node":"%s","running":%s,"idle":%s,"disk_free_gb":%s,"testhost":"v%s","runtime":%s}\n' \
     "$(jstr "$(host_name)")" "$(id -un)" "$(jstr "$(os_ver)")" "$(uname -m)" "$(ncpu)" "$(mem_gb)" "$(load_avg)" \
     "$("$PY" -V 2>&1 | awk '{print $2}')" "$(node -v 2>/dev/null)" "$r" "$([ "$r" -eq 0 ] && echo true || echo false)" \
-    "$(disk_free_gb || echo null)" "$VERSION"
+    "$(disk_free_gb || echo null)" "$VERSION" "$(runtime_identity)"
 }
 
 a_update() {

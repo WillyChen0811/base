@@ -22,9 +22,11 @@ python testhost/client.py run --repo . --workdir base --env-file testhost/lima-t
 脚本通过 passwd 取得服务账户真实 home，而非 testhost 替换的 run HOME：
 
 - `~/xxyi-testhost/tools/lima-2.3.0/`：二进制与安装来源、逐文件 SHA256 收据 `.testhost-source.json`。
-- `~/xxyi-testhost/config/studio-linux-arm64.yaml`：JSON 格式 YAML 配置。
+- `~/xxyi-testhost/config/studio-linux-arm64-30.yaml`：当前实例 JSON 格式 YAML 配置。
 - `~/xxyi-testhost/lima/`：LIMA_HOME，VM 状态、磁盘及连接资料。
-- VM 名：`studio-linux-arm64`，8 vCPU / 16GiB RAM / 100GiB 磁盘。
+- 当前 VM：`studio-linux-arm64-30`，8 vCPU / 16GiB RAM / 30GiB 磁盘。
+- 旧 VM：`studio-linux-arm64`，100GiB 磁盘，已停止并保留作回退。
+- 后续重建使用 `lima-install-30` 声明任务；默认 `lima-install` 仍用于原 100GiB 配置。
 - `mounts: []`：不默认挂载真实账户 home；禁用用户与系统 containerd。
 
 复用安装前检查收据来源及文件摘要；未知来源或内容变化立即失败，不覆盖现存安装。
@@ -41,11 +43,11 @@ python testhost/client.py run --repo . --workdir base --env-file testhost/lima-t
 管理命令必须使用真实账户 home 和专用 LIMA_HOME，例如在已审核的 testhost 管理任务内执行：
 
 ```sh
-LIMA_HOME="$REAL_ACCOUNT_HOME/xxyi-testhost/lima" "$REAL_ACCOUNT_HOME/xxyi-testhost/tools/lima-2.3.0/bin/limactl" stop studio-linux-arm64
+LIMA_HOME="$REAL_ACCOUNT_HOME/xxyi-testhost/lima" "$REAL_ACCOUNT_HOME/xxyi-testhost/tools/lima-2.3.0/bin/limactl" stop studio-linux-arm64-30
 ```
 
 `REAL_ACCOUNT_HOME` 应从 passwd 解析，不从隔离 HOME 猜测。删除前确认无运行任务，先停机，再使用同样环境的
-`limactl delete studio-linux-arm64`；该操作会删除 VM 磁盘，应先导出需保留的产物。
+`limactl delete studio-linux-arm64-30`；该操作会删除 VM 磁盘，应先导出需保留的产物。
 仅在确认不再使用后删除本工具专用的版本目录和配置文件，不清空用户其他 Lima 实例或共享缓存。
 现有 `clean runs` 只负责 run；此持久实例不应由普通 run 清理顺带删除。
 

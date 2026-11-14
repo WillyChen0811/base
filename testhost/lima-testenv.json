@@ -1,0 +1,21 @@
+{
+  "python": "3.12",
+  "pip": [],
+  "tasks": {
+    "lima-install": {
+      "cmd": [
+        "python",
+        "testhost/tools/install_lima.py",
+        "--version",
+        "2.3.0",
+        "--archive-sha256",
+        "b7af444bd8f91d3c307477e562f2cf3bd7595d62b9429185e4fa841563578cfc",
+        "--image-url",
+        "https://cloud-images.ubuntu.com/releases/noble/release-20261017/ubuntu-24.04-server-cloudimg-arm64.img",
+        "--image-sha256",
+        "50e24e1fb79e89116e939d90aa7738f7af48c442fa1bc2510131e0b39c50348e",
+        "--start"
+      ]
+    }
+  }
+}

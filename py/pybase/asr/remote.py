@@ -31,6 +31,9 @@ file/model/language/response_format），两个模型各有一半短板：
 短停顿交给识别模型自己判断，程序**不按音量挪句首**（实测 -30dB 的句首校正会把轻声的字
 当静音吞掉）。
 
+事后识别可传 `text_window_ms`：text_model 接收连续的较大音频窗口，timing_model 的句尾仅用作切点参考。
+返回 cue 对应整块输入音频，保留原音绝对时间，不冒充句级时间。较大窗口是否更准需调用方实测；缺省仍走逐句。
+
 `refine_cues` 是另一条用法：沿用已有时间轴（通常来自 Apple Speech），每句截出来交
 text_model 重听，只换文字、不动时间和说话人。
 
@@ -522,6 +525,31 @@ def drop_contained_duplicates(cues: Iterable[Cue]) -> list[Cue]:
 # ---------------------------------------------------------------------------
 
 
+def _text_windows(start_ms: int, end_ms: int, boundaries: Iterable[int],
+                  max_ms: int) -> list[tuple[int, int]]:
+    """Continuous input windows with timing-model ends as natural cut hints.
+
+    Timestamps describe uploaded audio ranges, not inferred word/sentence times.
+    Balance windows to avoid a tiny final clip, and preserve speech even when the
+    timing model omitted it. Every window respects the requested hard maximum.
+    """
+    if end_ms <= start_ms:
+        return []
+    count = (end_ms - start_ms + max_ms - 1) // max_ms
+    candidates = sorted(set(b for b in boundaries if start_ms < b < end_ms))
+    out, previous = [], start_ms
+    for i in range(1, count):
+        ideal = start_ms + (end_ms - start_ms) * i // count
+        lo = max(previous + 1, end_ms - (count - i) * max_ms)
+        hi = min(previous + max_ms, end_ms - (count - i))
+        nearby = [b for b in candidates if lo <= b <= hi and abs(b - ideal) <= max_ms // 5]
+        cut = min(nearby, key=lambda b: (abs(b - ideal), b)) if nearby else min(hi, max(lo, ideal))
+        out.append((previous, cut))
+        previous = cut
+    out.append((previous, end_ms))
+    return out
+
+
 def _write_json_atomic(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".tmp")
@@ -633,6 +661,7 @@ def transcribe_remote(
     concurrency: int = 2,
     segment_ms: int = 600_000,
     overlap_ms: int = 5_000,
+    text_window_ms: int | None = None,
     checkpoint_dir: str | os.PathLike,
     ffmpeg: str | None = None,
     ffprobe: str | None = None,
@@ -646,6 +675,10 @@ def transcribe_remote(
     `checkpoint_dir/audio-16k.wav`（`ffmpeg`/`ffprobe` 只用在这一步，不给就在 PATH 里找）。
     `language`：`zh`/`zh-CN`/`en-US` 这类，发给服务器前取主语言码（`zh`）；None 就不带，
     交给模型判断。`concurrency`：同时在飞的句子请求数（整段请求是串行的）。
+    `text_window_ms`：事后识别可选较大音频窗口（例如 60000 毫秒），默认 None 保持逐句请求。
+    非 None 时，text_model 实际接收连续、无重叠的较大音频窗口，timing_model 仅辅助寻找切点。
+    每个返回 cue 的时间是整块上传音频范围，不是块内句子或字词的精确时间；不删除短静音。
+    长度应由调用方按文本模型支持的音频长度选择。该参数进入断点指纹。
     `on_progress(stage, fraction)`：转码前回调一次 `("converting", None)`（只有要转时）；
     每段完成（含断点复用）回调一次 `("transcribing", 0..1)`。
 
@@ -663,6 +696,9 @@ def transcribe_remote(
         base_url, {"timing_model": timing_model, "text_model": text_model}, concurrency)
     if segment_ms <= 0 or overlap_ms < 0 or overlap_ms >= segment_ms:
         raise ValueError("要求 segment_ms > 0、0 <= overlap_ms < segment_ms")
+    if text_window_ms is not None and (isinstance(text_window_ms, bool)
+            or not isinstance(text_window_ms, int) or text_window_ms <= 0):
+        raise ValueError("text_window_ms 必须为正整数毫秒或 None")
     ckpt_dir = _require_checkpoint_dir(checkpoint_dir)
 
     cancel = cancel_event if cancel_event is not None else threading.Event()
@@ -699,6 +735,7 @@ def transcribe_remote(
             "long_silence_noise_db": _LONG_SILENCE_NOISE_DB,
             "long_silence_min_s": _LONG_SILENCE_MIN_S,
             "silence_frame_ms": _SILENCE_FRAME_MS,
+            **({"text_window_ms": text_window_ms} if text_window_ms is not None else {}),
         }
 
     cues: list[Cue] = []
@@ -732,7 +769,18 @@ def transcribe_remote(
             own_lo = segment.start_ms + (0 if first else halves)
             own_hi = segment.end_ms - (0 if last else halves)
             futures = []
-            for number, sentence in enumerate(sentences):
+            if text_window_ms is not None:
+                boundaries = [segment.start_ms + s["end_ms"] for s in sentences]
+                for number, (start_ms, end_ms) in enumerate(
+                        _text_windows(own_lo, own_hi, boundaries, text_window_ms)):
+                    futures.append((start_ms, end_ms, pool.submit(
+                        _transcribe_sentence, wav=wav, clip_start_ms=start_ms, clip_end_ms=end_ms,
+                        filename=f"seg-{segment.index:04d}-w{number:04d}.wav",
+                        where=f"文本模型 {text_model} 处理第 {segment.index + 1} 段音频窗口 {number + 1}",
+                        base_url=base_url, api_key=api_key, text_model=text_model,
+                        language=speech_language, cancel=cancel,
+                    )))
+            for number, sentence in enumerate(sentences if text_window_ms is None else ()):
                 start_ms = segment.start_ms + sentence["start_ms"]
                 end_ms = segment.start_ms + sentence["end_ms"]
                 if not own_lo <= (start_ms + end_ms) // 2 < own_hi or start_ms >= end_ms:

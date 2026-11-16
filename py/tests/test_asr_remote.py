@@ -954,3 +954,79 @@ def test_real_ffmpeg_refine_from_flac(make_server, tmp_path, monkeypatch):
     assert cues == [Cue(1_000, 2_000, "重听1300毫秒", "测试员")]   # 前后各 150ms 余量
     assert stats["changed"] == 1
     assert not (tmp_path / "ckpt").exists()
+
+
+# Offline review uses real multi-sentence uploads, retaining the original clock.
+def test_offline_windows_upload_long_audio_and_keep_absolute_ranges(make_server, tmp_path):
+    pcm = _pcm([("voice", 125_000)])
+    wav = _write_wav(tmp_path / "offline.wav", pcm)
+    script = [(i * 5_000, (i + 1) * 5_000, f"原句{i}。") for i in range(25)]
+    server = make_server(pcm, script)
+    def response(r):
+        if r["model"] == "qwen-asr":
+            return ("status", 200, json.dumps({"text": f"窗口{r['start_ms']}到{r['end_ms']}。"}))
+    server.hook = response
+    result = transcribe_remote(wav, **_kw(server, tmp_path), text_window_ms=60_000)
+    uploads = sorted(server.of("qwen-asr"), key=lambda r: r["start_ms"])
+    assert len(uploads) == 3  # not 25 short sentence requests
+    assert uploads[0]["start_ms"] == 0 and uploads[-1]["end_ms"] == 125_000
+    assert all(30_000 <= r["end_ms"] - r["start_ms"] <= 60_000 for r in uploads)
+    assert all(a["end_ms"] == b["start_ms"] for a, b in zip(uploads, uploads[1:]))
+    assert _cues(result) == [(r["start_ms"], r["end_ms"], f"窗口{r['start_ms']}到{r['end_ms']}。") for r in uploads]
+
+
+def test_offline_windows_cover_timing_omissions_and_segment_seams(nine, make_server, tmp_path):
+    wav, pcm = nine
+    server = make_server(pcm, [])  # timing misses all speech; text still receives the audio
+    server.hook = lambda r: (("status", 200, json.dumps({"text": "仍然有完整的讲话。"}))
+                             if r["model"] == "qwen-asr" else None)
+    result = transcribe_remote(wav, **_kw(server, tmp_path), segment_ms=5_000,
+                               overlap_ms=1_000, text_window_ms=4_000)
+    uploads = sorted(server.of("qwen-asr"), key=lambda r: r["start_ms"])
+    assert uploads[0]["start_ms"] == 0 and uploads[-1]["end_ms"] == 9_000
+    assert all(r["end_ms"] - r["start_ms"] <= 4_000 for r in uploads)
+    assert all(a["end_ms"] == b["start_ms"] for a, b in zip(uploads, uploads[1:]))
+    assert [(c.start_ms, c.end_ms) for c in result.cues] == [(r["start_ms"], r["end_ms"]) for r in uploads]
+
+
+@pytest.mark.parametrize("second_window", [4_000, 3_000, None])
+def test_offline_window_checkpoints_resume_only_matching_mode(nine, make_server, tmp_path, second_window):
+    wav, pcm = nine
+    server = make_server(pcm, SCRIPT_9S)
+    server.hook = lambda r: (("status", 400, "interrupted") if r["filename"] == "seg-0001.wav" else None)
+    with pytest.raises(AsrError, match="400"):
+        transcribe_remote(wav, **_kw(server, tmp_path), segment_ms=5_000,
+                          overlap_ms=1_000, text_window_ms=4_000)
+    saved = json.loads((tmp_path / "ckpt/seg-0000.json").read_text())
+    assert saved["fingerprint"]["text_window_ms"] == 4_000
+    server.hook = None
+    server.records.clear()
+    transcribe_remote(wav, **_kw(server, tmp_path), segment_ms=5_000,
+                      overlap_ms=1_000, text_window_ms=second_window)
+    reused = not any(r["filename"] == "seg-0000.wav" for r in server.records)
+    assert reused == (second_window == 4_000)
+
+
+@pytest.mark.parametrize("bad", [0, -1, True, 1.5])
+def test_offline_window_requires_positive_milliseconds(nine, make_server, tmp_path, bad):
+    wav, pcm = nine
+    server = make_server(pcm, SCRIPT_9S)
+    with pytest.raises(ValueError, match="text_window_ms"):
+        transcribe_remote(wav, **_kw(server, tmp_path), text_window_ms=bad)
+    assert server.records == []
+
+
+
+def test_offline_window_cancel_stops_following_uploads(nine, make_server, tmp_path):
+    wav, pcm = nine
+    server = make_server(pcm, SCRIPT_9S)
+    cancel = threading.Event()
+    def stop(r):
+        if r["model"] == "qwen-asr":
+            cancel.set()
+    server.hook = stop
+    with pytest.raises(TranscriptionCancelled):
+        transcribe_remote(wav, **_kw(server, tmp_path), text_window_ms=4_000,
+                          concurrency=1, cancel_event=cancel)
+    assert len(server.of("qwen-asr")) == 1
+    assert not (tmp_path / "ckpt/seg-0000.json").exists()

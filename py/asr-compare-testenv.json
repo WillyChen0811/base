@@ -1,0 +1,14 @@
+{
+  "_说明": "仅手动启动的真实oMLX对照，全部音频由macOS say合成，不读取客户数据或应用配置。ASR_COMPARE_API_KEY经环境注入，脚本不打印。先提交再从testhost启动asr-compare任务。",
+  "python": "3.12",
+  "pip": [],
+  "repos": {},
+  "pythonpath": ["py"],
+  "env": {"ASR_COMPARE_OUT": "{run}/out"},
+  "tasks": {
+    "asr-compare": {
+      "cmd": ["python", "py/scripts/asr_offline_compare.py"],
+      "outputs": ["out/reference.txt", "out/comparison.json", "out/comparison.txt", "out/synthetic-16k.wav"]
+    }
+  }
+}

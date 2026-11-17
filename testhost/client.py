@@ -51,14 +51,9 @@ class Transport:
             return ["bash", str(ENTRY)], dict(os.environ, SSH_ORIGINAL_COMMAND=cmd, TESTHOST_HOME=self.local)
         ctl = Path.home() / ".cache" / "xxyi-testhost"
         ctl.mkdir(parents=True, exist_ok=True)
-        # %C alone does not include host-key policy or identity file. Keep controls
-        # separate so changing verification settings cannot reuse an old connection.
-        policy = hashlib.sha256(json.dumps([self.host, self.key, self.port,
-                                           self.host_key_alias, self.known_hosts]).encode()).hexdigest()[:32]
         argv = ["ssh", "-T", "-i", self.key, "-o", "IdentitiesOnly=yes", "-o", "BatchMode=yes",
                 "-o", "StrictHostKeyChecking=yes", "-o", "ConnectTimeout=30",
-                "-o", "ServerAliveInterval=30", "-o", "ControlMaster=auto", "-o", "ControlPersist=120",
-                "-o", f"ControlPath={ctl}/cm-{policy}"]
+                "-o", "ServerAliveInterval=30", "-o", "ControlMaster=auto", "-o", "ControlPersist=120"]
         if self.port is not None:
             argv += ["-p", str(self.port)]
         if self.host_key_alias is not None:
@@ -66,6 +61,16 @@ class Transport:
         if self.known_hosts is not None:
             # OpenSSH parses -o values as config tokens, including path quoting.
             argv += ["-o", "UserKnownHostsFile=" + shlex.quote(self.known_hosts)]
+        # Resolve aliases using OpenSSH itself. Hashing only the caller's host
+        # string could reuse a master for an old HostName, User, or Port after
+        # ~/.ssh/config changes. Effective auth/host-key settings belong here too.
+        resolved = subprocess.run(argv + ["-G", self.host], capture_output=True, timeout=30)
+        if resolved.returncode:
+            raise THError("SSH 配置解析失败：" + resolved.stderr.decode(errors="replace")[-300:])
+        policy = hashlib.sha256(json.dumps([self.host, self.key, self.port,
+                                           self.host_key_alias, self.known_hosts]).encode()
+                                + b"\0" + resolved.stdout).hexdigest()[:32]
+        argv += ["-o", f"ControlPath={ctl}/cm-{policy}"]
         return argv + [self.host, cmd], None
 
     def call(self, cmd, stdin=None, raw=False, timeout=None):

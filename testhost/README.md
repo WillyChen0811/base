@@ -2,6 +2,8 @@
 
 Ubuntu 派活，Mac Studio（omlxwake 账户）跑任意仓库的 pytest 或描述里声明的耗时任务（导表、生成、批量处理、构建），结果拿回来。Ubuntu 只发 commit 与测试文件名/任务名，不在本机跑。
 
+远程接入支持「自持 Studio SSH 凭据，经指定端口转发」和「独立认证 Ubuntu，由 Ubuntu 代调 Studio」两种方式，配置与身份验证见 [REMOTE.md](REMOTE.md)。
+
 - `mac_testhost.sh`：Mac 端入口（bash 3.2 兼容，单文件），经 `update` 推到 `~/xxyi-testhost/bin/testhost`
 - `client.py`：Ubuntu 端客户端（标准库 + ssh/git 子进程）
 - `media.json`：media 动作用的 ffmpeg 环境描述（conda-forge ffmpeg），随 `push-tool` 推到 `~/xxyi-testhost/bin/media.json`

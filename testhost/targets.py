@@ -30,6 +30,18 @@ def _id(value):
     return value
 
 
+def validate_ssh_options(*, port=None, host_key_alias=None, known_hosts=None):
+    """Validate named SSH settings; never accept arbitrary ssh options."""
+    if port is not None and (type(port) is not int or not 1 <= port <= 65535):
+        raise TargetError('ssh_port must be an integer from 1 to 65535')
+    if host_key_alias is not None and (not isinstance(host_key_alias, str)
+            or not re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_.:\[\]-]*', host_key_alias)):
+        raise TargetError('invalid ssh_host_key_alias')
+    if known_hosts is not None and (not isinstance(known_hosts, str) or not known_hosts
+            or any(ord(c) < 32 or ord(c) == 127 for c in known_hosts)):
+        raise TargetError('invalid ssh_known_hosts')
+
+
 def validate_registry(data):
     """Validate budgets as configured reservations, not measured machine capacities."""
     if not isinstance(data, dict) or type(data.get('version')) is not int or data['version'] != 1:
@@ -61,6 +73,8 @@ def validate_registry(data):
             host = t.get('ssh_host')
             if not isinstance(host, str) or not re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_.@:\[\]-]*', host):
                 raise TargetError('invalid ssh_host')
+            validate_ssh_options(port=t.get('ssh_port'), host_key_alias=t.get('ssh_host_key_alias'),
+                                 known_hosts=t.get('ssh_known_hosts'))
             if 'ssh_key' in t and (not isinstance(t['ssh_key'], str) or not t['ssh_key'] or '\x00' in t['ssh_key']):
                 raise TargetError('invalid ssh_key')
         if 'image' in t and (not isinstance(t['image'], str) or not t['image']):

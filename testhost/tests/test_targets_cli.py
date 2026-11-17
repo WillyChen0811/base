@@ -119,3 +119,67 @@ def test_linux_uname_cannot_prove_native(machine, monkeypatch, capsys):
     assert client.validate_runtime({'runtime': runtime}, {'system': 'linux', 'arch': machine})
     with pytest.raises(TargetError, match='verified runtime proof'):
         client.validate_runtime({'runtime': runtime}, {'native': True})
+
+
+
+def test_forwarded_ssh_options_and_control_identity(tmp_path, monkeypatch):
+    monkeypatch.delenv('TESTHOST_LOCAL', raising=False)
+    monkeypatch.setenv('HOME', str(tmp_path))
+    hosts = str(tmp_path / "known hosts")
+    tr = client.Transport('tester@127.0.0.1', 'remote-key', port=2222,
+                          host_key_alias='studio', known_hosts=hosts)
+    argv, env = tr._argv('ping')
+    assert env is None
+    assert argv[-2:] == ['tester@127.0.0.1', 'ping']
+    assert argv[argv.index('-p') + 1] == '2222'
+    assert 'StrictHostKeyChecking=yes' in argv
+    assert 'HostKeyAlias=studio' in argv
+    assert '-T' in argv
+    # Let OpenSSH itself parse the options, including a path containing spaces.
+    import subprocess
+    expanded = subprocess.run(argv[:-2] + ['-G', tr.host], text=True, capture_output=True, check=True).stdout
+    assert 'port 2222\n' in expanded
+    assert 'hostkeyalias studio\n' in expanded
+    assert 'stricthostkeychecking true\n' in expanded or 'stricthostkeychecking yes\n' in expanded
+    assert 'userknownhostsfile "' + hosts + '"' in expanded or 'userknownhostsfile ' + hosts in expanded
+    def control(transport):
+        return next(x for x in transport._argv('ping')[0] if x.startswith('ControlPath='))
+    assert control(tr) != control(client.Transport(tr.host, tr.key, port=2222, host_key_alias='other', known_hosts=hosts))
+    assert control(tr) != control(client.Transport(tr.host, tr.key, port=2222, host_key_alias='studio', known_hosts=hosts + '.other'))
+    assert control(tr) != control(client.Transport(tr.host, 'other-key', port=2222, host_key_alias='studio', known_hosts=hosts))
+
+
+def test_forward_options_cli_and_registry_override(tmp_path, monkeypatch):
+    registry = {'version': 1, 'default_target': 'mac',
+                'hosts': {'studio': {'cpu': 8, 'memory_gb': 32}},
+                'targets': {'mac': {'backend': 'ssh', 'host_id': 'studio',
+                                    'system': 'darwin', 'arch': 'arm64',
+                                    'ssh_host': 'tester@localhost', 'ssh_port': 2222,
+                                    'ssh_host_key_alias': 'studio', 'ssh_known_hosts': str(tmp_path / 'hosts')}}}
+    path = tmp_path / 'targets.json'
+    path.write_text(json.dumps(registry))
+    args = Namespace(host='legacy', key='legacy-key', targets_file=str(path), target=None)
+    tr = client.selected_transport(args)
+    assert (tr.port, tr.host_key_alias, tr.known_hosts) == (2222, 'studio', str(tmp_path / 'hosts'))
+    args.port, args.host_key_alias, args.known_hosts = 2223, 'other', str(tmp_path / 'other')
+    tr = client.selected_transport(args)
+    assert (tr.port, tr.host_key_alias, tr.known_hosts) == (2223, 'other', str(tmp_path / 'other'))
+    seen = []
+    def factory(args):
+        seen.append((args.port, args.host_key_alias, args.known_hosts))
+        class Probe:
+            def call(self, cmd):
+                return {'success': True}
+        return Probe()
+    assert client.main(['--port', '2224', '--host-key-alias', 'studio', '--known-hosts', str(path),
+                        'ping'], transport_factory=factory) == 0
+    assert seen == [(2224, 'studio', str(path))]
+
+
+@pytest.mark.parametrize('args', [['--port', '0'], ['--port', '65536'],
+                                  ['--host-key-alias', 'bad alias'], ['--known-hosts', 'bad\nfile']])
+def test_bad_forward_cli_never_connects(args, monkeypatch):
+    def unexpected(*args, **kwargs):
+        raise AssertionError('must not connect')
+    monkeypatch.setattr(client.Transport, 'call', unexpected)
+    assert client.main(args + ['ping']) == 3

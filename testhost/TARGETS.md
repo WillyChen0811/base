@@ -53,3 +53,32 @@ macOS arm64 with no VM image returns the empty prefix to preserve existing envir
 hashes; other environments return an opaque prefix. VM/container image must be immutable
 or versioned. Future integration includes this prefix in environment cache paths.
 Cache names alone do not establish compatibility or provenance.
+
+
+## SSH through a forwarded port
+
+The client supports the same test protocol over a direct Studio SSH connection or
+an SSH port forwarded by wgtund. The caller retains its Studio private key; the
+forwarder only carries bytes. For example, after forwarding local port 12222 to
+Studio port 22:
+
+```sh
+python client.py --host tester@127.0.0.1 --port 12222 --key ~/.ssh/studio_testhost \
+  --host-key-alias studio --known-hosts ~/.ssh/testhost_known_hosts ping
+```
+
+`--host-key-alias` identifies Studio independently of the local forward port.
+Provision the verified Studio host public key under that alias in the selected
+known_hosts file before connecting. Every SSH connection uses
+`StrictHostKeyChecking=yes`, `BatchMode=yes`, and disables PTY allocation. Unknown
+or changed host keys fail rather than being automatically accepted. There is no
+interactive first-connection enrollment in this client.
+
+Registry SSH targets accept optional `ssh_port` (integer 1..65535),
+`ssh_host_key_alias`, and `ssh_known_hosts` (a file path). Corresponding explicit
+CLI options override these target settings. Omitted settings retain the system
+SSH port, host identity, and known_hosts configuration. SSH control connections
+are separated by destination, key, port, host-key alias, and known_hosts path so a
+connection authenticated under one configuration is not reused under another.
+A broker authenticated at Ubuntu may also use these options to verify Ubuntu;
+its downstream Studio credentials and host-key verification remain on Ubuntu.

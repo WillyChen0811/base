@@ -20,7 +20,7 @@ import xml.etree.ElementTree as ET
 from datetime import datetime
 from pathlib import Path
 
-from targets import TargetError, arch_name, check_requirements, load_registry, select_target
+from targets import TargetError, arch_name, check_requirements, load_registry, select_target, validate_ssh_options
 
 HERE = Path(__file__).resolve().parent
 ENTRY = HERE / "mac_testhost.sh"
@@ -39,8 +39,11 @@ class THError(Exception):
 class Transport:
     """经 ssh 调测试机入口；TESTHOST_LOCAL=<假 TH 目录> 时直接本机执行入口（自测用）。"""
 
-    def __init__(self, host, key):
+    def __init__(self, host, key, *, port=None, host_key_alias=None, known_hosts=None):
+        validate_ssh_options(port=port, host_key_alias=host_key_alias, known_hosts=known_hosts)
         self.host, self.key = host, key
+        self.port, self.host_key_alias = port, host_key_alias
+        self.known_hosts = str(Path(known_hosts).expanduser().resolve()) if known_hosts is not None else None
         self.local = os.environ.get("TESTHOST_LOCAL")
 
     def _argv(self, cmd):
@@ -48,10 +51,22 @@ class Transport:
             return ["bash", str(ENTRY)], dict(os.environ, SSH_ORIGINAL_COMMAND=cmd, TESTHOST_HOME=self.local)
         ctl = Path.home() / ".cache" / "xxyi-testhost"
         ctl.mkdir(parents=True, exist_ok=True)
-        return ["ssh", "-i", self.key, "-o", "IdentitiesOnly=yes", "-o", "BatchMode=yes",
-                "-o", "ConnectTimeout=30", "-o", "ServerAliveInterval=30",
-                "-o", "ControlMaster=auto", "-o", "ControlPersist=120",
-                "-o", f"ControlPath={ctl}/cm-%C", self.host, cmd], None
+        # %C alone does not include host-key policy or identity file. Keep controls
+        # separate so changing verification settings cannot reuse an old connection.
+        policy = hashlib.sha256(json.dumps([self.host, self.key, self.port,
+                                           self.host_key_alias, self.known_hosts]).encode()).hexdigest()[:16]
+        argv = ["ssh", "-T", "-i", self.key, "-o", "IdentitiesOnly=yes", "-o", "BatchMode=yes",
+                "-o", "StrictHostKeyChecking=yes", "-o", "ConnectTimeout=30",
+                "-o", "ServerAliveInterval=30", "-o", "ControlMaster=auto", "-o", "ControlPersist=120",
+                "-o", f"ControlPath={ctl}/cm-{policy}-%C"]
+        if self.port is not None:
+            argv += ["-p", str(self.port)]
+        if self.host_key_alias is not None:
+            argv += ["-o", "HostKeyAlias=" + self.host_key_alias]
+        if self.known_hosts is not None:
+            # OpenSSH parses -o values as config tokens, including path quoting.
+            argv += ["-o", "UserKnownHostsFile=" + shlex.quote(self.known_hosts)]
+        return argv + [self.host, cmd], None
 
     def call(self, cmd, stdin=None, raw=False, timeout=None):
         """stdin：bytes 整块送；打开的文件对象则把文件描述符直接交给 ssh 读（流式，不进内存）。"""
@@ -649,7 +664,9 @@ def validate_runtime(ping, requirements, target=None):
 def selected_transport(a):
     if not a.targets_file and not a.target:
         a.execution_target = None
-        return Transport(a.host, a.key)
+        return Transport(a.host, a.key, port=getattr(a, 'port', None),
+                         host_key_alias=getattr(a, 'host_key_alias', None),
+                         known_hosts=getattr(a, 'known_hosts', None))
     registry = load_registry(a.targets_file) if a.targets_file else None
     target = select_target(registry, a.target, legacy_host=a.host, legacy_key=a.key)
     if target['backend'] != 'ssh':
@@ -657,7 +674,10 @@ def selected_transport(a):
     if target['system'] != 'darwin':
         raise THError("Linux 执行目标尚未接入此入口；请使用独立 Linux executor")
     a.execution_target = target
-    return Transport(target['ssh_host'], target.get('ssh_key') or a.key)
+    return Transport(target['ssh_host'], target.get('ssh_key') or a.key,
+                     port=getattr(a, 'port', None) if getattr(a, 'port', None) is not None else target.get('ssh_port'),
+                     host_key_alias=getattr(a, 'host_key_alias', None) or target.get('ssh_host_key_alias'),
+                     known_hosts=getattr(a, 'known_hosts', None) or target.get('ssh_known_hosts'))
 
 
 def cmd_run(tr, a):
@@ -727,6 +747,9 @@ def main(argv=None, transport_factory=None):
     ap = argparse.ArgumentParser(description="Mac 测试机客户端")
     ap.add_argument("--host", default=os.environ.get("TESTHOST_SSH", "omlxwake@192.168.147.196"))
     ap.add_argument("--key", default=os.environ.get("TESTHOST_KEY", str(Path.home() / ".ssh/xxyi_testhost")))
+    ap.add_argument("--port", type=int, help="SSH 端口（可指向 wgtund 本机转发口）")
+    ap.add_argument("--host-key-alias", help="SSH 校验的真实主机名（转发到 Studio 时仍校验 Studio）")
+    ap.add_argument("--known-hosts", help="已核验主机公钥的 known_hosts 文件")
     ap.add_argument("--targets-file", help="机器本地执行目标 registry JSON（不属于项目配置）")
     ap.add_argument("--target", help="执行目标 ID；默认沿用现有 Studio")
     sp = ap.add_subparsers(dest="cmd", required=True)

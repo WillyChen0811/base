@@ -76,3 +76,23 @@ def test_runtime_cache_separation():
     assert cache_namespace(linux) == cache_namespace(copy.deepcopy(linux))
     with pytest.raises(TargetError):
         cache_namespace({'system': 'linux', 'arch': 'arm64'})
+
+
+@pytest.mark.parametrize('field,value', [
+    ('ssh_port', 0), ('ssh_port', 65536), ('ssh_port', True), ('ssh_port', '22'),
+    ('ssh_host_key_alias', '-oProxyCommand=x'), ('ssh_host_key_alias', 'studio\nHost *'),
+    ('ssh_known_hosts', 'hosts\nProxyCommand anything'), ('ssh_known_hosts', '')])
+def test_invalid_ssh_settings(field, value):
+    data = registry()
+    data['targets']['linux'][field] = value
+    with pytest.raises(TargetError):
+        validate_registry(data)
+
+
+def test_forwarded_ssh_registry():
+    data = registry()
+    data['targets']['linux'].update(ssh_port=2222, ssh_host_key_alias='studio',
+                                   ssh_known_hosts='~/.ssh/studio_hosts')
+    target = select_target(data)
+    assert (target['ssh_port'], target['ssh_host_key_alias'], target['ssh_known_hosts']) == (
+        2222, 'studio', '~/.ssh/studio_hosts')

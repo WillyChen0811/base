@@ -149,7 +149,7 @@ class Forward:
 def wire(monkeypatch):
     tool('ssh')
     tool('sshd')
-    short = tempfile.TemporaryDirectory(prefix='thssh-', dir='/tmp')
+    short = tempfile.TemporaryDirectory(prefix='s', dir='/tmp')
     tmp_path = Path(short.name)
     monkeypatch.delenv('TESTHOST_LOCAL', raising=False)
     # ssh control sockets have a short Unix pathname limit, especially on macOS.
@@ -182,7 +182,7 @@ else:
         try:
             yield tmp_path, caller, other, studio_caller, port, hostkey, known
         finally:
-            for control in (tmp_path / '.cache').rglob('cm-*'):
+            for control in tmp_path.rglob('cm-*'):
                 if control.is_socket():
                     subprocess.run([tool('ssh'), '-S', str(control), '-O', 'exit',
                                     'localhost'], capture_output=True, timeout=10)
@@ -245,7 +245,8 @@ def test_ubuntu_broker_separate_credentials_and_both_host_checks(wire):
         'host_key_alias': 'studio-test', 'known_hosts': str(known),
     }))
     config.chmod(0o600)
-    command = shlex.join([sys.executable, str(broker), '--config', str(config)])
+    command = shlex.join(['/usr/bin/env', 'HOME=' + str(root / 'b'),
+                          sys.executable, str(broker), '--config', str(config)])
     with sshd(root / 'ubuntu', caller, command) as (ubuntu_port, ubuntu_key):
         ubuntu_known = pin(root / 'ubuntu_known_hosts', 'ubuntu-test', ubuntu_key)
         tr = transport(caller, ubuntu_port, 'ubuntu-test', ubuntu_known)

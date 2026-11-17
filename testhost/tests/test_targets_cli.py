@@ -183,3 +183,16 @@ def test_bad_forward_cli_never_connects(args, monkeypatch):
         raise AssertionError('must not connect')
     monkeypatch.setattr(client.Transport, 'call', unexpected)
     assert client.main(args + ['ping']) == 3
+
+
+
+def test_control_path_fits_ssh_unix_socket_limit(monkeypatch):
+    # OpenSSH adds a dot and 16 random characters while creating its listener.
+    # Keep the actual Ubuntu home path within the stricter macOS 104-byte bound.
+    monkeypatch.delenv('TESTHOST_LOCAL', raising=False)
+    monkeypatch.setattr(client.Path, 'home', classmethod(lambda cls: Path('/home/chenwy')))
+    monkeypatch.setattr(client.Path, 'mkdir', lambda *args, **kwargs: None)
+    argv, _ = client.Transport('tester@studio', 'key', port=2222, host_key_alias='studio')._argv('ping')
+    path = next(x.split('=', 1)[1] for x in argv if x.startswith('ControlPath='))
+    assert '%C' not in path
+    assert len((path + '.' + 'x' * 16).encode()) < 104

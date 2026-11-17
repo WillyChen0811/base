@@ -54,11 +54,11 @@ class Transport:
         # %C alone does not include host-key policy or identity file. Keep controls
         # separate so changing verification settings cannot reuse an old connection.
         policy = hashlib.sha256(json.dumps([self.host, self.key, self.port,
-                                           self.host_key_alias, self.known_hosts]).encode()).hexdigest()[:16]
+                                           self.host_key_alias, self.known_hosts]).encode()).hexdigest()[:32]
         argv = ["ssh", "-T", "-i", self.key, "-o", "IdentitiesOnly=yes", "-o", "BatchMode=yes",
                 "-o", "StrictHostKeyChecking=yes", "-o", "ConnectTimeout=30",
                 "-o", "ServerAliveInterval=30", "-o", "ControlMaster=auto", "-o", "ControlPersist=120",
-                "-o", f"ControlPath={ctl}/cm-{policy}-%C"]
+                "-o", f"ControlPath={ctl}/cm-{policy}"]
         if self.port is not None:
             argv += ["-p", str(self.port)]
         if self.host_key_alias is not None:

@@ -80,5 +80,8 @@ CLI options override these target settings. Omitted settings retain the system
 SSH port, host identity, and known_hosts configuration. SSH control connections
 are separated by destination, key, port, host-key alias, and known_hosts path so a
 connection authenticated under one configuration is not reused under another.
+Each invocation resolves the effective SSH configuration with `ssh -G` before
+choosing its control socket, so changing an alias's HostName, User, or Port also
+selects a new connection while keeping the socket filename short.
 A broker authenticated at Ubuntu may also use these options to verify Ubuntu;
 its downstream Studio credentials and host-key verification remain on Ubuntu.

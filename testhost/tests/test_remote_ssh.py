@@ -8,7 +8,6 @@ import contextlib
 import json
 import os
 import pwd
-import select
 import shlex
 import shutil
 import signal
@@ -55,6 +54,14 @@ def pin(path, alias, key):
     return path
 
 
+def close_masters(root):
+    """Only controls beneath this test's private temporary root are eligible."""
+    for control in list(root.rglob('cm-*')):
+        if control.is_socket():
+            subprocess.run([tool('ssh'), '-S', str(control), '-O', 'exit',
+                            'localhost'], capture_output=True, timeout=5)
+
+
 @contextlib.contextmanager
 def sshd(root, caller, command):
     root.mkdir()
@@ -73,34 +80,46 @@ def sshd(root, caller, command):
         'AllowTcpForwarding no', 'PermitTTY no', 'LogLevel VERBOSE',
         'ForceCommand ' + command, '',
     ]))
-    process = subprocess.Popen([tool('sshd'), '-D', '-e', '-f', str(config)],
-                               stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-                               start_new_session=True)
-    lines = []
-    try:
-        deadline = time.monotonic() + 15
-        while time.monotonic() < deadline:
-            ready, _, _ = select.select([process.stderr], [], [], max(0, deadline-time.monotonic()))
-            if not ready:
-                break
-            line = process.stderr.readline()
-            if not line:
-                break
-            lines.append(line.decode(errors='replace'))
-            if b'Server listening on' in line:
-                break
-        else:
-            pytest.fail('temporary sshd did not become ready: ' + ''.join(lines))
-        if not any('Server listening on' in line for line in lines):
-            pytest.fail('temporary sshd failed: ' + ''.join(lines))
-        # Drain logs continuously so SSH traffic cannot fill the pipe.
-        threading.Thread(target=lambda: process.stderr.read(), daemon=True).start()
-        yield port, hostkey
-    finally:
-        if process.poll() is None:
-            os.killpg(process.pid, signal.SIGTERM)
-        process.wait(timeout=10)
-        process.stderr.close()
+    ready_hosts = pin(root / 'ready_hosts', 'ready-test', hostkey)
+    log_path = root / 'sshd.log'
+    # A regular file has no reader lock or EOF dependency on inherited child FDs.
+    # With a PIPE, a ControlPersist child could keep the log reader in read() and
+    # make BufferedReader.close() wait the full 120 seconds during teardown.
+    with log_path.open('wb') as log:
+        process = subprocess.Popen([tool('sshd'), '-D', '-e', '-f', str(config)],
+                                   stdout=subprocess.DEVNULL, stderr=log,
+                                   start_new_session=True)
+        try:
+            ready = subprocess.run([
+                tool('ssh'), '-F', '/dev/null', '-i', str(caller), '-p', str(port),
+                '-o', 'IdentitiesOnly=yes', '-o', 'BatchMode=yes',
+                '-o', 'StrictHostKeyChecking=yes', '-o', 'HostKeyAlias=ready-test',
+                '-o', f'UserKnownHostsFile={ready_hosts}',
+                '-o', 'ControlMaster=no', '-o', 'ControlPath=none',
+                '-o', 'ConnectTimeout=3', '-o', 'ConnectionAttempts=5',
+                pwd.getpwuid(os.getuid()).pw_name + '@127.0.0.1', 'ping',
+            ], capture_output=True, timeout=20)
+            assert ready.returncode == 0, ('temporary sshd failed: '
+                + log_path.read_text(errors='replace')
+                + ready.stderr.decode(errors='replace'))
+            yield port, hostkey
+        finally:
+            started = time.monotonic()
+            try:
+                # Inner (Ubuntu) sshd exits before the wire fixture. Close both
+                # hops' temporary masters now rather than waiting for that fixture.
+                close_masters(root.parent)
+            finally:
+                if process.poll() is None:
+                    os.killpg(process.pid, signal.SIGTERM)
+                try:
+                    process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    os.killpg(process.pid, signal.SIGKILL)
+                    process.wait(timeout=5)
+            # Generous cleanup budget, but far below ControlPersist=120. A timing
+            # assertion here covers context teardown, unlike command timeouts.
+            assert time.monotonic() - started < 30, 'temporary SSH cleanup exceeded 30s'
 
 
 class Forward:
@@ -112,6 +131,7 @@ class Forward:
         self.listener.listen()
         self.port = self.listener.getsockname()[1]
         self.connections = []
+        self.workers = []
         self.stopped = threading.Event()
         self.thread = threading.Thread(target=self.accept, daemon=True)
         self.thread.start()
@@ -120,13 +140,23 @@ class Forward:
         while not self.stopped.is_set():
             try:
                 down, _ = self.listener.accept()
+            except OSError:
+                return
+            try:
                 up = socket.create_connection(('127.0.0.1', self.upstream), timeout=5)
                 up.settimeout(None)
             except OSError:
+                down.close()
+                return
+            if self.stopped.is_set():
+                down.close()
+                up.close()
                 return
             self.connections.extend((down, up))
             for source, target in ((down, up), (up, down)):
-                threading.Thread(target=self.copy, args=(source, target), daemon=True).start()
+                worker = threading.Thread(target=self.copy, args=(source, target), daemon=True)
+                self.workers.append(worker)
+                worker.start()
 
     def copy(self, source, target):
         try:
@@ -138,11 +168,18 @@ class Forward:
 
     def close(self):
         self.stopped.set()
+        with contextlib.suppress(OSError):
+            self.listener.shutdown(socket.SHUT_RDWR)
         self.listener.close()
+        self.thread.join(timeout=6)
+        assert not self.thread.is_alive(), 'TCP forward accept did not stop'
         for sock in self.connections:
             with contextlib.suppress(OSError):
                 sock.shutdown(socket.SHUT_RDWR)
             sock.close()
+        for worker in self.workers:
+            worker.join(timeout=2)
+            assert not worker.is_alive(), 'TCP forward copy did not stop'
 
 
 @pytest.fixture
@@ -182,10 +219,7 @@ else:
         try:
             yield tmp_path, caller, other, studio_caller, port, hostkey, known
         finally:
-            for control in tmp_path.rglob('cm-*'):
-                if control.is_socket():
-                    subprocess.run([tool('ssh'), '-S', str(control), '-O', 'exit',
-                                    'localhost'], capture_output=True, timeout=10)
+            close_masters(tmp_path)
     short.cleanup()
 
 

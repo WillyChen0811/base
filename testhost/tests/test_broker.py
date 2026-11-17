@@ -58,7 +58,9 @@ def test_local_config_and_upstream_validation(tmp_path):
     assert parsed['key'] == str(Path.home() / 'key')
     for bad in ({}, {**config, 'port': True}, {**config, 'host': '-oProxyCommand=id'},
                 {**config, 'host': 'studio extra'}, {**config, 'extra': 'no'},
-                {**config, 'known_hosts': ''}, {**config, 'host_key_alias': 'a b'}):
+                {**config, 'known_hosts': ''}, {**config, 'host_key_alias': 'a b'},
+                {**config, 'host_key_alias': 'a\x00b'}, {**config, 'key': '/key\nbad'},
+                {**config, 'known_hosts': '/known\x00bad'}):
         path.write_text(json.dumps(bad))
         with pytest.raises(broker.BrokerError):
             broker.load_config(path)

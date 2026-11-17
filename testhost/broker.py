@@ -83,14 +83,17 @@ def load_config(path):
     for key in ('host', 'key', 'known_hosts'):
         if not isinstance(data.get(key), str) or not data[key]:
             raise BrokerError('broker configuration requires ' + key)
-    if data['host'].startswith('-') or any(c.isspace() or ord(c) < 32 for c in data['host']):
+    if data['host'].startswith('-') or any(c.isspace() or ord(c) < 32 or ord(c) == 127 for c in data['host']):
         raise BrokerError('invalid upstream host')
     if 'port' in data and (type(data['port']) is not int or not 1 <= data['port'] <= 65535):
         raise BrokerError('invalid upstream port')
     if 'host_key_alias' in data and (not isinstance(data['host_key_alias'], str)
-                                    or not data['host_key_alias'] or any(c.isspace() for c in data['host_key_alias'])):
+                                    or not data['host_key_alias'] or any(c.isspace() or ord(c) < 32 or ord(c) == 127
+                                                                         for c in data['host_key_alias'])):
         raise BrokerError('invalid upstream host_key_alias')
     for key in ('key', 'known_hosts'):
+        if any(ord(c) < 32 or ord(c) == 127 for c in data[key]):
+            raise BrokerError('invalid upstream ' + key)
         data[key] = str(Path(data[key]).expanduser())
     return data
 
